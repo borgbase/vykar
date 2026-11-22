@@ -11,7 +11,7 @@
 use tracing::debug;
 
 use crate::compress::Compression;
-use crate::index::dedup_cache::DedupPrefilter;
+use crate::index::table::DedupPrefilter;
 use crate::repo::Repository;
 use crate::repo::file_cache::{CachedChunks, FileCache};
 use crate::snapshot::SnapshotStats;
@@ -61,7 +61,7 @@ pub(super) fn consume_processed_entry(
 
             let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
 
-            process_worker_chunks(repo, &mut item, chunks, stats, compression, prefilter)?;
+            process_worker_chunks(repo, &mut item, chunks, stats, prefilter)?;
 
             // Release budget bytes now that chunks are committed.
             budget.release(acquired_bytes);
@@ -149,7 +149,7 @@ pub(super) fn consume_processed_entry(
             let accum = large_file_accum.as_mut().ok_or_else(|| {
                 VykarError::Other("BUG: large_file_accum missing after segment validation".into())
             })?;
-            process_worker_chunks(repo, &mut accum.item, chunks, stats, compression, prefilter)?;
+            process_worker_chunks(repo, &mut accum.item, chunks, stats, prefilter)?;
             budget.release(acquired_bytes);
 
             if segment_index < num_segments - 1 {

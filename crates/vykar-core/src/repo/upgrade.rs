@@ -24,9 +24,11 @@ use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::index_store::{self, StoredHead};
 use super::{INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat, Repository};
 use crate::compress;
-use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
+use std::sync::Arc;
+
+use crate::index::dedup_cache::{self, generation_for_state};
 use crate::index::head::IndexHead;
-use crate::index::{ChunkIndex, IndexBlob};
+use crate::index::{ChunkIndex, ChunkTable, IndexBlob, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
@@ -139,7 +141,6 @@ impl Repository {
         })?;
 
         // 2–3. Base and head, unless an interrupted upgrade already wrote them.
-        let path = self.full_cache_path();
         let (head, resumed) = match self.storage.get("index")? {
             Some(data) if is_index_head(&data) => {
                 info!("completing an interrupted upgrade");
@@ -171,8 +172,14 @@ impl Repository {
                 (self.write_upgraded_index(&index)?, false)
             }
         };
-        if let Some(scratch) = self.index_scratch.take() {
-            self.index_scratch = index_store::install_cache(scratch, path.as_deref());
+        // The state written or verified above, as a scratch table: publish it.
+        let written = std::mem::take(&mut self.chunk_index);
+        if let Some(table) = written.table().cloned() {
+            drop(written);
+            if let Some(table) = Arc::into_inner(table) {
+                let table = index_store::publish_table(table, self.cache_dir().as_deref());
+                self.chunk_index = LiveIndex::from_table(Arc::new(table));
+            }
         }
 
         // 4. The version switch.
@@ -184,8 +191,6 @@ impl Repository {
         self.index_generation = generation_for_state(&head.state_hash);
         self.index_head = Some(head);
         self.index_dirty = false;
-        // The dedup and restore caches carry the old generation.
-        self.local_caches_stale = true;
         Ok(UpgradeOutcome::Upgraded {
             from: from.version(),
             to: target.version(),
@@ -267,16 +272,9 @@ impl Repository {
         };
         match self.sync_index(Some(head), false) {
             Ok(synced) => {
-                // Nothing here reads the index; only the cache file is kept.
-                let index_store::SyncedIndex {
-                    head,
-                    cache,
-                    scratch,
-                    ..
-                } = synced;
-                drop(cache);
-                self.index_scratch = scratch;
-                Ok(Ok(head))
+                // Kept as the handle's index.
+                self.chunk_index = LiveIndex::from_table(synced.table);
+                Ok(Ok(synced.head))
             }
             Err(e) if index_store::is_object_damage(&e) => Ok(Err(e)),
             Err(e) => Err(e),
@@ -285,17 +283,16 @@ impl Repository {
 
     /// Write `index` as a base (none for an empty index) and the head naming
     /// it; debris of an earlier attempt in `index.d/` is deleted after the
-    /// head is in place. The new full cache is left in `index_scratch`.
+    /// head is in place. The new state is left as the handle's index, in a
+    /// scratch table.
     fn write_upgraded_index(&mut self, index: &ChunkIndex) -> Result<IndexHead> {
         self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
-        let path = self.full_cache_path();
-        let anchor = index_store::cache_anchor(path.as_deref());
+        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
         let next = dedup_cache::full_cache_from_index_to_temp(index, &anchor)?;
-        let cache = MmapFullIndexCache::open_verified(&next)
-            .ok_or_else(|| VykarError::Other("new index state failed verification".into()))?;
-        let head = self.put_base(None, &cache)?;
-        drop(cache);
-        self.index_scratch = Some(next);
+        let table = ChunkTable::scratch(next)
+            .map_err(|_| VykarError::Other("new index state failed verification".into()))?;
+        let head = self.put_base(None, table.cache())?;
+        self.chunk_index = LiveIndex::from_table(Arc::new(table));
         Ok(head)
     }
 }

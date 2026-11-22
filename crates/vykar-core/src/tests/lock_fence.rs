@@ -134,8 +134,13 @@ fn fence_blocks_persist_index_via_mark_dirty() {
 
     let mut repo = crate::testutil::test_repo_plaintext();
 
-    // Dirty the index so save_state will try to persist it.
-    repo.mark_index_dirty();
+    // Edit the index so save_state will try to persist it.
+    repo.chunk_index_mut().add(
+        vykar_types::chunk_id::ChunkId::from_bytes([7; 32]),
+        10,
+        vykar_types::pack_id::PackId::from_bytes([8; 32]),
+        0,
+    );
 
     // Install an always-fail fence.
     let fail_fence: Arc<dyn Fn() -> vykar_types::error::Result<()> + Send + Sync> =

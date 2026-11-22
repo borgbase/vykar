@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::index::dedup_cache::{full_index_cache_path, generation_for_state};
+use crate::index::dedup_cache::generation_for_state;
 use crate::index::head::empty_state_hash;
 use crate::repo::ChunkerParams;
 use crate::repo::format::ObjectType;
@@ -194,8 +194,10 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         let (repo, ops) = env.open_logged(OpenOptions::new().with_index());
         assert_eq!(entries(repo.chunk_index()), entries(&s2));
         assert_eq!(index_d_gets(&ops), 2);
-        let path = full_index_cache_path(&repo.config.id, Some(env.cache.path())).unwrap();
-        assert!(path.exists(), "the synced cache is kept for the next open");
+        let dir =
+            crate::cache_paths::repo_cache_dir(&repo.config.id, Some(env.cache.path())).unwrap();
+        let path = crate::index::table::table_path(&dir, &w.head.state_hash);
+        assert!(path.exists(), "the synced table is kept for the next open");
 
         let (repo, ops) = env.open_logged(OpenOptions::new().with_index());
         assert_eq!(entries(repo.chunk_index()), entries(&s2));
@@ -241,7 +243,7 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
         inner: Arc::clone(&env.inner),
         ops: Arc::clone(&ops),
     };
-    let (_, index) = Repository::fetch_full_index(&logged, env.repo.crypto.as_ref()).unwrap();
+    let index = Repository::fetch_full_index(&logged, env.repo.crypto.as_ref()).unwrap();
     assert_eq!(entries(&index), entries(&s2));
     assert_eq!(index_d_gets(&ops.lock().unwrap()), 2);
 

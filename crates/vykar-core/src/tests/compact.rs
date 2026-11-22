@@ -763,7 +763,7 @@ mod server_side {
     }
 
     fn sorted_entries(repo: &Repository) -> Vec<(ChunkId, ChunkIndexEntry)> {
-        let mut v: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
+        let mut v: Vec<_> = repo.chunk_index().iter().collect();
         v.sort_by_key(|(id, _)| *id.as_bytes());
         v
     }

@@ -9,7 +9,7 @@ use super::types::{
     RepairPlan, RepairResult, ServerVerifyOutcome,
 };
 use crate::config::VykarConfig;
-use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 use vykar_types::chunk_id::ChunkId;
@@ -22,13 +22,13 @@ type PackChunks = HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>;
 
 /// Group a chunk index by pack — the shape both the server-verify request and
 /// the repair planner consume.
-fn group_by_pack(index: &ChunkIndex) -> PackChunks {
+fn group_by_pack(index: &LiveIndex) -> PackChunks {
     let mut pack_chunks: PackChunks = HashMap::new();
     for (chunk_id, entry) in index.iter() {
         pack_chunks
             .entry(entry.pack_id)
             .or_default()
-            .push((*chunk_id, *entry));
+            .push((chunk_id, entry));
     }
     pack_chunks
 }

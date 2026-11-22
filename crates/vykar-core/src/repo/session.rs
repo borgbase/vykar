@@ -1,4 +1,4 @@
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::Repository;
 use super::journal_recovery::PendingIndexRecovery;
@@ -7,8 +7,8 @@ use super::write_session::{
     DEFAULT_SESSION_ID, RollbackTracker, WriteMetricsSnapshot, WriteSessionState, active,
     active_mut,
 };
-use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
-use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
+use crate::index::IndexDelta;
+use crate::index::table::DedupPrefilter;
 use vykar_storage::BackendProfile;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -78,7 +78,13 @@ impl Repository {
     ///
     /// Creates a fresh `WriteSessionState` with pack targets computed from the
     /// current chunk index and repo config. Must be called before any write-path
-    /// methods (`store_chunk`, `flush_packs`, dedup modes, etc.).
+    /// methods (`store_chunk`, `flush_packs`, etc.).
+    ///
+    /// Over an unedited index the session resolves existing chunks against
+    /// the repository's table as it is now, and records their bumps by table
+    /// position (see `CachedBumps`); backup workers get a prefilter over the
+    /// same table. Over an index with unsaved edits (repair) every lookup and
+    /// bump goes through the live index by key, and there is no prefilter.
     ///
     /// Applies every field of `opts`.
     ///
@@ -105,6 +111,15 @@ impl Repository {
         ws.persisted_pack_count = num_packs;
         ws.session_id.clone_from(&opts.session_id);
         ws.stream_data_packs = opts.stream_data_packs;
+        ws.table = self
+            .chunk_index
+            .table()
+            .filter(|_| !self.chunk_index.is_modified())
+            .cloned();
+        ws.index_delta = Some(match &ws.table {
+            Some(table) => IndexDelta::with_cached_bumps(std::sync::Arc::clone(table)),
+            None => IndexDelta::new(),
+        });
         self.write_session = Some(ws);
         Ok(())
     }
@@ -164,102 +179,20 @@ impl Repository {
         self.write_session.as_ref().map(|ws| ws.metrics.snapshot())
     }
 
-    /// Switch to dedup-only index mode to reduce memory during backup.
-    ///
-    /// Builds a lightweight `DedupIndex` (chunk_id → stored_size only) from the
-    /// full `ChunkIndex`, then drops the full index to reclaim memory. All
-    /// mutations are recorded in an `IndexDelta` and merged back at save time.
-    ///
-    /// For 10M chunks this reduces steady-state memory from ~800 MB to ~450 MB.
-    pub fn enable_dedup_mode(&mut self) {
-        let ws = active_mut(&mut self.write_session);
-        if ws.dedup_index.is_some() {
-            return; // already enabled
-        }
-        let dedup = DedupIndex::from_chunk_index(&self.chunk_index);
-        // Drop the full index to reclaim memory
-        self.chunk_index = ChunkIndex::new();
-        self.local_caches_stale = false;
-        ws.dedup_index = Some(dedup);
-        ws.index_delta = Some(IndexDelta::new());
-    }
-
-    /// Switch to tiered dedup mode for minimal memory usage during backup.
-    ///
-    /// Tries to open a local mmap'd dedup cache validated against the manifest's
-    /// `index_generation`. On success: drops the full `ChunkIndex`, builds an
-    /// xor filter over the cache's keys, and routes all lookups through the three-tier structure
-    /// (~12 MB RSS for 10M chunks instead of ~680 MB).
-    ///
-    /// On failure (no cache, stale generation, corrupt file): falls back to the
-    /// existing `DedupIndex` HashMap path.
-    pub fn enable_tiered_dedup_mode(&mut self) {
-        {
-            let ws = self.ws();
-            if ws.tiered_dedup.is_some() || ws.dedup_index.is_some() {
-                return; // already in a dedup mode
-            }
-        }
-
-        self.rebuild_dedup_cache = true;
-        let generation = self.index_generation;
-        if let Some(mmap_cache) = dedup_cache::MmapDedupCache::open(
-            &self.config.id,
-            generation,
-            self.cache_dir_override.as_deref(),
-        ) {
-            // Drop the full index to reclaim memory *before* building the xor
-            // filter: filter construction needs scratch space of the same
-            // order as the index itself, and nothing on this path reads the
-            // index again (the mmap cache now answers every lookup). The
-            // fallback below still has the index because it only runs when
-            // the cache failed to open.
-            self.chunk_index = ChunkIndex::new();
-            self.local_caches_stale = false;
-            let tiered = TieredDedupIndex::new(mmap_cache);
-            debug!(?tiered, "tiered dedup mode: using mmap cache");
-            // Bumps for chunks already in the cache are recorded by position
-            // in this same cache instance (`bump_ref_*` in chunks.rs).
-            let index_delta =
-                IndexDelta::with_cached_bumps(std::sync::Arc::clone(tiered.mmap_cache()));
-            let ws = self.ws_mut();
-            ws.tiered_dedup = Some(tiered);
-            ws.index_delta = Some(index_delta);
-        } else {
-            debug!("tiered dedup mode: no valid cache, falling back to DedupIndex");
-            self.enable_dedup_mode();
-        }
-    }
-
-    /// Return the worker-side prefilter for whichever dedup mode is active.
-    /// Returns `None` when no dedup mode or no write session is active, or the
-    /// mode has no xor filter.
-    ///
-    /// In tiered mode the prefilter also carries the immutable mmap tier, so
-    /// workers can confirm filter hits themselves. The `DedupIndex` fallback
-    /// only shares the filter: its map is owned and mutated by the session,
-    /// so its hits stay unconfirmed until the consumer resolves them.
+    /// The worker-side prefilter over the session's table: `None` without a
+    /// write session, a table, or a filter (an empty table).
     pub(crate) fn dedup_prefilter(&self) -> Option<DedupPrefilter> {
         let ws = self.write_session.as_ref()?;
-        if let Some(ref tiered) = ws.tiered_dedup {
-            return tiered.prefilter();
-        }
-        if let Some(ref dedup) = ws.dedup_index {
-            return dedup.xor_filter().map(DedupPrefilter::filter_only);
-        }
-        None
+        ws.table.as_ref().and_then(DedupPrefilter::new)
     }
 
-    /// Check if a chunk exists in the index (works in normal, dedup, and tiered modes).
-    /// Falls through to chunk_index when no write session is active.
+    /// Check if a chunk exists: stored earlier in the active session, or in
+    /// the index.
     pub fn chunk_exists(&self, id: &ChunkId) -> bool {
-        if let Some(ref ws) = self.write_session {
-            if let Some(ref tiered) = ws.tiered_dedup {
-                return tiered.contains(id);
-            }
-            if let Some(ref dedup) = ws.dedup_index {
-                return dedup.contains(id);
-            }
+        if let Some(ref ws) = self.write_session
+            && ws.session_new.contains_key(id)
+        {
+            return true;
         }
         self.chunk_index.contains(id)
     }
@@ -317,7 +250,7 @@ impl Repository {
     /// Recover chunk→pack mappings from a previous interrupted session's
     /// `pending_index` file. Verifies each pack exists before adding entries.
     ///
-    /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
+    /// Must be called inside the repo lock, before any chunk is stored.
     /// Pack lookups use the backend's request width
     /// (`BackendProfile::request_width`).
     pub fn recover_pending_index(&mut self) -> Result<PendingIndexRecovery> {
@@ -345,11 +278,8 @@ impl Repository {
 
     /// Begin a rollback checkpoint: flush any pending data pack, snapshot
     /// the current `IndexDelta` state, and arm the rollback tracker so all
-    /// subsequent mutations can be undone if the guarded scope fails.
-    ///
-    /// Requires an active dedup mode (tiered or plain). The backup pipeline
-    /// always enables one of these before any callsite, and the rollback
-    /// machinery only tracks mutations that flow through `index_delta`.
+    /// subsequent mutations can be undone if the guarded scope fails. Every
+    /// mutation of a session flows through its `index_delta`.
     #[allow(
         clippy::panic_in_result_fn,
         reason = "asserts encode programmer invariants on internal state"
@@ -360,10 +290,6 @@ impl Repository {
             assert!(
                 ws.rollback_tracker.is_none(),
                 "begin_rollback_checkpoint called while another checkpoint is armed"
-            );
-            assert!(
-                ws.tiered_dedup.is_some() || ws.dedup_index.is_some(),
-                "begin_rollback_checkpoint requires an active dedup mode"
             );
         }
 
@@ -378,7 +304,7 @@ impl Repository {
         let delta_checkpoint = ws
             .index_delta
             .as_mut()
-            .expect("dedup mode implies index_delta is set")
+            .expect("an active session has an index delta")
             .checkpoint();
         let data_pack_target_size = ws.data_pack_writer.target_size();
         ws.rollback_tracker = Some(RollbackTracker {
@@ -419,15 +345,9 @@ impl Repository {
             delta.rollback(tracker.delta_checkpoint);
         }
 
-        // 2. Remove dedup inserts from the active dedup structure.
-        if let Some(ref mut tiered) = ws.tiered_dedup {
-            for chunk_id in &tracker.dedup_inserts {
-                tiered.remove(chunk_id);
-            }
-        } else if let Some(ref mut dedup) = ws.dedup_index {
-            for chunk_id in &tracker.dedup_inserts {
-                dedup.remove(chunk_id);
-            }
+        // 2. Forget the chunks the scope stored or promoted.
+        for chunk_id in &tracker.dedup_inserts {
+            ws.session_new.remove(chunk_id);
         }
 
         // 3. Re-insert promoted recovered chunks.
@@ -450,15 +370,10 @@ impl Repository {
             PackWriter::new(PackType::Data, tracker.data_pack_target_size, hash_algo);
     }
 
-    /// Promote a recovered chunk into the active dedup structure and index delta.
+    /// Promote a recovered chunk into the session and its index delta.
     /// Returns the stored size if the chunk was in `recovered_chunks`, None otherwise.
     pub(super) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        let (stored_size, index_modified) = active_mut(&mut self.write_session)
-            .promote_recovered_chunk(chunk_id, &mut self.chunk_index)?;
-        if index_modified {
-            self.index_dirty = true;
-        }
-        Some(stored_size)
+        active_mut(&mut self.write_session).promote_recovered_chunk(chunk_id)
     }
 }
 
@@ -469,18 +384,22 @@ impl Repository {
         self.ws().data_pack_writer.target_size()
     }
 
-    /// Enter tiered dedup mode over an explicit mmap cache (for testing).
-    pub(crate) fn enable_tiered_dedup_mode_with(&mut self, cache: dedup_cache::MmapDedupCache) {
+    /// Make `index` the repository's table and restart the active session's
+    /// lookups and delta over it, as if the session had begun with it
+    /// loaded (for testing).
+    pub(crate) fn set_session_table_for_test(&mut self, index: &crate::index::ChunkIndex) {
+        use std::sync::Arc;
+        let anchor = super::index_store::cache_anchor(None);
+        let tmp = crate::index::dedup_cache::full_cache_from_index_to_temp(index, &anchor).unwrap();
+        let table = Arc::new(crate::index::ChunkTable::scratch(tmp).unwrap());
+        self.chunk_index = crate::index::LiveIndex::from_table(Arc::clone(&table));
         let ws = self.ws_mut();
-        let tiered = TieredDedupIndex::new(cache);
-        ws.index_delta = Some(IndexDelta::with_cached_bumps(std::sync::Arc::clone(
-            tiered.mmap_cache(),
-        )));
-        ws.tiered_dedup = Some(tiered);
+        ws.index_delta = Some(IndexDelta::with_cached_bumps(Arc::clone(&table)));
+        ws.table = Some(table);
     }
 
     /// Refcount bumps recorded in the index delta for `id`, by key or by
-    /// dedup-cache position (for testing).
+    /// table position (for testing).
     pub(crate) fn delta_refcount_bump(&self, id: &ChunkId) -> u32 {
         let Some(delta) = self
             .write_session
@@ -493,7 +412,7 @@ impl Repository {
         let positional = delta.cached_bumps.as_ref().map_or(0, |cached| {
             cached
                 .cache()
-                .find_with_position(id)
+                .find(id)
                 .map_or(0, |(position, _)| cached.count_at(position as usize))
         });
         keyed + positional
@@ -614,7 +533,6 @@ mod tests {
     #[test]
     fn rollback_checkpoint_armed_and_committed_round_trips() {
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         assert!(!repo.rollback_tracker_armed());
         repo.begin_rollback_checkpoint().unwrap();
         assert!(repo.rollback_tracker_armed());
@@ -625,7 +543,6 @@ mod tests {
     #[test]
     fn rollback_checkpoint_rollback_clears_tracker() {
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         repo.begin_rollback_checkpoint().unwrap();
         repo.abort_rollback_checkpoint();
         assert!(!repo.rollback_tracker_armed());
@@ -635,17 +552,8 @@ mod tests {
     #[should_panic(expected = "begin_rollback_checkpoint called while another checkpoint is armed")]
     fn cannot_begin_overlapping_rollback_checkpoint() {
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         repo.begin_rollback_checkpoint().unwrap();
         // Second begin must panic via the overlap assertion.
-        let _ = repo.begin_rollback_checkpoint();
-    }
-
-    #[test]
-    #[should_panic(expected = "begin_rollback_checkpoint requires an active dedup mode")]
-    fn begin_rollback_checkpoint_without_dedup_mode_panics() {
-        let mut repo = test_repo_plaintext();
-        // No enable_dedup_mode call — must panic.
         let _ = repo.begin_rollback_checkpoint();
     }
 
@@ -657,7 +565,6 @@ mod tests {
         use crate::repo::pack::PackType;
 
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         repo.store_chunk(b"first pack chunk", Compression::None, PackType::Data)
             .unwrap();
         repo.flush_writer_async(PackType::Data).unwrap();
@@ -692,7 +599,6 @@ mod tests {
         use crate::repo::pack::PackType;
 
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         repo.store_chunk(b"first", Compression::None, PackType::Data)
             .unwrap();
         repo.begin_rollback_checkpoint().unwrap();
@@ -745,7 +651,6 @@ mod tests {
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
-        repo.enable_dedup_mode();
         repo.write_session.as_mut().unwrap().stream_data_packs = true;
 
         repo.store_chunk(b"streamed chunk", Compression::None, PackType::Data)
@@ -851,7 +756,6 @@ mod tests {
             released_tx,
             gate_rx: std::sync::Mutex::new(gate_rx),
         });
-        repo.enable_dedup_mode();
 
         repo.store_chunk(b"x", Compression::None, PackType::Data)
             .unwrap();
@@ -892,7 +796,6 @@ mod tests {
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
-        repo.enable_dedup_mode();
         repo.write_session.as_mut().unwrap().stream_data_packs = true;
 
         repo.begin_rollback_checkpoint().unwrap();
@@ -917,7 +820,6 @@ mod tests {
         use crate::repo::pack::PackType;
 
         let mut repo = test_repo_plaintext();
-        repo.enable_dedup_mode();
         let (gated, tx) =
             crate::testutil::PackUploadBackend::gated(std::sync::Arc::clone(&repo.storage));
         repo.storage = std::sync::Arc::new(gated);
@@ -955,5 +857,93 @@ mod tests {
             "the upload still completes; the pack is an orphan for compact"
         );
         repo.write_session = None;
+    }
+
+    /// Over an unedited index a session finds existing chunks in the table
+    /// and counts their bumps by table position, not by key; workers get a
+    /// prefilter over the same table.
+    #[test]
+    fn session_dedups_against_the_table_by_position() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        let (id, size, _) = repo
+            .store_chunk(
+                b"stored before the session",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+        repo.save_state().unwrap();
+
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        let prefilter = repo.dedup_prefilter().expect("prefilter over the table");
+        assert!(Arc::ptr_eq(
+            prefilter.table(),
+            repo.chunk_index().table().unwrap()
+        ));
+        let (again, again_size, is_new) = repo
+            .store_chunk(
+                b"stored before the session",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+        assert_eq!((again, again_size, is_new), (id, size, false));
+        assert_eq!(repo.reuse_cached_chunk_ref(&id).unwrap(), size);
+
+        let ws = repo.write_session.as_ref().unwrap();
+        let delta = ws.index_delta.as_ref().unwrap();
+        assert!(
+            delta.refcount_bumps.is_empty(),
+            "no keyed bump for a table hit"
+        );
+        assert_eq!(repo.delta_refcount_bump(&id), 2);
+
+        repo.save_state().unwrap();
+        assert_eq!(repo.chunk_index().get(&id).unwrap().refcount, 3);
+    }
+
+    /// Over an index with unsaved edits (repair) a session sees the edits:
+    /// lookups and bumps go through the live index by key, and there is no
+    /// prefilter over the (outdated) table.
+    #[test]
+    fn session_over_an_edited_index_records_by_key() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        let (kept, _, _) = repo
+            .store_chunk(b"kept chunk", Compression::None, PackType::Data)
+            .unwrap();
+        let (removed, _, _) = repo
+            .store_chunk(b"removed chunk", Compression::None, PackType::Data)
+            .unwrap();
+        repo.save_state().unwrap();
+
+        assert!(repo.chunk_index_mut().remove(&removed).is_some());
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        assert!(repo.dedup_prefilter().is_none());
+        assert!(
+            repo.bump_ref_if_exists(&removed).is_none(),
+            "the removal is seen"
+        );
+        assert!(repo.bump_ref_if_exists(&kept).is_some());
+        let delta = repo
+            .write_session
+            .as_ref()
+            .unwrap()
+            .index_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(delta.refcount_bumps.get(&kept), Some(&1));
+        assert!(delta.cached_bumps.is_none());
+
+        repo.save_state().unwrap();
+        assert!(!repo.chunk_index().contains(&removed));
+        assert_eq!(repo.chunk_index().get(&kept).unwrap().refcount, 2);
     }
 }

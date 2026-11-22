@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::compress::{Compression, compress_append, compressed_size_bound};
-use crate::index::dedup_cache::{DedupPrefilter, PrefilterVerdict};
+use crate::index::table::{DedupPrefilter, PrefilterVerdict};
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
@@ -13,43 +13,30 @@ pub(crate) struct PreparedChunk {
     pub(crate) packed: Vec<u8>,
 }
 
-/// A chunk that was only hashed (xor filter said "probably exists") and could
-/// not be confirmed in the worker.
-pub(crate) struct HashedChunk {
-    pub(crate) chunk_id: ChunkId,
-    pub(crate) data: Vec<u8>,
-}
-
-/// A chunk the worker confirmed in the pre-session mmap tier.
+/// A chunk the worker confirmed in the session's table.
 pub(crate) struct ExistingChunk {
     pub(crate) chunk_id: ChunkId,
     pub(crate) uncompressed_size: u32,
     pub(crate) stored_size: u32,
-    /// Position of the chunk in the mmap'd dedup cache, so the consumer can
+    /// Position of the chunk in the session's table, so the consumer can
     /// record the refcount bump without a second lookup.
     pub(crate) cache_position: u32,
 }
 
 /// Result of worker-side classify.
 pub(crate) enum WorkerChunk {
-    /// Not in the pre-session chunk set, or no filter: already
+    /// Not in the session's table, or no filter: already
     /// compressed+encrypted. The consumer still dedups it against chunks
     /// added earlier in this session.
     Prepared(PreparedChunk),
-    /// Confirmed pre-session dedup hit (tiered mode): no data retained.
+    /// Confirmed dedup hit in the session's table: no data retained.
     Existing(ExistingChunk),
-    /// Unconfirmed filter hit (`DedupIndex` fallback): only hashed, raw data
-    /// retained for the false-positive fallback.
-    Hashed(HashedChunk),
 }
 
-/// Classify a single chunk: hash → prefilter → transform, data-less hit, or
-/// hash-only.
+/// Classify a single chunk: hash → prefilter → transform, or data-less hit.
 ///
-/// `data` is usually a slice lent by the chunker's read buffer; it is only
-/// copied into an owned `Vec` on the hash-only path, which has to keep the raw
-/// bytes for the filter false-positive fallback. In tiered mode filter hits
-/// are confirmed against the mmap tier right here, so a worker holding a whole
+/// `data` is usually a slice lent by the chunker's read buffer. Filter hits
+/// are confirmed against the table right here, so a worker holding a whole
 /// already-stored file keeps a few bytes per chunk instead of a raw copy, and
 /// a false positive is packed like any other new chunk. The transform path
 /// reads `data` in place.
@@ -71,12 +58,6 @@ pub(super) fn classify_chunk(
                 uncompressed_size: data.len() as u32,
                 stored_size,
                 cache_position: position,
-            }));
-        }
-        Some(PrefilterVerdict::Unconfirmed) => {
-            return Ok(WorkerChunk::Hashed(HashedChunk {
-                chunk_id,
-                data: data.into_owned(),
             }));
         }
     }
@@ -123,49 +104,22 @@ mod tests {
     use crate::repo::format::unpack_object_expect_with_context;
     use vykar_crypto::PlaintextEngine;
 
-    use crate::index::ChunkIndex;
-    use crate::index::dedup_cache::{
-        MmapDedupCache, TieredDedupIndex, build_dedup_cache_to_path, chunk_id_to_u64,
-    };
+    use crate::index::dedup_cache::{chunk_id_to_u64, full_cache_from_index_to_temp};
+    use crate::index::{ChunkIndex, ChunkTable};
     use std::sync::Arc;
     use vykar_types::pack_id::PackId;
 
-    /// Tiered-mode prefilter over a pre-session set holding `stored` chunks.
-    fn tiered_prefilter(stored: &[(ChunkId, u32)]) -> (tempfile::TempDir, DedupPrefilter) {
+    /// Prefilter over a table holding `stored` chunks.
+    fn table_prefilter(stored: &[(ChunkId, u32)]) -> (tempfile::TempDir, DedupPrefilter) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dedup_cache");
         let mut index = ChunkIndex::new();
         for &(id, stored_size) in stored {
             index.add(id, stored_size, PackId::from_bytes([0x01; 32]), 0);
         }
-        build_dedup_cache_to_path(&index, 1, &path).unwrap();
-        let cache = MmapDedupCache::open_path(&path, 1).unwrap();
-        let prefilter = TieredDedupIndex::new(cache).prefilter().unwrap();
+        let tmp = full_cache_from_index_to_temp(&index, &dir.path().join("chunk_table")).unwrap();
+        let table = Arc::new(ChunkTable::scratch(tmp).unwrap());
+        let prefilter = DedupPrefilter::new(&table).unwrap();
         (dir, prefilter)
-    }
-
-    #[test]
-    fn borrowed_unconfirmed_filter_hit_retains_bytes_after_reader_buffer_changes() {
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
-        let mut payload = vec![0x42; 1024];
-        let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
-        let key = chunk_id_to_u64(&chunk_id);
-        let prefilter =
-            DedupPrefilter::filter_only(Arc::new(xorf::Xor8::from(std::slice::from_ref(&key))));
-        let result = classify_chunk(
-            chunk_id,
-            Cow::Borrowed(&payload),
-            Some(&prefilter),
-            Compression::Lz4,
-            &engine,
-        )
-        .unwrap();
-        payload.fill(0);
-        let WorkerChunk::Hashed(chunk) = result else {
-            panic!("unconfirmed filter hit must retain raw data for fallback");
-        };
-        assert_eq!(chunk.chunk_id, chunk_id);
-        assert_eq!(chunk.data, vec![0x42; 1024]);
     }
 
     #[test]
@@ -173,7 +127,7 @@ mod tests {
         let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
-        let (_dir, prefilter) = tiered_prefilter(&[(chunk_id, 77)]);
+        let (_dir, prefilter) = table_prefilter(&[(chunk_id, 77)]);
         let result = classify_chunk(
             chunk_id,
             Cow::Borrowed(&payload),
@@ -183,7 +137,7 @@ mod tests {
         )
         .unwrap();
         let WorkerChunk::Existing(chunk) = result else {
-            panic!("chunk in the mmap tier must be a data-less hit");
+            panic!("chunk in the table must be a data-less hit");
         };
         assert_eq!(chunk.chunk_id, chunk_id);
         assert_eq!(chunk.uncompressed_size, 1024);
@@ -191,7 +145,7 @@ mod tests {
     }
 
     /// A filter false positive (same 64-bit filter key, different chunk) is
-    /// ruled out by the mmap tier and packed in the worker.
+    /// ruled out by the table and packed in the worker.
     #[test]
     fn filter_false_positive_is_packed_in_worker() {
         let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
@@ -201,7 +155,7 @@ mod tests {
         colliding[31] ^= 0xFF;
         let colliding = ChunkId::from_bytes(colliding);
         assert_eq!(chunk_id_to_u64(&colliding), chunk_id_to_u64(&chunk_id));
-        let (_dir, prefilter) = tiered_prefilter(&[(colliding, 77)]);
+        let (_dir, prefilter) = table_prefilter(&[(colliding, 77)]);
         let result = classify_chunk(
             chunk_id,
             Cow::Borrowed(&payload),

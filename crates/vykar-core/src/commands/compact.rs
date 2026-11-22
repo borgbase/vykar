@@ -153,7 +153,7 @@ fn compact_packs(
     let mut per_pack_lookup: HashMap<PackId, Vec<(ChunkId, u32, u64)>> = HashMap::new();
     for (chunk_id, entry) in repo.chunk_index().iter() {
         per_pack_lookup.entry(entry.pack_id).or_default().push((
-            *chunk_id,
+            chunk_id,
             entry.stored_size,
             entry.pack_offset,
         ));

@@ -4,6 +4,7 @@ use super::*;
 use crate::index::dedup_cache::{build_full_index_cache_to_path, chunk_index_from_full_cache};
 use crate::index::head::empty_state_hash;
 use crate::index::segment::diff_to_temp;
+use crate::index::table::{self, ChunkTable};
 use crate::index::{ChunkIndex, ChunkIndexEntry};
 use crate::repo::{EncryptionMode, RepoFormat};
 use crate::tests::helpers::FailGet;
@@ -84,10 +85,8 @@ pub(crate) fn index_with(range: std::ops::Range<u32>, extra_refs: u32) -> ChunkI
     index
 }
 
-pub(crate) fn entries(index: &ChunkIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
-    let mut v: Vec<_> = index.iter().map(|(k, e)| (*k, *e)).collect();
-    v.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    v
+pub(crate) fn entries(index: &impl crate::testutil::EntryIter) -> Vec<(ChunkId, ChunkIndexEntry)> {
+    index.entry_vec()
 }
 
 /// A minimal writer for the segmented layout, the way the write path will
@@ -214,8 +213,8 @@ fn sync(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     head: IndexHead,
-    path: Option<&Path>,
-    scratch: Option<TempPath>,
+    dir: Option<&Path>,
+    live: Option<Arc<ChunkTable>>,
     use_local: bool,
 ) -> Result<SyncedIndex> {
     sync_full_cache(
@@ -223,12 +222,39 @@ fn sync(
         crypto,
         head,
         CacheLocation {
-            path,
-            scratch,
+            dir,
+            live,
             use_local,
         },
         2,
     )
+}
+
+/// The full cache file `src` copied into `dir` as the table of its state.
+fn place_table(dir: &Path, src: &Path) -> PathBuf {
+    let state = MmapFullIndexCache::open_verified(src).unwrap().state_hash();
+    let path = table::table_path(dir, &state);
+    std::fs::copy(src, &path).unwrap();
+    path
+}
+
+/// `index` written into `dir` as the table of its state.
+fn write_table(dir: &Path, index: &ChunkIndex) -> PathBuf {
+    let src = dir.join("source");
+    build_full_index_cache_to_path(index, 1, &src).unwrap();
+    let path = place_table(dir, &src);
+    std::fs::remove_file(src).unwrap();
+    path
+}
+
+/// The states of the table files in `dir`, sorted.
+fn table_states(dir: &Path) -> Vec<StateHash> {
+    let mut v: Vec<StateHash> = table::list_tables(dir)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 fn index_d_gets(gets: &[String]) -> usize {
@@ -279,7 +305,7 @@ fn sync_downloads_catches_up_and_reuses() {
         w.commit(&s2);
 
         let cache_dir = tempfile::tempdir().unwrap();
-        let path = cache_dir.path().join("sub").join("full_index_cache");
+        let path = cache_dir.path().join("sub");
 
         let synced = sync(
             &log,
@@ -291,11 +317,12 @@ fn sync_downloads_catches_up_and_reuses() {
         )
         .unwrap();
         assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-        assert!(synced.scratch.is_none(), "persisted at the cache path");
         assert_eq!(
-            entries(&chunk_index_from_full_cache(&synced.cache)),
-            entries(&s2)
+            synced.table.file_path(),
+            Some(table::table_path(&path, &w.head.state_hash).as_path()),
+            "published under its state"
         );
+        assert_eq!(entries(&*synced.table), entries(&s2));
         assert_eq!(index_d_gets(&log.take()), 2, "base and one segment");
         drop(synced);
 
@@ -310,10 +337,7 @@ fn sync_downloads_catches_up_and_reuses() {
         )
         .unwrap();
         assert_eq!(synced.source, SyncSource::CaughtUp { segments: 1 });
-        assert_eq!(
-            entries(&chunk_index_from_full_cache(&synced.cache)),
-            entries(&s3)
-        );
+        assert_eq!(entries(&*synced.table), entries(&s3));
         assert_eq!(index_d_gets(&log.take()), 1, "only the new segment");
         drop(synced);
 
@@ -340,8 +364,8 @@ fn sync_from_base_state_applies_the_whole_chain() {
     w.commit(&index_with(0..50, 0));
     w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
-    std::fs::copy(w.cache_path(), &path).unwrap();
+    let path = cache_dir.path().to_path_buf();
+    place_table(&path, &w.cache_path());
     let last = index_with(20..90, 3);
     w.commit(&index_with(10..60, 1));
     w.commit(&index_with(15..80, 2));
@@ -357,23 +381,24 @@ fn sync_from_base_state_applies_the_whole_chain() {
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::CaughtUp { segments: 3 });
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&last)
-    );
+    assert_eq!(entries(&*synced.table), entries(&last));
 }
 
-/// A local cache at a state outside the chain is not used.
+/// Tables at states outside the chain are not used, nor is a file whose
+/// name is a state of the chain but whose content is another state.
 #[test]
-fn sync_ignores_an_unrelated_local_cache() {
+fn local_start_ignores_tables_outside_the_chain() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
+    let base_state = w.head.state_hash;
     let s1 = index_with(0..30, 0);
     w.commit(&s1);
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
-    build_full_index_cache_to_path(&index_with(500..510, 0), 9, &path).unwrap();
+    let path = cache_dir.path().to_path_buf();
+    let unrelated = write_table(&path, &index_with(500..510, 0));
+    // The chain's base state (the empty index) named over other content.
+    std::fs::copy(&unrelated, table::table_path(&path, &base_state)).unwrap();
 
     let synced = sync(
         mem.as_ref(),
@@ -385,10 +410,7 @@ fn sync_ignores_an_unrelated_local_cache() {
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&s1)
-    );
+    assert_eq!(entries(&*synced.table), entries(&s1));
 }
 
 /// An empty base (`base: None`) with no segments is the empty index.
@@ -405,13 +427,16 @@ fn sync_of_the_empty_head() {
         true,
     )
     .unwrap();
-    assert_eq!(synced.cache.entry_count(), 0);
-    assert_eq!(synced.cache.state_hash(), empty_state_hash());
-    assert!(synced.scratch.is_some(), "no cache path: a temp file");
+    assert_eq!(synced.table.len(), 0);
+    assert_eq!(synced.table.state().0, empty_state_hash());
+    assert!(
+        synced.table.file_path().is_none(),
+        "no cache dir: a temp file"
+    );
 }
 
-/// Without a cache path the result is a temp file, reused by the next sync
-/// of the same run.
+/// Without a cache dir the result is a temp file, reused by the next sync
+/// of the same run as the live table.
 #[test]
 fn sync_without_cache_dir_keeps_a_scratch_file() {
     let crypto = plaintext();
@@ -420,8 +445,8 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..40, 0));
     let synced = sync(&log, crypto.as_ref(), w.head.clone(), None, None, true).unwrap();
-    let scratch = synced.scratch.expect("temp cache");
-    assert!(scratch.exists());
+    assert!(synced.table.file_path().is_none(), "temp table");
+    let live = synced.table;
     log.take();
 
     let s2 = index_with(5..45, 1);
@@ -431,15 +456,12 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
         crypto.as_ref(),
         w.head.clone(),
         None,
-        Some(scratch),
+        Some(live),
         true,
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::CaughtUp { segments: 1 });
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&s2)
-    );
+    assert_eq!(entries(&*synced.table), entries(&s2));
     assert_eq!(index_d_gets(&log.take()), 1);
 }
 
@@ -453,22 +475,26 @@ fn sync_without_local_caches_verifies_the_whole_chain() {
     w.commit(&index_with(0..40, 0));
     w.fold();
     w.commit(&index_with(0..60, 0));
-    let path = w.cache_path();
-    let before = std::fs::read(&path).unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let path = cache_dir.path().to_path_buf();
+    let local = place_table(&path, &w.cache_path());
+    let before = std::fs::read(&local).unwrap();
+    let live = Arc::new(ChunkTable::open_file(&local).unwrap());
 
     let synced = sync(
         &log,
         crypto.as_ref(),
         w.head.clone(),
         Some(&path),
-        None,
+        Some(live),
         false,
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-    assert!(synced.scratch.is_some());
+    assert!(synced.table.file_path().is_none());
     assert_eq!(index_d_gets(&log.take()), 2);
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read(&local).unwrap(), before);
+    assert_eq!(table_states(&path), vec![w.head.state_hash]);
 }
 
 /// A modified object, or a valid object under another object's name, fails
@@ -561,10 +587,7 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     let old_base = object_key(&old_head.base.as_ref().unwrap().name);
     let synced = sync(&log, crypto.as_ref(), old_head, None, None, true).unwrap();
     assert_eq!(synced.head, w.head, "re-read the head");
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&latest)
-    );
+    assert_eq!(entries(&*synced.table), entries(&latest));
     let gets = log.take();
     assert_eq!(gets.iter().filter(|k| *k == "index").count(), 1);
     assert!(
@@ -1141,10 +1164,10 @@ fn collect_garbage_with_nothing_to_delete_sends_no_request() {
 }
 
 /// A recorded head state that the objects do not produce is rejected before
-/// anything is installed: the cache path keeps what it held. Covers both the
+/// anything is installed: the cache dir keeps what it held. Covers both the
 /// segment branch and the base-only branch of the final state check.
 #[test]
-fn wrong_head_state_leaves_the_cache_path_alone() {
+fn wrong_head_state_leaves_the_cache_dir_alone() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -1157,7 +1180,7 @@ fn wrong_head_state_leaves_the_cache_path_alone() {
     for mut head in [base_only, with_segment] {
         head.state_hash = [9; 32];
         let cache_dir = tempfile::tempdir().unwrap();
-        let path = cache_dir.path().join("full_index_cache");
+        let path = cache_dir.path().to_path_buf();
         let sync_err = || {
             sync(
                 mem.as_ref(),
@@ -1174,23 +1197,22 @@ fn wrong_head_state_leaves_the_cache_path_alone() {
 
         let err = sync_err();
         assert!(err.contains("differs from the head"), "{err}");
-        assert!(!path.exists(), "nothing installed at the path");
+        assert!(table_states(&path).is_empty(), "nothing installed");
 
-        build_full_index_cache_to_path(&index_with(500..510, 0), 9, &path).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let other = write_table(&path, &index_with(500..510, 0));
+        let before = std::fs::read(&other).unwrap();
         let err = sync_err();
         assert!(err.contains("differs from the head"), "{err}");
-        assert_eq!(std::fs::read(&path).unwrap(), before, "path unchanged");
+        assert_eq!(std::fs::read(&other).unwrap(), before, "table unchanged");
+        assert_eq!(table_states(&path).len(), 1);
     }
 }
 
-/// Smoke test for concurrent installs over one path: two readers on
-/// different heads share one cache path, each renaming its result over the
-/// other's, and both succeed with their own head's state. Not a regression
-/// guard: the interleaving is not deterministic, so it would only
-/// occasionally catch a sync that re-opens the path after its rename.
+/// Concurrent syncs into one cache dir: two readers on different heads and
+/// two on the same head. Every sync succeeds with its own head's state, and
+/// each state is published once (one file, never replaced while mapped).
 #[test]
-fn concurrent_syncs_over_one_cache_path_succeed() {
+fn concurrent_syncs_over_one_cache_dir_succeed() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -1201,10 +1223,10 @@ fn concurrent_syncs_over_one_cache_path_succeed() {
     w.commit(&s2);
     let h2 = w.head.clone();
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
+    let path = cache_dir.path().to_path_buf();
 
     std::thread::scope(|scope| {
-        for (head, want) in [(&h1, &s1), (&h2, &s2)] {
+        for (head, want) in [(&h1, &s1), (&h2, &s2), (&h2, &s2)] {
             let (mem, crypto, path) = (&mem, &crypto, &path);
             scope.spawn(move || {
                 for _ in 0..25 {
@@ -1218,18 +1240,18 @@ fn concurrent_syncs_over_one_cache_path_succeed() {
                     )
                     .unwrap();
                     assert_eq!(synced.head, *head);
-                    assert_eq!(
-                        entries(&chunk_index_from_full_cache(&synced.cache)),
-                        entries(want)
-                    );
+                    assert_eq!(entries(&*synced.table), entries(want));
                 }
             });
         }
     });
+    let mut want = vec![h1.state_hash, h2.state_hash];
+    want.sort_unstable();
+    assert_eq!(table_states(&path), want);
 }
 
 /// A downloaded base with no segments to apply is the result as mapped, and
-/// is renamed to the cache path while mapped.
+/// is published in the cache dir while mapped.
 #[test]
 fn sync_downloads_a_base_without_segments_and_persists_it() {
     let crypto = plaintext();
@@ -1239,7 +1261,7 @@ fn sync_downloads_a_base_without_segments_and_persists_it() {
     w.commit(&s1);
     w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
+    let path = cache_dir.path().to_path_buf();
 
     let synced = sync(
         mem.as_ref(),
@@ -1251,23 +1273,21 @@ fn sync_downloads_a_base_without_segments_and_persists_it() {
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::Downloaded { segments: 0 });
-    assert!(synced.scratch.is_none(), "persisted at the cache path");
-    let at_path = MmapFullIndexCache::open_verified(&path).expect("cache at the path");
+    let file = table::table_path(&path, &w.head.state_hash);
+    assert_eq!(synced.table.file_path(), Some(file.as_path()));
+    let at_path = MmapFullIndexCache::open_verified(&file).expect("table in the cache dir");
     assert_eq!(
         (at_path.state_hash(), u64::from(at_path.entry_count())),
         (w.head.state_hash, w.head.entries)
     );
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&s1)
-    );
+    assert_eq!(entries(&*synced.table), entries(&s1));
 }
 
-/// A reader on an older head persists its state over a newer cache (there
-/// is no comparison, by design); the next sync to the newer head catches up
-/// from it with the missing segment only.
+/// A reader on an older head publishes its state beside the newer one
+/// instead of over it; a later sync to the newer head finds that table and
+/// downloads nothing.
 #[test]
-fn a_late_reader_leaves_an_older_state_that_the_next_sync_catches_up() {
+fn a_late_reader_does_not_displace_the_newer_table() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
@@ -1278,12 +1298,8 @@ fn a_late_reader_leaves_an_older_state_that_the_next_sync_catches_up() {
     w.commit(&s2);
     let h2 = w.head.clone();
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
+    let path = cache_dir.path().to_path_buf();
 
-    let state_at_path = || {
-        let c = MmapFullIndexCache::open_verified(&path).unwrap();
-        c.state_hash()
-    };
     let read = |head: &IndexHead| {
         sync(
             mem.as_ref(),
@@ -1296,103 +1312,62 @@ fn a_late_reader_leaves_an_older_state_that_the_next_sync_catches_up() {
         .unwrap()
     };
     drop(read(&h2));
-    assert_eq!(state_at_path(), h2.state_hash);
     drop(read(&h1));
-    assert_eq!(
-        state_at_path(),
-        h1.state_hash,
-        "the older state replaced it"
-    );
+    let mut want = vec![h1.state_hash, h2.state_hash];
+    want.sort_unstable();
+    assert_eq!(table_states(&path), want, "both states coexist");
 
     let synced = sync(&log, crypto.as_ref(), h2, Some(&path), None, true).unwrap();
-    assert_eq!(synced.source, SyncSource::CaughtUp { segments: 1 });
-    assert_eq!(index_d_gets(&log.take()), 1);
-    assert_eq!(
-        entries(&chunk_index_from_full_cache(&synced.cache)),
-        entries(&s2)
-    );
+    assert_eq!(synced.source, SyncSource::UpToDate);
+    assert_eq!(index_d_gets(&log.take()), 0);
+    assert_eq!(entries(&*synced.table), entries(&s2));
 }
 
-/// The writer's catch-up applies segments to a local cache in the chain and
-/// otherwise gives up without touching storage; a lost segment is an error.
+/// Garbage under the head's table name is replaced by the synced table, and
+/// the next sync finds it (R1: a damaged table under a state name heals).
 #[test]
-fn catch_up_never_downloads_a_base() {
+fn a_damaged_table_under_the_state_name_heals() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..60, 0));
-    let h1 = w.head.clone();
-    w.commit(&index_with(10..80, 1));
-    let h2 = w.head.clone();
+    let s1 = index_with(0..60, 0);
+    w.commit(&s1);
     let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().join("full_index_cache");
+    let path = cache_dir.path().to_path_buf();
+    let file = table::table_path(&path, &w.head.state_hash);
+    std::fs::write(&file, b"not a table").unwrap();
 
-    let catch_up = |head: &IndexHead| {
-        let mut location = CacheLocation {
-            path: Some(&path),
-            scratch: None,
-            use_local: true,
-        };
-        let r = catch_up_local_cache(&log, crypto.as_ref(), head, &mut location, 2);
-        assert!(location.scratch.is_none());
-        r
-    };
-    let at_path = || {
-        let c = MmapFullIndexCache::open_verified(&path).unwrap();
-        (c.state_hash(), u64::from(c.entry_count()))
-    };
-    let read = |head: &IndexHead| {
-        sync(
-            mem.as_ref(),
-            crypto.as_ref(),
-            head.clone(),
-            Some(&path),
-            None,
-            true,
-        )
-        .unwrap()
-    };
-
-    // (a) No local cache.
-    assert!(catch_up(&h2).unwrap().is_none());
-    assert_eq!(index_d_gets(&log.take()), 0);
-
-    // (b) A cache outside the chain.
-    build_full_index_cache_to_path(&index_with(500..510, 0), 9, &path).unwrap();
-    assert!(catch_up(&h2).unwrap().is_none());
-    assert_eq!(index_d_gets(&log.take()), 0);
-
-    // (c) A cache at an earlier state of the chain.
-    drop(read(&h1));
-    assert_eq!(at_path(), (h1.state_hash, h1.entries));
-    let (cache, source) = catch_up(&h2).unwrap().expect("caught up");
-    assert_eq!(source, SyncSource::CaughtUp { segments: 1 });
-    assert_eq!(
-        (cache.state_hash(), u64::from(cache.entry_count())),
-        (h2.state_hash, h2.entries)
+    let synced = sync(
+        &log,
+        crypto.as_ref(),
+        w.head.clone(),
+        Some(&path),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
+    assert_eq!(synced.table.file_path(), Some(file.as_path()));
+    drop(synced);
+    assert!(
+        ChunkTable::open_file(&file).is_some(),
+        "the file is valid now"
     );
-    drop(cache);
-    assert_eq!(index_d_gets(&log.take()), 1);
-    assert_eq!(at_path(), (h2.state_hash, h2.entries));
+    log.take();
 
-    // (d) A cache at the head.
-    let (_, source) = catch_up(&h2).unwrap().expect("up to date");
-    assert_eq!(source, SyncSource::UpToDate);
+    let synced = sync(
+        &log,
+        crypto.as_ref(),
+        w.head.clone(),
+        Some(&path),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(synced.source, SyncSource::UpToDate);
     assert_eq!(index_d_gets(&log.take()), 0);
-
-    // (e) A cache at an earlier state, and the segment it needs is lost.
-    drop(read(&h1));
-    let lost = h2.segments.last().unwrap().name;
-    mem.delete(&object_key(&lost)).unwrap();
-    match catch_up(&h2) {
-        Err(VykarError::IndexObjectMissing { kind, key }) => {
-            assert_eq!(kind, "segment");
-            assert_eq!(key, object_key(&lost));
-        }
-        Err(e) => panic!("unexpected error: {e}"),
-        Ok(r) => panic!("expected IndexObjectMissing, got {:?}", r.map(|(_, s)| s)),
-    }
+    assert_eq!(entries(&*synced.table), entries(&s1));
 }
 
 #[test]

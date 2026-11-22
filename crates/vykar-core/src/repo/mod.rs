@@ -42,7 +42,7 @@ use tracing::warn;
 
 use self::write_session::WriteSessionState;
 pub use crate::chunker::ChunkerParams;
-use crate::index::ChunkIndex;
+use crate::index::LiveIndex;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
@@ -349,21 +349,21 @@ pub struct Repository {
     /// manifest. Non-empty means `manifest` is an incomplete view of the
     /// repository — see [`Repository::skipped_snapshots`].
     skipped_snapshots: Vec<snapshot_cache::SkippedSnapshot>,
-    chunk_index: ChunkIndex,
+    /// The chunk index: the mapped table of the loaded state plus this
+    /// process's edits. Not loaded (empty) until a load or write.
+    chunk_index: LiveIndex,
     pub config: RepoConfig,
     /// Resolved once from `config.version` at init/open. Every downstream
     /// caller asks the repository rather than re-inspecting the integer.
     format: RepoFormat,
     file_cache: FileCache,
-    /// Cache-validity token for the local dedup/restore caches, derived from
-    /// the head's state hash (`generation_for_state`); 0 when there is no head.
+    /// Generation of the loaded head's state (`generation_for_state`), the
+    /// value full index cache headers carry; 0 when there is no head.
     index_generation: u64,
     /// Whether the chunk index has been modified since last persist.
     index_dirty: bool,
     /// Whether the file cache has been modified since last persist.
     file_cache_dirty: bool,
-    /// Whether to rebuild the local dedup cache at save time.
-    rebuild_dedup_cache: bool,
     /// Override for the cache directory root (from config `cache_dir`).
     cache_dir_override: Option<PathBuf>,
     /// Write-path state: pack writers, upload queue, dedup, journal, sizing.
@@ -377,18 +377,10 @@ pub struct Repository {
     /// would cost another Argon2id derivation and need the passphrase threaded
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
-    /// `save_state` persisted the index without rebuilding the local
-    /// full/dedup/restore caches, so they are labelled with an older
-    /// generation. Cleared by a rebuild and by every replacement of `chunk_index`.
-    local_caches_stale: bool,
     /// The head the in-memory state was loaded from (or written as). `None`
     /// on a handle opened for the upgrade, and while `check --repair`
     /// rebuilds the index.
     index_head: Option<crate::index::head::IndexHead>,
-    /// The full index cache when it lives in a temp file (no cache
-    /// directory, or persisting over the cache failed), kept from open to the
-    /// next index load or write.
-    index_scratch: Option<tempfile::TempPath>,
     /// When chains are folded into a new base.
     fold_policy: index_write::FoldPolicy,
     /// Make the next index write a fold.
@@ -439,7 +431,7 @@ impl Repository {
 
     // ----- Accessors for private fields -----
 
-    /// Current index generation (cache-validity token).
+    /// Generation of the loaded index state.
     pub fn index_generation(&self) -> u64 {
         self.index_generation
     }
@@ -465,21 +457,20 @@ impl Repository {
     }
 
     /// Read-only access to the chunk index.
-    pub fn chunk_index(&self) -> &ChunkIndex {
+    pub fn chunk_index(&self) -> &LiveIndex {
         &self.chunk_index
     }
 
     /// Mutable access to the chunk index. Automatically marks it dirty.
-    pub fn chunk_index_mut(&mut self) -> &mut ChunkIndex {
+    pub fn chunk_index_mut(&mut self) -> &mut LiveIndex {
         self.index_dirty = true;
         &mut self.chunk_index
     }
 
-    /// Replace the chunk index with an empty one (frees memory).
+    /// Drop the chunk index (unmaps its table, frees its edits).
     /// Does not mark dirty — intended for memory optimization (e.g. restore).
     pub fn clear_chunk_index(&mut self) {
-        self.chunk_index = ChunkIndex::new();
-        self.local_caches_stale = false;
+        self.chunk_index = LiveIndex::empty();
     }
 
     /// Read-only access to the file cache.

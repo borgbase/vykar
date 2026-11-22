@@ -182,7 +182,7 @@ fn checker_detects_refcount_deflation() {
             .chunk_index()
             .iter()
             .find(|(_, e)| e.refcount >= 2)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .expect("a chunk with two references");
         repo.chunk_index_mut().decrement(&id);
         repo.mark_index_dirty();

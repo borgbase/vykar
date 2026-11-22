@@ -829,7 +829,7 @@ fn refcounts(repo_dir: &Path) -> Refcounts {
     crate::tests::helpers::open_local_repo(repo_dir)
         .chunk_index()
         .iter()
-        .map(|(id, e)| (*id, e.refcount))
+        .map(|(id, e)| (id, e.refcount))
         .collect()
 }
 
@@ -1038,19 +1038,17 @@ fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::
 }
 
 /// The index as a client with an empty cache dir at `cache` reads it.
-fn cold_index(config: &crate::config::VykarConfig, cache: &Path) -> crate::index::ChunkIndex {
+fn cold_index(config: &crate::config::VykarConfig, cache: &Path) -> crate::index::LiveIndex {
     cold_repo(config, cache).chunk_index().clone()
 }
 
 fn sorted_entries(
-    index: &crate::index::ChunkIndex,
+    index: &impl crate::testutil::EntryIter,
 ) -> Vec<(
     vykar_types::chunk_id::ChunkId,
     crate::index::ChunkIndexEntry,
 )> {
-    let mut v: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
-    v.sort_by_key(|(id, _)| *id.as_bytes());
-    v
+    index.entry_vec()
 }
 
 /// Another client commits the same chunks while this session runs: the
@@ -1075,7 +1073,7 @@ fn concurrent_commit_of_the_same_chunks_becomes_bumps() {
             let refcounts: Refcounts = repo
                 .chunk_index()
                 .iter()
-                .map(|(id, e)| (*id, e.refcount))
+                .map(|(id, e)| (id, e.refcount))
                 .collect();
             let ids = sorted_entries(repo.chunk_index())
                 .into_iter()

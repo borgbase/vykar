@@ -484,59 +484,33 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
 }
 
 // ---------------------------------------------------------------------------
-// Index-free restore via restore cache
+// Restore through the local chunk table
 // ---------------------------------------------------------------------------
 
-#[test]
-fn restore_loads_items_via_restore_cache_without_index() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    let source_dir = tmp.path().join("source");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    std::fs::create_dir_all(&source_dir).unwrap();
-
-    let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
-    std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
-    backup_source(
-        &config,
-        &source_dir,
-        "src",
-        "snap1",
-        None,
-        config.xattrs.enabled,
-    );
-
-    // Open repo WITHOUT loading the chunk index
-    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let mut repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
-
-    // Restore cache should exist (built by save_state during backup)
-    let cache = repo
-        .open_restore_cache()
-        .expect("restore cache should exist after backup");
-
-    // Load items via cache — should succeed without loading full index
-    let items = commands::list::load_snapshot_items_via_lookup(
-        &mut repo,
-        "snap1",
-        |id| cache.lookup(id),
-        &CancelToken::new(),
-    )
-    .unwrap();
-
-    assert!(!items.is_empty());
-    assert!(items.iter().any(|i| i.path.contains("file.txt")));
-
-    // The chunk index must still be empty — never loaded
-    assert!(
-        repo.chunk_index().is_empty(),
-        "chunk index should not have been loaded"
-    );
+/// The chunk table files of `repo_id` in the default cache dir.
+fn chunk_tables(repo_id: &[u8]) -> Vec<std::path::PathBuf> {
+    let dir = filecache_path(repo_id)
+        .parent()
+        .expect("repo cache dir")
+        .to_path_buf();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("chunk_table."))
+        })
+        .collect()
 }
 
+/// With the local table gone, restore downloads the index, restores, and
+/// leaves a table behind for the next run.
 #[test]
-fn restore_falls_back_to_index_on_cache_miss() {
+fn restore_downloads_the_index_when_the_local_table_is_gone() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_dir = tmp.path().join("source");
@@ -555,26 +529,15 @@ fn restore_falls_back_to_index_on_cache_miss() {
         config.xattrs.enabled,
     );
 
-    // Read repo_id and index_generation
     let repo = open_local_repo(&repo_dir, None);
     let repo_id = repo.config.id.clone();
-    let generation = repo.index_generation();
     drop(repo);
+    let tables = chunk_tables(&repo_id);
+    assert!(!tables.is_empty(), "the backup left a table");
+    for path in tables {
+        std::fs::remove_file(path).unwrap();
+    }
 
-    // Overwrite restore cache: valid generation, but 0 entries.
-    // open_restore_cache() will succeed, but every lookup() returns None,
-    // triggering the ChunkNotInIndex fallback in restore.rs.
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-    let empty_index = vykar_core::index::ChunkIndex::new();
-    vykar_core::index::dedup_cache::build_restore_cache_to_path(
-        &empty_index,
-        generation,
-        &cache_path,
-    )
-    .unwrap();
-
-    // Run full restore — must succeed via the fallback branch
     let restore_dir = tmp.path().join("restore");
     let stats = commands::restore::run(
         &config,
@@ -593,54 +556,10 @@ fn restore_falls_back_to_index_on_cache_miss() {
         std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
         "hello"
     );
-}
-
-#[test]
-fn restore_works_without_restore_cache() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    let source_dir = tmp.path().join("source");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    std::fs::create_dir_all(&source_dir).unwrap();
-
-    let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
-    std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
-    backup_source(
-        &config,
-        &source_dir,
-        "src",
-        "snap1",
-        None,
-        config.xattrs.enabled,
-    );
-
-    // Delete the restore cache file
-    let repo = open_local_repo(&repo_dir, None);
-    let repo_id = repo.config.id.clone();
-    drop(repo);
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-    let _ = std::fs::remove_file(&cache_path);
-
-    // Full restore should still work via the no-cache path
-    let restore_dir = tmp.path().join("restore");
-    let stats = commands::restore::run(
-        &config,
-        None,
-        "snap1",
-        restore_dir.to_str().unwrap(),
-        None,
-        false,
-        false,
-        &CancelToken::new(),
-    )
-    .unwrap();
-
-    assert_eq!(stats.files, 1);
     assert_eq!(
-        std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
-        "hello"
+        chunk_tables(&repo_id).len(),
+        1,
+        "the downloaded index is kept"
     );
 }
 
@@ -687,8 +606,11 @@ fn one_file_repo(
     )
 }
 
+/// The local table at the open head serves the item stream and the data
+/// chunks: with every `index.d/` object removed (the head stays, open reads
+/// it), the restore can only succeed without downloading the index.
 #[test]
-fn restore_resolves_data_chunks_via_restore_cache_without_index() {
+fn restore_reads_the_local_table_without_index_downloads() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, _, _, _) = one_file_repo(tmp.path());
 
@@ -720,182 +642,16 @@ fn restore_resolves_data_chunks_via_restore_cache_without_index() {
     );
 }
 
-/// Overwrite the restore cache with the full index minus `drop_id`: the item
-/// stream still resolves through the cache, but the data chunk misses.
-fn write_cache_without(
-    repo_dir: &std::path::Path,
-    repo_id: &[u8],
-    generation: u64,
-    drop_id: &vykar_types::chunk_id::ChunkId,
-) {
-    let mut index = open_local_repo(repo_dir, None).chunk_index().clone();
-    assert!(index.remove(drop_id).is_some());
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(repo_id, None).expect("cache path");
-    vykar_core::index::dedup_cache::build_restore_cache_to_path(&index, generation, &cache_path)
-        .unwrap();
-}
-
+/// A chunk that is unreadable where the index places it is a failure:
+/// strict mode reports the source as unreadable, continue mode marks the
+/// file damaged.
 #[test]
-fn restore_falls_back_to_index_when_cache_lacks_data_chunk() {
-    for continue_on_error in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
-        let (config, repo_id, generation, data_chunk) = one_file_repo(tmp.path());
-        write_cache_without(&tmp.path().join("repo"), &repo_id, generation, &data_chunk);
-
-        // A stale cache must neither fail a strict restore nor mark the file
-        // damaged in continue mode: the miss loads the index first.
-        let restore_dir = tmp.path().join("restore");
-        let stats = commands::restore::run_with_options(
-            &config,
-            None,
-            "snap1",
-            restore_dir.to_str().unwrap(),
-            None,
-            commands::restore::RestoreOptions {
-                continue_on_error,
-                ..Default::default()
-            },
-            &CancelToken::new(),
-        )
-        .unwrap();
-
-        assert_eq!(stats.files, 1, "continue_on_error={continue_on_error}");
-        assert_eq!(
-            stats.damaged_total, 0,
-            "continue_on_error={continue_on_error}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
-            "hello"
-        );
-    }
-}
-
-#[test]
-fn restore_falls_back_to_index_when_cached_item_stream_location_is_wrong() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (config, repo_id, generation, data_chunk) = one_file_repo(tmp.path());
-    let repo_dir = tmp.path().join("repo");
-
-    // A complete cache whose item-stream entries point at the data chunk's
-    // bytes: every lookup hits, but the stream cannot be read there.
-    let repo = open_local_repo(&repo_dir, None);
-    let item_ptrs = commands::list::load_snapshot_meta(&repo, "snap1")
-        .unwrap()
-        .item_ptrs;
-    let mut index = repo.chunk_index().clone();
-    let data = *index.get(&data_chunk).unwrap();
-    for id in &item_ptrs {
-        assert!(index.update_location(id, data.pack_id, data.pack_offset, data.stored_size));
-    }
-    drop(repo);
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-    vykar_core::index::dedup_cache::build_restore_cache_to_path(&index, generation, &cache_path)
-        .unwrap();
-
-    let restore_dir = tmp.path().join("restore");
-    let stats = commands::restore::run(
-        &config,
-        None,
-        "snap1",
-        restore_dir.to_str().unwrap(),
-        None,
-        false,
-        false,
-        &CancelToken::new(),
-    )
-    .unwrap();
-
-    assert_eq!(stats.files, 1);
-    assert_eq!(
-        std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
-        "hello"
-    );
-}
-
-/// A restore cache that holds every chunk but places the data chunk
-/// somewhere it is not: in a pack that no longer exists (what a stale cache
-/// left behind by another client's compaction looks like), or at another
-/// blob's coordinates.
-#[test]
-fn restore_re_resolves_data_chunks_the_cache_places_wrongly() {
-    for (gone_pack, continue_on_error) in
-        [(true, false), (true, true), (false, false), (false, true)]
-    {
-        let case = format!("gone_pack={gone_pack} continue_on_error={continue_on_error}");
-        let tmp = tempfile::tempdir().unwrap();
-        let (config, repo_id, generation, data_chunk) = one_file_repo(tmp.path());
-        let repo_dir = tmp.path().join("repo");
-
-        let repo = open_local_repo(&repo_dir, None);
-        let item_ptr = *commands::list::load_snapshot_meta(&repo, "snap1")
-            .unwrap()
-            .item_ptrs
-            .first()
-            .expect("item-stream chunk");
-        let mut index = repo.chunk_index().clone();
-        let data = *index.get(&data_chunk).unwrap();
-        let (pack_id, offset, size) = if gone_pack {
-            let gone = vykar_types::pack_id::PackId::from_hex(&"ab".repeat(32)).unwrap();
-            (gone, data.pack_offset, data.stored_size)
-        } else {
-            let other = *index.get(&item_ptr).unwrap();
-            (other.pack_id, other.pack_offset, other.stored_size)
-        };
-        assert_ne!(
-            (pack_id, offset, size),
-            (data.pack_id, data.pack_offset, data.stored_size),
-            "{case}"
-        );
-        assert!(index.update_location(&data_chunk, pack_id, offset, size));
-        drop(repo);
-        let cache_path =
-            vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-        vykar_core::index::dedup_cache::build_restore_cache_to_path(
-            &index,
-            generation,
-            &cache_path,
-        )
-        .unwrap();
-
-        let restore_dir = tmp.path().join("restore");
-        let stats = commands::restore::run_with_options(
-            &config,
-            None,
-            "snap1",
-            restore_dir.to_str().unwrap(),
-            None,
-            commands::restore::RestoreOptions {
-                continue_on_error,
-                ..Default::default()
-            },
-            &CancelToken::new(),
-        )
-        .expect(&case);
-
-        assert_eq!(stats.files, 1, "{case}");
-        assert_eq!(stats.damaged_total, 0, "{case}");
-        assert_eq!(
-            std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
-            "hello",
-            "{case}"
-        );
-    }
-}
-
-/// A chunk that is unreadable where the index itself places it stays a
-/// failure with the restore cache in use: strict mode reports the source as
-/// unreadable, continue mode marks the file damaged.
-#[test]
-fn restore_reports_unreadable_data_chunk_with_restore_cache_in_use() {
+fn restore_reports_an_unreadable_data_chunk() {
     for continue_on_error in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         let (config, _, _, data_chunk) = one_file_repo(tmp.path());
         let repo_dir = tmp.path().join("repo");
         let repo = open_local_repo(&repo_dir, None);
-        assert!(repo.open_restore_cache().is_some());
         let pack_id = repo.chunk_index().get(&data_chunk).unwrap().pack_id;
         drop(repo);
         std::fs::remove_file(repo_dir.join(pack_id.storage_key())).unwrap();
@@ -990,50 +746,6 @@ fn restore_streams_a_multi_chunk_item_stream() {
     }
 }
 
-#[test]
-fn item_stream_reader_resolves_from_cache_then_falls_back_once() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (_config, repo_id, generation, data_chunk) = one_file_repo(tmp.path());
-    let repo_dir = tmp.path().join("repo");
-
-    // Complete cache: lookups are served without touching the index.
-    // Scoped so the cache is unmapped before it is replaced (Windows refuses).
-    {
-        let (mut repo, index_gets) = open_counting_repo(&repo_dir);
-        let mut reader = commands::list::ItemStreamReader::new(&repo);
-        reader
-            .load(&mut repo, "snap1", &CancelToken::new())
-            .unwrap();
-        reader
-            .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
-            .unwrap();
-        assert!(reader.uses_restore_cache());
-        assert!(!reader.index_loaded());
-        assert!(reader.lookup(&repo, &data_chunk).is_some());
-        assert_eq!(index_gets.load(Ordering::Relaxed), 1);
-        assert!(repo.chunk_index().is_empty());
-    }
-
-    // Cache lacking the data chunk: the first miss loads the index using the
-    // head read at open, and every later lookup uses it.
-    write_cache_without(&repo_dir, &repo_id, generation, &data_chunk);
-    let (mut repo, index_gets) = open_counting_repo(&repo_dir);
-    let mut reader = commands::list::ItemStreamReader::new(&repo);
-    reader
-        .load(&mut repo, "snap1", &CancelToken::new())
-        .unwrap();
-    assert!(!reader.index_loaded());
-    for _ in 0..2 {
-        reader
-            .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
-            .unwrap();
-        assert!(!reader.uses_restore_cache());
-        assert!(reader.index_loaded());
-        assert!(reader.lookup(&repo, &data_chunk).is_some());
-    }
-    assert_eq!(index_gets.load(Ordering::Relaxed), 1);
-}
-
 /// Counts GETs of the remote index head, including at open.
 struct IndexGetCounter {
     inner: LocalBackend,
@@ -1116,10 +828,7 @@ fn stream_paths(stream: &[u8]) -> Vec<String> {
 #[test]
 fn item_stream_reader_loads_index_once_across_snapshots() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_config, repo_id, _) = two_snapshot_repo(tmp.path());
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-    std::fs::remove_file(&cache_path).unwrap();
+    let (_config, _repo_id, _) = two_snapshot_repo(tmp.path());
 
     let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
     let mut reader = commands::list::ItemStreamReader::new(&repo);
@@ -1135,36 +844,6 @@ fn item_stream_reader_loads_index_once_across_snapshots() {
     assert!(reader.index_loaded());
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);
 }
-
-#[test]
-fn item_stream_reader_falls_back_once_on_empty_cache() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (_config, repo_id, generation) = two_snapshot_repo(tmp.path());
-    // Valid generation but no entries: every lookup misses.
-    let cache_path =
-        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
-    vykar_core::index::dedup_cache::build_restore_cache_to_path(
-        &vykar_core::index::ChunkIndex::new(),
-        generation,
-        &cache_path,
-    )
-    .unwrap();
-
-    let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
-    let mut reader = commands::list::ItemStreamReader::new(&repo);
-    let s1 = reader
-        .load(&mut repo, "snap1", &CancelToken::new())
-        .unwrap();
-    let s2 = reader
-        .load(&mut repo, "snap2", &CancelToken::new())
-        .unwrap();
-
-    assert!(stream_paths(&s1).iter().any(|p| p.contains("a.txt")));
-    assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
-    assert!(reader.index_loaded());
-    assert_eq!(index_gets.load(Ordering::Relaxed), 1);
-}
-
 #[test]
 fn item_stream_reader_propagates_interrupt_without_fallback() {
     let tmp = tempfile::tempdir().unwrap();

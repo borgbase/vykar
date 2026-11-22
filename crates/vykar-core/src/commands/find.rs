@@ -124,8 +124,8 @@ pub struct PathTimeline {
 }
 
 /// Run the find command: search for files across snapshots.
-/// Tries the local restore cache first to avoid downloading the full index.
-/// Falls back to the full index on cache miss.
+/// Resolves item streams through the local chunk table where there is one,
+/// so no index download is needed.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,

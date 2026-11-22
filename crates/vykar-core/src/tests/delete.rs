@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::commands;
 use crate::commands::snapshot_ops;
-use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::index::ChunkIndexEntry;
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
@@ -424,8 +424,8 @@ fn delete_single_snapshot_handles_empty_stats() {
     assert!(result.warnings[0].contains("snap-wrapper"));
 }
 
-fn index_entries(index: &ChunkIndex) -> HashMap<ChunkId, ChunkIndexEntry> {
-    index.iter().map(|(id, e)| (*id, *e)).collect()
+fn index_entries(index: &impl crate::testutil::EntryIter) -> HashMap<ChunkId, ChunkIndexEntry> {
+    index.entry_vec().into_iter().collect()
 }
 
 /// Phase 3 reads the deleted snapshot's item stream on several threads when

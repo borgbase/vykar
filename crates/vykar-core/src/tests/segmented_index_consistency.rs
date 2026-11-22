@@ -11,7 +11,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
 use crate::compress::Compression;
-use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::ChunkerParams;
 use crate::repo::index_write::FoldPolicy;
 use crate::repo::pack::PackType;
@@ -20,9 +20,8 @@ use crate::testutil::init_test_environment;
 
 #[derive(Debug, Clone)]
 enum Op {
-    /// A dedup-mode write session storing `payload(b)` for each b, then
-    /// save_state; tiered dedup mode when the flag is set.
-    Store(Vec<u8>, bool),
+    /// A write session storing `payload(b)` for each b, then save_state.
+    Store(Vec<u8>),
     Decrement(usize),
     /// Relocate to the synthetic pack `[p; 32]`, with this stored size.
     Relocate(usize, u8, u32),
@@ -35,8 +34,7 @@ enum Op {
 
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        4 => (prop::collection::vec(0..12u8, 1..6), any::<bool>())
-            .prop_map(|(bs, tiered)| Op::Store(bs, tiered)),
+        4 => prop::collection::vec(0..12u8, 1..6).prop_map(Op::Store),
         2 => any::<usize>().prop_map(Op::Decrement),
         1 => (any::<usize>(), any::<u8>(), 1..1000u32).prop_map(|(i, p, s)| Op::Relocate(i, p, s)),
         1 => any::<u64>().prop_map(Op::Rebuild),
@@ -99,34 +97,29 @@ fn fixture(hard_segments: usize) -> Fixture {
 }
 
 /// The index of the repository at `dir`, opened with a fresh cache dir.
-fn cold(dir: &Path, scratch: &Path) -> ChunkIndex {
+fn cold(dir: &Path, scratch: &Path) -> LiveIndex {
     let cache = tempfile::tempdir_in(scratch).unwrap();
     open(dir, cache.path(), OpenOptions::new().with_index())
         .chunk_index()
         .clone()
 }
 
-fn sorted_ids(index: &ChunkIndex) -> Vec<ChunkId> {
-    let mut ids: Vec<ChunkId> = index.iter().map(|(id, _)| *id).collect();
+fn sorted_ids(index: &LiveIndex) -> Vec<ChunkId> {
+    let mut ids: Vec<ChunkId> = index.iter().map(|(id, _)| id).collect();
     ids.sort_unstable_by_key(|id| *id.as_bytes());
     ids
 }
 
-fn sorted_entries(index: &ChunkIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
-    let mut v: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+fn sorted_entries(index: &LiveIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
+    let mut v: Vec<_> = index.iter().collect();
     v.sort_unstable_by_key(|(id, _)| *id.as_bytes());
     v
 }
 
-/// Store each `payload(b)` in one dedup-mode write session; returns the IDs.
-fn store(repo: &mut Repository, bs: &[u8], tiered: bool) -> Vec<ChunkId> {
+/// Store each `payload(b)` in one write session; returns the IDs.
+fn store(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
     repo.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
-    if tiered {
-        repo.enable_tiered_dedup_mode();
-    } else {
-        repo.enable_dedup_mode();
-    }
     let ids = bs
         .iter()
         .map(|&b| {
@@ -195,8 +188,8 @@ proptest! {
 
         for op in &ops {
             match op {
-                Op::Store(bs, tiered) => {
-                    let ids = store(&mut t.repo, bs, *tiered);
+                Op::Store(bs) => {
+                    let ids = store(&mut t.repo, bs);
                     for (id, &byte) in ids.iter().zip(bs) {
                         payloads.insert(*id, byte);
                     }

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use super::helpers::{backup_single_source, make_test_config};
 use crate::commands;
 use crate::config::VykarConfig;
-use crate::index::ChunkIndex;
 use crate::index::head::IndexHead;
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::INDEX_OBJECT_DIR;
@@ -80,8 +79,9 @@ fn head(config: &VykarConfig) -> IndexHead {
     open(config).index_head().cloned().unwrap()
 }
 
-fn sorted_entries(index: &ChunkIndex) -> Vec<String> {
+fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
+        .entry_vec()
         .iter()
         .map(|(id, e)| format!("{id:?} {e:?}"))
         .collect();
@@ -228,7 +228,7 @@ fn v5_folds_at_the_hard_limit_on_an_append_only_server() {
     let mut last = None;
     for round in 0..5u32 {
         repo.load_chunk_index_under_lock().unwrap();
-        let id = *repo.chunk_index().iter().next().unwrap().0;
+        let id = repo.chunk_index().iter().next().unwrap().0;
         repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
         repo.save_state().unwrap();

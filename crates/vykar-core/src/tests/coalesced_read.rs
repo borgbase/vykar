@@ -40,7 +40,7 @@ fn store_chunks(repo: &mut Repository, count: usize) -> Vec<vykar_types::chunk_i
             .unwrap();
         ids.push(id);
     }
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(repo);
     ids
 }
 
@@ -56,7 +56,7 @@ fn resolve_chunks(
 )> {
     ids.iter()
         .map(|id| {
-            let entry = *repo.chunk_index().get(id).unwrap();
+            let entry = repo.chunk_index().get(id).unwrap();
             (*id, entry.pack_id, entry.pack_offset, entry.stored_size)
         })
         .collect()
@@ -133,12 +133,12 @@ fn cross_pack_grouping() {
     let (id_a, _, _) = repo
         .store_chunk(data_a, Compression::None, PackType::Tree)
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
 
     let (id_b, _, _) = repo
         .store_chunk(data_b, Compression::None, PackType::Tree)
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
 
     let chunks = resolve_chunks(&repo, &[id_a, id_b]);
 
@@ -189,7 +189,7 @@ fn output_order_preserved_across_packs() {
             PackType::Tree,
         )
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
 
     let (id_b1, _, _) = repo
         .store_chunk(
@@ -198,7 +198,7 @@ fn output_order_preserved_across_packs() {
             PackType::Tree,
         )
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
 
     // Request order: a1, b1, a2 — interleaved across packs.
     let chunks = resolve_chunks(&repo, &[id_a1, id_b1, id_a2]);
@@ -264,7 +264,7 @@ fn large_gap_splits_into_separate_reads() {
     let (id_b, _, _) = repo
         .store_chunk(data_b, Compression::None, PackType::Tree)
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
 
     // All three should be in the same pack.
     let all_chunks = resolve_chunks(&repo, &[id_a, id_gap, id_b]);
@@ -454,7 +454,7 @@ fn repo_with_cancelling_backend(
         let (id, _, _) = repo
             .store_chunk(data.as_bytes(), Compression::None, PackType::Tree)
             .unwrap();
-        repo.flush_packs().unwrap();
+        crate::testutil::save_and_resume(&mut repo);
         ids.push(id);
     }
     reads.store(0, Ordering::Relaxed);
@@ -550,7 +550,7 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
 /// compression and no AEAD the blob stays decodable at the same length, so only
 /// the chunk ID check can notice.
 fn flip_byte_in_stored_chunk(repo: &Repository, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
-    let entry = *repo.chunk_index().get(id).unwrap();
+    let entry = repo.chunk_index().get(id).unwrap();
     let key = entry.pack_id.storage_key();
     let mut pack = repo.storage.get(&key).unwrap().unwrap();
     let start = entry.pack_offset as usize;
@@ -570,7 +570,7 @@ fn plaintext_read_chunk_rejects_corrupt_blob() {
     let (id, _, _) = repo
         .store_chunk(data, Compression::None, PackType::Tree)
         .unwrap();
-    repo.flush_packs().unwrap();
+    crate::testutil::save_and_resume(&mut repo);
     flip_byte_in_stored_chunk(&repo, &id, data);
 
     for attempt in 0..2 {
@@ -722,7 +722,7 @@ fn store_packs(repo: &mut Repository, pack_sizes: &[usize]) -> Vec<Vec<(ChunkId,
                 .unwrap();
             chunks.push((id, data));
         }
-        repo.flush_packs().unwrap();
+        crate::testutil::save_and_resume(repo);
         packs.push(chunks);
     }
     packs

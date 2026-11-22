@@ -63,8 +63,8 @@ fn store_and_read_chunk_roundtrip() {
         .unwrap();
     assert!(is_new);
 
-    // Flush packs so chunks are readable
-    repo.flush_packs().unwrap();
+    // A session's chunks are readable through the index once it is saved
+    repo.save_state().unwrap();
 
     let read_back = repo.read_chunk(&chunk_id).unwrap();
     assert_eq!(read_back, data);
@@ -86,8 +86,8 @@ fn store_chunk_dedup() {
     assert!(!is_new2, "second store should be a dedup hit");
     assert_eq!(id1, id2);
 
-    // Flush packs to commit to index
-    repo.flush_packs().unwrap();
+    // A session's chunks are in the index once it is saved.
+    repo.save_state().unwrap();
 
     // Refcount should be 2
     let entry = repo.chunk_index().get(&id1).unwrap();
@@ -103,8 +103,8 @@ fn store_chunk_with_compression() {
         .unwrap();
     assert!(is_new);
 
-    // Flush packs so chunks are readable
-    repo.flush_packs().unwrap();
+    // A session's chunks are readable through the index once it is saved
+    repo.save_state().unwrap();
 
     let read_back = repo.read_chunk(&chunk_id).unwrap();
     assert_eq!(read_back, data);
@@ -148,7 +148,7 @@ fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
         .unwrap();
     repo.flush_packs().unwrap();
     repo.save_state().unwrap();
-    let entry = *repo.chunk_index().get(&id).unwrap();
+    let entry = repo.chunk_index().get(&id).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let bare = Repository::open(
@@ -177,9 +177,9 @@ fn read_chunk_at_roundtrip() {
     let (chunk_id, _stored_size, _) = repo
         .store_chunk(data, Compression::None, PackType::Data)
         .unwrap();
-    repo.flush_packs().unwrap();
+    repo.save_state().unwrap();
 
-    let entry = *repo.chunk_index().get(&chunk_id).unwrap();
+    let entry = repo.chunk_index().get(&chunk_id).unwrap();
     let read_back = repo
         .read_chunk_at(
             &chunk_id,
@@ -234,8 +234,13 @@ fn save_state_writes_only_dirty_components() {
     let (mut repo, log) = repo_on_recording_backend();
     log.clear();
 
-    // Mark index dirty
-    repo.mark_index_dirty();
+    // Edit the index (an unchanged index publishes nothing, dirty or not)
+    repo.chunk_index_mut().add(
+        vykar_types::chunk_id::ChunkId::from_bytes([7; 32]),
+        10,
+        vykar_types::pack_id::PackId::from_bytes([8; 32]),
+        0,
+    );
     repo.save_state().unwrap();
 
     let entries = log.entries();
@@ -263,7 +268,7 @@ fn store_chunk_marks_index_dirty() {
 }
 
 #[test]
-fn dedup_mode_empty_delta_restores_index_without_write() {
+fn empty_session_writes_no_index() {
     let (mut repo, log) = repo_on_recording_backend();
 
     // Store some chunks in normal mode
@@ -277,29 +282,20 @@ fn dedup_mode_empty_delta_restores_index_without_write() {
 
     // Verify chunk is in the index
     assert_eq!(repo.chunk_index().len(), 1);
-    let entry_before = *repo.chunk_index().get(&id_a).unwrap();
+    let entry_before = repo.chunk_index().get(&id_a).unwrap();
 
-    // Start a new write session and enable dedup mode (drops full index)
+    // A new write session keeps the loaded index.
     repo.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
-    repo.enable_dedup_mode();
-    assert!(
-        repo.chunk_index().is_empty(),
-        "chunk_index should be empty in dedup mode"
-    );
+    assert_eq!(repo.chunk_index().len(), 1);
 
     log.clear();
 
     // save_state with no new chunks — empty delta
     repo.save_state().unwrap();
 
-    // chunk_index should be restored from storage
-    assert_eq!(
-        repo.chunk_index().len(),
-        1,
-        "chunk_index should be restored"
-    );
-    let entry_after = *repo.chunk_index().get(&id_a).unwrap();
+    assert_eq!(repo.chunk_index().len(), 1);
+    let entry_after = repo.chunk_index().get(&id_a).unwrap();
     assert_eq!(entry_before.refcount, entry_after.refcount);
 
     // No index write should have occurred (delta was empty)
@@ -311,7 +307,7 @@ fn dedup_mode_empty_delta_restores_index_without_write() {
 }
 
 #[test]
-fn dedup_mode_with_delta_writes_index() {
+fn session_with_new_chunks_writes_a_segment() {
     let (mut repo, log) = repo_on_recording_backend();
 
     // Store initial chunks
@@ -321,29 +317,27 @@ fn dedup_mode_with_delta_writes_index() {
     repo.save_state().unwrap();
     assert_eq!(repo.chunk_index().len(), 1);
 
-    // Start a new write session and enable dedup mode
     repo.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
-    repo.enable_dedup_mode();
     log.clear();
 
-    // Store a NEW chunk in dedup mode
+    // Store a new chunk in the session
     let (new_id, _, is_new) = repo
-        .store_chunk(
-            b"new chunk in dedup mode",
-            Compression::None,
-            PackType::Data,
-        )
+        .store_chunk(b"new chunk in a session", Compression::None, PackType::Data)
         .unwrap();
     assert!(is_new);
 
     repo.save_state().unwrap();
 
-    // Index should be written because delta had new entries
+    // The head and a segment are written because the delta had new entries
     let entries = log.entries();
     assert!(
         entries.contains(&"index".to_string()),
         "index should be written for non-empty delta: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|k| k.starts_with("index.d/")),
+        "a segment should be written: {entries:?}"
     );
 
     // chunk_index should contain both old and new entries
@@ -394,7 +388,7 @@ fn file_cache_path(repo_id: &[u8]) -> Option<PathBuf> {
 }
 
 #[test]
-fn deferred_hydration_survives_file_cache_save_error() {
+fn file_cache_save_error_leaves_the_index_in_place() {
     let (mut repo, _log) = repo_on_recording_backend();
 
     // Store a chunk so the index has content
@@ -406,11 +400,8 @@ fn deferred_hydration_survives_file_cache_save_error() {
     repo.save_state().unwrap();
     assert_eq!(repo.chunk_index().len(), 1);
 
-    // Start a new write session and enable dedup mode (drops full index, activates deferred hydration path)
     repo.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
-    repo.enable_dedup_mode();
-    assert!(repo.chunk_index().is_empty());
 
     // Mark file_cache dirty so save_state() will attempt file_cache.save()
     repo.mark_file_cache_dirty();
@@ -432,11 +423,11 @@ fn deferred_hydration_survives_file_cache_save_error() {
         "save_state should fail when file cache write is blocked"
     );
 
-    // ...but chunk_index must be hydrated despite the error
+    // ...and the index is still the loaded one
     assert_eq!(
         repo.chunk_index().len(),
         1,
-        "chunk_index should be hydrated even when file_cache.save() fails"
+        "chunk_index should be intact when file_cache.save() fails"
     );
     assert!(
         repo.chunk_index().get(&id_a).is_some(),
@@ -1195,4 +1186,117 @@ fn initial_session_seed_includes_tree_packs() {
         target, expected,
         "initial session target should be based on all packs (data + tree)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The repository's table as the index (05 step 3)
+// ---------------------------------------------------------------------------
+
+/// Writing an index that was never loaded over a head with entries would
+/// diff an empty index against that state; it is refused instead.
+#[test]
+fn persist_refuses_an_unloaded_index_over_a_non_empty_head() {
+    let mut repo = test_repo_plaintext();
+    repo.store_chunk(b"one chunk", Compression::None, PackType::Data)
+        .unwrap();
+    repo.save_state().unwrap();
+    assert!(repo.index_head().unwrap().entries > 0);
+
+    repo.clear_chunk_index();
+    repo.mark_index_dirty();
+    let err = repo.save_state().unwrap_err().to_string();
+    assert!(err.contains("not loaded before it was written"), "{err}");
+}
+
+/// Without a cache dir, and after a load that ignores local tables, the
+/// repository's own table serves every later sync: a write, a fold, a load
+/// under the lock and a backup commit read no index object (R2).
+#[test]
+fn writes_reuse_the_live_table_without_a_cache_dir() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    crate::testutil::init_test_environment();
+    let mem: Arc<dyn vykar_storage::StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut repo = Repository::init(
+        Box::new(Arc::clone(&mem)),
+        EncryptionMode::None,
+        ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    repo.store_chunk(b"first chunk", Compression::None, PackType::Data)
+        .unwrap();
+    repo.save_state().unwrap();
+    drop(repo);
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let fail = Arc::clone(&armed);
+    let storage = crate::tests::helpers::FailGet::new(
+        Arc::clone(&mem),
+        move |k| fail.load(Ordering::SeqCst) && k.starts_with("index.d/"),
+        usize::MAX,
+    );
+    let mut repo = Repository::open(
+        Box::new(storage),
+        None,
+        None,
+        crate::repo::OpenOptions::new(),
+    )
+    .unwrap();
+    repo.load_chunk_index_uncached().unwrap();
+    armed.store(true, Ordering::SeqCst);
+
+    // A write: segment from the live table.
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    repo.store_chunk(b"second chunk", Compression::None, PackType::Data)
+        .unwrap();
+    repo.save_state().unwrap();
+    assert_eq!(repo.chunk_index().len(), 2);
+
+    // A fold of the same state.
+    let mut policy = crate::repo::index_write::FoldPolicy::default();
+    policy.soft.segments = 1;
+    repo.set_fold_policy(policy);
+    repo.maintain_segmented_index().unwrap();
+    assert!(repo.index_head().unwrap().segments.is_empty(), "folded");
+
+    // A load under the lock, at the head the fold wrote.
+    repo.load_chunk_index_under_lock().unwrap();
+    assert_eq!(repo.chunk_index().len(), 2);
+
+    // A backup commit merges against the live table.
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    repo.store_chunk(b"third chunk", Compression::None, PackType::Data)
+        .unwrap();
+    let id = vykar_types::snapshot_id::SnapshotId::generate();
+    let entry = crate::repo::manifest::SnapshotEntry {
+        name: "s1".into(),
+        id,
+        time: chrono::Utc::now(),
+        source_label: String::new(),
+        label: String::new(),
+        source_paths: Vec::new(),
+        hostname: String::new(),
+    };
+    let mut file_cache = crate::repo::file_cache::FileCache::new();
+    repo.commit_concurrent_session_with_progress(
+        entry,
+        b"snapshot".to_vec(),
+        &mut file_cache,
+        &|_: crate::repo::control::CommitEvent| {},
+        || {},
+    )
+    .unwrap();
+    assert_eq!(repo.chunk_index().len(), 3);
+    assert_eq!(repo.chunk_index().table().unwrap().state(), {
+        let head = repo.index_head().unwrap();
+        (head.state_hash, head.entries)
+    });
 }

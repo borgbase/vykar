@@ -10,7 +10,7 @@ use super::snapshot_cache;
 use crate::index::dedup_cache;
 use crate::index::head::IndexHead;
 use crate::index::segment;
-use crate::index::{ChunkIndex, IndexDelta};
+use crate::index::{IndexDelta, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -49,7 +49,7 @@ fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
 
 impl Repository {
     /// Load the chunk index from storage on demand: GET the head and bring
-    /// the local full index cache to it. Can be called after opening without
+    /// a local chunk table to it. Can be called after opening without
     /// `load_index` to lazily load the index. Also recalculates the data pack
     /// writer target from the loaded index.
     pub fn load_chunk_index(&mut self) -> Result<()> {
@@ -67,8 +67,8 @@ impl Repository {
         Ok(())
     }
 
-    /// Load the chunk index from storage, ignoring the local full index
-    /// cache. Use this for operations like `check` that must verify what's
+    /// Load the chunk index from storage, ignoring the local chunk tables.
+    /// Use this for operations like `check` that must verify what's
     /// actually in the remote repository: every object of the chain is
     /// fetched and verified. The head is kept for later writes.
     pub fn load_chunk_index_uncached(&mut self) -> Result<()> {
@@ -96,10 +96,11 @@ impl Repository {
         Ok(())
     }
 
-    /// Bring the local full index cache to `head`, or to
-    /// a freshly read head. `use_local: false` ignores and leaves alone the
-    /// local cache (the result lives in a temp file), so every object of the
-    /// chain is fetched and verified.
+    /// Bring a local chunk table to `head`, or to a freshly read head: the
+    /// repository's own table first, then the table files of the cache dir.
+    /// `use_local: false` ignores and leaves alone the local tables (the
+    /// result lives in a temp file), so every object of the chain is fetched
+    /// and verified.
     pub(super) fn sync_index(
         &mut self,
         head: Option<IndexHead>,
@@ -109,17 +110,10 @@ impl Repository {
             Some(head) => head,
             None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
         };
-        let path = use_local
-            .then(|| {
-                dedup_cache::full_index_cache_path(
-                    &self.config.id,
-                    self.cache_dir_override.as_deref(),
-                )
-            })
-            .flatten();
+        let dir = use_local.then(|| self.cache_dir()).flatten();
         let location = CacheLocation {
-            path: path.as_deref(),
-            scratch: self.index_scratch.take(),
+            dir: dir.as_deref(),
+            live: self.chunk_index.table().cloned().filter(|_| use_local),
             use_local,
         };
         let start = std::time::Instant::now();
@@ -148,21 +142,18 @@ impl Repository {
         Ok(synced)
     }
 
-    /// Make a synced full cache the in-memory index.
+    /// Make a synced table the in-memory index.
     pub(super) fn install_synced_index(&mut self, synced: SyncedIndex) {
-        self.chunk_index = dedup_cache::chunk_index_from_full_cache(&synced.cache);
-        drop(synced.cache);
+        self.chunk_index = LiveIndex::from_table(synced.table);
         self.index_generation = dedup_cache::generation_for_state(&synced.head.state_hash);
         self.index_head = Some(synced.head);
-        self.index_scratch = synced.scratch;
-        self.local_caches_stale = false;
         self.rebase_pack_target_from_index();
     }
 
-    /// Flush pending packs and wait for uploads, then drop the tiered dedup
-    /// index and take the session's `IndexDelta` out for processing. The
-    /// delta's positional bumps keep the dedup cache mapped until they are
-    /// applied; everything else in the tiered index is released here.
+    /// Flush pending packs and wait for uploads, then take the session's
+    /// `IndexDelta` out for processing and drop its lookup state. The
+    /// delta's positional bumps keep the session's table mapped until they
+    /// are applied.
     ///
     /// On the concurrent backup path Phase 1 has normally drained uploads
     /// already, so the flush here is a no-op safety net; for
@@ -175,124 +166,46 @@ impl Repository {
         self.flush_packs()?;
 
         let ws = self.ws_mut();
-        ws.tiered_dedup.take();
         let delta = ws.index_delta.take();
-        if delta.is_some() {
-            ws.dedup_index = None;
-        }
+        ws.table = None;
+        ws.session_new = Default::default();
         Ok(delta)
     }
 
-    /// Flush pending packs, wait for uploads, and apply the dedup delta from
-    /// the active write session. Must only be called when `write_session` is `Some`.
+    /// Flush pending packs, wait for uploads, and apply the session's delta
+    /// to the in-memory index. Must only be called when `write_session` is
+    /// `Some`.
     ///
-    /// On success, the session's dedup structures and delta are consumed
-    /// (moved into the chunk index or cache). On failure, the session remains
+    /// The delta is applied to the index as loaded: the write that follows
+    /// refuses a head that moved since. On failure, the session remains
     /// active (not consumed) so the caller can invoke `flush_on_abort()` for
-    /// best-effort journal persistence. Note that `tiered_dedup` and
-    /// `index_delta` may already be taken out of the session at that point —
-    /// `flush_on_abort` does not need them (it only seals packs, joins uploads,
-    /// and writes the journal).
-    /// Returns `true` when chunk_index hydration should be deferred to after
-    /// persistence (reduces peak memory when incremental update or cache
-    /// rebuild succeeds).
-    fn apply_write_session(&mut self) -> Result<bool> {
-        let delta = self.flush_and_take_session_delta()?;
-
-        let mut deferred_index_load = false;
-
-        if let Some(delta) = delta {
-            if !delta.is_empty() {
-                // The head as storage holds it now, from the local full
-                // cache where it can be; the write then diffs against it.
-                // Without a head (`check --repair` rebuilding the index) the
-                // loaded index is the one to extend.
-                if self.index_head.is_some() {
-                    let synced = self.sync_index(None, true)?;
-                    self.install_synced_index(synced);
-                }
-                delta.apply_to(&mut self.chunk_index);
-                self.index_dirty = true;
-            } else if self.rebuild_dedup_cache {
-                // Empty delta: index unchanged, but caches may need rebuilding.
-                // Try to rebuild caches from full_index_cache if available.
-                let mut rebuilt_from_cache = false;
-                let cd = self.cache_dir_override.as_deref();
-                let generation = self.index_generation;
-                if let Some(full) =
-                    dedup_cache::MmapFullIndexCache::open(&self.config.id, generation, cd)
-                {
-                    let id = &self.config.id;
-                    let dedup_ok =
-                        dedup_cache::build_dedup_cache_from_full_cache(&full, id, cd).is_ok();
-                    let restore_ok =
-                        dedup_cache::build_restore_cache_from_full_cache(&full, id, cd).is_ok();
-                    if dedup_ok && restore_ok {
-                        self.rebuild_dedup_cache = false;
-                        rebuilt_from_cache = true;
-                        // Defer chunk_index hydration to reduce peak memory.
-                        deferred_index_load = true;
-                    } else {
-                        warn!("cache rebuild from full_index_cache partially failed, falling back");
-                    }
-                }
-                if !rebuilt_from_cache {
-                    // No valid full cache — must reload full index for slow-path cache rebuild.
-                    self.chunk_index = self.reload_full_index()?;
-                }
-            } else {
-                // Empty delta, no cache rebuild needed.
-                // Still must restore chunk_index for postcondition (deferred).
-                deferred_index_load = true;
-            }
+    /// best-effort journal persistence; the delta may already be taken out
+    /// of the session at that point, which `flush_on_abort` does not need.
+    fn apply_write_session(&mut self) -> Result<()> {
+        if let Some(delta) = self.flush_and_take_session_delta()?
+            && !delta.is_empty()
+        {
+            delta.apply_to(&mut self.chunk_index);
+            self.index_dirty = true;
         }
-
-        Ok(deferred_index_load)
+        Ok(())
     }
 
     /// Save the chunk index back to storage.
-    /// When a write session is active: flushes pending packs, applies dedup delta.
+    /// When a write session is active: flushes pending packs, applies its delta.
     /// When no session is active: just persists dirty index/file_cache.
     /// Only writes components that have been marked dirty.
     pub fn save_state(&mut self) -> Result<()> {
-        let deferred_index_load = if self.write_session.is_some() {
-            self.apply_write_session()?
-        } else {
-            false
-        };
+        if self.write_session.is_some() {
+            self.apply_write_session()?;
+        }
 
-        // An index write derives `index_generation` from the new state, which
-        // invalidates the local dedup cache, and leaves the local full cache
-        // at that state.
-        let persisted = self.index_dirty;
-        if persisted {
+        // An index write leaves the repository's table at the new state.
+        if self.index_dirty {
             self.persist_segmented_index()?;
         }
 
-        if self.rebuild_dedup_cache {
-            self.rebuild_local_caches(persisted);
-            self.rebuild_dedup_cache = false;
-            self.local_caches_stale = false;
-        } else if persisted {
-            self.local_caches_stale = true;
-        }
-
-        // Save file cache before hydrating chunk_index to reduce peak memory.
-        // Capture error instead of early-returning so we can hydrate first.
-        let fc_result = self.save_file_cache_if_dirty();
-
-        // Always hydrate chunk_index — postcondition: self.chunk_index is valid
-        // on all exit paths (success and error).
-        if deferred_index_load {
-            // Try local full_index_cache first (fast, no storage round-trip),
-            // fall back to reloading from remote storage if cache is unavailable.
-            self.chunk_index = self
-                .chunk_index_from_local_cache()
-                .or_else(|_| self.reload_full_index())?;
-        }
-
-        // Now propagate any file cache save error
-        fc_result?;
+        self.save_file_cache_if_dirty()?;
 
         // Consume the write session on success — all entries are now in the
         // persisted index. The pending_index file itself is deleted later by
@@ -388,8 +301,7 @@ impl Repository {
             self.apply_snapshot_refresh(refresh?);
         }
 
-        let deferred_chunk_index_hydrate =
-            self.commit_prepare(&snapshot_entry, delta, prefetched, events)?;
+        self.commit_prepare(&snapshot_entry, delta, prefetched, events)?;
 
         // ---- COMMIT POINT ----
         let ctx = emit_stage(events, "write snapshot");
@@ -415,7 +327,7 @@ impl Repository {
         // the cache is pruned against `snapshots/` on every open.
         self.persist_snapshot_cache_from_manifest();
 
-        self.commit_finalize(new_file_cache, deferred_chunk_index_hydrate, events);
+        self.commit_finalize(new_file_cache, events);
         Ok(())
     }
 
@@ -426,16 +338,13 @@ impl Repository {
     /// a non-empty delta, fetched the index head (`prefetched`):
     ///   4. Enforce snapshot name uniqueness against the fresh list.
     ///   5. Merge the delta into the index at that head, persist it.
-    ///
-    /// Returns `true` when chunk_index hydration should be deferred to
-    /// `commit_finalize`.
     fn commit_prepare(
         &mut self,
         snapshot_entry: &manifest::SnapshotEntry,
         delta: Option<IndexDelta>,
         prefetched: Option<Result<IndexHead>>,
         events: &dyn EventSink<CommitEvent>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         // 4. Check snapshot name uniqueness against fresh list.
         if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
             return Err(VykarError::SnapshotAlreadyExists(
@@ -443,32 +352,30 @@ impl Repository {
             ));
         }
 
-        // 5. Merge the delta into the index at the head, persist it.
-        let mut deferred_chunk_index_hydrate = false;
-        if let Some(delta) = delta {
-            if !delta.is_empty() {
-                let head = match prefetched {
-                    Some(head) => head?,
-                    None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
-                };
-                self.segmented_commit(head, delta, events)?;
-            }
-            // The local full cache is at the index state; the in-memory
-            // index is rebuilt from it after the commit point.
-            deferred_chunk_index_hydrate = true;
+        // 5. Merge the delta into the index at the head, persist it. The
+        // write installs the new state as the repository's table.
+        if let Some(delta) = delta
+            && !delta.is_empty()
+        {
+            let head = match prefetched {
+                Some(head) => head?,
+                None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
+            };
+            self.segmented_commit(head, delta, events)?;
         }
 
         // Defensive: persist index if dirty but no delta (unreachable today
-        // because backup always activates dedup mode, but guards future callers).
+        // because a backup session records every change in its delta, but
+        // guards future callers).
         if self.index_dirty {
             self.persist_segmented_index()?;
         }
 
-        Ok(deferred_chunk_index_hydrate)
+        Ok(())
     }
 
-    /// Bring the local full cache to `head` (normally
-    /// already there), merge-walk the session's `delta` over it into the next
+    /// Bring a local table to `head` (normally the repository's own, already
+    /// there), merge-walk the session's `delta` over it into the next
     /// state and its segment while the session's packs are verified, and
     /// publish. The snapshot PUT that follows remains the commit point.
     fn segmented_commit(
@@ -480,14 +387,8 @@ impl Repository {
         let ctx = emit_stage(events, "fetch index");
         let synced = self.sync_index(Some(head), true)?;
         log_stage_elapsed(ctx);
-        let SyncedIndex {
-            head,
-            cache,
-            scratch,
-            ..
-        } = synced;
-        self.index_scratch = scratch;
-        let anchor = index_store::cache_anchor(self.full_cache_path().as_deref());
+        let SyncedIndex { head, table, .. } = synced;
+        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
 
         let ctx = emit_stage(events, "reconcile");
         let pack_ids = Self::delta_pack_ids(&delta);
@@ -498,11 +399,10 @@ impl Repository {
             let verify = scope.spawn(|| {
                 super::pack_verify::verify_packs_present(storage, &pack_ids, persisted_packs, width)
             });
-            let merged = segment::merge_delta_to_temp(&cache, &delta, &anchor);
+            let merged = segment::merge_delta_to_temp(table.cache(), &delta, &anchor);
             (join_scoped(verify), merged)
         });
-        // Unmap the predecessor before its file is replaced (Windows).
-        drop(cache);
+        drop(table);
         drop(delta);
         // A stale bump is the typed error callers retry on; report it first.
         let (diff, next) = merged?;
@@ -522,15 +422,8 @@ impl Repository {
     fn commit_finalize(
         &mut self,
         new_file_cache: &mut file_cache::FileCache,
-        deferred_chunk_index_hydrate: bool,
         events: &dyn EventSink<CommitEvent>,
     ) {
-        // The commit deferred `chunk_index` hydration past the commit point.
-        // It runs last (below): neither the file-cache save nor
-        // `rebuild_local_caches(true)` reads `self.chunk_index`, so doing it
-        // first would only keep the hydrated index alive next to the file
-        // cache's serialization buffer and raise the commit's peak memory.
-
         // Merge active sections if any were produced (filesystem backup).
         // Dump-only runs produce no active sections and skip this block.
         let sections = new_file_cache.take_active_sections();
@@ -558,22 +451,6 @@ impl Repository {
         }
         log_stage_elapsed(ctx);
 
-        // Rebuild local caches if needed. When the index write already left
-        // the full cache (deferred_chunk_index_hydrate), skip the redundant sort;
-        // the derivation then streams the on-disk full_index_cache and does
-        // not read `self.chunk_index`, which is not hydrated yet.
-        let ctx = emit_stage(events, "rebuild local caches");
-        if self.rebuild_dedup_cache {
-            self.rebuild_local_caches(deferred_chunk_index_hydrate);
-            self.rebuild_dedup_cache = false;
-            self.local_caches_stale = false;
-        }
-        log_stage_elapsed(ctx);
-
-        if deferred_chunk_index_hydrate {
-            self.hydrate_deferred_chunk_index(events);
-        }
-
         // Clean up recovered index journals from previous interrupted sessions.
         if let Some(ws) = self.write_session.as_mut() {
             ws.cleanup_recovered_indices(&*self.storage);
@@ -581,36 +458,6 @@ impl Repository {
 
         // Consume write session.
         self.write_session = None;
-    }
-
-    /// Restore `self.chunk_index` after a commit, which never built the
-    /// in-memory index: from the merged local full_index_cache, falling back
-    /// to the remote index.
-    ///
-    /// Best-effort: a failure here is non-fatal since the remote index is
-    /// already committed; it leaves `chunk_index` stale and the next
-    /// Repository operation calls `reload_full_index` and rehydrates from
-    /// remote.
-    fn hydrate_deferred_chunk_index(&mut self, events: &dyn EventSink<CommitEvent>) {
-        match self.chunk_index_from_local_cache().or_else(|e| {
-            warn!("local cache hydration failed ({e}), reloading from remote");
-            self.reload_full_index()
-        }) {
-            Ok(idx) => {
-                self.chunk_index = idx;
-            }
-            Err(e) => {
-                post_commit_warning(
-                    events,
-                    format!(
-                        "snapshot was successfully committed, but hydrating the \
-                         in-memory chunk index from local cache and remote storage \
-                         both failed: {e}. The on-disk chunk index is intact; the \
-                         next repository operation will reload it."
-                    ),
-                );
-            }
-        }
     }
 
     /// The packs a delta's new entries live in.
@@ -623,74 +470,6 @@ impl Repository {
         self.write_session
             .as_ref()
             .map_or(0, |ws| ws.persisted_pack_count)
-    }
-
-    /// Rebuild the local full/dedup/restore caches after a maintenance
-    /// operation persisted the index (see `local_caches_stale`). Local and
-    /// best-effort, and safe without the repository lock: every cache writer
-    /// renames a uniquely named temp file into place, and each cache carries
-    /// the generation of the index it holds. A copy that a concurrent process
-    /// outdates is a miss for anything that promotes it to the index, and at
-    /// worst an older consistent view for the dedup and restore readers,
-    /// which commit and read verification catch.
-    /// Only refreshes caches this machine already keeps (an existing
-    /// `full_index_cache`), and only while `chunk_index` is exactly the
-    /// persisted index (`!index_dirty`, no write session).
-    pub(crate) fn refresh_stale_local_caches(&mut self) {
-        if !self.local_caches_stale || self.index_dirty || self.write_session.is_some() {
-            return;
-        }
-        let cd = self.cache_dir_override.as_deref();
-        if !dedup_cache::full_index_cache_path(&self.config.id, cd).is_some_and(|p| p.exists()) {
-            return;
-        }
-        let start = std::time::Instant::now();
-        // An index write leaves the full cache at the new state.
-        self.rebuild_local_caches(true);
-        self.local_caches_stale = false;
-        debug!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            generation = self.index_generation,
-            "rebuilt local caches after maintenance index write"
-        );
-    }
-
-    /// Rebuild all local caches: full index cache (1 sort), then derive
-    /// dedup + restore caches from it (O(n) streaming, no sort).
-    ///
-    /// When `full_cache_fresh` is true, the full index cache is already
-    /// up-to-date (e.g. from an index write) and only the derivation
-    /// step runs. The full cache is opened and verified once; both
-    /// derivations stream from that mapping.
-    fn rebuild_local_caches(&self, full_cache_fresh: bool) {
-        let cd = self.cache_dir_override.as_deref();
-        let generation = self.index_generation;
-        if !full_cache_fresh
-            && let Err(e) = dedup_cache::build_full_index_cache(
-                &self.chunk_index,
-                generation,
-                &self.config.id,
-                cd,
-            )
-        {
-            warn!("failed to build full index cache: {e}");
-        }
-        let Some(full_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) else {
-            return;
-        };
-        let Some(full) = dedup_cache::MmapFullIndexCache::open_path(&full_path, generation) else {
-            warn!(
-                "failed to rebuild dedup and restore caches: full index cache not found or stale"
-            );
-            return;
-        };
-        if let Err(e) = dedup_cache::build_dedup_cache_from_full_cache(&full, &self.config.id, cd) {
-            warn!("failed to rebuild dedup cache from full cache: {e}");
-        }
-        if let Err(e) = dedup_cache::build_restore_cache_from_full_cache(&full, &self.config.id, cd)
-        {
-            warn!("failed to rebuild restore cache from full cache: {e}");
-        }
     }
 
     /// Persist the local snapshot list cache from the current in-memory
@@ -741,30 +520,22 @@ impl Repository {
         self.manifest = Manifest::from_snapshot_entries(refresh.entries);
     }
 
-    /// Reload the full chunk index from storage (always downloads from remote).
-    fn reload_full_index(&self) -> Result<ChunkIndex> {
-        Self::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref()).map(|(_, i)| i)
-    }
-
-    /// Download and decode the full chunk index + generation using only the
-    /// storage and crypto handles, for readers that cannot borrow the
-    /// repository. Does not touch the repository's own index or local
-    /// caches: the index is built from its base and segments in a temp file.
+    /// Download the index at a freshly read head into a temp-file table,
+    /// using only the storage and crypto handles, for readers that cannot
+    /// borrow the repository. Does not touch the repository's own index or
+    /// the local tables.
     pub(crate) fn fetch_full_index(
         storage: &dyn vykar_storage::StorageBackend,
         crypto: &dyn CryptoEngine,
-    ) -> Result<(u64, ChunkIndex)> {
+    ) -> Result<LiveIndex> {
         let head = index_store::fetch_head(storage, crypto)?;
         let location = CacheLocation {
-            path: None,
-            scratch: None,
+            dir: None,
+            live: None,
             use_local: false,
         };
         let width = storage.profile().request_width.max(1);
         let synced = index_store::sync_full_cache(storage, crypto, head, location, width)?;
-        Ok((
-            dedup_cache::generation_for_state(&synced.head.state_hash),
-            dedup_cache::chunk_index_from_full_cache(&synced.cache),
-        ))
+        Ok(LiveIndex::from_table(synced.table))
     }
 }

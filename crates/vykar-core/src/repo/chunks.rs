@@ -7,20 +7,11 @@ use super::format::{ObjectType, pack_object_with_context};
 use super::pack::{self, PackType, SealedPack, compute_data_pack_target};
 use super::write_session::{active_mut, duration_nanos};
 use crate::compress;
-use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
-use crate::index::{IndexDelta, PendingChunkEntry};
+use crate::index::PendingChunkEntry;
+use crate::index::table::DedupPrefilter;
 use vykar_protocol::PACK_HEADER_SIZE;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
-
-/// Record the refcount bump for a tiered-dedup hit: by cache position for
-/// chunks in the mmap'd dedup cache, by key for chunks created this session.
-fn bump_tiered_hit(delta: &mut IndexDelta, chunk_id: &ChunkId, hit: TieredHit) {
-    match hit {
-        TieredHit::Cached { position, .. } => delta.bump_cached_refcount(chunk_id, position),
-        TieredHit::SessionNew { .. } => delta.bump_refcount(chunk_id),
-    }
-}
 
 impl Repository {
     /// Resolve a cache-hit chunk reference by bumping its refcount.
@@ -35,7 +26,8 @@ impl Repository {
         })
     }
 
-    /// Increment the refcount for a chunk (works in both normal and dedup modes).
+    /// Increment the refcount for a chunk: in the session's delta, or in the
+    /// index when no session is active.
     pub fn increment_chunk_ref(&mut self, id: &ChunkId) {
         if let Some(ref mut ws) = self.write_session
             && let Some(ref mut delta) = ws.index_delta
@@ -47,154 +39,145 @@ impl Repository {
         self.index_dirty = true;
     }
 
-    /// Increment refcount if this chunk already exists in committed or pending state.
-    /// Returns stored size when found. Works in normal, dedup, and tiered modes.
-    /// Falls back to recovered chunks from a previous interrupted session.
-    pub fn bump_ref_if_exists(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        // Check dedup modes (write session required).
-        let in_dedup_mode = {
-            let ws = self.ws_mut();
-            if let Some(ref tiered) = ws.tiered_dedup {
-                if let Some(hit) = tiered.find(chunk_id) {
-                    if let Some(ref mut delta) = ws.index_delta {
-                        bump_tiered_hit(delta, chunk_id, hit);
-                    }
-                    return Some(hit.stored_size());
-                }
-                true
-            } else if let Some(ref dedup) = ws.dedup_index {
-                if let Some(stored_size) = dedup.get_stored_size(chunk_id) {
-                    if let Some(ref mut delta) = ws.index_delta {
-                        delta.bump_refcount(chunk_id);
-                    }
-                    return Some(stored_size);
-                }
-                true
-            } else {
-                false
-            }
+    /// An existing chunk `id` for a new reference: stored earlier in the
+    /// session, else (index unedited) in the session's table, found through
+    /// the filter (unless `skip_filter`) and recorded by table position, else
+    /// (index edited after the session began: repair, tests) in the live
+    /// index by key. Records the bump in the session delta and returns the
+    /// stored size; `None` when not found.
+    fn bump_existing(&mut self, id: &ChunkId, skip_filter: bool) -> Option<u32> {
+        let edited = self.chunk_index.is_modified();
+        let keyed_hit = if edited {
+            self.chunk_index.get(id).map(|e| e.stored_size)
+        } else {
+            None
         };
+        let ws = self.ws_mut();
+        let delta = ws.index_delta.as_mut()?;
+        if let Some(&stored_size) = ws.session_new.get(id) {
+            delta.bump_refcount(id);
+            return Some(stored_size);
+        }
+        if edited {
+            let stored_size = keyed_hit?;
+            delta.bump_refcount(id);
+            return Some(stored_size);
+        }
+        let table = ws.table.as_ref()?;
+        if !skip_filter
+            && let Some(filter) = table.filter()
+            && !xorf::Filter::contains(
+                filter.as_ref(),
+                &crate::index::dedup_cache::chunk_id_to_u64(id),
+            )
+        {
+            return None;
+        }
+        let (position, entry) = table.find(id)?;
+        delta.bump_cached_refcount(id, position);
+        Some(entry.stored_size)
+    }
 
-        // Normal mode: check chunk_index (only when no dedup mode is active).
-        if !in_dedup_mode && let Some(entry) = self.chunk_index.get(chunk_id) {
-            let stored_size = entry.stored_size;
+    /// Increment refcount if this chunk already exists in committed or pending state.
+    /// Returns stored size when found. Falls back to recovered chunks from a
+    /// previous interrupted session, then to the pending pack writers.
+    /// Without a write session, bumps the refcount in the index.
+    pub fn bump_ref_if_exists(&mut self, chunk_id: &ChunkId) -> Option<u32> {
+        if self.write_session.is_none() {
+            let stored_size = self.chunk_index.get(chunk_id)?.stored_size;
             self.chunk_index.increment_refcount(chunk_id);
             self.index_dirty = true;
             return Some(stored_size);
         }
-
-        // Check recovered chunks before pending pack writers.
+        if let Some(stored_size) = self.bump_existing(chunk_id, false) {
+            return Some(stored_size);
+        }
         if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
             return Some(stored_size);
         }
-
         self.bump_ref_pending(chunk_id)
     }
 
-    /// Prefilter said "probably exists" — tiered: skip xor, check session_new → mmap → pending.
-    /// Non-tiered: falls through to bump_ref_if_exists.
-    pub fn bump_ref_prefilter_hit(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        let is_tiered = {
-            let ws = self.ws_mut();
-            if let Some(ref tiered) = ws.tiered_dedup {
-                if let Some(hit) = tiered.find_skip_filter(chunk_id) {
-                    if let Some(ref mut delta) = ws.index_delta {
-                        bump_tiered_hit(delta, chunk_id, hit);
-                    }
-                    return Some(hit.stored_size());
-                }
-                true
-            } else {
-                false
-            }
-        };
-        if is_tiered {
-            if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
-                return Some(stored_size);
-            }
-            return self.bump_ref_pending(chunk_id);
-        }
-        self.bump_ref_if_exists(chunk_id)
-    }
-
-    /// A worker confirmed `chunk_id` in the pre-session mmap tier through
+    /// A worker confirmed `chunk_id` in the session's table through
     /// `prefilter` (`PrefilterVerdict::Present`): record the reference.
     ///
-    /// No second lookup is needed: `cache_position` is where the worker found
+    /// No second lookup is needed: `table_position` is where the worker found
     /// the chunk, and the bump is recorded against it (the positional table
     /// re-checks that the entry there is `chunk_id` and otherwise records the
-    /// bump by key). The verdict came from the very mapping the
-    /// active `TieredDedupIndex` resolves against (checked by identity), and
-    /// that tier is immutable for the session — nothing removes pre-session
-    /// entries (`remove` and rollback only touch `session_new`), and a chunk in
-    /// it is never also in `session_new` or the recovered set, because every
-    /// path consults the mmap before committing or promoting a chunk.
+    /// bump by key). The verdict came from the very table the session
+    /// resolves against (checked by identity), and that table is immutable —
+    /// a chunk in it is never also in `session_new` or the recovered set,
+    /// because every path consults the table before storing or promoting a
+    /// chunk.
     ///
     /// Errors, rather than recording a possibly dangling reference, if the
-    /// prefilter does not belong to the active tiered index.
+    /// prefilter does not belong to the active session.
     pub(crate) fn bump_ref_presession_hit(
         &mut self,
         chunk_id: &ChunkId,
         stored_size: u32,
-        cache_position: u32,
+        table_position: u32,
         prefilter: &DedupPrefilter,
     ) -> Result<()> {
+        // A positional hit comes from the session's immutable table. An index
+        // edited during the session could have removed that entry.
+        debug_assert!(
+            !self.chunk_index.is_modified(),
+            "pre-session dedup hit over an index edited during the session"
+        );
         let ws = self.ws_mut();
-        let tiered = ws
-            .tiered_dedup
+        let table = ws
+            .table
             .as_ref()
-            .filter(|t| {
-                prefilter
-                    .presession_cache()
-                    .is_some_and(|c| t.is_backed_by(c))
-            })
+            .filter(|t| Arc::ptr_eq(t, prefilter.table()))
             .ok_or_else(|| {
                 VykarError::Other(format!(
                     "BUG: pre-session dedup hit for chunk {chunk_id} does not match \
-                     the active tiered dedup index"
+                     the active session's table"
                 ))
             })?;
         debug_assert_eq!(
-            tiered.find_skip_filter(chunk_id),
-            Some(TieredHit::Cached {
-                position: cache_position,
-                stored_size,
-            }),
-            "pre-session hit must resolve to the worker's cache entry"
+            table.find(chunk_id).map(|(p, e)| (p, e.stored_size)),
+            Some((table_position, stored_size)),
+            "pre-session hit must resolve to the worker's table entry"
         );
-        let delta = ws.index_delta.as_mut().ok_or_else(|| {
-            VykarError::Other("BUG: tiered dedup mode without an index delta".into())
-        })?;
-        delta.bump_cached_refcount(chunk_id, cache_position);
+        let delta = ws
+            .index_delta
+            .as_mut()
+            .ok_or_else(|| VykarError::Other("BUG: write session without an index delta".into()))?;
+        delta.bump_cached_refcount(chunk_id, table_position);
         Ok(())
     }
 
-    /// Prefilter said "not in the pre-session set" (`PrefilterVerdict::Absent`:
-    /// a filter miss, or a false positive the worker ruled out in the mmap) —
-    /// tiered: session_new → recovered → pending only.
-    /// Non-tiered: falls through to bump_ref_if_exists.
+    /// Prefilter said "not in the session's table" (`PrefilterVerdict::Absent`:
+    /// a filter miss, or a false positive the worker ruled out in the table)
+    /// — session-new → recovered → pending only.
     pub fn bump_ref_prefilter_miss(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        let is_tiered = {
+        let found = {
             let ws = self.ws_mut();
-            if let Some(ref tiered) = ws.tiered_dedup {
-                if let Some(stored_size) = tiered.session_new_stored_size(chunk_id) {
+            match ws.session_new.get(chunk_id).copied() {
+                Some(stored_size) => {
                     if let Some(ref mut delta) = ws.index_delta {
                         delta.bump_refcount(chunk_id);
                     }
-                    return Some(stored_size);
+                    Some(stored_size)
                 }
-                true
-            } else {
-                false
+                None => None,
             }
         };
-        if is_tiered {
-            if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
+        if found.is_some() {
+            return found;
+        }
+        if self.chunk_index.is_modified() {
+            // Edits after the session began are only seen by key.
+            if let Some(stored_size) = self.bump_existing(chunk_id, true) {
                 return Some(stored_size);
             }
-            return self.bump_ref_pending(chunk_id);
         }
-        self.bump_ref_if_exists(chunk_id)
+        if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
+            return Some(stored_size);
+        }
+        self.bump_ref_pending(chunk_id)
     }
 
     /// Check only pending pack writers (shared helper).
@@ -271,13 +254,7 @@ impl Repository {
         pack_id: vykar_types::pack_id::PackId,
         entries: Vec<pack::PackedChunkEntry>,
     ) {
-        if active_mut(&mut self.write_session).apply_sealed_entries(
-            pack_id,
-            entries,
-            &mut self.chunk_index,
-        ) {
-            self.index_dirty = true;
-        }
+        active_mut(&mut self.write_session).apply_sealed_entries(pack_id, entries);
     }
 
     /// Seal a pack writer and upload in the background.

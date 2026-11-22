@@ -283,7 +283,7 @@ fn decode_chunk(
     id: &ChunkId,
     shape: Option<&mut DirShape>,
 ) -> Result<ChunkKeys> {
-    let entry = *repo
+    let entry = repo
         .chunk_index()
         .get(id)
         .ok_or_else(|| VykarError::Other(format!("tree chunk {id} not in the index")))?;

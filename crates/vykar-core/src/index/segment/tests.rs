@@ -693,14 +693,29 @@ mod merge {
     use std::sync::Arc;
 
     use super::*;
-    use crate::index::IndexDelta;
-    use crate::index::dedup_cache::{MmapDedupCache, build_dedup_cache_to_path};
+    use crate::index::dedup_cache::full_cache_from_index_to_temp;
+    use crate::index::{ChunkTable, IndexDelta, LiveIndex};
 
-    /// A delta whose positional bumps index a dedup cache of `session_start`.
+    /// `index` as a scratch table in `dir`.
+    fn table_of(index: &ChunkIndex, dir: &Path) -> Arc<ChunkTable> {
+        let tmp = full_cache_from_index_to_temp(index, &dir.join("chunk_table")).unwrap();
+        Arc::new(ChunkTable::scratch(tmp).unwrap())
+    }
+
+    /// A delta whose positional bumps index a table of `session_start`.
     fn delta_over(session_start: &ChunkIndex, dir: &Path) -> IndexDelta {
-        let path = dir.join("dedup");
-        build_dedup_cache_to_path(session_start, 1, &path).unwrap();
-        IndexDelta::with_cached_bumps(Arc::new(MmapDedupCache::open_path(&path, 1).unwrap()))
+        IndexDelta::with_cached_bumps(table_of(session_start, dir))
+    }
+
+    /// `delta` applied to `index` by key.
+    fn apply_keyed(index: &ChunkIndex, delta: IndexDelta) -> ChunkIndex {
+        let mut live = LiveIndex::empty();
+        for (id, e) in index.iter() {
+            live.add(*id, e.stored_size, e.pack_id, e.pack_offset);
+            live.increment_refcount_by(id, e.refcount.saturating_sub(1));
+        }
+        delta.apply_to(&mut live);
+        live.to_chunk_index()
     }
 
     fn bump_by_position(delta: &mut IndexDelta, chunk: ChunkId) {
@@ -709,7 +724,7 @@ mod merge {
             .as_ref()
             .unwrap()
             .cache()
-            .find_with_position(&chunk)
+            .find(&chunk)
             .unwrap();
         delta.bump_cached_refcount(&chunk, position);
     }
@@ -726,9 +741,7 @@ mod merge {
 
     /// The delta applied to `prev` by key, as the monolithic path does.
     fn expected(prev: &ChunkIndex, delta: IndexDelta) -> ChunkIndex {
-        let mut index = prev.clone();
-        delta.reconcile(prev).unwrap().apply_to(&mut index);
-        index
+        apply_keyed(prev, delta.reconcile(prev).unwrap())
     }
 
     /// Merge `delta` over `prev_index` and check the written state equals
@@ -913,9 +926,9 @@ mod merge {
     }
 
     /// `ops` recorded on a fresh delta whose positional bumps index `cache`
-    /// (a dedup cache of the session start, whose chunks are `start_ids`).
+    /// (a table of the session start, whose chunks are `start_ids`).
     fn build_delta(
-        cache: &Arc<MmapDedupCache>,
+        cache: &Arc<ChunkTable>,
         start_ids: &[ChunkId],
         elsewhere: &[ChunkId],
         ops: &[DeltaOp],
@@ -982,18 +995,12 @@ mod merge {
                 .into_iter()
                 .filter(|id| !start_index.contains(id))
                 .collect();
-            let path = dir.path().join("dedup");
-            build_dedup_cache_to_path(&start_index, 1, &path).unwrap();
-            let cache = Arc::new(MmapDedupCache::open_path(&path, 1).unwrap());
+            let cache = table_of(&start_index, dir.path());
 
             // `IndexDelta` is not `Clone`: build it once per side.
             let keyed = build_delta(&cache, &start_ids, &elsewhere, &ops)
                 .reconcile(&prev_index)
-                .map(|d| {
-                    let mut index = prev_index.clone();
-                    d.apply_to(&mut index);
-                    index
-                });
+                .map(|d| apply_keyed(&prev_index, d));
             let prev = write_cache(&prev_index, dir.path(), "prev");
             let delta = build_delta(&cache, &start_ids, &elsewhere, &ops);
             let merged = merge_delta_to_temp(&prev, &delta, &target(dir.path()));

@@ -1275,7 +1275,8 @@ mod tests {
         let (id_b, _, _) = repo
             .store_chunk(&data_b, Compression::None, PackType::Data)
             .unwrap();
-        repo.flush_packs().unwrap();
+        // A session's chunks are in the index once it is saved.
+        repo.save_state().unwrap();
         rv.armed.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let repo = Arc::new(repo);

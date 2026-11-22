@@ -1,6 +1,6 @@
 use tracing::warn;
 
-use crate::index::ChunkIndex;
+use crate::index::LiveIndex;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;
 use vykar_types::chunk_id::ChunkId;
@@ -61,7 +61,7 @@ pub struct SnapshotChunkImpact {
 /// Used by both the live delete path (operating on the repo's real index) and
 /// the dry-run path (operating on a cloned scratch index).
 pub fn decrement_chunk_refs_on_index(
-    index: &mut ChunkIndex,
+    index: &mut LiveIndex,
     items_stream: &[u8],
     item_ptrs: &[ChunkId],
 ) -> Result<SnapshotChunkImpact> {

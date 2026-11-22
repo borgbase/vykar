@@ -81,7 +81,6 @@ mod tests {
     use std::path::PathBuf;
 
     /// Plan reads using a lookup closure that returns `(pack_id, pack_offset, stored_size)`.
-    /// The closure abstracts over ChunkIndex vs MmapRestoreCache.
     fn plan_reads<L>(
         file_items: &[(&Item, PathBuf)],
         lookup: L,

@@ -574,7 +574,7 @@ fn pick_data_only_pack(
         pack_to_chunks
             .entry(entry.pack_id)
             .or_default()
-            .push(*chunk_id);
+            .push(chunk_id);
     }
     let candidate = pack_to_chunks
         .iter()
@@ -1875,8 +1875,8 @@ fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
             crate::repo::pack::PackType::Data,
         )
         .unwrap();
-    repo.flush_packs().unwrap();
-    let entry = *repo.chunk_index().get(&id).unwrap();
+    crate::testutil::save_and_resume(&mut repo);
+    let entry = repo.chunk_index().get(&id).unwrap();
 
     let mut issues: Vec<IntegrityIssue> = Vec::new();
     let count = verify_pack_full(

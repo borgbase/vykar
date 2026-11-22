@@ -89,7 +89,7 @@ impl Fixture {
 
     fn flip_byte_in_chunk(&self, id: &ChunkId) {
         let repo = open_local_repo(&self.repo_dir, self.passphrase);
-        let entry = *repo.chunk_index().get(id).unwrap();
+        let entry = repo.chunk_index().get(id).unwrap();
         let path = self.repo_dir.join(entry.pack_id.storage_key());
         let mut pack = std::fs::read(&path).unwrap();
         pack[entry.pack_offset as usize + entry.stored_size as usize / 2] ^= 0x01;

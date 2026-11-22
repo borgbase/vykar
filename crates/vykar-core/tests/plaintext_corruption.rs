@@ -48,7 +48,7 @@ fn setup(tmp: &Path) -> (VykarConfig, std::path::PathBuf) {
 /// `Compression::None`, so the blob still decodes at the same length.
 fn flip_byte_in_chunk(repo_dir: &Path, id: &ChunkId) {
     let repo = open_local_repo(repo_dir, None);
-    let entry = *repo.chunk_index().get(id).unwrap();
+    let entry = repo.chunk_index().get(id).unwrap();
     let path = repo_dir.join(entry.pack_id.storage_key());
     let mut pack = std::fs::read(&path).unwrap();
     let pos = entry.pack_offset as usize + entry.stored_size as usize / 2;

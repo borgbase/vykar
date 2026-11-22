@@ -11,7 +11,6 @@ use super::blob_read::{
 use super::control::CancelToken;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
-use crate::index::dedup_cache;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -126,16 +125,6 @@ impl Assembler<'_> {
 }
 
 impl Repository {
-    /// Try to open the mmap'd restore cache for this repository.
-    /// Returns `None` if the cache is missing, stale, or corrupt.
-    pub fn open_restore_cache(&self) -> Option<dedup_cache::MmapRestoreCache> {
-        dedup_cache::MmapRestoreCache::open(
-            &self.config.id,
-            self.index_generation,
-            self.cache_dir_override.as_deref(),
-        )
-    }
-
     /// Read and decrypt a chunk located through the in-memory chunk index.
     ///
     /// # Errors
@@ -144,7 +133,7 @@ impl Repository {
     /// `chunk_id`, which is always the case on a repository opened without
     /// `OpenOptions::with_index()`.
     pub fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
-        let entry = *self
+        let entry = self
             .chunk_index
             .get(chunk_id)
             .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
@@ -159,7 +148,7 @@ impl Repository {
 
     /// Read and decrypt a chunk given explicit pack location coordinates.
     /// Bypasses the chunk index — the caller supplies (pack_id, offset, stored_size)
-    /// e.g. from the mmap restore cache.
+    /// e.g. from an index resolved earlier.
     pub fn read_chunk_at(
         &self,
         chunk_id: &ChunkId,

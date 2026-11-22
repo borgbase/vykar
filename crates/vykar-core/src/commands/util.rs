@@ -285,10 +285,6 @@ pub fn with_open_repo_maintenance_lock<T>(
 /// markers (unparseable JSON or bad timestamps) are preserved and surfaced
 /// in the blocking list — maintenance will not proceed past them without
 /// operator intervention (`break-lock --sessions`).
-///
-/// After the action, before the lock is released, refreshes this machine's
-/// existing local index caches if the action persisted the index (see
-/// `Repository::refresh_stale_local_caches`).
 pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
@@ -343,14 +339,7 @@ pub fn with_maintenance_lock<T>(
     }
 
     // Session checks passed — hand off to the shared fence/flush/release epilogue.
-    run_under_fence(repo, guard, |repo| {
-        let result = action(repo);
-        // Before the release: a backup on this machine that starts once the
-        // lock is free then finds the caches at the generation just written,
-        // and its commit does not race this rebuild for the same cache files.
-        repo.refresh_stale_local_caches();
-        result
-    })
+    run_under_fence(repo, guard, action)
 }
 
 #[cfg(test)]

@@ -370,15 +370,10 @@ mod tests {
         "true"
     }
 
-    /// Helper: set up a repo for streaming dump tests.
-    ///
-    /// The real backup pipeline enables tiered/dedup mode before executing
-    /// command dumps, and `begin_rollback_checkpoint` now asserts that
-    /// invariant — mirror it here.
+    /// Helper: set up a repo with an active write session for streaming
+    /// dump tests.
     fn setup_test_repo() -> Repository {
-        let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
-        repo
+        crate::testutil::test_repo_plaintext()
     }
 
     #[test]

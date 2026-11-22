@@ -14,7 +14,7 @@ use std::time::Instant;
 use tracing::warn;
 
 use crate::compress::Compression;
-use crate::index::dedup_cache::DedupPrefilter;
+use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
 use crate::repo::ChunkerParams;
 use vykar_crypto::CryptoEngine;

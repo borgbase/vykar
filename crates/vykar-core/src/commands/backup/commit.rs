@@ -1,5 +1,4 @@
-use crate::compress::Compression;
-use crate::index::dedup_cache::DedupPrefilter;
+use crate::index::table::DedupPrefilter;
 use crate::repo::Repository;
 use crate::repo::file_cache::CachedChunks;
 use crate::repo::pack::PackType;
@@ -17,7 +16,6 @@ pub(super) fn process_worker_chunks(
     item: &mut Item,
     chunks: impl IntoIterator<Item = WorkerChunk>,
     stats: &mut SnapshotStats,
-    compression: Compression,
     prefilter: Option<&DedupPrefilter>,
 ) -> Result<()> {
     for worker_chunk in chunks {
@@ -25,7 +23,7 @@ pub(super) fn process_worker_chunks(
             WorkerChunk::Prepared(prepared) => {
                 let size = prepared.uncompressed_size;
                 // With a prefilter, the worker established the chunk is not
-                // in the pre-session set; it can only dedup against chunks
+                // in the session's table; it can only dedup against chunks
                 // added during this session.
                 let existing = if prefilter.is_some() {
                     repo.bump_ref_prefilter_miss(&prepared.chunk_id)
@@ -78,35 +76,6 @@ pub(super) fn process_worker_chunks(
                     size,
                     csize,
                 });
-            }
-            WorkerChunk::Hashed(hashed) => {
-                let size = hashed.data.len() as u32;
-                if let Some(csize) = repo.bump_ref_prefilter_hit(&hashed.chunk_id) {
-                    // True dedup hit — skip transform.
-                    stats.original_size += size as u64;
-                    stats.compressed_size += csize as u64;
-                    item.chunks.push(ChunkRef {
-                        id: hashed.chunk_id,
-                        size,
-                        csize,
-                    });
-                } else {
-                    // False positive — inline compress+encrypt.
-                    let csize = repo.commit_chunk_inline(
-                        hashed.chunk_id,
-                        &hashed.data,
-                        compression,
-                        PackType::Data,
-                    )?;
-                    stats.original_size += size as u64;
-                    stats.compressed_size += csize as u64;
-                    stats.deduplicated_size += csize as u64;
-                    item.chunks.push(ChunkRef {
-                        id: hashed.chunk_id,
-                        size,
-                        csize,
-                    });
-                }
             }
         }
     }
@@ -170,25 +139,23 @@ mod tests {
         }
     }
 
-    mod tiered {
+    mod prefilter {
         use super::*;
         use crate::commands::backup::chunk_process::{WorkerChunk, classify_chunk};
-        use crate::index::ChunkIndex;
-        use crate::index::dedup_cache::{
-            MmapDedupCache, TieredDedupIndex, build_dedup_cache_to_path, chunk_id_to_u64,
-        };
+        use crate::compress::Compression;
+        use crate::index::dedup_cache::chunk_id_to_u64;
+        use crate::index::{ChunkIndex, ChunkTable};
         use std::borrow::Cow;
+        use std::sync::Arc;
         use vykar_types::pack_id::PackId;
 
-        /// Write a dedup cache holding `stored` and return its open path.
-        fn write_cache(dir: &tempfile::TempDir, stored: &[(ChunkId, u32)]) -> std::path::PathBuf {
-            let path = dir.path().join("dedup_cache");
+        /// An index holding `stored`.
+        fn index_of(stored: &[(ChunkId, u32)]) -> ChunkIndex {
             let mut index = ChunkIndex::new();
             for &(id, stored_size) in stored {
                 index.add(id, stored_size, PackId::from_bytes([0x01; 32]), 0);
             }
-            build_dedup_cache_to_path(&index, 1, &path).unwrap();
-            path
+            index
         }
 
         fn classify(repo: &Repository, prefilter: &DedupPrefilter, data: &[u8]) -> WorkerChunk {
@@ -208,24 +175,15 @@ mod tests {
             let mut repo = test_repo_plaintext();
             let data = b"already stored before this session".to_vec();
             let id = ChunkId::compute(repo.crypto.chunk_hasher(), &data);
-            let dir = tempfile::tempdir().unwrap();
-            let path = write_cache(&dir, &[(id, 77)]);
-            repo.enable_tiered_dedup_mode_with(MmapDedupCache::open_path(&path, 1).unwrap());
+            repo.set_session_table_for_test(&index_of(&[(id, 77)]));
             let prefilter = repo.dedup_prefilter().unwrap();
 
             let chunk = classify(&repo, &prefilter, &data);
             assert!(matches!(chunk, WorkerChunk::Existing(_)));
             let mut item = empty_item();
             let mut stats = SnapshotStats::default();
-            process_worker_chunks(
-                &mut repo,
-                &mut item,
-                [chunk],
-                &mut stats,
-                Compression::None,
-                Some(&prefilter),
-            )
-            .unwrap();
+            process_worker_chunks(&mut repo, &mut item, [chunk], &mut stats, Some(&prefilter))
+                .unwrap();
 
             assert_eq!(item.chunks.len(), 1);
             assert_eq!(item.chunks[0].id, id);
@@ -237,32 +195,27 @@ mod tests {
             assert_eq!(repo.delta_refcount_bump(&id), 1);
         }
 
-        /// A data-less hit whose verdict came from a different mapping than
-        /// the active tiered index must fail loudly, not record a reference.
+        /// A data-less hit whose verdict came from a different table than
+        /// the session's must fail loudly, not record a reference.
         #[test]
         fn presession_hit_from_foreign_prefilter_errors() {
             let mut repo = test_repo_plaintext();
             let data = b"already stored before this session".to_vec();
             let id = ChunkId::compute(repo.crypto.chunk_hasher(), &data);
-            let dir = tempfile::tempdir().unwrap();
-            let path = write_cache(&dir, &[(id, 77)]);
-            repo.enable_tiered_dedup_mode_with(MmapDedupCache::open_path(&path, 1).unwrap());
-            let foreign = TieredDedupIndex::new(MmapDedupCache::open_path(&path, 1).unwrap())
-                .prefilter()
-                .unwrap();
+            let index = index_of(&[(id, 77)]);
+            repo.set_session_table_for_test(&index);
+            let anchor = crate::repo::index_store::cache_anchor(None);
+            let tmp =
+                crate::index::dedup_cache::full_cache_from_index_to_temp(&index, &anchor).unwrap();
+            let other = Arc::new(ChunkTable::scratch(tmp).unwrap());
+            let foreign = DedupPrefilter::new(&other).unwrap();
 
             let chunk = classify(&repo, &foreign, &data);
             let mut item = empty_item();
             let mut stats = SnapshotStats::default();
-            let err = process_worker_chunks(
-                &mut repo,
-                &mut item,
-                [chunk],
-                &mut stats,
-                Compression::None,
-                Some(&foreign),
-            )
-            .expect_err("foreign prefilter must be rejected");
+            let err =
+                process_worker_chunks(&mut repo, &mut item, [chunk], &mut stats, Some(&foreign))
+                    .expect_err("foreign prefilter must be rejected");
             assert!(err.to_string().contains("pre-session dedup hit"), "{err}");
             assert!(item.chunks.is_empty());
             assert_eq!(stats.original_size, 0);
@@ -280,9 +233,7 @@ mod tests {
             colliding[31] ^= 0xFF;
             let colliding = ChunkId::from_bytes(colliding);
             assert_eq!(chunk_id_to_u64(&colliding), chunk_id_to_u64(&id));
-            let dir = tempfile::tempdir().unwrap();
-            let path = write_cache(&dir, &[(colliding, 77)]);
-            repo.enable_tiered_dedup_mode_with(MmapDedupCache::open_path(&path, 1).unwrap());
+            repo.set_session_table_for_test(&index_of(&[(colliding, 77)]));
             let prefilter = repo.dedup_prefilter().unwrap();
 
             let mut stats = SnapshotStats::default();
@@ -290,15 +241,8 @@ mod tests {
             for item in &mut items {
                 let chunk = classify(&repo, &prefilter, &data);
                 assert!(matches!(chunk, WorkerChunk::Prepared(_)));
-                process_worker_chunks(
-                    &mut repo,
-                    item,
-                    [chunk],
-                    &mut stats,
-                    Compression::None,
-                    Some(&prefilter),
-                )
-                .unwrap();
+                process_worker_chunks(&mut repo, item, [chunk], &mut stats, Some(&prefilter))
+                    .unwrap();
             }
 
             let csize = items[0].chunks[0].csize;

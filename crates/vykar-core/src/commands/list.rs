@@ -1,12 +1,10 @@
 use std::io::{BufRead, Read};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use tracing::info;
 
 use crate::config::VykarConfig;
-use crate::index::dedup_cache::MmapRestoreCache;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;
 use crate::repo::format::{
@@ -34,8 +32,8 @@ pub fn list_snapshots(
 }
 
 /// List all items in a specific snapshot.
-/// Tries the local restore cache first to avoid downloading the full index.
-/// Falls back to the full index on cache miss.
+/// Resolves the item stream through the local chunk table where there is
+/// one, so no index download is needed.
 pub fn list_snapshot_items(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -185,24 +183,18 @@ pub fn load_snapshot_item_stream(
     load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, shutdown)
 }
 
-/// Item-stream reader for one read-only operation: tries the local restore
-/// cache first to avoid downloading the chunk index, and falls back to the
-/// full index (loaded at most once) on any cache miss or read/decrypt error.
+/// Item-stream reader for one read-only operation: resolves item-stream
+/// chunks through the chunk index of the snapshot view, loaded at most once
+/// (from the local chunk table when it is at the open head, so without an
+/// index download).
 pub struct ItemStreamReader {
-    restore_cache: Option<MmapRestoreCache>,
     index_loaded: bool,
-    /// Raised by a [`LazyItemStream`] of this reader when a cached location
-    /// turned out to be unreadable mid-stream: the cache must not serve any
-    /// further lookup.
-    cache_distrusted: Arc<AtomicBool>,
 }
 
 impl ItemStreamReader {
-    pub fn new(repo: &Repository) -> Self {
+    pub fn new(_repo: &Repository) -> Self {
         Self {
-            restore_cache: repo.open_restore_cache(),
             index_loaded: false,
-            cache_distrusted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -213,25 +205,7 @@ impl ItemStreamReader {
         snapshot_name: &str,
         shutdown: &CancelToken,
     ) -> Result<Vec<u8>> {
-        if let Some(cache) = &self.restore_cache {
-            match load_snapshot_item_stream_via_lookup(
-                repo,
-                snapshot_name,
-                |chunk_id| cache.lookup(chunk_id),
-                shutdown,
-            ) {
-                Ok(stream) => return Ok(stream),
-                // A cancellation is not a stale cache — re-raise it instead of
-                // falling through, which would load the full index and retry.
-                Err(e @ VykarError::Interrupted) => return Err(e),
-                Err(e) => {
-                    // The cache is generation-pinned, so a miss means it is
-                    // incomplete or corrupt; drop it once the index is needed.
-                    info!("restore cache incomplete or stale, falling back to full index: {e}");
-                    self.restore_cache = None;
-                }
-            }
-        }
+        shutdown.check()?;
         self.ensure_index(repo)?;
         load_snapshot_item_stream(repo, snapshot_name, shutdown)
     }
@@ -239,8 +213,7 @@ impl ItemStreamReader {
     /// Open the item stream of `snapshot_name` for lazy, chunk-at-a-time
     /// decoding (see [`LazyItemStream`]) instead of materializing it.
     ///
-    /// Chunk locations are resolved up front, through the restore cache when
-    /// it holds every item-stream chunk, else through the full index (loaded
+    /// Chunk locations are resolved up front through the chunk index (loaded
     /// at most once). The first range read happens here, so a cancellation or
     /// an unreadable stream head fails before the caller mutates anything.
     pub fn open_lazy<'a>(
@@ -251,44 +224,15 @@ impl ItemStreamReader {
     ) -> Result<LazyItemStream<'a>> {
         shutdown.check()?;
         let meta = load_snapshot_meta(repo, snapshot_name)?;
-        let mut chunks = None;
-        if let Some(cache) = &self.restore_cache {
-            let resolved: std::result::Result<Vec<ChunkLoc>, ChunkId> = meta
-                .item_ptrs
-                .iter()
-                .map(|id| {
-                    cache
-                        .lookup(id)
-                        .map(|(pack_id, offset, size)| (*id, pack_id, offset, size))
-                        .ok_or(*id)
-                })
-                .collect();
-            match resolved {
-                Ok(c) => chunks = Some(c),
-                Err(missing) => {
-                    info!(
-                        "restore cache lacks item-stream chunk {missing}, falling back to full index"
-                    );
-                    self.restore_cache = None;
-                }
-            }
-        }
-        let from_cache = chunks.is_some();
-        let chunks = match chunks {
-            Some(c) => c,
-            None => {
-                self.ensure_index(repo)?;
-                resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?
-            }
-        };
+        self.ensure_index(repo)?;
+        let chunks = resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
 
         let mut stream = LazyItemStream {
             storage: Arc::clone(&repo.storage),
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
-            from_cache,
-            cache_distrusted: Arc::clone(&self.cache_distrusted),
+            retried: false,
             window_max: LAZY_WINDOW_MAX,
             next: 0,
             window: Vec::new(),
@@ -303,11 +247,6 @@ impl ItemStreamReader {
         if let Err(e) = stream.fill_buf() {
             return Err(stream.error.take().unwrap_or(VykarError::Io(e)));
         }
-        if from_cache && !stream.from_cache {
-            // The stream head was unreadable at the cached coordinates: stop
-            // trusting the cache for the caller's own lookups too.
-            self.restore_cache = None;
-        }
         Ok(stream)
     }
 
@@ -320,65 +259,21 @@ impl ItemStreamReader {
         Ok(())
     }
 
-    /// Prepare [`Self::lookup`] for `ids`: keep resolving through the restore
-    /// cache when it holds every one of them, otherwise drop the cache and
-    /// load the full index (once; later calls keep using the index).
-    ///
-    /// The cache is generation-pinned, so a miss means it is incomplete or
-    /// corrupt — not that the chunk is gone. Falling back *before* a caller
-    /// declares a chunk missing keeps an incomplete cache from marking files
-    /// damaged.
-    ///
-    /// This only checks presence. The pin is the generation the open read
-    /// from the index head, so a cache can hold every chunk and still be
-    /// stale (locations of packs a compaction has since rewritten); a caller
-    /// that fails to read a chunk at a cached location must call
-    /// [`Self::fall_back_to_index`] and resolve it again before treating the
-    /// chunk as unreadable.
+    /// Prepare [`Self::lookup`] for `ids`: load the chunk index (once).
     pub fn ensure_resolvable<'a>(
         &mut self,
         repo: &mut Repository,
-        ids: impl IntoIterator<Item = &'a ChunkId>,
+        _ids: impl IntoIterator<Item = &'a ChunkId>,
     ) -> Result<()> {
-        if self.cache_distrusted.load(Ordering::Relaxed) && self.restore_cache.is_some() {
-            info!("restore cache had an unreadable item-stream location, using the full index");
-            self.restore_cache = None;
-        }
-        if let Some(cache) = &self.restore_cache {
-            match ids.into_iter().find(|id| cache.lookup(id).is_none()) {
-                None => return Ok(()),
-                Some(missing) => {
-                    info!("restore cache lacks chunk {missing}, falling back to full index");
-                    self.restore_cache = None;
-                }
-            }
-        }
-        self.ensure_index(repo)
-    }
-
-    /// Stop using the restore cache and load the full index, which serves
-    /// every later [`Self::lookup`].
-    pub fn fall_back_to_index(&mut self, repo: &mut Repository) -> Result<()> {
-        self.restore_cache = None;
         self.ensure_index(repo)
     }
 
     /// Resolve a chunk to `(pack_id, pack_offset, stored_size)` through the
-    /// restore cache, or through the full index once the cache was dropped.
-    /// Call [`Self::ensure_resolvable`] first.
+    /// chunk index. Call [`Self::ensure_resolvable`] first.
     pub fn lookup(&self, repo: &Repository, id: &ChunkId) -> Option<(PackId, u64, u32)> {
-        match &self.restore_cache {
-            Some(cache) => cache.lookup(id),
-            None => repo
-                .chunk_index()
-                .get(id)
-                .map(|e| (e.pack_id, e.pack_offset, e.stored_size)),
-        }
-    }
-
-    /// Whether lookups are still served by the restore cache.
-    pub fn uses_restore_cache(&self) -> bool {
-        self.restore_cache.is_some()
+        repo.chunk_index()
+            .get(id)
+            .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
     }
 
     /// Whether this reader loaded the full chunk index.
@@ -400,7 +295,7 @@ const LAZY_WINDOW_MAX: u64 = 4 * 1024 * 1024;
 /// still read through rather than split into two range reads.
 const LAZY_WINDOW_GAP: u64 = 256 * 1024;
 
-fn resolve_from_index(index: &crate::index::ChunkIndex, ids: &[ChunkId]) -> Result<Vec<ChunkLoc>> {
+fn resolve_from_index(index: &crate::index::LiveIndex, ids: &[ChunkId]) -> Result<Vec<ChunkLoc>> {
     ids.iter()
         .map(|id| {
             let e = index.get(id).ok_or(VykarError::ChunkNotInIndex(*id))?;
@@ -419,17 +314,17 @@ fn resolve_from_index(index: &crate::index::ChunkIndex, ids: &[ChunkId]) -> Resu
 /// authenticated (AEAD) or, for unencrypted repositories, checked against its
 /// chunk ID, exactly like [`Repository::read_chunks_coalesced_into`].
 ///
-/// When the locations came from the restore cache and a chunk cannot be read
-/// or decoded at them, the remaining locations are re-resolved once through a
-/// freshly downloaded full index (dropped right after) and the read retried.
+/// When a chunk cannot be read or decoded at its location (a compaction
+/// moved it after the index was loaded), the remaining locations are
+/// re-resolved once through the index at a freshly read head, downloaded
+/// and dropped right after, and the read retried.
 pub struct LazyItemStream<'a> {
     storage: Arc<dyn StorageBackend>,
     crypto: Arc<dyn CryptoEngine>,
     shutdown: &'a CancelToken,
     chunks: Vec<ChunkLoc>,
-    from_cache: bool,
-    /// Shared with the [`ItemStreamReader`]; raised on a cache fallback.
-    cache_distrusted: Arc<AtomicBool>,
+    /// Whether the locations were already re-resolved once.
+    retried: bool,
     /// Range-read cap; [`LAZY_WINDOW_MAX`] outside tests.
     window_max: u64,
     /// Index into `chunks` of the next chunk to decode.
@@ -454,10 +349,11 @@ impl<'a> LazyItemStream<'a> {
     /// A stream over explicit chunk locations with a custom range-read cap,
     /// for tests that exercise window and chunk boundaries.
     #[cfg(test)]
+    /// `retry: false` disables the re-resolve on a failed read.
     pub(crate) fn for_test(
         repo: &Repository,
         chunks: Vec<ChunkLoc>,
-        from_cache: bool,
+        retry: bool,
         window_max: u64,
         shutdown: &'a CancelToken,
     ) -> Self {
@@ -466,8 +362,7 @@ impl<'a> LazyItemStream<'a> {
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
-            from_cache,
-            cache_distrusted: Arc::new(AtomicBool::new(false)),
+            retried: !retry,
             window_max,
             next: 0,
             window: Vec::new(),
@@ -481,10 +376,10 @@ impl<'a> LazyItemStream<'a> {
         }
     }
 
-    /// Whether a cached location failed and the stream fell back to the index.
+    /// Whether a location failed and the stream re-resolved the rest.
     #[cfg(test)]
-    pub(crate) fn cache_distrusted(&self) -> bool {
-        self.cache_distrusted.load(Ordering::Relaxed)
+    pub(crate) fn retried(&self) -> bool {
+        self.retried
     }
 
     /// Call `visit` for each item in stream order.
@@ -583,18 +478,26 @@ impl<'a> LazyItemStream<'a> {
     fn load_next(&mut self) -> Result<()> {
         match self.try_load_next() {
             Ok(()) => Ok(()),
-            // A cancellation is not a stale cache.
+            // A cancellation is not a stale location.
             Err(e @ VykarError::Interrupted) => Err(e),
-            Err(e) if self.from_cache => {
-                info!("restore cache location unreadable, falling back to full index: {e}");
-                self.from_cache = false;
-                self.cache_distrusted.store(true, Ordering::Relaxed);
-                let (_, index) =
-                    Repository::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())?;
+            Err(e) if !self.retried => {
+                info!("item-stream chunk unreadable, re-resolving against the latest index: {e}");
+                self.retried = true;
+                // When the retry cannot be set up, the read error is the one
+                // to report, not the retry's.
                 let rest = self.chunks.get(self.next..).unwrap_or_default();
                 let ids: Vec<ChunkId> = rest.iter().map(|c| c.0).collect();
-                let resolved = resolve_from_index(&index, &ids)?;
-                drop(index);
+                let resolved =
+                    Repository::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())
+                        .and_then(|index| resolve_from_index(&index, &ids));
+                let resolved = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(retry @ VykarError::Interrupted) => return Err(retry),
+                    Err(retry) => {
+                        info!("cannot re-resolve the item stream: {retry}");
+                        return Err(e);
+                    }
+                };
                 self.chunks.truncate(self.next);
                 self.chunks.extend(resolved);
                 self.window = Vec::new();
@@ -714,7 +617,7 @@ pub fn load_item_stream_from_ptrs(
         repo,
         item_ptrs,
         |chunk_id, repo| {
-            let entry = *repo
+            let entry = repo
                 .chunk_index()
                 .get(chunk_id)
                 .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;

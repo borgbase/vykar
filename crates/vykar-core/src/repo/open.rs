@@ -13,7 +13,7 @@ use super::{
     ChunkerParams, EncryptionMode, InitOptions, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
     OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size, default_min_pack_size,
 };
-use crate::index::ChunkIndex;
+use crate::index::LiveIndex;
 use crate::index::dedup_cache::generation_for_state;
 use crate::index::head::IndexHead;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
@@ -240,7 +240,7 @@ impl Repository {
         }
 
         let manifest = Manifest::new();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
         // Server-side init does not create `index.d/`: a server that predates
         // it refuses to start with the directory present.
         storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
@@ -271,14 +271,11 @@ impl Repository {
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,
-            rebuild_dedup_cache: false,
             cache_dir_override: cache_dir,
             write_session: None,
             lock_fence: None,
             key_blob,
-            local_caches_stale: false,
             index_head,
-            index_scratch: None,
             fold_policy: Default::default(),
             fold_requested: false,
         })
@@ -433,7 +430,8 @@ impl Repository {
         };
 
         // Leftovers of local cache writes interrupted by a kill or power
-        // loss; only files unwritten for a day.
+        // loss (only files unwritten for a day), and the fixed-name caches
+        // of older binaries.
         crate::index::dedup_cache::sweep_stale_cache_temps(&repo_config.id, cache_dir.as_deref());
 
         let mut index_generation = 0;
@@ -453,9 +451,9 @@ impl Repository {
 
         // The head, read once and only after the snapshot list. A writer
         // PUTs the head before its snapshot, so this head covers every listed
-        // snapshot. Opens without the index still use it for the state
-        // identity of the local caches. A handle opened for the upgrade has
-        // none.
+        // snapshot. Opens without the index still use it: a later index
+        // load syncs to it (`load_chunk_index_for_snapshot_view`). A handle
+        // opened for the upgrade has none.
         let index_head = if format.is_upgrade_only() {
             None
         } else {
@@ -477,7 +475,7 @@ impl Repository {
             crypto,
             manifest,
             skipped_snapshots,
-            chunk_index: ChunkIndex::new(),
+            chunk_index: LiveIndex::empty(),
             config: repo_config,
             format,
             // Filled in by `open` from `file_cache_load`.
@@ -485,14 +483,11 @@ impl Repository {
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,
-            rebuild_dedup_cache: false,
             cache_dir_override: cache_dir,
             write_session: None,
             lock_fence: None,
             key_blob,
-            local_caches_stale: false,
             index_head,
-            index_scratch: None,
             fold_policy: Default::default(),
             fold_requested: false,
         };
@@ -503,13 +498,12 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::dedup_cache;
     use crate::testutil::MemoryBackend;
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 
     /// A plaintext repository whose index (refcounts 2, 1, 1) was persisted,
-    /// with a full cache at its generation in `cache`.
+    /// with its chunk table in `cache`.
     fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -546,21 +540,25 @@ mod tests {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
         let stale_temp = dir.join(".full_index_cache.AbC123.tmp");
         let stale_legacy = dir.join("full_index_cache.merged");
+        let stale_table_temp = dir.join(".chunk_table.Old123.tmp");
         let fresh_temp = dir.join(".dedup_cache.Fresh1.tmp");
-        for path in [&stale_temp, &stale_legacy] {
+        let legacy_cache = dir.join("full_index_cache");
+        for path in [&stale_temp, &stale_legacy, &stale_table_temp] {
             std::fs::File::create(path)
                 .unwrap()
                 .set_modified(old)
                 .unwrap();
         }
         std::fs::write(&fresh_temp, b"fresh").unwrap();
+        std::fs::write(&legacy_cache, b"legacy").unwrap();
+        let state = repo.index_head().unwrap().state_hash;
+        let table = crate::index::table::table_path(&dir, &state);
         std::fs::File::options()
             .write(true)
-            .open(dir.join("full_index_cache"))
+            .open(&table)
             .unwrap()
             .set_modified(old)
             .unwrap();
-        let generation = repo.index_generation;
         drop(repo);
 
         let open = || {
@@ -576,10 +574,13 @@ mod tests {
 
         assert!(!stale_temp.exists());
         assert!(!stale_legacy.exists());
+        assert!(!stale_table_temp.exists());
         assert!(fresh_temp.exists());
         assert!(
-            dedup_cache::MmapFullIndexCache::open(&id, generation, Some(cache.path())).is_some()
+            !legacy_cache.exists(),
+            "legacy caches are deleted at any age"
         );
+        assert!(crate::index::ChunkTable::open_file(&table).is_some());
 
         // The cache dir is swept on every open, not rate-limited.
         let second = dir.join(".restore_cache.XyZ789.tmp");

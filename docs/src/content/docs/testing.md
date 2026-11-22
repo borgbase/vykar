@@ -11,7 +11,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | Category | Focus |
 |----------|-------|
 | Format & serialization | RepoObj envelope round-trips, pack header parsing, item serde |
-| Chunk index | Add/remove/refcount/generation, dedup-only and tiered modes |
+| Chunk index | Add/remove/refcount/generation, the mapped table and its edits |
 | Locking | Advisory lock acquire/release, stale cleanup, fence detection |
 | Prune & retention | Policy evaluation (keep-last, keep-daily/weekly/monthly/yearly) |
 | Repair | Plan-only vs apply modes, post-repair cleanliness assertions |

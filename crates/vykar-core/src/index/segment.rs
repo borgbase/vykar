@@ -34,6 +34,7 @@ use vykar_types::pack_id::PackId;
 
 use super::ChunkIndex;
 use super::dedup_cache::{FullCacheEntry, FullCacheWriter, MmapFullIndexCache, StateHash};
+pub use super::table::diff_live_to_temp;
 
 /// Segment body layout version.
 const SEGMENT_VERSION: u8 = 1;
@@ -902,7 +903,7 @@ fn sorted_new_entries(entries: &[super::NewChunkEntry]) -> Vec<FullCacheEntry> {
 /// `target`.
 ///
 /// One merge-walk over four sorted inputs: `prev`, the positional bumps (in
-/// the dedup cache's order, which is chunk-ID order), the keyed bumps, and
+/// the session's table order, which is chunk-ID order), the keyed bumps, and
 /// the new entries. No map of bumps is built, so `prev` may be a later
 /// state than the one the session started from:
 ///
@@ -912,7 +913,7 @@ fn sorted_new_entries(entries: &[super::NewChunkEntry]) -> Vec<FullCacheEntry> {
 ///   [`VykarError::StaleChunksDuringCommit`].
 ///
 /// Should the positional bumps turn out not to be in order (a damaged local
-/// dedup cache), all bumps are collected and sorted instead.
+/// table), all bumps are collected and sorted instead.
 pub fn merge_delta_to_temp(
     prev: &MmapFullIndexCache,
     delta: &super::IndexDelta,

@@ -145,7 +145,6 @@ mod tests {
     #[test]
     fn segment_out_of_order() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -187,7 +186,6 @@ mod tests {
     #[test]
     fn segment_file_identity_mismatch() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -229,7 +227,6 @@ mod tests {
     #[test]
     fn segment_nested_start() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -299,7 +296,6 @@ mod tests {
     #[test]
     fn incomplete_accumulator_check() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -350,7 +346,6 @@ mod tests {
     #[test]
     fn segment_count_mismatch() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -392,7 +387,6 @@ mod tests {
     #[test]
     fn segment_happy_path() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -435,7 +429,6 @@ mod tests {
     #[test]
     fn rollback_and_skip_large_file_drains_and_restores_stats() {
         let mut repo = crate::testutil::test_repo_plaintext();
-        repo.enable_dedup_mode();
 
         // Arm the checkpoint just like validate_segment_accum would for
         // segment 0.

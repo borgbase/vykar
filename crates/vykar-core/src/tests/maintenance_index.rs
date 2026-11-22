@@ -1,5 +1,5 @@
 //! Maintenance operations load the chunk index under the repository lock,
-//! and refresh this machine's existing local index caches after writing it.
+//! and leave this machine's chunk table at the state they write.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -17,7 +17,8 @@ use crate::commands::backup::{self, BackupProgressEvent};
 use crate::commands::util::with_maintenance_lock;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::ChunkIndexEntry;
-use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
+use crate::index::dedup_cache;
+use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, RepoFormat, Repository};
@@ -296,18 +297,19 @@ impl Env {
 }
 
 fn entries(repo: &Repository) -> HashMap<ChunkId, ChunkIndexEntry> {
-    repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect()
+    repo.chunk_index().iter().collect()
 }
 
-/// Whether the full, dedup and restore caches in `cache_dir` are valid at
-/// `generation`.
-fn caches_at(repo_id: &[u8], cache_dir: &Path, generation: u64) -> [bool; 3] {
-    let cd = Some(cache_dir);
-    [
-        MmapFullIndexCache::open(repo_id, generation, cd).is_some(),
-        MmapDedupCache::open(repo_id, generation, cd).is_some(),
-        MmapRestoreCache::open(repo_id, generation, cd).is_some(),
-    ]
+/// Whether `cache_dir` holds a valid chunk table of the state whose
+/// generation is `generation`.
+fn table_at(repo_id: &[u8], cache_dir: &Path, generation: u64) -> bool {
+    let Some(dir) = crate::cache_paths::repo_cache_dir(repo_id, Some(cache_dir)) else {
+        return false;
+    };
+    table::list_tables(&dir).into_iter().any(|(state, path)| {
+        dedup_cache::generation_for_state(&state) == generation
+            && ChunkTable::open_file(&path).is_some()
+    })
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -324,11 +326,11 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-// --- (A) local caches refreshed after a maintenance index write ---
+// --- (A) the local table after a maintenance index write ---
 
 const FORMATS: [RepoFormat; 1] = [RepoFormat::V5];
 
-/// The next backup used the refreshed caches: no `index.d/` download.
+/// The next backup used the local table: no `index.d/` download.
 fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
     let reads = Arc::new(IndexReads::default());
     env.backup_counting(src, "a", name, &reads);
@@ -338,7 +340,7 @@ fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
 }
 
 #[test]
-fn prune_refreshes_local_caches_so_next_backup_is_fast() {
+fn prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11)]);
@@ -361,9 +363,8 @@ fn prune_refreshes_local_caches_so_next_backup_is_fast() {
 
         let remote = env.open_fresh();
         let id = remote.config.id.clone();
-        assert_eq!(
-            caches_at(&id, &env.cache_dir, remote.index_generation()),
-            [true; 3],
+        assert!(
+            table_at(&id, &env.cache_dir, remote.index_generation()),
             "{format:?}"
         );
 
@@ -374,7 +375,7 @@ fn prune_refreshes_local_caches_so_next_backup_is_fast() {
 }
 
 #[test]
-fn compact_refreshes_local_caches() {
+fn compact_leaves_the_table_at_the_new_state() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11), ("dead.bin", 0x44)]);
@@ -394,9 +395,8 @@ fn compact_refreshes_local_caches() {
         let remote = env.open_fresh();
         assert_ne!(remote.index_generation(), before, "compact wrote the index");
         let id = remote.config.id.clone();
-        assert_eq!(
-            caches_at(&id, &env.cache_dir, remote.index_generation()),
-            [true; 3],
+        assert!(
+            table_at(&id, &env.cache_dir, remote.index_generation()),
             "{format:?}"
         );
 
@@ -406,9 +406,8 @@ fn compact_refreshes_local_caches() {
     }
 }
 
-/// Whether v5 maintenance should create caches on a host without them is
-/// undecided, so existence is deliberately not asserted: only that the write
-/// is a segment and that any cache present is at the new state.
+/// Maintenance on a host without a table of the repository writes a
+/// segment and leaves that host's cache dir with the table of the new state.
 #[test]
 fn maintenance_on_a_host_without_caches_segmented() {
     let env = Env::new(RepoFormat::V5);
@@ -441,27 +440,7 @@ fn maintenance_on_a_host_without_caches_segmented() {
 
     let id = remote.config.id.clone();
     let generation = dedup_cache::generation_for_state(&head_after.state_hash);
-    let cd = Some(other_cache.as_path());
-    let checks: [(Option<PathBuf>, bool); 3] = [
-        (
-            dedup_cache::full_index_cache_path(&id, cd),
-            MmapFullIndexCache::open(&id, generation, cd).is_some(),
-        ),
-        (
-            dedup_cache::dedup_cache_path(&id, cd),
-            MmapDedupCache::open(&id, generation, cd).is_some(),
-        ),
-        (
-            dedup_cache::restore_cache_path(&id, cd),
-            MmapRestoreCache::open(&id, generation, cd).is_some(),
-        ),
-    ];
-    for (path, current) in checks {
-        let path = path.unwrap();
-        if path.exists() {
-            assert!(current, "{} is not at the new state", path.display());
-        }
-    }
+    assert!(table_at(&id, &other_cache, generation));
 }
 
 #[test]
@@ -474,7 +453,7 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         env.backup(&src, "a", "s2");
         let remote = env.open_fresh();
         let (id, generation) = (remote.config.id.clone(), remote.index_generation());
-        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        assert!(table_at(&id, &env.cache_dir, generation));
         let index_before = env.index_bytes();
         let objects_before = env.index_object_names();
 
@@ -497,8 +476,8 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         assert!(stats.warnings[0].contains("persisting refcount changes failed"));
         drop(repo);
 
-        // The caches still describe the remote index, which was not replaced.
-        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        // The table still describes the remote index, which was not replaced.
+        assert!(table_at(&id, &env.cache_dir, generation));
         assert_eq!(env.index_bytes(), index_before, "{format:?}");
         let remote = env.open_fresh();
         assert_eq!(remote.index_generation(), generation);
@@ -538,14 +517,14 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         env.backup(&src, "a", "s1");
         let remote = env.open_fresh();
         let (id, generation) = (remote.config.id.clone(), remote.index_generation());
-        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        assert!(table_at(&id, &env.cache_dir, generation));
         let index_before = env.index_bytes();
         let objects_before = env.index_objects();
 
         let mut repo = env.open(env.local(), OpenOptions::new());
         let result = with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
-            let first = *repo.chunk_index().iter().next().unwrap().0;
+            let first = repo.chunk_index().iter().next().unwrap().0;
             repo.chunk_index_mut().increment_refcount(&first);
             for key in repo.storage.list("locks/").unwrap() {
                 if key.ends_with(".json") {
@@ -561,7 +540,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         );
         drop(repo);
 
-        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        assert!(table_at(&id, &env.cache_dir, generation));
         assert_eq!(env.open_fresh().index_generation(), generation);
         assert_eq!(env.index_bytes(), index_before, "{format:?}");
         // The segment is PUT, then the lock checked before the head PUT.
@@ -572,7 +551,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
 /// Changes a refcount and persists the index; call under the maintenance lock.
 fn bump_and_save(repo: &mut Repository) -> Result<()> {
     repo.load_chunk_index_under_lock()?;
-    let first = *repo.chunk_index().iter().next().unwrap().0;
+    let first = repo.chunk_index().iter().next().unwrap().0;
     repo.chunk_index_mut().increment_refcount(&first);
     repo.save_state()
 }
@@ -601,7 +580,7 @@ fn save_then_lose_lock(env: &Env) -> (u64, u64) {
 }
 
 #[test]
-fn lock_lost_after_save_still_refreshes_caches_segmented() {
+fn lock_lost_after_save_still_installs_the_table_segmented() {
     let env = Env::new(RepoFormat::V5);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
@@ -609,12 +588,11 @@ fn lock_lost_after_save_still_refreshes_caches_segmented() {
 
     let (before, after) = save_then_lose_lock(&env);
     assert_ne!(before, after);
-    assert_eq!(caches_at(&id, &env.cache_dir, after), [true; 3]);
+    assert!(table_at(&id, &env.cache_dir, after));
 }
 
 /// Saves under the maintenance lock, loses it, and lets another writer on
-/// this host persist a newer index before our late cache refresh. Returns
-/// our generation.
+/// this host persist a newer index. Returns our generation.
 fn save_then_get_taken_over(env: &Env) -> u64 {
     let mut repo = env.open(env.local(), OpenOptions::new());
     let ours = with_maintenance_lock(&mut repo, |repo| {
@@ -630,10 +608,11 @@ fn save_then_get_taken_over(env: &Env) -> u64 {
     ours
 }
 
-/// On v5 our late refresh finds the full cache at the newer state and
-/// leaves every cache there.
+/// After a takeover both states' tables are in the cache dir (ours is
+/// younger than `TABLE_KEEP_AGE`, and no table is replaced); the next open
+/// and backup use the newer one.
 #[test]
-fn late_refresh_after_takeover_keeps_the_newer_caches_segmented() {
+fn takeover_keeps_the_newer_table_segmented() {
     let env = Env::new(RepoFormat::V5);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
@@ -643,11 +622,8 @@ fn late_refresh_after_takeover_keeps_the_newer_caches_segmented() {
     let remote = env.open_fresh();
     let id = remote.config.id.clone();
     assert_ne!(ours, remote.index_generation());
-    assert_eq!(caches_at(&id, &env.cache_dir, ours), [false; 3]);
-    assert_eq!(
-        caches_at(&id, &env.cache_dir, remote.index_generation()),
-        [true; 3]
-    );
+    assert!(table_at(&id, &env.cache_dir, ours));
+    assert!(table_at(&id, &env.cache_dir, remote.index_generation()));
 
     let own = env.open(env.local(), OpenOptions::new().with_index());
     assert_eq!(own.index_generation(), remote.index_generation());

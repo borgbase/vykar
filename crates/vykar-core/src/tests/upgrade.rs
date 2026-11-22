@@ -11,8 +11,8 @@ use super::helpers::{
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
-use crate::index::ChunkIndex;
-use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
+use crate::index::dedup_cache;
+use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
@@ -197,8 +197,9 @@ impl Fixture {
     }
 }
 
-fn sorted_entries(index: &ChunkIndex) -> Vec<String> {
+fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
+        .entry_vec()
         .iter()
         .map(|(id, e)| format!("{id:?} {e:?}"))
         .collect();
@@ -339,11 +340,10 @@ fn interrupted_upgrade_resumes() {
     }
 }
 
-/// Both branches leave `chunk_index` unbuilt, and the epilogue rebuilds the
-/// local caches at the new generation. On resume the full cache can only
-/// come from the synced one.
+/// Both branches leave the handle's index at the upgraded state and its
+/// table in the cache dir. On resume the table can only come from the sync.
 #[test]
-fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
+fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
     for resumed in [false, true] {
         let fx = fixture(RepoFormat::V3);
         fx.write("a", "alpha");
@@ -354,16 +354,9 @@ fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
             fx.set_version(3);
         }
         let id = fx.repo_id();
-        let cd = Some(fx.cache());
-        let mut stale = vec![
-            dedup_cache::dedup_cache_path(&id, cd.as_deref()),
-            dedup_cache::restore_cache_path(&id, cd.as_deref()),
-        ];
-        if resumed {
-            stale.push(dedup_cache::full_index_cache_path(&id, cd.as_deref()));
-        }
-        for path in stale.into_iter().flatten() {
-            let _ = std::fs::remove_file(path);
+        let dir = crate::cache_paths::repo_cache_dir(&id, Some(&fx.cache())).unwrap();
+        for (_, path) in table::list_tables(&dir) {
+            std::fs::remove_file(path).unwrap();
         }
 
         let mut repo = fx.open_legacy(&fx.cache()).unwrap();
@@ -374,8 +367,12 @@ fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
             "{outcome:?}"
         );
         assert_eq!(repo.format(), RepoFormat::V5);
-        assert!(repo.chunk_index().is_empty(), "resumed: {resumed}");
         let head = repo.index_head().unwrap().clone();
+        assert_eq!(
+            repo.chunk_index().table().map(|t| t.state()),
+            Some((head.state_hash, head.entries)),
+            "resumed: {resumed}"
+        );
         let generation = dedup_cache::generation_for_state(&head.state_hash);
         assert_eq!(repo.index_generation(), generation);
         let bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
@@ -383,9 +380,7 @@ fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
         assert_eq!(index_store::decode_head(&bytes, &crypto).unwrap(), head);
         drop(repo);
 
-        assert!(MmapFullIndexCache::open(&id, generation, cd.as_deref()).is_some());
-        assert!(MmapDedupCache::open(&id, generation, cd.as_deref()).is_some());
-        assert!(MmapRestoreCache::open(&id, generation, cd.as_deref()).is_some());
+        assert!(ChunkTable::open_file(&table::table_path(&dir, &head.state_hash)).is_some());
         fx.check_clean();
     }
 }

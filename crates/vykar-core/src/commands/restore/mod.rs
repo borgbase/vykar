@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::VykarConfig;
 use crate::platform::fs;
@@ -343,8 +343,8 @@ where
     }
 
     // The item stream is read lazily, one range read at a time, while it is
-    // planned and restored (see `LazyItemStream`), via the restore cache when
-    // possible to avoid loading the full chunk index. Opening it performs the
+    // planned and restored (see `LazyItemStream`), resolved through the local
+    // chunk table of the open head where there is one. Opening it performs the
     // first read, so an interruption or an unreadable stream head propagates
     // before anything is written (`temp_root` does not exist yet), leaving the
     // filesystem untouched. A failure further into the stream surfaces from
@@ -439,23 +439,11 @@ where
             }
 
             if !batch_chunks.is_empty() {
-                // Resolve through the mmap'd restore cache (already resident
-                // for the item stream) and load the heap index only if the
-                // cache is absent or lacks a chunk of this batch.
+                // Resolve through the chunk index (the local table at the
+                // open head, mapped once for the item stream).
                 items.ensure_resolvable(repo, batch_chunks.keys())?;
             }
-            // Cached locations can be stale even when every chunk is present
-            // (the cache is pinned to the generation the open read), so a blob
-            // that cannot be read at one is not declared unreadable yet: the
-            // pass collects such blobs and they are re-resolved through the
-            // index below. Strict mode therefore finishes the batch before
-            // reporting a source error while the cache is in use.
-            let via_cache = !batch_chunks.is_empty() && items.uses_restore_cache();
-            let failures = if via_cache {
-                Some(parallel::BatchFailures::deferring())
-            } else {
-                continue_on_error.then(parallel::BatchFailures::default)
-            };
+            let failures = continue_on_error.then(parallel::BatchFailures::default);
             let groups = if batch_chunks.is_empty() {
                 Vec::new()
             } else {
@@ -495,79 +483,9 @@ where
             )
             .map_err(restore_error)?;
 
-            let (mut failed, unread) = failures
-                .map(parallel::BatchFailures::into_parts)
+            let failed = failures
+                .map(parallel::BatchFailures::into_map)
                 .unwrap_or_default();
-            let mut bytes = bytes;
-            if !unread.is_empty() {
-                // Blobs that failed at cached locations. Drop the cache for
-                // the rest of the restore and ask the index: a blob it places
-                // elsewhere was only stale in the cache and is read again from
-                // there; any other failure is final, as without a cache.
-                let index_ok = match items.fall_back_to_index(repo) {
-                    Ok(()) => true,
-                    Err(e @ VykarError::Interrupted) => return Err(e),
-                    Err(e) => {
-                        warn!(
-                            "{} chunk(s) unreadable at restore-cache locations and the \
-                             chunk index could not be loaded to re-resolve them: {e}",
-                            unread.len()
-                        );
-                        false
-                    }
-                };
-                let mut moved: HashMap<ChunkId, plan::ChunkTargets> = HashMap::new();
-                for blob in unread {
-                    let cached = (blob.pack_id, blob.pack_offset, blob.stored_size);
-                    let relocated = index_ok
-                        && items
-                            .lookup(repo, &blob.chunk_id)
-                            .is_some_and(|loc| loc != cached);
-                    if relocated {
-                        moved.insert(
-                            blob.chunk_id,
-                            plan::ChunkTargets {
-                                expected_size: blob.expected_size,
-                                targets: blob.targets,
-                            },
-                        );
-                    } else if continue_on_error {
-                        let reason = blob.error.to_string();
-                        for t in &blob.targets {
-                            failed.entry(t.file_idx).or_insert_with(|| reason.clone());
-                        }
-                    } else {
-                        return Err(VykarError::RestoreSourceUnreadable(Box::new(blob.error)));
-                    }
-                }
-                if !moved.is_empty() {
-                    info!(
-                        "restore cache was stale: reading {} chunk(s) again at their \
-                         chunk-index locations",
-                        moved.len()
-                    );
-                    let retry_failures = continue_on_error.then(parallel::BatchFailures::default);
-                    let groups = sorted_read_groups(moved, |id| items.lookup(repo, id))?;
-                    bytes += parallel::execute_parallel_restore(
-                        &batch_files,
-                        groups,
-                        &repo.storage,
-                        repo.crypto.as_ref(),
-                        &temp_root,
-                        readers,
-                        verify_chunks,
-                        shutdown,
-                        retry_failures.as_ref(),
-                    )
-                    .map_err(restore_error)?;
-                    for (idx, reason) in retry_failures
-                        .map(parallel::BatchFailures::into_map)
-                        .unwrap_or_default()
-                    {
-                        failed.entry(idx).or_insert(reason);
-                    }
-                }
-            }
             let bytes = if failed.is_empty() {
                 bytes
             } else {

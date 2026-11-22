@@ -770,7 +770,7 @@ mod index_delta {
         fn apply_to_refcount_conservation(
             (delta, entries, bumps) in arb_index_delta_standalone(),
         ) {
-            let mut index = ChunkIndex::new();
+            let mut index = crate::index::LiveIndex::empty();
             delta.apply_to(&mut index);
 
             // Expected: for each unique chunk_id, sum all entry.refcount values,
@@ -888,8 +888,12 @@ mod index_delta {
             }
 
             // Actually run reconcile + apply_to
-            let mut index = fresh_index;
-            let reconciled: IndexDelta = delta.reconcile(&index).unwrap();
+            let reconciled: IndexDelta = delta.reconcile(&fresh_index).unwrap();
+            let mut index = crate::index::LiveIndex::empty();
+            for (id, e) in fresh_index.iter() {
+                index.add(*id, e.stored_size, e.pack_id, e.pack_offset);
+                index.increment_refcount_by(id, e.refcount.saturating_sub(1));
+            }
             reconciled.apply_to(&mut index);
 
             for (id, expected_rc) in &expected {

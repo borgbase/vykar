@@ -1,25 +1,23 @@
-//! Positional refcount bumps for chunks found in the mmap'd dedup cache.
+//! Positional refcount bumps for chunks found in the session's chunk table.
 //!
 //! On an incremental backup almost every chunk reference resolves to a chunk
 //! that already exists in the repository, i.e. to an entry of the session's
-//! [`MmapDedupCache`]. Recording those bumps in a `HashMap<ChunkId, u32>`
-//! duplicates the cache's whole key set in anonymous memory (37 B per bucket,
+//! [`ChunkTable`]. Recording those bumps in a `HashMap<ChunkId, u32>`
+//! duplicates the table's whole key set in anonymous memory (37 B per bucket,
 //! up to two buckets per entry), which on a no-change backup of a 10M-chunk
-//! repository is ~620 MB — far more than the dedup structures the tiered mode
-//! exists to keep small. The binary search that proves the chunk exists
+//! repository is ~620 MB. The binary search that proves the chunk exists
 //! already knows the entry's position, so the bump is kept as a counter in a
 //! zero-initialised `Vec<u32>` indexed by that position instead: 4 B per
 //! repository chunk, and pages no bump touches are never faulted in.
 //!
-//! The counters are only meaningful together with the cache they index, so
-//! [`CachedBumps`] holds the cache (shared with `TieredDedupIndex`) and
-//! resolves positions back to chunk IDs wherever a keyed view is required —
-//! reconcile and `apply_to` on the slow commit path. The fast-path merge
-//! against the full index cache uses the counters directly after checking
-//! that both caches agree on every bumped position (see
-//! `dedup_cache::merge_full_index_cache`).
+//! The counters are only meaningful together with the table they index, so
+//! [`CachedBumps`] holds the table (shared with the session and the backup
+//! workers' prefilter) and resolves positions back to chunk IDs, in table
+//! order, wherever a keyed view is required: the commit's merge with the
+//! head's table (`segment::merge_delta_to_temp`), `reconcile` and
+//! `apply_to`.
 
-// `counts` has exactly `cache.entry_count()` elements; `bump` range-checks
+// `counts` has exactly `table.len()` elements; `bump` range-checks
 // every position before it is stored or journaled, and `count_at` documents
 // its bound like a slice index.
 #![allow(clippy::indexing_slicing)]
@@ -28,18 +26,18 @@ use std::sync::Arc;
 
 use vykar_types::chunk_id::ChunkId;
 
-use super::dedup_cache::MmapDedupCache;
+use super::table::ChunkTable;
 
-/// Refcount increments for chunks of one [`MmapDedupCache`], by entry position.
+/// Refcount increments for chunks of one [`ChunkTable`], by entry position.
 ///
 /// Logically equivalent to a `HashMap<ChunkId, u32>` whose keys are
-/// `cache.chunk_id_at(position)`; every recorded position is checked against
+/// `table.chunk_id_at(position)`; every recorded position is checked against
 /// the bumped chunk ID when it is recorded, so the equivalence does not depend
 /// on where the caller got the position from.
 pub struct CachedBumps {
-    cache: Arc<MmapDedupCache>,
+    cache: Arc<ChunkTable>,
     /// `counts[p]` = bumps recorded for the entry at position `p`.
-    /// Length is `cache.entry_count()`.
+    /// Length is `cache.len()`.
     counts: Vec<u32>,
     /// Sum of `counts`, so emptiness is O(1).
     total: u64,
@@ -51,10 +49,10 @@ pub struct CachedBumps {
 }
 
 impl CachedBumps {
-    pub fn new(cache: Arc<MmapDedupCache>) -> Self {
+    pub fn new(cache: Arc<ChunkTable>) -> Self {
         // `vec![0; n]` allocates zeroed memory (calloc), so a full backup that
         // finds few existing chunks only faults in the pages it touches.
-        let counts = vec![0u32; cache.entry_count() as usize];
+        let counts = vec![0u32; cache.len()];
         Self {
             cache,
             counts,
@@ -63,15 +61,15 @@ impl CachedBumps {
         }
     }
 
-    /// Record one refcount bump for `id`, found at `position` in this cache.
+    /// Record one refcount bump for `id`, found at `position` in this table.
     ///
     /// Returns `false` (recording nothing) when the entry at `position` is not
-    /// `id`, e.g. because the position came from a different cache; the caller
+    /// `id`, e.g. because the position came from a different table; the caller
     /// must then record the bump by key. The check reads the entry the
     /// caller's binary search just touched, so it costs one 32-byte compare.
     #[must_use]
     pub fn bump(&mut self, position: u32, id: &ChunkId) -> bool {
-        if position >= self.cache.entry_count()
+        if position as usize >= self.cache.len()
             || self.cache.chunk_id_bytes_at(position) != id.as_bytes().as_slice()
         {
             return false;
@@ -113,7 +111,7 @@ impl CachedBumps {
         self.journal = None;
     }
 
-    /// Number of positions (equal to the cache's entry count).
+    /// Number of positions (equal to the table's entry count).
     pub fn len(&self) -> usize {
         self.counts.len()
     }
@@ -123,12 +121,13 @@ impl CachedBumps {
         self.counts[position]
     }
 
-    /// The cache the positions refer to.
-    pub fn cache(&self) -> &MmapDedupCache {
+    /// The table the positions refer to.
+    pub fn cache(&self) -> &ChunkTable {
         &self.cache
     }
 
-    /// Every `(chunk_id, count)` with a non-zero count, in cache order.
+    /// Every `(chunk_id, count)` with a non-zero count, in table order
+    /// (chunk-ID order).
     ///
     /// Scans the whole counter array — meant for commit-time consumers, not
     /// for per-chunk use.
@@ -156,21 +155,17 @@ mod tests {
     //! Positional recording must be indistinguishable from keyed recording:
     //! every test runs the same operations against an `IndexDelta` with
     //! positional bumps and one without, and compares the commit outputs
-    //! (merged full index cache bytes, `apply_to`, `reconcile`).
+    //! (`merge_delta_to_temp` bytes and diff, `apply_to`, `reconcile`).
 
     use std::path::Path;
 
     use proptest::prelude::*;
 
     use super::*;
-    use crate::index::dedup_cache::{
-        self, MmapFullIndexCache, build_dedup_cache_to_path, build_full_index_cache_to_path,
-        merge_full_index_cache,
-    };
-    use crate::index::{ChunkIndex, IndexDelta};
+    use crate::index::dedup_cache::full_cache_from_index_to_temp;
+    use crate::index::segment::merge_delta_to_temp;
+    use crate::index::{ChunkIndex, ChunkIndexEntry, IndexDelta, LiveIndex};
     use vykar_types::pack_id::PackId;
-
-    const GEN: u64 = 7;
 
     fn index_from(ids: &[(ChunkId, u32)]) -> ChunkIndex {
         let mut index = ChunkIndex::new();
@@ -183,35 +178,42 @@ mod tests {
         index
     }
 
-    fn open_dedup(index: &ChunkIndex, path: &Path) -> Arc<MmapDedupCache> {
-        build_dedup_cache_to_path(index, GEN, path).unwrap();
-        Arc::new(MmapDedupCache::open_path(path, GEN).unwrap())
+    fn open_table(index: &ChunkIndex, dir: &Path, name: &str) -> Arc<ChunkTable> {
+        let tmp = full_cache_from_index_to_temp(index, &dir.join(name)).unwrap();
+        Arc::new(ChunkTable::scratch(tmp).unwrap())
     }
 
-    /// Sorted `(id, refcount, stored_size, pack_id, pack_offset)` view.
-    fn snapshot(index: &ChunkIndex) -> Vec<(ChunkId, u32, u32, PackId, u64)> {
-        let mut v: Vec<_> = index
-            .iter()
-            .map(|(id, e)| (*id, e.refcount, e.stored_size, e.pack_id, e.pack_offset))
-            .collect();
-        v.sort_unstable_by_key(|e| *e.0.as_bytes());
-        v
+    fn entries(index: &LiveIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
+        index.iter().collect()
     }
 
-    fn merged_bytes(old: &MmapFullIndexCache, delta: &IndexDelta, out: &Path) -> Vec<u8> {
-        merge_full_index_cache(old, delta, GEN + 1, out).unwrap();
-        std::fs::read(out).unwrap()
+    /// The merge of `delta` over `prev`: segment, resulting state and the
+    /// written table's bytes, or `None` for an error.
+    #[allow(clippy::type_complexity)]
+    fn merged(
+        prev: &ChunkTable,
+        delta: &IndexDelta,
+        target: &Path,
+    ) -> Option<(crate::index::segment::Segment, [u8; 32], u64, Vec<u8>)> {
+        let (diff, tmp) = merge_delta_to_temp(prev.cache(), delta, target).ok()?;
+        let bytes = std::fs::read(&tmp).unwrap();
+        Some((
+            diff.segment,
+            diff.state_hash_after,
+            diff.entries_after,
+            bytes,
+        ))
     }
 
     /// Apply the same bump to both deltas: positionally where the chunk is
-    /// in the dedup cache, by key otherwise.
+    /// in the table, by key otherwise.
     fn bump_both(
-        cache: &MmapDedupCache,
+        table: &ChunkTable,
         positional: &mut IndexDelta,
         keyed: &mut IndexDelta,
         id: &ChunkId,
     ) {
-        match cache.find_with_position(id) {
+        match table.find(id) {
             Some((position, _)) => positional.bump_cached_refcount(id, position),
             None => positional.bump_refcount(id),
         }
@@ -251,12 +253,12 @@ mod tests {
 
     /// Run `ops` against a positional and a keyed delta. Returns both.
     fn run_ops(
-        cache: &Arc<MmapDedupCache>,
+        table: &Arc<ChunkTable>,
         repo_ids: &[(ChunkId, u32)],
         ops: &[Op],
         allow_overlap: bool,
     ) -> (IndexDelta, IndexDelta) {
-        let mut positional = IndexDelta::with_cached_bumps(Arc::clone(cache));
+        let mut positional = IndexDelta::with_cached_bumps(Arc::clone(table));
         let mut keyed = IndexDelta::new();
         let mut checkpoints = None;
         let pack = PackId::from_bytes([2; 32]);
@@ -264,7 +266,7 @@ mod tests {
             match op {
                 Op::BumpExisting(i) if !repo_ids.is_empty() => {
                     let id = repo_ids[i % repo_ids.len()].0;
-                    bump_both(cache, &mut positional, &mut keyed, &id);
+                    bump_both(table, &mut positional, &mut keyed, &id);
                 }
                 Op::BumpExistingKeyed(i) if !repo_ids.is_empty() => {
                     let id = repo_ids[i % repo_ids.len()].0;
@@ -285,7 +287,7 @@ mod tests {
                 }
                 Op::BumpSessionNew(i) if !keyed.new_entries.is_empty() => {
                     let id = keyed.new_entries[i % keyed.new_entries.len()].chunk_id;
-                    bump_both(cache, &mut positional, &mut keyed, &id);
+                    bump_both(table, &mut positional, &mut keyed, &id);
                 }
                 Op::Checkpoint if checkpoints.is_none() => {
                     checkpoints = Some((positional.checkpoint(), keyed.checkpoint()));
@@ -319,7 +321,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
-        /// Fast-path merge, `apply_to`, and `reconcile` + `apply_to` produce
+        /// The commit merge, `apply_to`, and `reconcile` + `apply_to` produce
         /// identical results for positional and keyed recording over random
         /// bump / new-entry / checkpoint / rollback sequences.
         #[test]
@@ -330,73 +332,45 @@ mod tests {
         ) {
             let dir = tempfile::tempdir().unwrap();
             let index = index_from(&repo_ids);
-            let cache = open_dedup(&index, &dir.path().join("dedup"));
-            let full_path = dir.path().join("full");
-            build_full_index_cache_to_path(&index, GEN, &full_path).unwrap();
-            let full = MmapFullIndexCache::open_path(&full_path, GEN).unwrap();
+            let table = open_table(&index, dir.path(), "table");
 
-            // Overlapping new entries only on the slow path: the fast-path
-            // merge never sees them in practice (and writes duplicates then;
-            // `merge_with_duplicate_ids_in_full_cache_matches_keyed` covers
-            // the merge side of that case).
-            let (positional, keyed) = run_ops(&cache, &repo_ids, &ops, false);
+            let (positional, keyed) = run_ops(&table, &repo_ids, &ops, true);
             prop_assert_eq!(
-                merged_bytes(&full, &positional, &dir.path().join("m1")),
-                merged_bytes(&full, &keyed, &dir.path().join("m2"))
+                merged(&table, &positional, &dir.path().join("m1")),
+                merged(&table, &keyed, &dir.path().join("m2"))
             );
 
-            let mut a = index.clone();
-            let mut b = index.clone();
+            let mut a = LiveIndex::from_table(Arc::clone(&table));
+            let mut b = LiveIndex::from_table(Arc::clone(&table));
             positional.apply_to(&mut a);
             keyed.apply_to(&mut b);
-            prop_assert_eq!(snapshot(&a), snapshot(&b));
+            prop_assert_eq!(entries(&a), entries(&b));
 
-            // Slow path, including overlaps and a chunk deleted concurrently.
-            let (positional, keyed) = run_ops(&cache, &repo_ids, &ops, true);
+            // Reconcile, including overlaps and a chunk deleted concurrently.
+            let (positional, keyed) = run_ops(&table, &repo_ids, &ops, true);
             let mut fresh = index.clone();
             if let (Some(i), false) = (drop_from_fresh, repo_ids.is_empty()) {
                 fresh.remove(&repo_ids[i % repo_ids.len()].0);
             }
+            let fresh_table = open_table(&fresh, dir.path(), "fresh");
             match (positional.reconcile(&fresh), keyed.reconcile(&fresh)) {
                 (Ok(p), Ok(k)) => {
-                    let mut a = fresh.clone();
-                    let mut b = fresh.clone();
+                    let mut a = LiveIndex::from_table(Arc::clone(&fresh_table));
+                    let mut b = LiveIndex::from_table(Arc::clone(&fresh_table));
                     p.apply_to(&mut a);
                     k.apply_to(&mut b);
-                    prop_assert_eq!(snapshot(&a), snapshot(&b));
+                    prop_assert_eq!(entries(&a), entries(&b));
                 }
                 (Err(_), Err(_)) => {}
                 (p, k) => prop_assert!(false, "reconcile diverged: {:?} vs {:?}", p.is_ok(), k.is_ok()),
             }
         }
 
-        /// Overlapping new entries in the fast-path merge: the merged bytes
-        /// still match the keyed merge (which writes the duplicate and bumps
-        /// both copies).
+        /// When the head's table at commit is not the session's (another
+        /// client committed in between), the merge resolves positions to chunk
+        /// IDs and still matches the keyed merge, stale bumps included.
         #[test]
-        fn merge_with_overlapping_new_entries_matches_keyed(
-            repo_ids in arb_repo(),
-            ops in prop::collection::vec(arb_op(), 0..80),
-        ) {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_from(&repo_ids);
-            let cache = open_dedup(&index, &dir.path().join("dedup"));
-            let full_path = dir.path().join("full");
-            build_full_index_cache_to_path(&index, GEN, &full_path).unwrap();
-            let full = MmapFullIndexCache::open_path(&full_path, GEN).unwrap();
-
-            let (positional, keyed) = run_ops(&cache, &repo_ids, &ops, true);
-            prop_assert_eq!(
-                merged_bytes(&full, &positional, &dir.path().join("m1")),
-                merged_bytes(&full, &keyed, &dir.path().join("m2"))
-            );
-        }
-
-        /// When the full index cache no longer matches the dedup cache the
-        /// positions came from (index changed between session start and
-        /// commit), the merge falls back to keyed lookup and still matches.
-        #[test]
-        fn merge_against_different_full_cache_matches_keyed(
+        fn merge_against_a_different_table_matches_keyed(
             repo_ids in arb_repo(),
             extra in prop::collection::btree_map(any::<[u8; 32]>(), 1..5u32, 0..5),
             remove in prop::collection::vec(any::<usize>(), 0..3),
@@ -404,7 +378,7 @@ mod tests {
         ) {
             let dir = tempfile::tempdir().unwrap();
             let index = index_from(&repo_ids);
-            let cache = open_dedup(&index, &dir.path().join("dedup"));
+            let table = open_table(&index, dir.path(), "table");
 
             let mut other_ids = repo_ids.clone();
             for i in remove {
@@ -414,15 +388,12 @@ mod tests {
                 }
             }
             other_ids.extend(extra.into_iter().map(|(b, rc)| (ChunkId::from_bytes(b), rc)));
-            let other = index_from(&other_ids);
-            let full_path = dir.path().join("full");
-            build_full_index_cache_to_path(&other, GEN, &full_path).unwrap();
-            let full = MmapFullIndexCache::open_path(&full_path, GEN).unwrap();
+            let other = open_table(&index_from(&other_ids), dir.path(), "other");
 
-            let (positional, keyed) = run_ops(&cache, &repo_ids, &ops, false);
+            let (positional, keyed) = run_ops(&table, &repo_ids, &ops, true);
             prop_assert_eq!(
-                merged_bytes(&full, &positional, &dir.path().join("m1")),
-                merged_bytes(&full, &keyed, &dir.path().join("m2"))
+                merged(&other, &positional, &dir.path().join("m1")),
+                merged(&other, &keyed, &dir.path().join("m2"))
             );
         }
     }
@@ -433,8 +404,8 @@ mod tests {
         let ids: Vec<_> = (0u8..4)
             .map(|i| (ChunkId::from_bytes([i; 32]), 1))
             .collect();
-        let cache = open_dedup(&index_from(&ids), &dir.path().join("dedup"));
-        let mut bumps = CachedBumps::new(Arc::clone(&cache));
+        let table = open_table(&index_from(&ids), dir.path(), "table");
+        let mut bumps = CachedBumps::new(Arc::clone(&table));
 
         assert!(bumps.bump(1, &ids[1].0));
         bumps.checkpoint();
@@ -465,8 +436,8 @@ mod tests {
         let ids: Vec<_> = (0u8..3)
             .map(|i| (ChunkId::from_bytes([i; 32]), 1))
             .collect();
-        let cache = open_dedup(&index_from(&ids), &dir.path().join("dedup"));
-        let mut delta = IndexDelta::with_cached_bumps(Arc::clone(&cache));
+        let table = open_table(&index_from(&ids), dir.path(), "table");
+        let mut delta = IndexDelta::with_cached_bumps(Arc::clone(&table));
 
         // Wrong position, out-of-range position: recorded by key instead.
         delta.bump_cached_refcount(&ids[0].0, 2);
@@ -483,71 +454,19 @@ mod tests {
     }
 
     #[test]
-    fn find_with_position_matches_sorted_order() {
+    fn table_positions_follow_sorted_order() {
         let dir = tempfile::tempdir().unwrap();
         let ids: Vec<_> = [9u8, 3, 7, 1]
             .iter()
             .map(|&i| (ChunkId::from_bytes([i; 32]), 1))
             .collect();
-        let cache = open_dedup(&index_from(&ids), &dir.path().join("dedup"));
+        let table = open_table(&index_from(&ids), dir.path(), "table");
         for (expected_pos, byte) in [1u8, 3, 7, 9].iter().enumerate() {
             let id = ChunkId::from_bytes([*byte; 32]);
-            let (pos, _) = cache.find_with_position(&id).unwrap();
+            let (pos, _) = table.find(&id).unwrap();
             assert_eq!(pos as usize, expected_pos);
-            assert_eq!(cache.chunk_id_at(pos), id);
+            assert_eq!(table.chunk_id_at(pos), id);
         }
-        assert!(
-            cache
-                .find_with_position(&ChunkId::from_bytes([2; 32]))
-                .is_none()
-        );
-    }
-
-    /// A full index cache with a duplicated chunk ID (left behind by an
-    /// earlier fast-path merge whose new entry overlapped an old one) is not
-    /// strictly sorted: a positional bump would reach only one of the two
-    /// copies, whereas the keyed merge bumps both. The merge must detect this
-    /// and fall back.
-    #[test]
-    fn merge_with_duplicate_ids_in_full_cache_matches_keyed() {
-        let dir = tempfile::tempdir().unwrap();
-        let ids: Vec<_> = (0u8..4)
-            .map(|i| (ChunkId::from_bytes([i * 2; 32]), 1))
-            .collect();
-        let index = index_from(&ids);
-        let full_path = dir.path().join("full_index_cache");
-        build_full_index_cache_to_path(&index, GEN, &full_path).unwrap();
-
-        // Produce a full cache with chunk 2 duplicated.
-        let mut dup = IndexDelta::new();
-        dup.add_new_entry(ids[1].0, 50, PackId::from_bytes([3; 32]), 0, 1);
-        let dup_gen = GEN + 10;
-        {
-            let full = MmapFullIndexCache::open_path(&full_path, GEN).unwrap();
-            let out = dir.path().join("dup");
-            merge_full_index_cache(&full, &dup, dup_gen, &out).unwrap();
-            drop(full);
-            std::fs::rename(&out, &full_path).unwrap();
-        }
-        let full = MmapFullIndexCache::open_path(&full_path, dup_gen).unwrap();
-        assert_eq!(full.entry_count(), 5);
-
-        // Dedup cache derived from it: same order and count, so the cheap
-        // up-front checks pass.
-        let repo_id = [0x5a; 32];
-        let cache_dir = dir.path().join("cache");
-        dedup_cache::build_dedup_cache_from_full_cache(&full, &repo_id, Some(&cache_dir)).unwrap();
-        let cache = Arc::new(MmapDedupCache::open(&repo_id, dup_gen, Some(&cache_dir)).unwrap());
-
-        for target in [ids[1].0, ids[2].0, ids[0].0] {
-            let mut positional = IndexDelta::with_cached_bumps(Arc::clone(&cache));
-            let mut keyed = IndexDelta::new();
-            bump_both(&cache, &mut positional, &mut keyed, &target);
-            assert!(!positional.cached_bumps.as_ref().unwrap().is_empty());
-            assert_eq!(
-                merged_bytes(&full, &positional, &dir.path().join("m1")),
-                merged_bytes(&full, &keyed, &dir.path().join("m2"))
-            );
-        }
+        assert!(table.find(&ChunkId::from_bytes([2; 32])).is_none());
     }
 }

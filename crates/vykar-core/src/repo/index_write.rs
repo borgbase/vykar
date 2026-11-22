@@ -1,11 +1,12 @@
 //! Write side of the segmented index (formats v4/v5); see `index_store` for
 //! the objects and the read side.
 //!
-//! Every write runs under the repository lock: GET the head, bring the
-//! local full cache to it, produce the next state and its segment in one
-//! sorted pass, then PUT the segment, check the lock fence and PUT the head.
-//! A chain past the hard limit, no local cache in the head's chain, or an
-//! explicit request (compact, repair) writes a base instead: a *fold*.
+//! Every write runs under the repository lock: GET the head, check it is the
+//! state the in-memory index was loaded from, produce the next state and its
+//! segment in one pass over the loaded table, then PUT the segment, check the
+//! lock fence and PUT the head. A chain past the hard limit, a write without
+//! a head (repair, upgrade) or an explicit request (compact, repair) writes a
+//! base instead: a *fold*. The new state becomes the repository's table.
 //!
 //! Fold: PUT the new state as a base (none for the empty index), then the
 //! head with no segments and the previous live set as `retired`. With a
@@ -17,18 +18,18 @@
 //! re-reads the head.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tempfile::TempPath;
 use tracing::{debug, warn};
 
 use super::Repository;
-use super::index_store::{
-    self, CacheLocation, HeadlessOutcome, PackedObject, StoredHead, SyncSource,
-};
-use crate::index::ChunkIndex;
+use super::index_store::{self, HeadlessOutcome, PackedObject, StoredHead};
+use crate::index::LiveIndex;
 use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
-use crate::index::segment::{self, Diff};
+use crate::index::segment::Diff;
+use crate::index::table::{self, ChunkTable};
 use vykar_types::error::{Result, VykarError};
 
 /// How `check --repair` obtained the chunk index it repairs from.
@@ -43,7 +44,7 @@ pub enum IndexRecovery {
     /// `index` is absent; the index is rebuilt from nothing.
     HeadMissing,
     /// `index` cannot be read; see `index_store::rebuild_without_head`.
-    /// `from_local_cache`: rebuilt from this machine's full index cache (the
+    /// `from_local_cache`: rebuilt from this machine's chunk table (the
     /// counts are then 0). Else from `index.d/`: `bases` bases decoded,
     /// `applied` segments applied (including ones discarded at a join),
     /// `unplaced` decoded segments that follow no rebuilt state, `damaged`
@@ -136,31 +137,24 @@ impl Repository {
         self.fold_requested = true;
     }
 
-    /// The persistent full cache path, if there is a cache directory.
-    pub(super) fn full_cache_path(&self) -> Option<PathBuf> {
-        dedup_cache::full_index_cache_path(&self.config.id, self.cache_dir_override.as_deref())
+    /// The per-repo cache dir the chunk tables live in, if there is one.
+    pub(super) fn cache_dir(&self) -> Option<PathBuf> {
+        crate::cache_paths::repo_cache_dir(&self.config.id, self.cache_dir_override.as_deref())
     }
 
-    /// The local full index cache at `head`'s state: the temp-file cache of
-    /// this run, else the persistent one.
-    pub(super) fn local_full_cache_at(&self, head: &IndexHead) -> Option<MmapFullIndexCache> {
+    /// The local chunk table at `head`'s state: the repository's own, else
+    /// the table file of that state.
+    pub(super) fn local_table_at(&self, head: &IndexHead) -> Option<Arc<ChunkTable>> {
         let target = (head.state_hash, head.entries);
-        let path = self.full_cache_path();
-        self.index_scratch
-            .as_deref()
-            .into_iter()
-            .chain(path.as_deref())
-            .filter_map(MmapFullIndexCache::open_verified)
-            .find(|c| (c.state_hash(), u64::from(c.entry_count())) == target)
-    }
-
-    /// The in-memory index from the local full cache at the current head.
-    pub(super) fn chunk_index_from_local_cache(&self) -> Result<ChunkIndex> {
-        self.index_head
-            .as_ref()
-            .and_then(|head| self.local_full_cache_at(head))
-            .map(|cache| dedup_cache::chunk_index_from_full_cache(&cache))
-            .ok_or_else(|| VykarError::Other("full index cache not found or stale".into()))
+        if let Some(t) = self.chunk_index.table()
+            && t.state() == target
+        {
+            return Some(Arc::clone(t));
+        }
+        let dir = self.cache_dir()?;
+        ChunkTable::open_file(&table::table_path(&dir, &head.state_hash))
+            .filter(|t| t.state() == target)
+            .map(Arc::new)
     }
 
     /// GET the head and check it is the one the in-memory index was loaded
@@ -172,93 +166,50 @@ impl Repository {
         };
         let head = index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?;
         if head != *loaded {
-            return Err(VykarError::Other(
-                "the index changed on storage after it was loaded; retry the operation".into(),
-            ));
+            return Err(stale_index_error());
         }
         Ok(Some(head))
     }
 
-    /// The local full cache at `head` that a write diffs against, caught up
-    /// through the chain when it holds an earlier state (a lockless reader in
-    /// another process may have persisted the state it read over ours).
-    /// `None` when no local cache is in the chain or the catch-up fails; the
-    /// write then publishes a base.
-    fn predecessor_cache(&mut self, head: &IndexHead) -> Option<MmapFullIndexCache> {
-        let path = self.full_cache_path();
-        let mut location = CacheLocation {
-            path: path.as_deref(),
-            scratch: self.index_scratch.take(),
-            use_local: true,
-        };
-        let result = index_store::catch_up_local_cache(
-            self.storage.as_ref(),
-            self.crypto.as_ref(),
-            head,
-            &mut location,
-            self.request_width(),
-        );
-        self.index_scratch = location.scratch;
-        match result {
-            Ok(Some((cache, source))) => {
-                if source != SyncSource::UpToDate {
-                    debug!(?source, "local full cache caught up to the loaded head");
-                }
-                Some(cache)
-            }
-            Ok(None) => None,
-            Err(VykarError::IndexObjectMissing { kind, key }) => {
-                warn!(
-                    "index {kind} {key} is missing from storage; writing a base, which does not need it"
-                );
-                None
-            }
-            Err(e) => {
-                warn!(
-                    "cannot catch the local full cache up to the loaded head ({e}); writing a base"
-                );
-                None
-            }
-        }
-    }
-
-    /// Persist the in-memory `chunk_index` (no write session): diff it
-    /// against the local full cache at the loaded head (caught up through
-    /// the chain when it holds an earlier state) and publish the segment, or
-    /// a base when there is none.
+    /// Persist the in-memory index (no write session): diff it against the
+    /// table it was loaded over, which must be at the loaded head's state,
+    /// and publish the segment, or a base without a head.
     pub(super) fn persist_segmented_index(&mut self) -> Result<()> {
         let head = self.current_head_for_write()?;
-        let path = self.full_cache_path();
-        let anchor = index_store::cache_anchor(path.as_deref());
+        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
         let start = std::time::Instant::now();
-        let prev = match head.as_ref() {
-            Some(h) => self.predecessor_cache(h),
-            None => None,
-        };
-        let (diff, next) = match prev {
-            Some(prev) => {
-                let (diff, next) = segment::diff_to_temp(&prev, &self.chunk_index, &anchor)?;
-                (Some(diff), next)
+        let empty;
+        let prev = match self.chunk_index.table() {
+            Some(t) => t.cache(),
+            None if head.as_ref().is_some_and(|h| h.entries > 0) => {
+                return Err(VykarError::Other(
+                    "BUG: the chunk index was not loaded before it was written".into(),
+                ));
             }
             None => {
-                if head.is_some() {
-                    debug!("no local full cache in the loaded head's chain, writing a base");
-                }
-                let next = dedup_cache::full_cache_from_index_to_temp(&self.chunk_index, &anchor)?;
-                (None, next)
+                empty = ChunkTable::empty(&anchor)?;
+                empty.cache()
             }
         };
+        if let Some(h) = head.as_ref()
+            && (prev.state_hash(), u64::from(prev.entry_count())) != (h.state_hash, h.entries)
+        {
+            return Err(stale_index_error());
+        }
+        let (diff, next) = table::diff_live_to_temp(prev, &self.chunk_index, &anchor)?;
         debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "index diffed against its predecessor"
         );
+        // Without a head the state is written as a base; the diff is unused.
+        let diff = head.is_some().then_some(diff);
         self.publish_index_state(head, diff, next)
     }
 
     /// Publish the index state in `next` (a full cache in a temp file) as
     /// the successor of `prev`: as `diff`'s segment, or as a base when there
     /// is no diff, the hard limit is reached or a fold was requested. Then
-    /// install `next` as the local full cache.
+    /// install `next` as the repository's table, with no edits.
     ///
     /// An empty diff publishes nothing. On error nothing local changes and
     /// at most an unreferenced object is left on storage, with one
@@ -276,7 +227,13 @@ impl Repository {
             && !fold
         {
             debug!("index unchanged, nothing to write");
-            drop(next);
+            let at_prev = |t: &Arc<ChunkTable>| t.state() == (prev.state_hash, prev.entries);
+            if self.chunk_index.table().is_some_and(at_prev) || !self.chunk_index.is_loaded() {
+                drop(next);
+                self.chunk_index.discard_edits();
+            } else {
+                self.install_written_table(next);
+            }
             self.index_head = Some(prev.clone());
             self.index_dirty = false;
             return Ok(());
@@ -320,11 +277,29 @@ impl Repository {
             "index written"
         );
 
-        self.index_scratch = index_store::install_cache(next, self.full_cache_path().as_deref());
+        self.install_written_table(next);
         self.index_generation = generation_for_state(&head.state_hash);
         self.index_head = Some(head);
         self.index_dirty = false;
         Ok(())
+    }
+
+    /// Make the state an index write left in `next` the repository's table.
+    /// The head is already published, so a failure only logs: the old index
+    /// stays in place, and a later write from this handle is refused for its
+    /// state until the repository is opened again.
+    fn install_written_table(&mut self, next: TempPath) {
+        let dir = self.cache_dir();
+        match crate::index::table::ChunkTable::install(next, dir.as_deref()) {
+            Ok(table) => {
+                let table = Arc::new(table);
+                // Replace the index before pruning: the table it mapped until
+                // now is then unmapped and can be deleted once it is old enough.
+                self.chunk_index = LiveIndex::from_table(Arc::clone(&table));
+                index_store::prune_old_tables(&table, dir.as_deref());
+            }
+            Err(e) => warn!("cannot map the index state just written: {e}"),
+        }
     }
 
     /// PUT a segment, then the head that appends it.
@@ -441,16 +416,20 @@ impl Repository {
             }
             return Ok(());
         }
-        let cache = match self.local_full_cache_at(&head) {
-            Some(cache) => cache,
+        let table = match self.local_table_at(&head) {
+            Some(table) => table,
             None => {
                 let synced = self.sync_index(Some(head.clone()), true)?;
-                self.index_scratch = synced.scratch;
-                synced.cache
+                self.install_synced_index(synced);
+                self.chunk_index
+                    .table()
+                    .cloned()
+                    .ok_or_else(|| VykarError::Other("BUG: no table after a sync".into()))?
             }
         };
-        let new_head = self.put_base(Some(&head), &cache)?;
-        drop(cache);
+        // A fold writes the same state: the table stays the repository's.
+        let new_head = self.put_base(Some(&head), table.cache())?;
+        drop(table);
         self.index_generation = generation_for_state(&new_head.state_hash);
         self.index_head = Some(new_head);
         Ok(())
@@ -479,17 +458,19 @@ impl Repository {
         let (index, recovery) = match data {
             None => {
                 warn!("the index head is missing; rebuilding from an empty index");
-                (ChunkIndex::new(), IndexRecovery::HeadMissing)
+                (LiveIndex::empty(), IndexRecovery::HeadMissing)
             }
             Some(data) => match index_store::classify_head(&data, self.crypto.as_ref()) {
                 StoredHead::Legacy => {
                     warn!(
                         "`index` holds a monolithic index; rebuilding the segmented index from it"
                     );
-                    (
-                        super::upgrade::decode_index_blob(Some(data), self.crypto.as_ref())?.1,
-                        IndexRecovery::LegacyBlob,
-                    )
+                    let blob =
+                        super::upgrade::decode_index_blob(Some(data), self.crypto.as_ref())?.1;
+                    let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
+                    let tmp = dedup_cache::full_cache_from_index_to_temp(&blob, &anchor)?;
+                    drop(blob);
+                    (scratch_index(tmp)?, IndexRecovery::LegacyBlob)
                 }
                 StoredHead::Head(head) => {
                     let err = match self.sync_index(Some(head.clone()), false) {
@@ -499,19 +480,15 @@ impl Repository {
                         }
                         Err(e) => e,
                     };
-                    if let Some(cache) = self.local_full_cache_at(&head) {
+                    if let Some(table) = self.local_table_at(&head) {
                         warn!(
                             "the index chain cannot be read ({err}); rebuilding the index from \
                              this machine's cache of its latest state"
                         );
-                        (
-                            dedup_cache::chunk_index_from_full_cache(&cache),
-                            IndexRecovery::Complete,
-                        )
+                        (LiveIndex::from_table(table), IndexRecovery::Complete)
                     } else if index_store::is_object_damage(&err) {
                         warn!("the index chain cannot be read ({err}); salvaging it");
-                        let path = self.full_cache_path();
-                        let anchor = index_store::cache_anchor(path.as_deref());
+                        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
                         let salvaged = index_store::salvage_chain(
                             self.storage.as_ref(),
                             self.crypto.as_ref(),
@@ -535,10 +512,12 @@ impl Repository {
                             base_read = salvaged.base_read,
                             "rebuilding the index from the readable part of its chain"
                         );
-                        let cache = MmapFullIndexCache::open_verified(&salvaged.cache).ok_or_else(
-                            || VykarError::Other("salvaged index state failed verification".into()),
-                        )?;
-                        (dedup_cache::chunk_index_from_full_cache(&cache), recovery)
+                        let index = ChunkTable::scratch(salvaged.cache)
+                            .map(|t| LiveIndex::from_table(Arc::new(t)))
+                            .map_err(|_| {
+                                VykarError::Other("salvaged index state failed verification".into())
+                            })?;
+                        (index, recovery)
                     } else {
                         return Err(repair_load_refusal(err));
                     }
@@ -566,28 +545,36 @@ impl Repository {
         };
         self.chunk_index = index;
         self.index_head = None;
-        self.index_scratch = None;
         self.index_dirty = true;
-        self.local_caches_stale = false;
         self.rebase_pack_target_from_index();
         Ok(recovery)
     }
 
-    /// This machine's full index cache at any state: this run's temp-file
-    /// cache, else the persistent one.
-    fn local_full_cache_any(&self) -> Option<MmapFullIndexCache> {
-        let path = self.full_cache_path();
-        self.index_scratch
-            .as_deref()
+    /// This machine's chunk table at any state: the repository's own, else
+    /// the verified table file written last (newest mtime).
+    fn local_table_any(&self) -> Option<Arc<ChunkTable>> {
+        if let Some(t) = self.chunk_index.table() {
+            return Some(Arc::clone(t));
+        }
+        let dir = self.cache_dir()?;
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = table::list_tables(&dir)
             .into_iter()
-            .chain(path.as_deref())
-            .find_map(MmapFullIndexCache::open_verified)
+            .filter_map(|(_, path)| {
+                let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+                Some((mtime, path))
+            })
+            .collect();
+        files.sort_by_key(|a| std::cmp::Reverse(a.0));
+        files
+            .iter()
+            .find_map(|(_, path)| ChunkTable::open_file(path))
+            .map(Arc::new)
     }
 
     /// The index for `check --repair` when `index` cannot be read (`err`):
-    /// this machine's full cache, else rebuilt from `index.d/`.
-    fn chunk_index_without_head(&self, err: &VykarError) -> Result<(ChunkIndex, IndexRecovery)> {
-        if let Some(cache) = self.local_full_cache_any() {
+    /// this machine's chunk table, else rebuilt from `index.d/`.
+    fn chunk_index_without_head(&self, err: &VykarError) -> Result<(LiveIndex, IndexRecovery)> {
+        if let Some(table) = self.local_table_any() {
             warn!(
                 "the index head cannot be read ({err}); rebuilding the index from this \
                  machine's cache of it, which may be older than the repository's latest state"
@@ -599,15 +586,14 @@ impl Repository {
                 unplaced: 0,
                 damaged: 0,
             };
-            return Ok((dedup_cache::chunk_index_from_full_cache(&cache), recovery));
+            return Ok((LiveIndex::from_table(table), recovery));
         }
         warn!(
             "the index head cannot be read ({err}); rebuilding the index from the objects in \
              index.d/"
         );
         let names = list_objects_for_repair(self.storage.as_ref())?;
-        let path = self.full_cache_path();
-        let anchor = index_store::cache_anchor(path.as_deref());
+        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
         let rebuilt = match index_store::rebuild_without_head(
             self.storage.as_ref(),
             self.crypto.as_ref(),
@@ -626,8 +612,9 @@ impl Repository {
             damaged = rebuilt.damaged,
             "rebuilt the index from the objects in index.d/ without a head"
         );
-        let cache = MmapFullIndexCache::open_verified(&rebuilt.cache)
-            .ok_or_else(|| VykarError::Other("rebuilt index state failed verification".into()))?;
+        let index = ChunkTable::scratch(rebuilt.cache)
+            .map(|t| LiveIndex::from_table(Arc::new(t)))
+            .map_err(|_| VykarError::Other("rebuilt index state failed verification".into()))?;
         let recovery = IndexRecovery::HeadUnreadable {
             from_local_cache: false,
             bases: rebuilt.bases,
@@ -635,8 +622,20 @@ impl Repository {
             unplaced: rebuilt.unplaced,
             damaged: rebuilt.damaged,
         };
-        Ok((dedup_cache::chunk_index_from_full_cache(&cache), recovery))
+        Ok((index, recovery))
     }
+}
+
+/// The error a write returns when the head moved since the index was loaded.
+fn stale_index_error() -> VykarError {
+    VykarError::Other(
+        "the index changed on storage after it was loaded; retry the operation".into(),
+    )
+}
+
+/// `tmp` (a full cache in a temp file) as an index over a scratch table.
+fn scratch_index(tmp: TempPath) -> Result<LiveIndex> {
+    Ok(LiveIndex::from_table(Arc::new(ChunkTable::scratch(tmp)?)))
 }
 
 /// The `index.d/` listing for a repair without a head. A failure is named as

@@ -10,13 +10,14 @@
 //! because the name is the hash of the ciphertext and cannot be in its own
 //! AAD; the binding to the head is that check.
 //!
-//! [`sync_full_cache`] brings a local full index cache to a head's state:
-//! nothing to do when it already matches, the missing segments applied in
-//! one streaming pass when it matches a state in the head's chain, the base
-//! downloaded otherwise.
+//! [`sync_full_cache`] brings a local chunk table (`index::table`) to a
+//! head's state: nothing to do when one already matches, the missing
+//! segments applied in one streaming pass when one matches a state in the
+//! head's chain, the base downloaded otherwise.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tempfile::TempPath;
 use tracing::{debug, warn};
@@ -35,6 +36,7 @@ use crate::index::base;
 use crate::index::dedup_cache::{FullCacheWriter, MmapFullIndexCache, StateHash};
 use crate::index::head::{self, BaseRef, IndexHead, ObjectName, SegmentRef};
 use crate::index::segment::{self, ChainStep, Segment};
+use crate::index::table::{self, ChunkTable};
 
 /// Directory of the write-once base and segment objects.
 pub(crate) const INDEX_OBJECT_DIR: &str = "index.d/";
@@ -363,40 +365,40 @@ fn fetch_all(storage: &dyn StorageBackend, keys: &[String], width: usize) -> Res
 }
 
 // ---------------------------------------------------------------------------
-// Bringing a local full cache to a head's state
+// Bringing the local chunk table to a head's state
 // ---------------------------------------------------------------------------
 
 /// What [`sync_full_cache`] had to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncSource {
-    /// The local cache already held the head's state.
+    /// A local table already held the head's state.
     UpToDate,
-    /// The local cache held an earlier state of the chain; `segments` were
+    /// A local table held an earlier state of the chain; `segments` were
     /// fetched and applied.
     CaughtUp { segments: usize },
-    /// No usable local cache: the base and `segments` were downloaded.
+    /// No usable local table: the base and `segments` were downloaded.
     Downloaded { segments: usize },
 }
 
-/// Where the full index cache lives for one sync.
+/// Where the chunk tables live for one sync.
 pub(crate) struct CacheLocation<'a> {
-    /// The persistent cache file, when the repository has a cache directory.
-    pub path: Option<&'a Path>,
-    /// A temp-file cache kept from earlier in this run (see
-    /// `Repository::index_scratch`). Checked before `path`.
-    pub scratch: Option<TempPath>,
-    /// Whether existing local caches may be used at all (`false` for
+    /// The per-repo cache dir holding `chunk_table.<state>` files, when the
+    /// repository has one and local tables may be used. A table the sync
+    /// produces is published there; without a dir it stays a scratch file.
+    pub dir: Option<&'a Path>,
+    /// The repository's table, when one is loaded: checked first, and
+    /// accepted without re-verification (it was verified when mapped).
+    pub live: Option<Arc<ChunkTable>>,
+    /// Whether existing local tables may be used at all (`false` for
     /// `check`, which verifies every object in the chain).
     pub use_local: bool,
 }
 
-/// A full index cache at a head's state.
+/// A chunk table at a head's state.
 pub(crate) struct SyncedIndex {
     /// The head synced to; a re-read one if a named object vanished.
     pub head: IndexHead,
-    pub cache: MmapFullIndexCache,
-    /// Set when the cache lives in a temp file rather than at `path`.
-    pub scratch: Option<TempPath>,
+    pub table: Arc<ChunkTable>,
     pub source: SyncSource,
 }
 
@@ -405,21 +407,42 @@ fn temp_anchor() -> PathBuf {
     std::env::temp_dir().join(TEMP_ANCHOR_FILE)
 }
 
-/// Where temp files of a full index cache go: beside `path` when its
-/// directory exists or can be created, otherwise in the system temp dir.
-pub(crate) fn cache_anchor(path: Option<&Path>) -> PathBuf {
-    match path {
-        Some(p)
-            if p.parent()
-                .is_some_and(|d| std::fs::create_dir_all(d).is_ok()) =>
-        {
-            p.to_path_buf()
-        }
+/// Where temp files of a chunk table go: in `dir` when it exists or can be
+/// created, otherwise in the system temp dir.
+pub(crate) fn cache_anchor(dir: Option<&Path>) -> PathBuf {
+    match dir {
+        Some(d) if std::fs::create_dir_all(d).is_ok() => table::table_anchor(d),
         _ => temp_anchor(),
     }
 }
 
-/// Bring a local full index cache to `head`'s state.
+/// A scratch table published in `dir` (see [`ChunkTable::publish`]), after
+/// which the old tables there are deleted.
+pub(crate) fn publish_table(table: ChunkTable, dir: Option<&Path>) -> ChunkTable {
+    pruned_after(table.publish(dir), dir)
+}
+
+/// `table`, after deleting the old tables in `dir` when it is published there.
+fn pruned_after(table: ChunkTable, dir: Option<&Path>) -> ChunkTable {
+    prune_old_tables(&table, dir);
+    table
+}
+
+/// Delete the old tables in `dir` when `table` is published there. A table
+/// this process still maps is kept, so a caller that replaces its own table
+/// drops the old one first.
+pub(crate) fn prune_old_tables(table: &ChunkTable, dir: Option<&Path>) {
+    if let Some(dir) = dir
+        && table.file_path().is_some()
+    {
+        let deleted = table::prune_tables(dir, &table.state().0, table::TABLE_KEEP_AGE);
+        if deleted > 0 {
+            debug!(deleted, "deleted old chunk tables");
+        }
+    }
+}
+
+/// Bring a local chunk table to `head`'s state.
 ///
 /// Readers take no lock, so a fold may delete the objects of the head they
 /// read. A missing object is answered by re-reading the head: a head that
@@ -431,17 +454,16 @@ pub(crate) fn sync_full_cache(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     mut head: IndexHead,
-    mut location: CacheLocation<'_>,
+    location: CacheLocation<'_>,
     width: usize,
 ) -> Result<SyncedIndex> {
     let mut retries = 0;
     loop {
-        let missing = match sync_once(storage, crypto, &head, &mut location, width)? {
-            Attempt::Synced(cache, source) => {
+        let missing = match sync_once(storage, crypto, &head, &location, width)? {
+            Attempt::Synced(table, source) => {
                 return Ok(SyncedIndex {
                     head,
-                    cache,
-                    scratch: location.scratch,
+                    table,
                     source,
                 });
             }
@@ -477,7 +499,7 @@ struct MissingObject {
 
 /// One attempt of [`sync_full_cache`].
 enum Attempt {
-    Synced(MmapFullIndexCache, SyncSource),
+    Synced(Arc<ChunkTable>, SyncSource),
     /// An object named live by the attempted head is absent.
     Missing(MissingObject),
 }
@@ -486,81 +508,73 @@ fn sync_once(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     head: &IndexHead,
-    location: &mut CacheLocation<'_>,
+    location: &CacheLocation<'_>,
     width: usize,
 ) -> Result<Attempt> {
     let start = match local_start(head, location) {
-        LocalStart::AtHead(cache) => return Ok(Attempt::Synced(cache, SyncSource::UpToDate)),
-        LocalStart::InChain(cache, k) => Some((cache, k)),
+        LocalStart::AtHead(table) => return Ok(Attempt::Synced(table, SyncSource::UpToDate)),
+        LocalStart::InChain(table, k) => Some((table, k)),
         LocalStart::Absent => None,
     };
     sync_from(storage, crypto, head, location, start, width)
 }
 
-/// Bring a local cache in `head`'s chain to `head` and install it;
-/// `Ok(None)` when there is none. For writers under the lock: never
-/// downloads a base or re-reads the head, and since no fold runs under the
-/// lock, an absent object is lost ([`VykarError::IndexObjectMissing`]).
-pub(crate) fn catch_up_local_cache(
-    storage: &dyn StorageBackend,
-    crypto: &dyn CryptoEngine,
-    head: &IndexHead,
-    location: &mut CacheLocation<'_>,
-    width: usize,
-) -> Result<Option<(MmapFullIndexCache, SyncSource)>> {
-    let attempt = match local_start(head, location) {
-        LocalStart::AtHead(cache) => return Ok(Some((cache, SyncSource::UpToDate))),
-        LocalStart::InChain(cache, k) => {
-            sync_from(storage, crypto, head, location, Some((cache, k)), width)?
-        }
-        LocalStart::Absent => return Ok(None),
-    };
-    match attempt {
-        Attempt::Synced(cache, source) => Ok(Some((cache, source))),
-        Attempt::Missing(m) => Err(VykarError::IndexObjectMissing {
-            kind: m.kind,
-            key: object_key(&m.name),
-        }),
-    }
-}
-
-/// The local cache a sync can start from.
+/// The local table a sync can start from.
 enum LocalStart {
-    /// A local cache already at the head's state.
-    AtHead(MmapFullIndexCache),
-    /// A local cache at `chain_states()[k]`, the latest such position found.
-    InChain(MmapFullIndexCache, usize),
+    /// A local table already at the head's state.
+    AtHead(Arc<ChunkTable>),
+    /// A local table at `chain_states()[k]`, the latest such position found.
+    InChain(Arc<ChunkTable>, usize),
     /// None usable (or `use_local` is false).
     Absent,
 }
 
-/// Scan `location.scratch`, then `location.path`, for a cache at a state of
-/// `head`'s chain.
+/// The repository's live table, then the table files in `location.dir`
+/// named after a state of `head`'s chain, latest chain position first. A
+/// file whose content is not the state its name says is skipped.
 fn local_start(head: &IndexHead, location: &CacheLocation<'_>) -> LocalStart {
     if !location.use_local {
         return LocalStart::Absent;
     }
     let target_state = (head.state_hash, head.entries);
     let chain = head.chain_states();
-    // A local cache at some state of the chain, latest first.
-    let mut start: Option<(MmapFullIndexCache, usize)> = None;
-    let candidates = location.scratch.as_deref().into_iter().chain(location.path);
-    for path in candidates {
-        let Some(cache) = MmapFullIndexCache::open_verified(path) else {
+    let position = |state: &(StateHash, u64)| chain.iter().rposition(|s| s == state);
+    let live = location
+        .live
+        .as_ref()
+        .and_then(|t| Some((position(&t.state())?, Arc::clone(t))));
+    if let Some((_, t)) = &live
+        && t.state() == target_state
+    {
+        return LocalStart::AtHead(Arc::clone(t));
+    }
+    let mut files: Vec<(usize, PathBuf)> = location
+        .dir
+        .map(table::list_tables)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(state, path)| {
+            let k = chain.iter().rposition(|s| s.0 == state)?;
+            Some((k, path))
+        })
+        .filter(|(k, _)| live.as_ref().is_none_or(|(best, _)| k > best))
+        .collect();
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, path) in files {
+        let Some(t) = ChunkTable::open_file(&path) else {
             continue;
         };
-        let state = (cache.state_hash(), u64::from(cache.entry_count()));
-        if state == target_state {
-            return LocalStart::AtHead(cache);
+        let Some(k) = position(&t.state()) else {
+            continue;
+        };
+        let t = Arc::new(t);
+        if t.state() == target_state {
+            return LocalStart::AtHead(t);
         }
-        if let Some(k) = chain.iter().rposition(|s| *s == state)
-            && start.as_ref().is_none_or(|(_, best)| k > *best)
-        {
-            start = Some((cache, k));
-        }
+        return LocalStart::InChain(t, k);
     }
-    match start {
-        Some((cache, k)) => LocalStart::InChain(cache, k),
+    match live {
+        Some((k, t)) => LocalStart::InChain(t, k),
         None => LocalStart::Absent,
     }
 }
@@ -572,12 +586,13 @@ fn sync_from(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     head: &IndexHead,
-    location: &mut CacheLocation<'_>,
-    start: Option<(MmapFullIndexCache, usize)>,
+    location: &CacheLocation<'_>,
+    start: Option<(Arc<ChunkTable>, usize)>,
     width: usize,
 ) -> Result<Attempt> {
     let target_state = (head.state_hash, head.entries);
-    let anchor = cache_anchor(location.path);
+    let dir = location.dir.filter(|_| location.use_local);
+    let anchor = cache_anchor(dir);
 
     let from = start.as_ref().map_or(0, |(_, k)| *k);
     let pending = head
@@ -603,10 +618,8 @@ fn sync_from(
     };
 
     let downloaded = start.is_none();
-    // `prev_tmp` keeps a downloaded base alive while it is mapped; bound
-    // first so the mapping drops before its file on an early return.
-    let (prev_tmp, prev) = match start {
-        Some((cache, _)) => (None, cache),
+    let prev = match start {
+        Some((table, _)) => table,
         None => {
             let tmp = match &head.base {
                 Some(base_ref) => {
@@ -623,9 +636,9 @@ fn sync_from(
                     .0
                     .into_temp_path(),
             };
-            let cache = MmapFullIndexCache::open_verified(&tmp)
-                .ok_or_else(|| invalid("decoded index base failed verification"))?;
-            (Some(tmp), cache)
+            let table = ChunkTable::scratch(tmp)
+                .map_err(|_| invalid("decoded index base failed verification"))?;
+            Arc::new(table)
         }
     };
 
@@ -654,54 +667,22 @@ fn sync_from(
             segments: steps.len(),
         }
     };
-    // Map our own temp file, not the path (see [`install`]).
-    let (result, cache) = if steps.is_empty() {
+    let table = if steps.is_empty() {
         // A downloaded base already at the head's state.
-        let tmp = prev_tmp.ok_or_else(|| invalid("index chain has no segments to apply"))?;
-        (tmp, prev)
+        Arc::into_inner(prev)
+            .filter(|_| downloaded)
+            .ok_or_else(|| invalid("index chain has no segments to apply"))?
     } else {
-        let (tmp, _, _) = segment::apply_to_temp(&prev, &steps, &anchor)?;
-        // Unmap the predecessor before its file is replaced (Windows).
+        let (tmp, _, _) = segment::apply_to_temp(prev.cache(), &steps, &anchor)?;
         drop(prev);
-        drop(prev_tmp);
-        let cache = MmapFullIndexCache::open_verified(&tmp)
-            .ok_or_else(|| invalid("index cache failed verification after sync"))?;
-        (tmp, cache)
+        ChunkTable::scratch(tmp)
+            .map_err(|_| invalid("index cache failed verification after sync"))?
     };
-    if (cache.state_hash(), u64::from(cache.entry_count())) != target_state {
+    // Checked before anything is published.
+    if table.state() != target_state {
         return Err(invalid("index state after sync differs from the head"));
     }
-    install(result, location);
-    Ok(Attempt::Synced(cache, source))
-}
-
-/// Move a finished cache to `location.path`, or keep it as the scratch file
-/// (no path, local caches unused, or a failed rename). A caller that needs
-/// the cache maps `tmp` first: another process may rename its file over the
-/// path at any time.
-fn install(tmp: TempPath, location: &mut CacheLocation<'_>) {
-    match location.path {
-        Some(path) if location.use_local => match tmp.persist(path) {
-            Ok(()) => location.scratch = None,
-            Err(e) => {
-                debug!(error = %e.error, "keeping the index cache in its temp file");
-                location.scratch = Some(e.path);
-            }
-        },
-        _ => location.scratch = Some(tmp),
-    }
-}
-
-/// [`install`] for a cache written by an index write: persisted over
-/// `path`, or kept as a temp file. Returns the temp file when it stays one.
-pub(crate) fn install_cache(tmp: TempPath, path: Option<&Path>) -> Option<TempPath> {
-    let mut location = CacheLocation {
-        path,
-        scratch: None,
-        use_local: true,
-    };
-    install(tmp, &mut location);
-    location.scratch
+    Ok(Attempt::Synced(Arc::new(publish_table(table, dir)), source))
 }
 
 // ---------------------------------------------------------------------------

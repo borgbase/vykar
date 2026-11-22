@@ -809,6 +809,72 @@ delegate_storage_backend! {
 
 }
 
+/// The entries of either index type, in chunk-ID order (tests).
+pub(crate) trait EntryIter {
+    fn entry_vec(
+        &self,
+    ) -> Vec<(
+        vykar_types::chunk_id::ChunkId,
+        crate::index::ChunkIndexEntry,
+    )>;
+}
+
+impl EntryIter for crate::index::ChunkIndex {
+    fn entry_vec(
+        &self,
+    ) -> Vec<(
+        vykar_types::chunk_id::ChunkId,
+        crate::index::ChunkIndexEntry,
+    )> {
+        let mut v: Vec<_> = self.iter().map(|(id, e)| (*id, *e)).collect();
+        v.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        v
+    }
+}
+
+impl EntryIter for crate::index::LiveIndex {
+    fn entry_vec(
+        &self,
+    ) -> Vec<(
+        vykar_types::chunk_id::ChunkId,
+        crate::index::ChunkIndexEntry,
+    )> {
+        self.iter().collect()
+    }
+}
+
+impl EntryIter for crate::index::ChunkTable {
+    fn entry_vec(
+        &self,
+    ) -> Vec<(
+        vykar_types::chunk_id::ChunkId,
+        crate::index::ChunkIndexEntry,
+    )> {
+        self.cache()
+            .iter()
+            .map(|e| {
+                (
+                    e.chunk_id,
+                    crate::index::ChunkIndexEntry {
+                        refcount: e.refcount,
+                        stored_size: e.stored_size,
+                        pack_id: e.pack_id,
+                        pack_offset: e.pack_offset,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Save the active write session (its chunks enter the index) and begin a
+/// new one, for tests that read their own chunks through the index.
+pub(crate) fn save_and_resume(repo: &mut Repository) {
+    repo.save_state().expect("save_state");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -88,11 +88,14 @@ fn stored_stream(repo: &mut Repository, n: usize, cut: usize) -> (Vec<u8>, Vec<L
                 .0
         })
         .collect();
-    repo.flush_packs().unwrap();
+    // Chunks stored in a session are in the index once it is saved.
+    repo.save_state().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     let locs = ids
         .iter()
         .map(|id| {
-            let e = *repo.chunk_index().get(id).unwrap();
+            let e = repo.chunk_index().get(id).unwrap();
             (*id, e.pack_id, e.pack_offset, e.stored_size)
         })
         .collect();
@@ -203,23 +206,24 @@ fn lazy_stream_polls_shutdown_between_range_reads() {
     );
 }
 
+/// A location that no longer holds its chunk (a compaction moved it after
+/// the index was loaded) is re-resolved once against the index at a fresh
+/// head, and the read goes on.
 #[test]
-fn lazy_stream_from_cache_falls_back_to_index_on_bad_location() {
+fn lazy_stream_retries_a_bad_location_against_a_fresh_index() {
     let (mut repo, _log) = repo_on_counting_backend();
     let (stream, mut locs) = stored_stream(&mut repo, 200, 64);
-    repo.save_state().unwrap();
-    // A cached location that decodes to the wrong chunk.
+    // A location that decodes to the wrong chunk.
     let (_, p, o, s) = locs[2];
     locs[5] = (locs[5].0, p, o, s);
 
     let never = CancelToken::new();
     let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), true, u64::MAX, &never);
-    assert!(!lazy.cache_distrusted());
+    assert!(!lazy.retried());
     assert_eq!(paths_of(&mut lazy).unwrap(), eager_paths(&stream));
-    // The reader that opened the stream must stop using the cache as well.
-    assert!(lazy.cache_distrusted());
+    assert!(lazy.retried());
 
-    // Without the cache origin there is no fallback: the error surfaces.
+    // Without the retry the error surfaces.
     let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, &never);
     assert!(paths_of(&mut lazy).is_err());
 }

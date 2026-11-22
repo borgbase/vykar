@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
-use crate::index::dedup_cache::DedupPrefilter;
+use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;

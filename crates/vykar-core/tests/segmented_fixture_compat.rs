@@ -107,7 +107,7 @@ fn sorted_entries(
     vykar_types::chunk_id::ChunkId,
     vykar_core::index::ChunkIndexEntry,
 )> {
-    let mut out: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
+    let mut out: Vec<_> = repo.chunk_index().iter().collect();
     out.sort_by_key(|(id, _)| *id.as_bytes());
     out
 }

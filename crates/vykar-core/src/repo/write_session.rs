@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::index::dedup_cache::TieredDedupIndex;
+use crate::index::hasher::ChunkIdHashMap;
 use crate::index::{
-    ChunkIndex, DedupIndex, IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry,
-    RecoveredChunkEntry,
+    ChunkTable, IndexDelta, IndexDeltaCheckpoint, LiveIndex, PendingChunkEntry, RecoveredChunkEntry,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -31,7 +30,7 @@ pub(super) const DEFAULT_SESSION_ID: &str = "default";
 pub(crate) struct RollbackTracker {
     /// Truncation point for IndexDelta.
     pub delta_checkpoint: IndexDeltaCheckpoint,
-    /// ChunkIds inserted into tiered_dedup or dedup_index during this scope.
+    /// ChunkIds inserted into `session_new` during this scope.
     pub dedup_inserts: Vec<ChunkId>,
     /// Entries promoted out of recovered_chunks — saved to re-insert on rollback.
     pub promoted_recovered: Vec<(ChunkId, RecoveredChunkEntry)>,
@@ -106,13 +105,14 @@ pub(crate) struct WriteSessionState {
     /// (`StorageBackend::begin_staged_put`; local repositories). A staged
     /// pack holds no heap, so it counts 0 against the upload byte cap.
     pub(crate) stream_data_packs: bool,
-    /// Lightweight dedup-only index used during backup to save memory.
-    /// When active, `chunk_index` on Repository is empty.
-    pub(crate) dedup_index: Option<DedupIndex>,
-    /// Three-tier dedup index (xor filter + mmap + session HashMap).
-    /// When active, both `chunk_index` and `dedup_index` are empty.
-    pub(crate) tiered_dedup: Option<TieredDedupIndex>,
-    /// Tracks index mutations while in dedup mode, applied at save time.
+    /// The table lookups and positional bumps resolve against: the
+    /// repository's table when the session began (`None`: not loaded, reads
+    /// as empty). Immutable for the session.
+    pub(crate) table: Option<Arc<ChunkTable>>,
+    /// Chunks sealed or promoted in this session -> stored size.
+    pub(crate) session_new: ChunkIdHashMap<u32>,
+    /// Every index mutation of the session; `Some` from
+    /// `begin_write_session` until the commit or save takes it.
     pub(crate) index_delta: Option<IndexDelta>,
     /// Chunks recovered from a previous interrupted session's `pending_index`.
     pub(crate) recovered_chunks: StdHashMap<ChunkId, RecoveredChunkEntry>,
@@ -163,8 +163,8 @@ impl WriteSessionState {
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
             uploads: UploadQueue::new(max_in_flight_uploads),
             stream_data_packs: false,
-            dedup_index: None,
-            tiered_dedup: None,
+            table: None,
+            session_new: ChunkIdHashMap::default(),
             index_delta: None,
             recovered_chunks: StdHashMap::new(),
             recovered_index_keys: Vec::new(), // only .index keys, never .json
@@ -322,54 +322,17 @@ impl WriteSessionState {
 
     // --- Sealed entry dispatch ---
 
-    /// Update index entries for a freshly sealed pack.
-    ///
-    /// In dedup/tiered mode, entries go into the session's dedup structure and
-    /// index delta. In normal mode, entries go directly into `chunk_index`.
-    /// Returns `true` if `chunk_index` was modified (caller should set `index_dirty`).
-    pub(crate) fn apply_sealed_entries(
-        &mut self,
-        pack_id: PackId,
-        entries: Vec<PackedChunkEntry>,
-        chunk_index: &mut ChunkIndex,
-    ) -> bool {
-        if self.tiered_dedup.is_some() {
-            for (chunk_id, stored_size, offset, refcount) in entries {
-                if let Some(ref mut tiered) = self.tiered_dedup {
-                    tiered.insert(chunk_id, stored_size);
-                }
-                if let Some(ref mut delta) = self.index_delta {
-                    delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
-                }
-                if let Some(ref mut tracker) = self.rollback_tracker {
-                    tracker.dedup_inserts.push(chunk_id);
-                }
+    /// Record the entries of a freshly sealed pack: in `session_new`, the
+    /// session's delta and the rollback tracker.
+    pub(crate) fn apply_sealed_entries(&mut self, pack_id: PackId, entries: Vec<PackedChunkEntry>) {
+        for (chunk_id, stored_size, offset, refcount) in entries {
+            self.session_new.insert(chunk_id, stored_size);
+            if let Some(ref mut delta) = self.index_delta {
+                delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
             }
-            false
-        } else if self.dedup_index.is_some() {
-            for (chunk_id, stored_size, offset, refcount) in entries {
-                if let Some(ref mut dedup) = self.dedup_index {
-                    dedup.insert(chunk_id, stored_size);
-                }
-                if let Some(ref mut delta) = self.index_delta {
-                    delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
-                }
-                if let Some(ref mut tracker) = self.rollback_tracker {
-                    tracker.dedup_inserts.push(chunk_id);
-                }
+            if let Some(ref mut tracker) = self.rollback_tracker {
+                tracker.dedup_inserts.push(chunk_id);
             }
-            false
-        } else {
-            // Non-dedup mode: `begin_rollback_checkpoint` asserts a dedup
-            // mode is active, so no tracker can exist here.
-            debug_assert!(self.rollback_tracker.is_none());
-            for (chunk_id, stored_size, offset, refcount) in entries {
-                chunk_index.add(chunk_id, stored_size, pack_id, offset);
-                for _ in 1..refcount {
-                    chunk_index.increment_refcount(&chunk_id);
-                }
-            }
-            true
         }
     }
 
@@ -379,7 +342,7 @@ impl WriteSessionState {
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
-        chunk_index: &ChunkIndex,
+        chunk_index: &LiveIndex,
         width: usize,
     ) -> Result<PendingIndexRecovery> {
         journal_recovery::recover_pending_index(
@@ -403,16 +366,10 @@ impl WriteSessionState {
         journal_recovery::delete_recovered_indices(storage, &mut self.recovered_index_keys);
     }
 
-    /// Promote a recovered chunk into the active dedup structure and index delta.
-    /// Returns the stored size if the chunk was in `recovered_chunks`, None otherwise.
-    ///
-    /// In non-dedup mode, the chunk is added directly to `chunk_index` and
-    /// the caller should set `index_dirty = true` when this returns `Some`.
-    pub(crate) fn promote_recovered_chunk(
-        &mut self,
-        chunk_id: &ChunkId,
-        chunk_index: &mut ChunkIndex,
-    ) -> Option<(u32, bool)> {
+    /// Promote a recovered chunk into the session (`session_new` and the
+    /// delta, as a new entry with refcount 1). Returns the stored size if
+    /// the chunk was in `recovered_chunks`, None otherwise.
+    pub(crate) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let entry = self.recovered_chunks.remove(chunk_id)?;
 
         // Record for rollback now that we own the entry.
@@ -421,32 +378,7 @@ impl WriteSessionState {
             tracker.dedup_inserts.push(*chunk_id);
         }
 
-        // Promote into active dedup structure.
-        if let Some(ref mut tiered) = self.tiered_dedup {
-            tiered.insert(*chunk_id, entry.stored_size);
-        } else if let Some(ref mut dedup) = self.dedup_index {
-            dedup.insert(*chunk_id, entry.stored_size);
-        } else {
-            chunk_index.add(
-                *chunk_id,
-                entry.stored_size,
-                entry.pack_id,
-                entry.pack_offset,
-            );
-            // Record in delta as a new entry with refcount=1.
-            if let Some(ref mut delta) = self.index_delta {
-                delta.add_new_entry(
-                    *chunk_id,
-                    entry.stored_size,
-                    entry.pack_id,
-                    entry.pack_offset,
-                    1,
-                );
-            }
-            return Some((entry.stored_size, true));
-        }
-
-        // Record in delta as a new entry with refcount=1.
+        self.session_new.insert(*chunk_id, entry.stored_size);
         if let Some(ref mut delta) = self.index_delta {
             delta.add_new_entry(
                 *chunk_id,
@@ -457,7 +389,7 @@ impl WriteSessionState {
             );
         }
 
-        Some((entry.stored_size, false))
+        Some(entry.stored_size)
     }
 
     // --- Dedup query helpers ---

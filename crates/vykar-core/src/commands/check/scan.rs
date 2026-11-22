@@ -587,7 +587,7 @@ pub(super) fn integrity_scan(
         pack_chunks
             .entry(entry.pack_id)
             .or_default()
-            .push((*chunk_id, *entry));
+            .push((chunk_id, entry));
     }
     let packs_for_existence: Vec<(PackId, usize)> = pack_chunks
         .iter()
@@ -722,7 +722,7 @@ fn locate_items_in_missing_packs(
         .chunk_index()
         .iter()
         .filter(|(_, entry)| missing_packs.contains(&entry.pack_id))
-        .map(|(chunk_id, entry)| (*chunk_id, entry.pack_id))
+        .map(|(chunk_id, entry)| (chunk_id, entry.pack_id))
         .collect();
 
     if chunk_to_missing_pack.is_empty() {

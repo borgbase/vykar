@@ -4,16 +4,16 @@ pub mod dedup_cache;
 pub mod hasher;
 pub mod head;
 pub mod segment;
+pub mod table;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub use cached_bumps::CachedBumps;
 use hasher::{BuildChunkIdHasher, ChunkIdHashMap};
+pub use table::{ChunkTable, LiveIndex};
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
-use xorf::Xor8;
 
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
@@ -107,6 +107,11 @@ impl ChunkIndex {
         self.entries.get(id)
     }
 
+    /// Insert or replace the entry of `id` as given (refcount included).
+    pub(crate) fn insert_entry(&mut self, id: ChunkId, entry: ChunkIndexEntry) {
+        self.entries.insert(id, entry);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -190,74 +195,6 @@ impl ChunkIndex {
                 false
             }
         });
-    }
-}
-
-/// Lightweight dedup-only index that stores only chunk_id → stored_size.
-///
-/// Used during backup to reduce memory: ~68 bytes per entry vs ~112 bytes
-/// for the full `ChunkIndex`. For 10M chunks this saves ~400 MB of RAM.
-///
-/// Does not track refcounts, pack locations, or offsets — those are recorded
-/// in an `IndexDelta` and merged back into the full index at save time.
-#[derive(Debug)]
-pub struct DedupIndex {
-    entries: ChunkIdHashMap<u32>,
-    xor_filter: Option<Arc<Xor8>>,
-}
-
-impl DedupIndex {
-    /// Build a dedup index from the full chunk index, keeping only chunk_id → stored_size.
-    pub fn from_chunk_index(full: &ChunkIndex) -> Self {
-        let entries: ChunkIdHashMap<u32> = full
-            .entries
-            .iter()
-            .map(|(id, entry)| (*id, entry.stored_size))
-            .collect();
-        let keys: Vec<u64> = entries.keys().map(dedup_cache::chunk_id_to_u64).collect();
-        let xor_filter = dedup_cache::build_xor_filter_from_keys(&keys).map(Arc::new);
-        debug!(
-            "built dedup index with {} entries from full index",
-            entries.len()
-        );
-        Self {
-            entries,
-            xor_filter,
-        }
-    }
-
-    /// Return a shared reference to the pre-built xor filter (if any).
-    pub(crate) fn xor_filter(&self) -> Option<Arc<Xor8>> {
-        self.xor_filter.clone()
-    }
-
-    /// Check if a chunk exists (dedup hit).
-    pub fn contains(&self, id: &ChunkId) -> bool {
-        self.entries.contains_key(id)
-    }
-
-    /// Get the stored size for a chunk.
-    pub fn get_stored_size(&self, id: &ChunkId) -> Option<u32> {
-        self.entries.get(id).copied()
-    }
-
-    /// Insert a new chunk (used when new chunks are committed during backup).
-    pub fn insert(&mut self, id: ChunkId, stored_size: u32) {
-        self.entries.insert(id, stored_size);
-    }
-
-    /// Remove a session-local entry. The xor filter may still report false
-    /// positives for the removed chunk — safe because the precise lookup will miss.
-    pub fn remove(&mut self, id: &ChunkId) {
-        self.entries.remove(id);
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -384,8 +321,8 @@ pub fn decode_pending_journal(bytes: &[u8]) -> Result<DecodedJournal, rmp_serde:
 }
 
 /// Lightweight entry for recovered chunks (from a previous interrupted session).
-/// Lives in `Repository::recovered_chunks` until promoted into the active dedup
-/// structure on a dedup hit.
+/// Lives in `Repository::recovered_chunks` until promoted into the session on
+/// a dedup hit.
 #[derive(Debug, Clone)]
 pub struct RecoveredChunkEntry {
     pub stored_size: u32,
@@ -405,25 +342,26 @@ pub struct IndexDeltaCheckpoint {
 }
 
 impl IndexDeltaCheckpoint {
-    /// Create an empty checkpoint (for repos not using dedup mode).
+    /// Create an empty checkpoint.
     pub fn empty() -> Self {
         Self { new_entries_len: 0 }
     }
 }
 
-/// Records all index mutations that happen while in dedup-only mode.
+/// Records the index mutations of a write session.
 ///
-/// At save time, these are applied to a freshly-loaded full `ChunkIndex`.
+/// A backup commit merges it into the head's table (`segment::merge_delta_to_temp`);
+/// other writers apply it to the repository's `LiveIndex` at save time.
 #[derive(Debug, Default)]
 pub struct IndexDelta {
     /// New chunk entries added during this session.
     pub new_entries: Vec<NewChunkEntry>,
     /// Refcount increments recorded by chunk ID: chunks created earlier in
-    /// this session, chunks found through the non-tiered `DedupIndex`, and
-    /// bumps whose position could not be used (see `bump_cached_refcount`).
+    /// this session, chunks found in an edited index, and bumps whose
+    /// position could not be used (see `bump_cached_refcount`).
     pub refcount_bumps: HashMap<ChunkId, u32>,
-    /// Refcount increments for chunks of the tiered mode's mmap'd dedup
-    /// cache, by cache position (`None` outside tiered mode). The logical
+    /// Refcount increments for chunks of the session's table, by table
+    /// position (`None` when the session began without a table). The logical
     /// bump for a chunk is its `refcount_bumps` value plus its count here;
     /// every consumer below adds both.
     pub cached_bumps: Option<CachedBumps>,
@@ -434,7 +372,7 @@ pub struct IndexDelta {
     pub(crate) undo_log: Option<HashMap<ChunkId, Option<u32>>>,
 }
 
-/// A new chunk entry recorded during dedup-mode backup.
+/// A new chunk entry recorded during a write session.
 #[derive(Debug, Clone)]
 pub struct NewChunkEntry {
     pub chunk_id: ChunkId,
@@ -449,11 +387,10 @@ impl IndexDelta {
         Self::default()
     }
 
-    /// A delta that records bumps for chunks of `cache` by position
-    /// (tiered dedup mode).
-    pub fn with_cached_bumps(cache: Arc<dedup_cache::MmapDedupCache>) -> Self {
+    /// A delta that records bumps for chunks of `table` by position.
+    pub fn with_cached_bumps(table: Arc<ChunkTable>) -> Self {
         Self {
-            cached_bumps: Some(CachedBumps::new(cache)),
+            cached_bumps: Some(CachedBumps::new(table)),
             ..Self::default()
         }
     }
@@ -515,8 +452,8 @@ impl IndexDelta {
         }
     }
 
-    /// Record a refcount bump for a chunk found at `position` in the tiered
-    /// mode's mmap'd dedup cache. Falls back to the keyed map when this delta
+    /// Record a refcount bump for a chunk found at `position` in the
+    /// session's table. Falls back to the keyed map when this delta
     /// has no positional table or the position does not hold `id`, so the
     /// recorded logical bump is the same either way.
     pub fn bump_cached_refcount(&mut self, id: &ChunkId, position: u32) {
@@ -525,8 +462,8 @@ impl IndexDelta {
         {
             return;
         }
-        // Unreachable while positions come from `TieredDedupIndex::find*`
-        // on the cache this table was built from; the keyed fallback
+        // Unreachable while positions come from lookups in the session's
+        // table, the one this delta counts by; the keyed fallback
         // keeps the count exact if that ever stops holding.
         self.bump_refcount(id);
     }
@@ -596,8 +533,8 @@ impl IndexDelta {
         Ok(self)
     }
 
-    /// Apply this delta to a full `ChunkIndex`.
-    pub fn apply_to(self, index: &mut ChunkIndex) {
+    /// Apply this delta to the repository's index.
+    pub fn apply_to(self, index: &mut LiveIndex) {
         // Apply new entries first
         for entry in self.new_entries {
             index.add(
@@ -1168,7 +1105,7 @@ mod tests {
 
     #[test]
     fn apply_to_bulk_refcount() {
-        let mut index = ChunkIndex::new();
+        let mut index = LiveIndex::empty();
         let c1 = make_chunk_id(1);
         let c2 = make_chunk_id(2);
         let pack = make_pack_id(10);

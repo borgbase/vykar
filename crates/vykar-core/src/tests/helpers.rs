@@ -89,7 +89,11 @@ pub(crate) fn downgrade_to_legacy(
         RepoFormat::V5 => RepoFormat::V3,
         other => panic!("not a segmented format: {other:?}"),
     };
-    let blob = legacy_index_blob(repo.chunk_index(), GENERATION, repo.crypto.as_ref());
+    let blob = legacy_index_blob(
+        &repo.chunk_index().to_chunk_index(),
+        GENERATION,
+        repo.crypto.as_ref(),
+    );
     let repo_id = repo.config.id.clone();
     drop(repo);
 

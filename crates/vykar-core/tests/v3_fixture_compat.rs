@@ -249,7 +249,7 @@ fn v3_fixtures_upgrade_to_v5() {
         assert_eq!(repo.config.version, 5, "{mode}");
         assert_eq!(
             before,
-            sorted_entries(repo.chunk_index()),
+            sorted_entries(&repo.chunk_index().to_chunk_index()),
             "{mode}: the upgrade changed the index"
         );
         drop(repo);

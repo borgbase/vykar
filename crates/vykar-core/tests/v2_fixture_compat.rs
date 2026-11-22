@@ -174,7 +174,7 @@ fn v2_fixtures_upgrade_to_v4() {
         assert_eq!(repo.config.version, 4, "{mode}");
         assert_eq!(
             before,
-            sorted_entries(repo.chunk_index()),
+            sorted_entries(&repo.chunk_index().to_chunk_index()),
             "{mode}: the upgrade changed the index"
         );
         drop(repo);

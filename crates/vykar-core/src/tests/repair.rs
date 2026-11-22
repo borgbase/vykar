@@ -448,7 +448,7 @@ fn per_chunk_corruption_preserves_siblings() {
         by_pack
             .entry(entry.pack_id)
             .or_default()
-            .push((*chunk_id, *entry));
+            .push((chunk_id, entry));
     }
 
     let (target_pack_id, chunks_in_pack) = by_pack
@@ -846,7 +846,6 @@ fn repair_reclaims_crash_orphan_index_entries() {
             .chunk_index()
             .iter()
             .next()
-            .map(|(id, e)| (*id, *e))
             .expect("backup should have produced at least one chunk");
         (
             id,

@@ -12,8 +12,8 @@ use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
 use crate::index::ChunkIndex;
-use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::head::{IndexHead, ObjectName};
+use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
@@ -153,8 +153,9 @@ fn find(dir: &Path, name: &str) -> PathBuf {
     walk(dir, name).unwrap_or_else(|| panic!("{name} not found below {}", dir.display()))
 }
 
-fn sorted_entries(index: &ChunkIndex) -> Vec<String> {
+fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
+        .entry_vec()
         .iter()
         .map(|(id, e)| format!("{id:?} {e:?}"))
         .collect();
@@ -212,10 +213,10 @@ fn backups_append_one_segment_each() {
     }
 }
 
-/// A backup commit leaves the full, dedup and restore caches at the new
-/// state, and the derived caches agree with the index a cold client builds.
+/// A backup commit leaves the chunk table at the new state, and it agrees
+/// with the index a cold client builds.
 #[test]
-fn backup_leaves_derived_caches_at_the_new_state() {
+fn backup_leaves_the_table_at_the_new_state() {
     for format in [RepoFormat::V4, RepoFormat::V5] {
         let fx = fixture(format);
         fx.write("a", "alpha");
@@ -224,43 +225,26 @@ fn backup_leaves_derived_caches_at_the_new_state() {
         fx.backup(&fx.config, "s2");
 
         let repo = fx.open(&fx.cache(), false).unwrap();
-        let generation = repo.index_generation();
-        let id = repo.config.id.clone();
-        let cd = fx.cache();
-        let entries = fx.head().entries;
-        let full = MmapFullIndexCache::open(&id, generation, Some(&cd)).unwrap();
-        let dedup = MmapDedupCache::open(&id, generation, Some(&cd)).unwrap();
-        let restore = MmapRestoreCache::open(&id, generation, Some(&cd)).unwrap();
-        assert_eq!(u64::from(full.entry_count()), entries);
-        assert_eq!(u64::from(dedup.entry_count()), entries);
-        assert_eq!(u64::from(restore.entry_count()), entries);
-
-        let cold = fx.tmp.path().join("cold");
-        let cold_repo = fx.open(&cold, true).unwrap();
-        assert_eq!(cold_repo.chunk_index().len() as u64, entries);
-        for (chunk_id, e) in cold_repo.chunk_index().iter() {
-            assert_eq!(dedup.get_stored_size(chunk_id), Some(e.stored_size));
-            assert_eq!(
-                restore.lookup(chunk_id),
-                Some((e.pack_id, e.pack_offset, e.stored_size))
-            );
-        }
+        let head = fx.head();
+        let dir = crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&fx.cache())).unwrap();
+        let table = ChunkTable::open_file(&table::table_path(&dir, &head.state_hash))
+            .expect("the table of the new state");
+        assert_eq!(table.state(), (head.state_hash, head.entries));
+        assert_eq!(sorted_entries(&table), cold_index(&fx, "cold"));
     }
 }
 
-/// `save_state` of a session that asked for tiered dedup, with no changes,
-/// derives the dedup and restore caches from the local full cache and
-/// hydrates the index from it, without reading the index from storage.
+/// `save_state` of a session with no changes writes nothing and reads no
+/// index object: the loaded table stays the index, and its file as it was.
 #[test]
-fn empty_session_rebuilds_derived_caches_from_the_full_cache() {
+fn an_empty_session_leaves_the_table_as_is() {
     for format in [RepoFormat::V4, RepoFormat::V5] {
         let fx = fixture(format);
         fx.write("a", "alpha");
         fx.backup(&fx.config, "s1");
         let cd = fx.cache();
 
-        // Index reads fail once the repository is open, so the fallback
-        // (`reload_full_index`) would error.
+        // Index reads fail once the repository is open.
         let fail = Arc::new(AtomicBool::new(false));
         let armed = Arc::clone(&fail);
         let storage = FailGet::new(
@@ -273,24 +257,23 @@ fn empty_session_rebuilds_derived_caches_from_the_full_cache() {
         let mut repo = fx
             .open_with(Box::new(storage), &cd, OpenOptions::new().with_index())
             .unwrap();
-        let id = repo.config.id.clone();
         let generation = repo.index_generation();
-        for path in [
-            dedup_cache::dedup_cache_path(&id, Some(&cd)).unwrap(),
-            dedup_cache::restore_cache_path(&id, Some(&cd)).unwrap(),
-        ] {
-            std::fs::remove_file(path).unwrap();
-        }
+        let file = repo
+            .chunk_index()
+            .table()
+            .unwrap()
+            .file_path()
+            .unwrap()
+            .to_path_buf();
+        let before = std::fs::read(&file).unwrap();
         fail.store(true, Ordering::SeqCst);
 
         repo.begin_write_session(&WriteSessionOptions::default())
             .unwrap();
-        repo.enable_tiered_dedup_mode();
         repo.save_state().unwrap();
 
         assert_eq!(repo.index_generation(), generation);
-        assert!(MmapDedupCache::open(&id, generation, Some(&cd)).is_some());
-        assert!(MmapRestoreCache::open(&id, generation, Some(&cd)).is_some());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
         assert_eq!(sorted_entries(repo.chunk_index()), cold_index(&fx, "cold"));
     }
 }
@@ -366,7 +349,6 @@ fn compact(fx: &Fixture, segments: usize) {
 /// second they are deleted, and it retries on the re-read head.
 #[test]
 fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
-    use crate::index::dedup_cache::chunk_index_from_full_cache;
     use crate::repo::index_store::{self, CacheLocation};
 
     let fx = fixture(RepoFormat::V5);
@@ -388,8 +370,8 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
             repo.crypto.as_ref(),
             head,
             CacheLocation {
-                path: None,
-                scratch: None,
+                dir: None,
+                live: None,
                 use_local: false,
             },
             2,
@@ -413,10 +395,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
     }
     let synced = sync(h0);
     assert_eq!(synced.head, fx.head(), "retried on the re-read head");
-    assert_eq!(
-        sorted_entries(&chunk_index_from_full_cache(&synced.cache)),
-        cold_index(&fx, "cold")
-    );
+    assert_eq!(sorted_entries(&*synced.table), cold_index(&fx, "cold"));
 }
 
 /// Every writer folds at the hard limit, so a repository that is never
@@ -438,7 +417,7 @@ fn maintenance_writes_fold_at_the_hard_limit() {
     let mut last = None;
     for round in 0..5u32 {
         repo.load_chunk_index_under_lock().unwrap();
-        let id = *repo.chunk_index().iter().next().unwrap().0;
+        let id = repo.chunk_index().iter().next().unwrap().0;
         repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
         repo.save_state().unwrap();
@@ -466,7 +445,7 @@ fn repeated_plaintext_segment_folds() {
     fx.backup(&fx.config, "s1");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     repo.load_chunk_index_under_lock().unwrap();
-    let id = *repo.chunk_index().iter().next().unwrap().0;
+    let id = repo.chunk_index().iter().next().unwrap().0;
     for change in [1i64, -1, 1] {
         if change > 0 {
             repo.chunk_index_mut().increment_refcount(&id);
@@ -493,7 +472,7 @@ fn fence_failure_publishes_nothing() {
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     repo.load_chunk_index_under_lock().unwrap();
     let before = sorted_entries(repo.chunk_index());
-    let id = *repo.chunk_index().iter().next().unwrap().0;
+    let id = repo.chunk_index().iter().next().unwrap().0;
     repo.chunk_index_mut().increment_refcount(&id);
     repo.set_lock_fence(Arc::new(|| Err(VykarError::Other("lock lost".into()))));
     let err = repo.save_state().unwrap_err().to_string();
@@ -551,7 +530,11 @@ fn repair_rebuilds_an_overwritten_head() {
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
-    let index = fx.open(&fx.cache(), true).unwrap().chunk_index().clone();
+    let index = fx
+        .open(&fx.cache(), true)
+        .unwrap()
+        .chunk_index()
+        .to_chunk_index();
     std::fs::write(fx.repo_dir.join("index"), legacy_blob(&index)).unwrap();
 
     let err = fx.open(&fx.cache(), false).err().unwrap().to_string();
@@ -917,7 +900,6 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
             .chunk_index()
             .iter()
             .max_by_key(|(_, e)| e.pack_offset)
-            .map(|(id, e)| (*id, *e))
             .unwrap();
         repo.chunk_index_mut().remove_by_pack(&entry.pack_id);
         ops.lock().unwrap().clear();
@@ -961,7 +943,11 @@ fn damaged(damage: Damage) -> (Fixture, std::collections::BTreeSet<String>, Vec<
     let fx = three_backups();
     match damage {
         Damage::LegacyBlob => {
-            let index = fx.open(&fx.cache(), true).unwrap().chunk_index().clone();
+            let index = fx
+                .open(&fx.cache(), true)
+                .unwrap()
+                .chunk_index()
+                .to_chunk_index();
             std::fs::write(fx.repo_dir.join("index"), legacy_blob(&index)).unwrap();
         }
         Damage::LostSegment => {
@@ -1370,57 +1356,50 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
     fx.check_clean(&fx.config);
 }
 
-/// Two backups over the same cache, the full cache at the first one kept
-/// aside, then a repository at the second head loaded under the lock.
+/// Two backups over the same cache, then a repository at the second head
+/// loaded under the lock. Returns the fixture, the repo cache dir, the
+/// repository and the head after the first backup.
 fn loaded_after_two_backups() -> (Fixture, PathBuf, Repository, IndexHead) {
     let fx = fixture(RepoFormat::V5);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
-    let older = fx.tmp.path().join("older_full_index_cache");
-    std::fs::copy(find(&fx.cache(), "full_index_cache"), &older).unwrap();
+    let first = fx.head();
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     repo.load_chunk_index_under_lock().unwrap();
-    let before = repo.index_head().cloned().unwrap();
-    (fx, older, repo, before)
-}
-
-/// Replace `path` the way another vykar process does: a sibling file
-/// renamed over it, never a write in place.
-fn replace_by_rename(path: &Path, write: impl FnOnce(&Path)) {
-    let sibling = path.with_file_name("replacement");
-    write(&sibling);
-    std::fs::rename(&sibling, path).unwrap();
+    let dir = crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&fx.cache())).unwrap();
+    (fx, dir, repo, first)
 }
 
 fn bump_one_refcount(repo: &mut Repository) {
-    let id = *repo.chunk_index().iter().next().unwrap().0;
+    let id = repo.chunk_index().iter().next().unwrap().0;
     repo.chunk_index_mut().increment_refcount(&id);
 }
 
-/// A lockless reader on an older head persisted that state over the local
-/// cache after this writer loaded the index. The write catches the cache up
-/// through the chain and appends a segment instead of folding.
+/// A lockless reader on an older head published that state's table in the
+/// same cache dir. It coexists with the writer's table and does not displace
+/// it: the write appends a segment to the state it loaded.
 #[test]
-fn a_write_catches_up_a_cache_a_reader_replaced_with_an_earlier_state() {
-    let (fx, older, mut repo, before) = loaded_after_two_backups();
+fn a_readers_earlier_state_does_not_displace_the_writers_table() {
+    let (fx, dir, mut repo, first) = loaded_after_two_backups();
+    let before = repo.index_head().cloned().unwrap();
     let objects = fx.index_objects();
-    let path = find(&fx.cache(), "full_index_cache");
-    replace_by_rename(&path, |p| {
-        std::fs::copy(&older, p).unwrap();
-    });
+    let older = table::table_path(&dir, &first.state_hash);
+    assert!(
+        ChunkTable::open_file(&older).is_some(),
+        "the earlier state's table"
+    );
+    assert!(ChunkTable::open_file(&table::table_path(&dir, &before.state_hash)).is_some());
 
     bump_one_refcount(&mut repo);
     repo.save_state().unwrap();
 
     let head = repo.index_head().cloned().unwrap();
-    let cache = crate::index::dedup_cache::MmapFullIndexCache::open_verified(&path).unwrap();
-    assert_eq!(
-        (cache.state_hash(), u64::from(cache.entry_count())),
-        (head.state_hash, head.entries)
-    );
-    drop(cache);
+    let table = ChunkTable::open_file(&table::table_path(&dir, &head.state_hash)).unwrap();
+    assert_eq!(table.state(), (head.state_hash, head.entries));
+    drop(table);
+    assert!(older.exists(), "a young table of another state is kept");
     assert_eq!(head, fx.head());
     assert_eq!(head.segments.len(), before.segments.len() + 1);
     assert_eq!(head.base, before.base);
@@ -1429,61 +1408,35 @@ fn a_write_catches_up_a_cache_a_reader_replaced_with_an_earlier_state() {
     assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
 }
 
-/// As above, but the segment the catch-up needs is lost from storage. The
-/// write does not fail: it publishes a base whose live set no longer names
-/// the lost object, built from the index loaded at the head.
+/// A write diffs against the table it loaded, mapped in memory: removing
+/// the table files, or putting another state's content under the loaded
+/// state's name, changes nothing about it.
 #[test]
-fn a_write_whose_catch_up_finds_a_lost_segment_writes_a_base() {
-    let (fx, older, mut repo, before) = loaded_after_two_backups();
-    let path = find(&fx.cache(), "full_index_cache");
-    replace_by_rename(&path, |p| {
-        std::fs::copy(&older, p).unwrap();
-    });
-    let lost = before.segments.last().unwrap().name;
-    std::fs::remove_file(fx.repo_dir.join(INDEX_OBJECT_DIR).join(lost.to_hex())).unwrap();
-
-    bump_one_refcount(&mut repo);
-    repo.save_state().unwrap();
-
-    let head = fx.head();
-    assert_eq!(repo.index_head(), Some(&head));
-    assert!(head.base.is_some(), "{head:?}");
-    assert!(head.segments.is_empty(), "{head:?}");
-    assert!(head.live_objects().all(|n| n != lost), "{head:?}");
-    let warm = sorted_entries(repo.chunk_index());
-    drop(repo);
-    assert_eq!(cold_index(&fx, "cold"), warm);
-}
-
-/// With no local cache in the loaded head's chain (none at all, or one at
-/// an unrelated state) a write publishes a base that retires the previous
-/// live set (tests plan item 1.6, first assertion).
-#[test]
-fn a_write_without_a_local_cache_in_the_chain_writes_a_base() {
+fn a_write_does_not_need_the_table_file() {
     for unrelated in [false, true] {
-        let (fx, _, mut repo, before) = loaded_after_two_backups();
-        let live: Vec<_> = before.live_objects().collect();
-        let path = find(&fx.cache(), "full_index_cache");
+        let (fx, dir, mut repo, _) = loaded_after_two_backups();
+        let before = repo.index_head().cloned().unwrap();
+        let path = table::table_path(&dir, &before.state_hash);
+        std::fs::remove_file(&path).unwrap();
         if unrelated {
-            replace_by_rename(&path, |p| {
-                crate::index::dedup_cache::build_full_index_cache_to_path(
-                    &crate::repo::index_store::tests::index_with(500..510, 0),
-                    9,
-                    p,
-                )
-                .unwrap();
-            });
-        } else {
-            std::fs::remove_file(&path).unwrap();
+            crate::index::dedup_cache::build_full_index_cache_to_path(
+                &crate::repo::index_store::tests::index_with(500..510, 0),
+                9,
+                &path,
+            )
+            .unwrap();
         }
 
         bump_one_refcount(&mut repo);
         repo.save_state().unwrap();
 
         let head = fx.head();
-        assert!(head.base.is_some(), "{unrelated}: {head:?}");
-        assert!(head.segments.is_empty(), "{unrelated}");
-        assert_eq!(head.retired, live, "{unrelated}");
+        assert_eq!(head.base, before.base, "{unrelated}");
+        assert_eq!(
+            head.segments.len(),
+            before.segments.len() + 1,
+            "{unrelated}"
+        );
         assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
     }
 }
@@ -1678,7 +1631,7 @@ fn repair_after_a_state_changing_fold_needs_a_current_cache() {
     let mut counts = Vec::new();
     for round in 0..3u32 {
         repo.load_chunk_index_under_lock().unwrap();
-        let id = *repo.chunk_index().iter().next().unwrap().0;
+        let id = repo.chunk_index().iter().next().unwrap().0;
         repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
         repo.save_state().unwrap();
         counts.push(repo.index_head().unwrap().segments.len());

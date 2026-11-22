@@ -126,20 +126,13 @@ Rationale:
 
 Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in format v2, keyed BLAKE3 in v3). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented. Because the algorithm is part of the chunk's identity, **dedup never spans chunk hashes** — which is also why the hash cannot be changed in place (the index layout can, see [Repository Versions](#repository-versions)).
 
-vykar supports three index modes for dedup lookups:
+The repository's chunk index is one memory-mapped **chunk table** per index state plus this process's edits (`LiveIndex`, see [Local Optimization Caches](#local-optimization-caches-client-machine)). There is one lookup path for backup, restore, compact and check; no dedup mode is chosen.
 
-1. **Full index mode** — in-memory `ChunkIndex` (`HashMap<ChunkId, ChunkIndexEntry>`)
-2. **Dedup-only mode** — lightweight `DedupIndex` (`ChunkId -> stored_size`) plus `IndexDelta` for mutations
-3. **Tiered dedup mode** — `TieredDedupIndex`:
-   - session-local HashMap for new chunks in the current backup
-   - Xor filter (`xorf::Xor8`) as probabilistic negative check
-   - mmap-backed on-disk dedup cache for exact lookup
-
-During backup, `enable_tiered_dedup_mode()` is used by default. If the mmap cache is missing/stale/corrupt, vykar safely falls back to dedup-only HashMap mode.
-
-**Two-level dedup check** (in `Repository::bump_ref_if_exists`):
-1. **Persistent dedup tier** — full index, dedup-only index, or tiered dedup index (depending on mode)
-2. **Pending pack writers** — blobs buffered in data/tree `PackWriter`s that have not yet been flushed
+**Dedup check during a write session** (`Repository::bump_ref_if_exists` and the backup consumer):
+1. **Chunks stored earlier in this session** — a small `session_new` map
+2. **The session's table** — an xor filter (`xorf::Xor8`, built once per table) as probabilistic negative check, then a binary search of the mapped table. A hit is recorded as a refcount bump by *table position* (`CachedBumps`), resolved to chunk IDs in table order at commit. Backup workers run this check themselves (`DedupPrefilter`) and send a confirmed hit without its data. Over an index with unsaved edits (repair) the lookup goes through the live index by key instead, with no prefilter.
+3. **Chunks recovered** from an interrupted session's journal
+4. **Pending pack writers** — blobs buffered in data/tree `PackWriter`s that have not yet been flushed
 
 This prevents duplicates both across backups and within a single backup run.
 
@@ -228,7 +221,7 @@ There is deliberately **no user-facing choice** at `init`: no `--hash` flag, no 
 | TOFU identity fingerprint (`derive_key` over `repo_id ‖ chunk_id_key`) | `pin3.<BLAKE3(url)>` | Old `pin.*` files are ignored: the first open per client per repository re-pins without verification |
 | Check-state file name | `check3.<BLAKE3(url)>` | Old state orphaned; the next `check` is a full one |
 | `PathHash` in the file cache (first 16 bytes of BLAKE3) | `filecache` | Old caches rejected; the next backup re-reads every file once |
-| Full-index cache checksum trailer | `full_index_cache` | Rebuilt once |
+| Full-index cache checksum trailer | `full_index_cache` (now `chunk_table.<state>`) | Rebuilt once |
 | Index blob digest (conditional-GET validator of 0.24 and earlier) | `index_blob` | No longer written; `vykar upgrade` deletes it |
 | Segmented index object names and state hashes | `index.d/`, head | none (BLAKE3 from the start) |
 | Hard-link `chunks_fingerprint` | runtime only | none |
@@ -268,14 +261,18 @@ These files live under a per-repo local cache root. By default this is the platf
 <cache>/<repo_id_hex>/
 |- filecache                 # File metadata -> cached ChunkRefs
 |- snapshot_list             # Snapshot ID -> SnapshotEntry cache
-|- dedup_cache               # Sorted ChunkId -> stored_size (mmap + xor filter)
-|- restore_cache             # Sorted ChunkId -> pack_id, pack_offset, stored_size (mmap)
-|- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
+|- chunk_table.<state hex>   # One index state: sorted 80-byte records + BLAKE3 trailer (mmap)
 `- index_blob                # 0.24 and earlier only: the v2/v3 index blob this machine last wrote;
                              #   no longer read or written, deleted by `vykar upgrade`
 ```
 
-The index caches are validated against the current index generation, derived from the head's `state_hash` (its first eight bytes, 0 mapped to 1); `full_index_cache` is matched by its whole 32-byte trailer, which is that state hash.
+A chunk table is the full index cache format (VGFULL v3) of one index state, named after its `state_hash` and verified against it (the 32-byte trailer) on every open; a file whose content is not the state its name says is ignored. Rules, so that any number of processes can share one cache dir:
+
+- A table is written once, through a uniquely named temp file published with a no-clobber link; it is never modified, renamed over or replaced. A name that is already taken is adopted when its content verifies, and replaced only when it does not.
+- A table is deleted (when another one is installed) only if it is not the state just installed, no table of this process maps it, and its mtime is more than an hour old. On Unix a deleted table stays readable through every mapping; a process that later looks for it finds it gone and syncs again, which may download the index.
+- A sync starts from the repository's own table, else from a table file at a state of the head's chain; a write diffs against the table it loaded, so it needs no table file.
+
+The fixed-name caches of earlier binaries (`dedup_cache`, `restore_cache`, `full_index_cache`) are deleted at open. Without a cache dir, or for `check`'s verifying load, the table lives in a temp file kept by the repository handle.
 
 In v2/v3 the authenticated generation is `IndexBlob.generation` inside `index`, and `index.gen` is an advisory hint that only pre-0.25 binaries write and read. This vykar reads neither outside `vykar upgrade`, which GETs and decodes the `IndexBlob` once (`check --repair` also decodes an `IndexBlob` that a pre-0.25 client left at `index` of a v4/v5 repository). The client no longer sends `If-None-Match`; vykar-server still answers it (`304`) for 0.24 clients.
 
@@ -305,19 +302,15 @@ flowchart LR
         direction TB
         filecache["filecache"]
         snapshotlist["snapshot_list"]
-        dedupcache["dedup_cache"]
-        restorecache["restore_cache"]
-        fullindex["full_index_cache"]
+        chunktable["chunk_table.‹state›"]
     end
 
-    index --> dedupcache
-    index --> restorecache
-    index --> fullindex
+    index --> chunktable
     snapshots --> snapshotlist
     filecache -. reuse .-> index
     indexgen -. hint .-> index
     index -. names .-> indexd
-    indexd --> fullindex
+    indexd --> chunktable
 ```
 
 ### Key Data Structures
@@ -329,7 +322,7 @@ flowchart LR
 | generation | u64 | Authenticated cache-validity token rotated when the index changes |
 | chunks | ChunkIndex | Full chunk-to-pack mapping |
 
-**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob` (v2/v3) or as a base plus segments (v4/v5). The central lookup table for deduplication, restore, and compaction.
+**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob` (v2/v3); read by the upgrade and the repair of an overwritten head. In v4/v5 the same entries are a base plus segments on storage and a `LiveIndex` (mapped chunk table plus edits) in memory, the central lookup table for deduplication, restore, and compaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -416,21 +409,21 @@ index                # mutable, small: IndexHead
 index.d/<64 hex>     # write-once: base or segment, name = BLAKE3 of the stored bytes
 ```
 
-- **State identity.** An index state is identified by `state_hash`, BLAKE3 over its canonical sorted 80-byte records — the checksum trailer of `full_index_cache`. A local cache is therefore matched to a state by content, and identical content keeps caches valid across a fold.
+- **State identity.** An index state is identified by `state_hash`, BLAKE3 over its canonical sorted 80-byte records — the checksum trailer of a chunk table, whose file is named after it. A local table is therefore matched to a state by content, and identical content keeps tables valid across a fold.
 - **Head** (`IndexHead`, positional msgpack, frozen; `layout` = 1): `state_hash`, `entries`, `base: Option<{name, size, state_hash, entries}>` (`None` = the empty index, which `init` writes), `segments: [{name, size, state_hash_after, entries_after}]` in order, and `retired`: the objects of the last head before the most recent fold.
 - **Base**: a pack-ID table, then the sorted records referencing packs by table index; zstd; AEAD.
 - **Segment**: the change from its predecessor state, by *position* in the predecessor's sorted order — refcount deltas (position gaps and zigzag deltas as separate columns; a result of 0 removes the entry, a result outside `u32` is a decode error), relocations (position, pack, offset, size) for compact, and new entries as full sorted records. Nearly every backup bumps the refcount of most chunks; by position a bump costs a fraction of a bit, by chunk ID 33 bytes. All counts are bounded against the input length before allocating.
 - **Every read of `index.d/<name>` checks `BLAKE3(bytes) == name` and the recorded size first.** The AEAD contexts are static because the name is the hash of the ciphertext; the binding to the head is this check. On a plaintext repository it is the only corruption check before decompression.
 
-**Write** (any writer, under the repository lock): GET the head; bring the local full cache to it; produce the next state and its segment in one sorted pass; PUT the segment, check the lock fence, PUT the head. The backup commit's reconcile is a merge-walk over the caught-up cache, the session's positional bumps, its keyed bumps and its new entries: a new entry already present becomes a bump, a bump on a chunk in neither is `StaleChunksDuringCommit`. Maintenance writes (prune, delete, compact, repair) diff the in-memory index against the local full cache at the loaded head, caught up through the chain when it holds an earlier state; with no local cache in the head's chain, or when the catch-up fails, they write a base. A write refuses when the head changed after the index was loaded.
+**Write** (any writer, under the repository lock): GET the head; produce the next state and its segment in one sorted pass; PUT the segment, check the lock fence, PUT the head; install the new state as this machine's chunk table. The backup commit brings a local table to the head (normally the repository's own, already there) and merge-walks it with the session's positional bumps, its keyed bumps and its new entries: a new entry already present becomes a bump, a bump on a chunk in neither is `StaleChunksDuringCommit`. Maintenance writes (prune, delete, compact, repair) diff the in-memory index against the table it was loaded over, reading its edits by position; a write without a head (repair) writes a base. A write refuses when the head changed after the index was loaded.
 
-**Read**: open lists snapshots first, then GETs the head once (a writer PUTs the head before its snapshot, so this head covers every listed snapshot). A local full cache at the head's state needs nothing; one at a state in the chain gets the missing segments applied in one streaming pass; otherwise the segments are downloaded (in parallel), then the base, and applied. Readers take no lock. A 404 on a named object makes the reader re-read the head: if the new head still names the object it is lost, and the read fails naming it (`vykar check --repair`); otherwise a fold moved the head and the reader retries on it (bounded retries). Without a cache directory the full cache lives in a temp file kept on the `Repository`, so the base is downloaded once per run.
+**Read**: open lists snapshots first, then GETs the head once (a writer PUTs the head before its snapshot, so this head covers every listed snapshot). The repository's own table or a local table file at the head's state needs nothing; one at a state in the chain gets the missing segments applied in one streaming pass; otherwise the segments are downloaded (in parallel), then the base, and applied. Readers take no lock. A 404 on a named object makes the reader re-read the head: if the new head still names the object it is lost, and the read fails naming it (`vykar check --repair`); otherwise a fold moved the head and the reader retries on it (bounded retries). Without a cache directory the table lives in a temp file kept on the `Repository`, so the base is downloaded once per run.
 
-**Fold** (writing a base instead of a segment), under the lock: delete every `index.d/` object the current head names neither as live nor as retired, and the retired ones; PUT the base (none for the empty index, which is `base: None` as `init` writes it); PUT the head with no segments and the previous live set as `retired`. A fold without a valid previous head (`check --repair`, `upgrade`) deletes the unreferenced objects only after the head PUT, since until then they may be the only copy of the index. A reader on the previous head finishes; one on the head before it gets a 404 and re-reads. Peak storage is two bases. Every writer folds at the hard limit (64 segments, or segments ≥ 20 % of the base and ≥ 4 MiB); compact folds at the soft limit (16, or 5 % and ≥ 1 MiB) and otherwise deletes unreferenced `index.d/` objects (debris of interrupted writes) — in one batch request where the backend has one (vykar-server, and S3 without `s3_soft_delete`), else one by one. No local cache in the head's chain, or a plaintext segment whose name the head already holds, also folds.
+**Fold** (writing a base instead of a segment), under the lock: delete every `index.d/` object the current head names neither as live nor as retired, and the retired ones; PUT the base (none for the empty index, which is `base: None` as `init` writes it); PUT the head with no segments and the previous live set as `retired`. A fold without a valid previous head (`check --repair`, `upgrade`) deletes the unreferenced objects only after the head PUT, since until then they may be the only copy of the index. A reader on the previous head finishes; one on the head before it gets a 404 and re-reads. Peak storage is two bases. Every writer folds at the hard limit (64 segments, or segments ≥ 20 % of the base and ≥ 4 MiB); compact folds at the soft limit (16, or 5 % and ≥ 1 MiB) and otherwise deletes unreferenced `index.d/` objects (debris of interrupted writes) — in one batch request where the backend has one (vykar-server, and S3 without `s3_soft_delete`), else one by one. A plaintext segment whose name the head already holds also folds.
 
 **Order against pack deletes**: no pack is deleted while the head on storage names a state that references it. Client-side compact saves once per batch of source packs (64 packs or 4 GiB), then deletes that batch's sources, empty packs included.
 
-**Damage**: a `ChunkIndex` blob at `index` (an older binary overwrote the head) or a chain with missing or damaged objects is refused by every command except `check --repair`, which rebuilds from the blob, from this machine's cache of the latest state, or from the readable part of the chain, and writes a fresh base. Only an absent object or one that fails verification or decoding is salvaged around; a storage error aborts the repair unless this machine's cache holds the latest state. A chain read only in part loses the entries of the unreadable objects: snapshots that need them are removed by the plan (which says how much of the chain was read), and an interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently. A head that cannot be read is rebuilt from this machine's full index cache when there is one, whatever state it holds (the plan says it may be older than the latest), else from the objects in `index.d/`: each segment records the state it follows, so the chains from every base and from the empty index are followed. A single end state is used; it cannot be confirmed to be the latest: a segment of a failed write that follows the latest state is applied too, and when a fold returned to a state inside the retired chain, the walk follows the retired segments past it. Two segments following one state, a cycle, or several end states are refused, with the objects listed. After a fold that changed the state, the previous generation is a second end state until a fold that leaves the state unchanged (the one at the end of `compact`; a fold on a write path changes the state and leaves a new second end), so only a machine with a current local cache can repair an unreadable head then. A head of an unknown layout, or an `index` of an unknown type, is refused.
+**Damage**: a `ChunkIndex` blob at `index` (an older binary overwrote the head) or a chain with missing or damaged objects is refused by every command except `check --repair`, which rebuilds from the blob, from this machine's table of the latest state, or from the readable part of the chain, and writes a fresh base. Only an absent object or one that fails verification or decoding is salvaged around; a storage error aborts the repair unless this machine's cache holds the latest state. A chain read only in part loses the entries of the unreadable objects: snapshots that need them are removed by the plan (which says how much of the chain was read), and an interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently. A head that cannot be read is rebuilt from this machine's chunk table when there is one (the one written last, by mtime), whatever state it holds (the plan says it may be older than the latest), else from the objects in `index.d/`: each segment records the state it follows, so the chains from every base and from the empty index are followed. A single end state is used; it cannot be confirmed to be the latest: a segment of a failed write that follows the latest state is applied too, and when a fold returned to a state inside the retired chain, the walk follows the retired segments past it. Two segments following one state, a cycle, or several end states are refused, with the objects listed. After a fold that changed the state, the previous generation is a second end state until a fold that leaves the state unchanged (the one at the end of `compact`; a fold on a write path changes the state and leaves a new second end), so only a machine with a current local cache can repair an unreadable head then. A head of an unknown layout, or an `index` of an unknown type, is refused.
 
 ### In-Place Upgrade
 
@@ -439,7 +432,7 @@ index.d/<64 hex>     # write-once: base or segment, name = BLAKE3 of the stored 
 1. Probe the server's `segmented_index` capability, and PUT the stored `config` bytes back unchanged. A server that refuses overwrites (append-only) fails here, with the repository untouched.
 2. GET `index` and decode the legacy index, then write it as a base (none for an empty index). An index that cannot be decoded fails the upgrade before anything is written. Anything an earlier attempt left in `index.d/` is deleted after step 3, or by the next compact if the upgrade is interrupted there.
 3. Overwrite `index` with the head. From here every older binary fails on its next index read (`UnknownObjectType`), rather than reading an empty index — compact deletes packs with no index entries, so an empty index would be dangerous, not just wrong.
-4. Rewrite `config` with the new version; delete `index.gen` and the local `index_blob`. The local full cache is installed at the new state and the dedup and restore caches are rebuilt.
+4. Rewrite `config` with the new version; delete `index.gen` and the local `index_blob`. The chunk table of the new state is installed in the local cache dir.
 
 A v2/v3 `config` with a head at `index` is an upgrade interrupted after step 3: every other command refuses the repository and names `vykar upgrade`, which verifies the head and every object of its chain and completes step 4. `prove_key` accepts either object at `index`, so key-copy disagreement can be resolved in every state. Remaining hole: a pre-0.25 prune or delete that loaded the index before the upgrade and gets the lock after it can overwrite the head with a legacy blob; that is the damage case above, repaired by `check --repair`. Stop all other clients before upgrading. With a damaged chain or head, `vykar upgrade` still completes the version switch, without the deletions of step 4, and returns an error that names `check --repair`, which then repairs the repository as v4/v5. Every released binary already fails on such a repository, so the switch loses nothing. When the head cannot be read and `index.d/` holds no objects, `index` is more likely a damaged monolithic index: the upgrade refuses and changes nothing.
 
@@ -523,7 +516,7 @@ open repo (full index loaded once)
 begin_write_session(session_id) → journal key = sessions/<session_id>.index
   → prune stale local file-cache entries
   → recover own sessions/<session_id>.index if present (batch-verify packs, promote into dedup structures)
-  → enable tiered dedup mode (mmap cache + xor filter, fallback to dedup HashMap)
+  → dedup against the repository's chunk table (xor filter + mmap, positional bumps)
   → derive upload/pipeline limits from `limits.connections` + `limits.threads`
   → execute `command_dumps` first:
     → stream each command's stdout directly into chunk storage
@@ -537,11 +530,11 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
           (segmentation applies when file_size > 64 MiB;
            segment size is min(64 MiB, pipeline_buffer_bytes))
         → worker threads read/chunk/hash and classify each chunk:
-          - xor prefilter says "maybe present" → hash-only chunk
-          - xor prefilter miss (or no filter) → compress + encrypt prepacked chunk
+          - xor filter hit confirmed in the table → data-less hit (table position)
+          - filter miss or false positive (or no filter) → compress + encrypt prepacked chunk
         → sequential consumer validates segment order, performs dedup checks
-          (persistent dedup tier + pending pack writers), commits new chunks,
-          and handles xor false positives via inline transform
+          (session-new chunks, recovered chunks, pending pack writers) and
+          commits new chunks
         → ByteBudget enforces pipeline_buffer_bytes as a hard in-flight memory cap
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
   → serialize items incrementally into item-stream chunks (tree packs)
@@ -571,13 +564,13 @@ commit_concurrent_session_with_progress():
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list
   → if delta is non-empty:
-      → GET head, bring the local full cache to it
-      → merge-walk cache + positional bumps + keyed bumps + new entries:
+      → GET head, bring a local chunk table to it (normally the loaded one)
+      → merge-walk table + positional bumps + keyed bumps + new entries:
         new entries already present → bumps; bump targets in neither → Err(StaleChunksDuringCommit)
       → verify packs alongside
       → PUT index.d/<segment> (or a base at the fold limit), fence check, PUT index (head)
+      → install the new state's chunk table as the repository's index
   → write snapshots/<id> (commit point)
-  → rebuild local dedup/restore/full-index caches as needed
   → update in-memory manifest
   → persist local file cache
 deregister_session() → delete sessions/<session_id>.json (while holding lock)
@@ -607,11 +600,8 @@ Decrypt and deserialize failures are warned and skipped in both modes. Snapshot 
 ```mermaid
 flowchart LR
     open["Open repo<br/>no index"] --> resolve["Resolve snapshot"]
-    resolve --> cache{"Restore cache<br/>valid?"}
-    cache -- yes --> items1["Load items<br/>via cache"]
-    cache -- no --> items2["Load full index<br/>+ items"]
-    items1 --> decode["Stream-decode<br/>into file batches"]
-    items2 --> decode
+    resolve --> table["Map the chunk table<br/>(sync if absent)"]
+    table --> decode["Stream-decode<br/>into file batches"]
     decode --> plan["Plan coalesced<br/>read groups"]
     plan --> read["Parallel reads<br/>decrypt + write"]
     read --> meta["File metadata"]
@@ -622,16 +612,15 @@ flowchart LR
 ```text
 open repository without index (`open_without_index`)
   → resolve snapshot
-  → try mmap restore cache (validated by index_generation)
-  → load item stream:
-    → preferred: lookup tree-pack chunk locations via restore cache
-    → fallback: load full index and read item stream normally
+  → load the index of the open head: the local chunk table at that state
+    maps with no download; otherwise sync it (segments, or the base)
+  → read the item stream lazily through it
   → create a hidden staging directory inside the destination (`.vykar-restore-<hex>`)
   → stream-decode items once:
     → directories and symlinks are created in staging as they are decoded
     → regular files accumulate into bounded batches (100,000 files)
   → for each batch:
-    → build coalesced pack read groups via the full index
+    → build coalesced pack read groups via the chunk index
     → create the batch's files exclusively
     → parallel coalesced range reads by pack/offset
       (merge when gap <= 256 KiB and merged range <= 16 MiB)
@@ -658,7 +647,7 @@ Because the entry, not its offset, decides where a chunk ends, an inserted or re
 Command dumps participate in this same item stream. A source with `command_dumps` produces a synthetic `vykar-dumps/` directory entry plus one regular-file `Item` per dump, so restores treat dump output like ordinary files.
 
 Restore now also consumes item streams incrementally (streaming deserialization) instead of materializing full `Vec<Item>` state up front.
-When the mmap restore cache is valid, item-stream chunk lookups can avoid loading the full chunk index. File-data read-group planning still uses the full index after planning, avoiding unrecoverable stale-location failures.
+Item-stream and file-data chunks are resolved through the chunk table of the open head. A lazily read item stream whose chunk cannot be read at its location (a compaction moved it after the index was loaded) re-resolves the rest once against the index at a freshly read head.
 
 Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
 
@@ -695,7 +684,7 @@ The lock fence detects a lost lock at its next check; it cannot stop a write alr
 
 The advisory lock is used for:
 - **Backup commit phase**: acquired with `acquire_lock_with_deadline`, which retries (500 ms base delay, exponential backoff + 25 % jitter) for up to `COMMIT_LOCK_MAX_WAIT` (10 minutes) and is interruptible by Ctrl-C. Waiters do not queue, so the bound is soft when several commits contend. The lock is held only for the brief commit — typically seconds, since all packs are uploaded before it is taken.
-- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on. Maintenance commands open without the chunk index and load it only after the lock is held and the session check has passed, so they act on the index as storage holds it while no other writer can change it. `prune` loads it only when it removes at least one snapshot (never for `--dry-run`). When the operation persisted the index, the machine's existing local index caches (`full_index_cache`, `dedup_cache`, `restore_cache`) are rebuilt at the new generation before the lock is released, so the next backup can use tiered dedup without downloading index objects. A machine without a `full_index_cache` gets none created.
+- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on. Maintenance commands open without the chunk index and load it only after the lock is held and the session check has passed, so they act on the index as storage holds it while no other writer can change it. `prune` loads it only when it removes at least one snapshot (never for `--dry-run`). An index write leaves this machine's chunk table at the new state, so the next backup needs no index download.
 
 #### Command Summary
 
@@ -775,7 +764,7 @@ Each backup session accumulates index mutations in an `IndexDelta`: `new_entries
   - `new_entries` for chunks already present in the fresh index (another client uploaded the same chunk) are converted to `refcount_bumps`
   - `refcount_bumps` referencing chunks no longer in the index (deleted by a concurrent maintenance operation) cause `StaleChunksDuringCommit` — the backup must be retried
 - Pack verification (`verify_delta_packs`) runs after reconciliation to avoid false negatives when chunks were absorbed as refcount bumps.
-- If the delta is empty, no remote index write is needed. The client only reloads the full index when local dedup caches need rebuilding.
+- If the delta is empty, no remote index write is needed.
 
 #### Index Then Snapshot Commit Point
 

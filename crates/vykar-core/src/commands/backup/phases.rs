@@ -226,9 +226,7 @@ pub(super) fn phase1_upload(
         }
     }
 
-    // Switch to tiered dedup mode to minimize memory during backup.
-    repo.enable_tiered_dedup_mode();
-
+    // Workers confirm dedup hits against the session's table themselves.
     let prefilter = repo.dedup_prefilter();
 
     let time_start = Utc::now();
@@ -453,11 +451,10 @@ pub(super) fn phase2_commit(
 
     // Once the snapshot is committed, deregister the session and delete
     // its journal on a helper thread while the commit finishes its local
-    // post-commit work (file cache save, cache rebuilds), instead of
-    // after it. The lock is still held throughout and released only
-    // after that thread is joined, below: deregistration happens under
-    // the lock as before, and the local caches are still rebuilt under
-    // it. The guard's Drop stops the heartbeat thread and joins it
+    // post-commit work (the file cache save), instead of after it. The
+    // lock is still held throughout and released only after that thread
+    // is joined, below: deregistration happens under the lock as before.
+    // The guard's Drop stops the heartbeat thread and joins it
     // before the marker is deleted, so no concurrent refresh_session
     // call can race with this delete. This sequencing is why the commit
     // path releases the lock itself instead of running under

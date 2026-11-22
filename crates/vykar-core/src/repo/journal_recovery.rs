@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use crate::compress;
 use crate::index::{
-    ChunkIndex, DecodedJournal, PendingIndexJournal, RecoveredChunkEntry, decode_pending_journal,
+    DecodedJournal, LiveIndex, PendingIndexJournal, RecoveredChunkEntry, decode_pending_journal,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -68,13 +68,13 @@ pub(crate) struct RecoveryTarget<'a> {
 /// or **stale** (companion `.json` has `last_refresh` older than 45 min).
 /// Active sessions and sessions with unreadable markers are skipped.
 ///
-/// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
+/// Must be called inside the repo lock, before any chunk is stored.
 /// Returns the total number of recovered chunk entries. `persisted_packs` and
 /// `width` steer the pack lookups (see `pack_lookup`).
 pub(crate) fn recover_pending_index(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_index: &ChunkIndex,
+    chunk_index: &LiveIndex,
     own_session_id: &str,
     persisted_packs: usize,
     width: usize,
@@ -201,7 +201,7 @@ pub(crate) fn recover_pending_index(
 fn recover_single_index(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_index: &ChunkIndex,
+    chunk_index: &LiveIndex,
     key: &str,
     persisted_packs: usize,
     width: usize,
@@ -388,7 +388,7 @@ mod tests {
         let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(storage, &crypto, &ChunkIndex::new(), 1)
+            .recover_pending_index(storage, &crypto, &LiveIndex::empty(), 1)
             .unwrap();
         (ws, recovery)
     }
@@ -420,7 +420,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Write a valid journal for session "old" with no .json marker.
         let index_key = session_index_key("old");
@@ -447,7 +447,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Write a stale .json marker and companion .index.
         write_session_marker(&storage, "stale", &stale_timestamp());
@@ -480,7 +480,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Write an active (fresh) .json marker and companion .index.
         write_session_marker(&storage, "active", &fresh_timestamp());
@@ -506,7 +506,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Write invalid JSON as the session marker.
         storage
@@ -588,7 +588,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Valid orphan journal.
         let valid_key = session_index_key("valid");
@@ -626,7 +626,7 @@ mod tests {
         init_test_environment();
         let storage = MemoryBackend::new();
         let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
+        let chunk_index = LiveIndex::empty();
 
         // Write a stale .json marker.
         write_session_marker(&storage, "old", &stale_timestamp());
@@ -664,7 +664,7 @@ mod tests {
         let (_pack_id, chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
 
         // Pre-populate the chunk index so recovery yields 0 new chunks.
-        let mut chunk_index = ChunkIndex::new();
+        let mut chunk_index = LiveIndex::empty();
         chunk_index.add(chunk_id, 100, PackId::from_bytes([0x11; 32]), 0);
 
         let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
@@ -942,7 +942,7 @@ mod tests {
             ws.session_id = "current".to_string();
             ws.persisted_pack_count = persisted;
             let recovery = ws
-                .recover_pending_index(&storage, &crypto, &ChunkIndex::new(), 1)
+                .recover_pending_index(&storage, &crypto, &LiveIndex::empty(), 1)
                 .unwrap();
             assert_eq!(recovery.recovered_chunks, 3, "{persisted}");
             assert_eq!(storage.counts(), expected, "{persisted}");

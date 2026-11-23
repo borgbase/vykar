@@ -10,7 +10,7 @@ Dumb storage backends (S3, WebDAV, SFTP) work well for basic backups, but they c
 
 | Capability | S3 / dumb storage | vykar-server |
 |------------|-------------------|-------------|
-| Append-only mode | [S3 Object Lock + soft-delete](/backends#s3-append-only--ransomware-protection) preserves previous versions for a configurable retention period; overwrites are not blocked but are recoverable within the retention window | Rejects deletes and overwrites of immutable keys; only `index`, `index.gen`, `locks/*`, and `sessions/*` remain mutable |
+| Append-only mode | [S3 Object Lock + soft-delete](/backends#s3-append-only--ransomware-protection) preserves previous versions for a configurable retention period; overwrites are not blocked but are recoverable within the retention window | Rejects deletes and overwrites of committed keys, index heads, index objects and pack maps included; only `locks/*`, `sessions/*` and the legacy `index` and `index.gen` remain mutable. Index objects are checked against their BLAKE3 name on every upload |
 | Server-side compaction | Client must download and re-upload all live blobs | Server repacks locally on disk from a compact plan |
 | Quota enforcement | Requires external bucket policy/IAM setup | Built-in byte quota checks on writes |
 | Backup freshness monitoring | Requires external polling and parsing | Tracks `last_backup_at` on new snapshot writes |
@@ -33,7 +33,7 @@ All settings are passed as CLI flags. The authentication token is read from the 
 |------|---------|-------------|
 | `-l, --listen` | `localhost:8585` | Address to listen on |
 | `-d, --data-dir` | `/var/lib/vykar` | Root directory where repositories are stored |
-| `--append-only` | `false` | Reject `DELETE` and overwriting immutable keys (config, keys, snapshots, packs). Mutable keys (index, index.gen, locks, sessions) remain writable. |
+| `--append-only` | `false` | Reject `DELETE` and overwriting of committed keys (config, keys, snapshots, packs, index heads, index objects, pack maps). Locks, sessions and the legacy `index` and `index.gen` remain writable. Index objects are checked against their BLAKE3 name in every mode. |
 | `--log-format` | `pretty` | Log output format: `json` or `pretty` |
 | `--quota` | auto-detect | Storage quota (`500M`, `10G`, plain bytes). If omitted, the server detects filesystem quota or falls back to free space |
 | `--network-threads` | `4` | Async threads for handling network connections |
@@ -176,6 +176,12 @@ Retention therefore has to be applied from a trusted machine during a maintenanc
 3. Restart the server with `--append-only` and the original token.
 
 Backups in progress are interrupted by each restart.
+
+Between windows, old index heads and index objects accumulate on the server, since it refuses to delete them. The window's `vykar prune --compact` (or `vykar compact`) removes them.
+
+### Recovering from a damaged or crafted index
+
+A damaged index, or one a compromised client wrote to hide data, is fixed from the trusted machine during a maintenance window. `vykar check --repair` rebuilds the index from the packs, which describe their own contents (pack trailers and pack maps; see [Repair](/maintenance#repair)). An index head crafted to drop entries is also caught by `compact` itself: it marks every live snapshot before deleting anything, and refuses, changing nothing, when a chunk a snapshot needs is missing from the index.
 
 ## Health check
 

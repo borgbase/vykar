@@ -120,6 +120,14 @@ pub async fn head_object(
 /// in every mode). Any other `If-None-Match` value is a 400. 501 when the
 /// data directory's filesystem cannot rename without replacing.
 ///
+/// Two keys have rules of their own in every mode
+/// ([`vykar_protocol::put_rule`]), checked after the body and any digest
+/// header, and published with a no-clobber rename:
+/// - `index.d/<id>`: 409 unless `<id>` is the BLAKE3 of the body. Onto an
+///   existing object nothing is stored (the mtime is not renewed): 204.
+/// - `index.h/<gen>`: write-once. Onto an existing head nothing is stored:
+///   204 when the bytes are the stored ones, else 409.
+///
 /// Streams the request body to a temp file to avoid buffering large uploads
 /// in memory. Atomic rename on completion.
 ///
@@ -151,6 +159,7 @@ pub async fn put_object(
         .file_path(&key)
         .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
     let is_index = crate::index_etag::is_index_key(&key);
+    let rule = vykar_protocol::put_rule(&key);
 
     let existing_meta = match tokio::fs::metadata(&file_path).await {
         Ok(meta) => Some(meta),
@@ -165,8 +174,12 @@ pub async fn put_object(
     }
 
     // Append-only: an existing object may be replaced only where the key-class
-    // table allows it (`vykar_protocol::KeyClass`).
+    // table allows it (`vykar_protocol::KeyClass`). Keys with a put rule are
+    // never replaced in any mode; their outcome on an existing key is decided
+    // after the body (identical bytes are acknowledged), so append-only adds
+    // nothing for them.
     if state.inner.config.append_only
+        && rule == vykar_protocol::PutRule::Plain
         && existing_meta.is_some()
         && !vykar_protocol::append_only_allows(&key, vykar_protocol::Verb::Overwrite)
     {
@@ -175,8 +188,14 @@ pub async fn put_object(
         ));
     }
 
-    // Track old file size for quota accounting.
-    let old_size = existing_meta.as_ref().map_or(0, std::fs::Metadata::len);
+    // Track old file size for quota accounting. Keys with a put rule are never
+    // replaced: the reservation covers the whole body and is committed only
+    // when this request creates the object.
+    let old_size = if rule == vykar_protocol::PutRule::Plain {
+        existing_meta.as_ref().map_or(0, std::fs::Metadata::len)
+    } else {
+        0
+    };
 
     // Parse Content-Length once (reused for the reservation and the
     // post-upload size check).
@@ -200,6 +219,10 @@ pub async fn put_object(
         })?;
 
     let expected_digest = parse_expected_digest(&headers, key.starts_with("packs/"))?;
+    // BLAKE3 of the body for the put rule, unless the header hasher already is one.
+    let header_is_blake3 = matches!(expected_digest, Some((HashAlgorithm::Blake3, _)));
+    let mut rule_hasher = (rule != vykar_protocol::PutRule::Plain && !header_is_blake3)
+        .then(|| Hasher256::new(HashAlgorithm::Blake3));
 
     let parent = file_path
         .parent()
@@ -213,7 +236,7 @@ pub async fn put_object(
 
     // Stream body to temp file. The write block scopes writer/reader so
     // file handles are closed before rename (required on Windows).
-    let (data_len, hasher) = {
+    let (data_len, hasher, rule_hasher) = {
         let stream = body.into_data_stream();
         let stream = TryStreamExt::map_err(stream, std::io::Error::other);
         let mut reader = StreamReader::new(stream);
@@ -259,6 +282,9 @@ pub async fn put_object(
                 if let Some(ref mut h) = hasher {
                     h.update(chunk);
                 }
+                if let Some(ref mut h) = rule_hasher {
+                    h.update(chunk);
+                }
 
                 writer.write_all(chunk).await.map_err(ServerError::from)?;
 
@@ -299,7 +325,7 @@ pub async fn put_object(
 
         write_result?;
 
-        (data_len, hasher)
+        (data_len, hasher, rule_hasher)
     };
 
     // Validate Content-Length if it was present
@@ -312,17 +338,57 @@ pub async fn put_object(
     }
 
     // Verify the content digest if a header was present.
+    let mut header_hex = None;
     if let (Some((algo, expected)), Some(hasher)) = (&expected_digest, hasher) {
         let actual_hex = hasher.finalize_hex();
         if actual_hex != *expected {
             return Err(digest_mismatch(*algo, expected, &actual_hex));
+        }
+        header_hex = Some(actual_hex);
+    }
+
+    // The body's BLAKE3, for keys with a put rule.
+    let body_blake3 = match rule {
+        vykar_protocol::PutRule::Plain => None,
+        _ if header_is_blake3 => header_hex,
+        _ => rule_hasher.map(Hasher256::finalize_hex),
+    };
+    if rule == vykar_protocol::PutRule::NamedByBlake3 {
+        let actual = body_blake3
+            .as_deref()
+            .expect("a BLAKE3 is computed for every key with a put rule");
+        if vykar_protocol::index_object_name(&key) != Some(actual) {
+            return Err(ServerError::Conflict(format!(
+                "index object name mismatch: {key} is not the BLAKE3 of its body ({actual})"
+            )));
         }
     }
 
     // Atomic rename temp → final path (file handle already closed). `persist`
     // consumes the owner, so nothing is unlinked afterwards; on failure the
     // temp is still dropped (and unlinked) with the error.
-    if is_index {
+    if rule != vykar_protocol::PutRule::Plain {
+        match publish_new(temp_path, &file_path, conditional)? {
+            Published::Created => {}
+            Published::Exists if conditional => {
+                return Err(ServerError::PreconditionFailed("object exists".into()));
+            }
+            // Same name, so the same bytes: nothing to store. The reservation
+            // is released by its Drop.
+            Published::Exists if rule == vykar_protocol::PutRule::NamedByBlake3 => {
+                return ack_committed(&file_path).await;
+            }
+            Published::Exists => {
+                let stored = digest_of(&file_path, HashAlgorithm::Blake3).await?;
+                if stored.is_some() && stored == body_blake3 {
+                    return ack_committed(&file_path).await;
+                }
+                return Err(ServerError::Conflict(format!(
+                    "index head {key} exists with other bytes; heads are write-once"
+                )));
+            }
+        }
+    } else if is_index {
         // Only a verified BLAKE3 can answer a conditional GET (it is the
         // digest clients cache the index under); any other PUT clears the
         // record. The lock keeps other `index` writes out
@@ -405,6 +471,50 @@ fn persist_temp(
                  replacing"
                     .into(),
             ))
+        }
+        Err(e) => Err(ServerError::from(e.error)),
+    }
+}
+
+/// What publishing an upload under a never-replaced key did.
+enum Published {
+    /// This request created the object.
+    Created,
+    /// An object was already there; nothing was written.
+    Exists,
+}
+
+/// Publish under a key that is never replaced (`PutRule::NamedByBlake3` or
+/// `PutRule::WriteOnce`) with a no-clobber rename. On a filesystem that cannot
+/// rename without replacing, a conditional PUT gets 501 as before; a plain PUT
+/// falls back to "exists -> Exists, else a replacing rename", which a
+/// concurrent creator of the same key can race: the later rename then replaces
+/// the earlier object, and both requests are accounted as creations, so the
+/// quota counts the key twice until usage is next recomputed. On every path
+/// but `Created` the temp file is dropped (unlinked).
+fn publish_new(
+    temp_path: tempfile::TempPath,
+    file_path: &std::path::Path,
+    conditional: bool,
+) -> Result<Published, ServerError> {
+    match temp_path.persist_noclobber(file_path) {
+        Ok(()) => Ok(Published::Created),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(Published::Exists),
+        Err(e) if vykar_common::fs::is_no_clobber_unsupported(&e.error) => {
+            if conditional {
+                return Err(ServerError::NotImplemented(
+                    "conditional PUT: the data directory's filesystem cannot create without \
+                     replacing"
+                        .into(),
+                ));
+            }
+            if file_path.exists() {
+                return Ok(Published::Exists);
+            }
+            e.path
+                .persist(file_path)
+                .map_err(|e| ServerError::from(e.error))?;
+            Ok(Published::Created)
         }
         Err(e) => Err(ServerError::from(e.error)),
     }
@@ -554,6 +664,57 @@ pub(crate) async fn fsync_dir_async(dir: std::path::PathBuf) -> std::io::Result<
     tokio::task::spawn_blocking(move || vykar_common::fs::fsync_dir(&dir))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
+}
+
+/// Acknowledge an object some request already committed under `file_path`.
+/// Its contents were fdatasync'ed before their rename, but the rename is only
+/// durable once the directory is fsync'ed — which that request may not have
+/// done (it failed) or finished (it is still running). Sync it here, so no
+/// `204` is sent before the object is durable under its final name.
+pub(crate) async fn ack_committed(file_path: &std::path::Path) -> Result<Response, ServerError> {
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
+    fsync_dir_async(parent.to_path_buf())
+        .await
+        .map_err(ServerError::from)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Digest of the committed object at `path`, or `None` if there is none.
+pub(crate) async fn digest_of(
+    path: &std::path::Path,
+    algo: HashAlgorithm,
+) -> Result<Option<String>, ServerError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
+        Ok(file) => hash_reader(&file, algo).map(|(_, digest)| Some(digest)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?
+    .map_err(ServerError::from)
+}
+
+pub(crate) fn hash_reader(
+    mut reader: impl std::io::Read,
+    algo: HashAlgorithm,
+) -> std::io::Result<(u64, String)> {
+    let mut hasher = Hasher256::new(algo);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut len: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(buf.get(..n).expect("n <= buf.len()"));
+        len += n as u64;
+    }
+    Ok((len, hasher.finalize_hex()))
 }
 
 async fn stream_full_read(file_path: &std::path::Path, key: &str) -> Result<Response, ServerError> {
@@ -1403,7 +1564,7 @@ mod tests {
             (pack_key(0x7e), WriteOnce),
             ("index.h/7".into(), WriteOnce),
             (format!("packmaps/{hex}"), WriteOnce),
-            (format!("index.d/{hex}"), ContentAddressed),
+            (format!("index.d/{}", blake3_hex(b"one")), ContentAddressed),
             ("index".into(), LegacyMutable),
             ("index.gen".into(), LegacyMutable),
             ("locks/l.json".into(), Ephemeral),
@@ -1451,10 +1612,20 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::CREATED, "{ctx}");
             }
 
-            // Overwrite.
-            let resp = put_with_blake3(router.clone(), &key, b"two").await;
+            // Overwrite. Keys with a put rule are never replaced, in any mode:
+            // an index object is re-sent with its own bytes (acknowledged
+            // without a write), a head with other bytes (refused).
+            let rule = vykar_protocol::put_rule(&key);
+            let second: &[u8] = if rule == vykar_protocol::PutRule::NamedByBlake3 {
+                b"one"
+            } else {
+                b"two"
+            };
+            let resp = put_with_blake3(router.clone(), &key, second).await;
             let expected = if class == KeyClass::Temp {
                 StatusCode::BAD_REQUEST
+            } else if rule == vykar_protocol::PutRule::WriteOnce {
+                StatusCode::CONFLICT
             } else if allows(Verb::Overwrite) {
                 StatusCode::NO_CONTENT
             } else {
@@ -1463,7 +1634,7 @@ mod tests {
             assert_eq!(resp.status(), expected, "overwrite {ctx}");
             let stored = std::fs::read(&path).unwrap();
             let want: &[u8] = if expected == StatusCode::NO_CONTENT {
-                b"two"
+                second
             } else {
                 b"one"
             };
@@ -1548,12 +1719,12 @@ mod tests {
         }
     }
 
-    /// Index objects are content-named: a repeated PUT and a DELETE are
-    /// allowed in append-only mode, as overwriting `index` always was.
+    /// Index objects are content-named: a repeated PUT of the same bytes is
+    /// acknowledged in append-only mode, a DELETE is refused.
     #[tokio::test]
-    async fn append_only_allows_index_object_overwrite_and_delete() {
+    async fn append_only_index_object_reput_is_acked_and_delete_refused() {
         let (router, _state, tmp) = setup_app_append_only(0);
-        let key = format!("index.d/{}", "5a".repeat(32));
+        let key = format!("index.d/{}", blake3_hex(b"obj"));
         let uri = format!("/{key}");
 
         let resp = authed_put(router.clone(), &uri, b"obj".to_vec()).await;
@@ -1561,8 +1732,8 @@ mod tests {
         let resp = authed_put(router.clone(), &uri, b"obj".to_vec()).await;
         assert_status(&resp, StatusCode::NO_CONTENT);
         let resp = authed_delete(router.clone(), &uri).await;
-        assert_status(&resp, StatusCode::NO_CONTENT);
-        assert!(!tmp.path().join(&key).exists());
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read(tmp.path().join(&key)).unwrap(), b"obj");
 
         for bad in ["/index.d/abc", "/index.d/x/y"] {
             let resp = authed_put(router.clone(), bad, b"obj".to_vec()).await;
@@ -2230,9 +2401,19 @@ mod tests {
     }
 
     /// The race path: the target appears after the existence check, while the
-    /// body is still streaming. The no-clobber rename must refuse it (412),
-    /// leave the other writer's bytes, and release the reservation.
+    /// body is still streaming. The no-clobber rename must decide it
+    /// (`expected`: 412 for a conditional PUT), leave the other writer's
+    /// bytes `winner`, and release the reservation.
     async fn conditional_put_loses_race(key: &str) {
+        put_races_a_creator(key, true, b"winner", StatusCode::PRECONDITION_FAILED).await;
+    }
+
+    async fn put_races_a_creator(
+        key: &str,
+        conditional: bool,
+        winner: &[u8],
+        expected: StatusCode,
+    ) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
@@ -2259,11 +2440,12 @@ mod tests {
                 ))
             }
         });
-        let req = authed_request("PUT", &format!("/{key}"))
-            .header("Content-Length", body.len().to_string())
-            .header("If-None-Match", "*")
-            .body(Body::from_stream(stream))
-            .unwrap();
+        let mut req = authed_request("PUT", &format!("/{key}"))
+            .header("Content-Length", body.len().to_string());
+        if conditional {
+            req = req.header("If-None-Match", "*");
+        }
+        let req = req.body(Body::from_stream(stream)).unwrap();
         let handle = tokio::spawn(router.oneshot(req));
 
         // The temp file exists once the handler is past the existence check
@@ -2276,12 +2458,12 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        std::fs::write(&target, b"winner").unwrap();
+        std::fs::write(&target, winner).unwrap();
         release.store(true, Ordering::SeqCst);
 
         let resp = handle.await.unwrap().unwrap();
-        assert_status(&resp, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(std::fs::read(&target).unwrap(), b"winner");
+        assert_status(&resp, expected);
+        assert_eq!(std::fs::read(&target).unwrap(), winner);
         assert_eq!(state.quota_used(), used, "a lost race commits nothing");
         assert_eq!(state.quota_reserved(), 0, "the reservation is released");
         assert_eq!(temp_file_count(&dir), 0);
@@ -2295,6 +2477,170 @@ mod tests {
     #[tokio::test]
     async fn conditional_put_race_is_decided_by_the_rename_for_index() {
         conditional_put_loses_race("index").await;
+    }
+
+    /// A plain PUT of a head that another writer creates while the body
+    /// streams: other bytes are refused (409), the same bytes acknowledged.
+    #[tokio::test]
+    async fn head_put_race_is_decided_by_the_rename() {
+        put_races_a_creator("index.h/9", false, b"winner", StatusCode::CONFLICT).await;
+        put_races_a_creator("index.h/9", false, b"loser", StatusCode::NO_CONTENT).await;
+    }
+
+    /// Move a file's mtime an hour back, so a rewrite would be visible.
+    fn age_file(path: &std::path::Path) -> std::time::SystemTime {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// The identity of the file at `path`: its mtime and (unix) inode.
+    fn file_identity(path: &std::path::Path) -> (std::time::SystemTime, u64) {
+        let meta = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let ino = 0;
+        (meta.modified().unwrap(), ino)
+    }
+
+    /// Every PUT of `index.d/<id>` is refused unless `<id>` is the BLAKE3 of
+    /// the body, whatever digest header (if any) the PUT carries.
+    #[tokio::test]
+    async fn index_object_put_checks_the_name() {
+        for append_only in [false, true] {
+            for header in [Some("X-Content-BLAKE3"), Some("X-Content-BLAKE2b"), None] {
+                let ctx = format!("append_only={append_only} header={header:?}");
+                let (router, state, tmp) = setup_app_with(1_000_000, append_only);
+                let put = |key: String, body: &'static [u8]| {
+                    let router = router.clone();
+                    async move {
+                        let digest = match header {
+                            Some("X-Content-BLAKE3") => blake3_hex(body),
+                            _ => blake2b_hex(body),
+                        };
+                        let digests: Vec<(&str, &str)> =
+                            header.map(|h| (h, digest.as_str())).into_iter().collect();
+                        authed_put_with_digests(router, &format!("/{key}"), body.to_vec(), &digests)
+                            .await
+                    }
+                };
+
+                let good = format!("index.d/{}", blake3_hex(b"named"));
+                let resp = put(good.clone(), b"named").await;
+                assert_eq!(resp.status(), StatusCode::CREATED, "{ctx}");
+                assert_eq!(std::fs::read(tmp.path().join(&good)).unwrap(), b"named");
+                let used = state.quota_used();
+
+                let bad = format!("index.d/{}", blake3_hex(b"claimed"));
+                let resp = put(bad.clone(), b"other").await;
+                assert_eq!(resp.status(), StatusCode::CONFLICT, "{ctx}");
+                assert!(!tmp.path().join(&bad).exists(), "{ctx}");
+                assert_eq!(state.quota_used(), used, "{ctx}");
+                assert_eq!(state.quota_reserved(), 0, "{ctx}");
+                assert_no_temp_files(&tmp.path().join("index.d"));
+            }
+        }
+    }
+
+    /// A PUT onto an existing index object stores nothing: the same bytes are
+    /// acknowledged (204) without renewing the file, other bytes under its
+    /// name are refused (409) before the existing object is considered.
+    #[tokio::test]
+    async fn index_object_reput_keeps_the_file() {
+        for append_only in [false, true] {
+            let ctx = format!("append_only={append_only}");
+            let (router, state, tmp) = setup_app_with(1_000_000, append_only);
+            let key = format!("index.d/{}", blake3_hex(b"object"));
+            let path = tmp.path().join(&key);
+            let resp = put_with_blake3(router.clone(), &key, b"object").await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{ctx}");
+            age_file(&path);
+            let before = file_identity(&path);
+            let used = state.quota_used();
+
+            let resp = put_with_blake3(router.clone(), &key, b"object").await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{ctx}");
+            assert_eq!(file_identity(&path), before, "{ctx}");
+            assert_eq!(state.quota_used(), used, "{ctx}");
+            assert_eq!(state.quota_reserved(), 0, "{ctx}");
+
+            let resp = put_with_blake3(router.clone(), &key, b"impostor").await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{ctx}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"object", "{ctx}");
+            assert_eq!(file_identity(&path), before, "{ctx}");
+            assert_eq!(state.quota_used(), used, "{ctx}");
+            assert_eq!(state.quota_reserved(), 0, "{ctx}");
+            assert_no_temp_files(&tmp.path().join("index.d"));
+        }
+    }
+
+    /// `index.h/<gen>` is write-once in every mode: the same bytes again are
+    /// acknowledged without a write, other bytes refused, and a create-only
+    /// PUT answers "exists" either way.
+    #[tokio::test]
+    async fn head_is_write_once_in_every_mode() {
+        for append_only in [false, true] {
+            let ctx = format!("append_only={append_only}");
+            let (router, state, tmp) = setup_app_with(1_000_000, append_only);
+            let path = tmp.path().join("index.h/3");
+            let resp = authed_put(router.clone(), "/index.h/3", b"head".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{ctx}");
+            age_file(&path);
+            let before = file_identity(&path);
+            let used = state.quota_used();
+
+            let resp = authed_put(router.clone(), "/index.h/3", b"head".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{ctx}");
+            assert_eq!(file_identity(&path), before, "{ctx}");
+
+            let resp = authed_put(router.clone(), "/index.h/3", b"other".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{ctx}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"head", "{ctx}");
+            assert_eq!(file_identity(&path), before, "{ctx}");
+            assert_eq!(state.quota_used(), used, "{ctx}");
+            assert_eq!(state.quota_reserved(), 0, "{ctx}");
+
+            let resp = put_if_none_match(router, "/index.h/3", "*", b"head".to_vec()).await;
+            assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED, "{ctx}");
+            assert_no_temp_files(&tmp.path().join("index.h"));
+        }
+    }
+
+    /// Append-only refuses deletes of index heads, index objects and pack
+    /// maps, alone and in a batch; temp debris under `index.d/` stays
+    /// deletable.
+    #[tokio::test]
+    async fn append_only_refuses_index_deletes() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let hex = "0123456789abcdef".repeat(4);
+        let keys = [
+            format!("index.d/{hex}"),
+            "index.h/1".to_string(),
+            format!("packmaps/{hex}"),
+        ];
+        for key in &keys {
+            let path = tmp.path().join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        for key in &keys {
+            let resp = authed_delete(router.clone(), &format!("/{key}")).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{key}");
+            let body = serde_json::to_vec(&[key]).unwrap();
+            let resp = authed_post(router.clone(), "/?batch-delete", body).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "batch {key}");
+            assert!(tmp.path().join(key).exists(), "{key}");
+        }
+        std::fs::write(tmp.path().join("index.d/.tmp.x.1"), b"partial").unwrap();
+        let resp = authed_delete(router, "/index.d/.tmp.x.1").await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("index.d/.tmp.x.1").exists());
     }
 
     #[tokio::test]

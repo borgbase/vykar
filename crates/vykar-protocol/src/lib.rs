@@ -223,8 +223,8 @@ pub struct ServerCapabilities {
     #[serde(default)]
     pub pack_parts: bool,
     /// The server serves the segmented index (format v6): it accepts
-    /// `index.d/` keys and, in append-only mode, lets clients overwrite and
-    /// delete them. Absent on older servers.
+    /// `index.d/` keys, named by the BLAKE3 of their bytes (checked on every
+    /// PUT). Absent on older servers.
     #[serde(default)]
     pub segmented_index: bool,
     /// Top-level key directories the server accepts (its `KNOWN_ROOT_DIRS`).
@@ -260,6 +260,14 @@ pub struct ServerCapabilities {
     /// trailer only when it is advertised.
     #[serde(default)]
     pub repack_trailer: bool,
+    /// The server runs in append-only mode: it refuses overwrites and deletes
+    /// per the key-class table ([`KeyClass::append_only_allows`]), which
+    /// includes deletes of `index.d/`, `index.h/` and `packmaps/` keys. A
+    /// client skips work the server would refuse. Absent on servers that
+    /// predate the field, which reads as `false`: such a server may still be
+    /// append-only, so `false` means "not known to be".
+    #[serde(default)]
+    pub append_only: bool,
 }
 
 impl ServerCapabilities {
@@ -776,10 +784,12 @@ pub fn is_valid_storage_key(key: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyClass {
     /// `config`, `keys/*`, `snapshots/*`, `packs/<shard>/<id>`, `index.h/<gen>`,
-    /// `packmaps/<hex>`, and the legacy `pending_index/*`.
+    /// `packmaps/<hex>`, and the legacy `pending_index/*`. `index.h/<gen>` is
+    /// write-once in every mode, not only append-only (see [`put_rule`]).
     WriteOnce,
-    /// `index.d/<64 hex>`: named by the BLAKE3 of its bytes, so a repeated PUT
-    /// stores the same bytes.
+    /// `index.d/<64 hex>`: named by the BLAKE3 of its bytes, which the server
+    /// checks on every PUT. A PUT onto an existing object stores nothing. Not
+    /// deletable in append-only mode.
     ContentAddressed,
     /// `index`, `index.gen`, `manifest`: overwritten in place by v2/v3 clients.
     LegacyMutable,
@@ -818,8 +828,10 @@ impl KeyClass {
             (Self::Temp, Verb::Delete) => true,
             (_, Verb::Create) => true,
             (Self::WriteOnce, Verb::Overwrite | Verb::Delete) => false,
-            // 03 step 1a refuses Delete here.
-            (Self::ContentAddressed, Verb::Overwrite | Verb::Delete) => true,
+            // Named by its BLAKE3, which the server checks on every PUT, so an
+            // accepted PUT onto an existing object stores nothing new.
+            (Self::ContentAddressed, Verb::Overwrite) => true,
+            (Self::ContentAddressed, Verb::Delete) => false,
             (Self::LegacyMutable, Verb::Overwrite) => true,
             (Self::LegacyMutable, Verb::Delete) => false,
             (Self::Ephemeral, Verb::Overwrite | Verb::Delete) => true,
@@ -845,6 +857,45 @@ pub fn key_class(key: &str) -> Option<KeyClass> {
 /// class (a directory, an unknown key) allows nothing.
 pub fn append_only_allows(key: &str, verb: Verb) -> bool {
     key_class(key).is_some_and(|class| class.append_only_allows(verb))
+}
+
+/// What a server checks on a PUT of a key in every mode, beyond the
+/// append-only table (03 step 1a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutRule {
+    /// No rule of its own: a PUT creates or replaces (subject to append-only).
+    Plain,
+    /// `index.d/<64 hex>`: the body's BLAKE3 must be the key's name, else 409.
+    /// A PUT onto an existing object stores nothing and answers 204, without
+    /// renewing its mtime.
+    NamedByBlake3,
+    /// `index.h/<gen>`: write-once in every mode. A PUT onto an existing head
+    /// stores nothing: 204 when the bytes are the stored ones, else 409.
+    WriteOnce,
+}
+
+/// The [`PutRule`] of `key`. Leading and trailing slashes are ignored, as in
+/// [`key_class`]. Keys outside the schema are [`PutRule::Plain`] (the server
+/// refuses them before this matters).
+pub fn put_rule(key: &str) -> PutRule {
+    match key_class(key) {
+        Some(KeyClass::ContentAddressed) => PutRule::NamedByBlake3,
+        Some(KeyClass::WriteOnce) if head_generation(key.trim_matches('/')).is_some() => {
+            PutRule::WriteOnce
+        }
+        _ => PutRule::Plain,
+    }
+}
+
+/// The name an `index.d/` key claims: its last path segment (64 lowercase
+/// hex, as [`is_index_object_key`] requires). `None` for any other key.
+/// Leading and trailing slashes are ignored.
+pub fn index_object_name(key: &str) -> Option<&str> {
+    let trimmed = key.trim_matches('/');
+    if !is_index_object_key(trimmed) {
+        return None;
+    }
+    trimmed.strip_prefix(INDEX_OBJECT_DIR)?.strip_prefix('/')
 }
 
 /// What a committed key names.
@@ -1617,14 +1668,16 @@ mod tests {
                 );
             }
             if is_valid_storage_key(k) || is_temp_file(k) {
+                // 03 step 1a: index objects are no longer deletable in
+                // append-only mode, which the old allowlists allowed.
                 assert_eq!(
                     append_only_allows(k, Verb::Delete),
-                    legacy_delete_allowed(k),
+                    legacy_delete_allowed(k) && !is_index_object_key(k),
                     "{k:?}"
                 );
                 // Batch delete now follows single DELETE for locks and sessions.
-                let expected =
-                    legacy_batch_delete_allowed(k) || key_class(k) == Some(KeyClass::Ephemeral);
+                let expected = (legacy_batch_delete_allowed(k) && !is_index_object_key(k))
+                    || key_class(k) == Some(KeyClass::Ephemeral);
                 assert_eq!(append_only_allows(k, Verb::Delete), expected, "{k:?}");
             }
         }
@@ -1662,7 +1715,7 @@ mod tests {
         // (class, create, overwrite, delete) on an append-only server.
         let table = [
             (WriteOnce, true, false, false),
-            (ContentAddressed, true, true, true),
+            (ContentAddressed, true, true, false),
             (LegacyMutable, true, true, false),
             (Ephemeral, true, true, true),
             (Temp, false, false, true),
@@ -1679,6 +1732,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn put_rules() {
+        for (key, variants) in key_corpus() {
+            for k in std::iter::once(key).chain(variants) {
+                let trimmed = k.trim_matches('/');
+                let rule = put_rule(k);
+                assert_eq!(
+                    rule == PutRule::NamedByBlake3,
+                    key_class(k) == Some(KeyClass::ContentAddressed),
+                    "{k:?}"
+                );
+                assert_eq!(
+                    rule == PutRule::WriteOnce,
+                    key_class(k) == Some(KeyClass::WriteOnce) && head_generation(trimmed).is_some(),
+                    "{k:?}"
+                );
+                assert_eq!(rule, put_rule(trimmed), "{k:?}");
+                match index_object_name(k) {
+                    Some(name) => {
+                        assert!(is_index_object_key(trimmed), "{k:?}");
+                        assert_eq!(format!("{INDEX_OBJECT_DIR}/{name}"), trimmed, "{k:?}");
+                    }
+                    None => assert!(!is_index_object_key(trimmed), "{k:?}"),
+                }
+            }
+        }
+        let hex = "a".repeat(64);
+        assert_eq!(put_rule(&format!("index.d/{hex}")), PutRule::NamedByBlake3);
+        assert_eq!(
+            index_object_name(&format!("/index.d/{hex}/")),
+            Some(hex.as_str())
+        );
+        assert_eq!(put_rule("index.h/7"), PutRule::WriteOnce);
+        assert_eq!(put_rule("index.h/07"), PutRule::Plain);
+        assert_eq!(put_rule(&format!("packmaps/{hex}")), PutRule::Plain);
+        assert_eq!(put_rule("config"), PutRule::Plain);
+        assert_eq!(index_object_name("index.h/7"), None);
+    }
+
     // ── Server capabilities / part uploads ────────────────────────────
 
     #[test]
@@ -1692,6 +1784,11 @@ mod tests {
         )
         .unwrap();
         assert!(caps.pack_parts);
+        assert!(!caps.append_only);
+        let caps: ServerCapabilities =
+            serde_json::from_str(r#"{"status":"ok","version":"0.25.0","append_only":true}"#)
+                .unwrap();
+        assert!(caps.append_only);
     }
 
     #[test]

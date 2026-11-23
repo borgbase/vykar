@@ -280,6 +280,52 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     check_clean(&c.config);
 }
 
+/// The index GC after a fold deletes unnamed index objects on a normal
+/// server; an append-only server refuses those deletes (03 step 1a) and the
+/// write still succeeds. Heads are left out: the GC keeps the 17 newest, and
+/// their deletes were refused in append-only mode before.
+#[test]
+fn append_only_server_refuses_index_garbage_collection() {
+    for append_only in [false, true] {
+        let server = Server::start(append_only);
+        let c = Client::init(&server);
+        c.write("a", "alpha");
+        c.write("b", "bravo");
+        c.backup("s1");
+        c.write("c", "charlie");
+        c.backup("s2");
+
+        let debris = server
+            .data
+            .path()
+            .join(INDEX_OBJECT_DIR)
+            .join("ab".repeat(32));
+        std::fs::write(&debris, b"debris").unwrap();
+
+        let mut repo = open(&c.config);
+        let mut policy = FoldPolicy::default();
+        policy.hard.segments = 2;
+        policy.hard.percent = 100_000;
+        repo.set_fold_policy(policy);
+        repo.set_index_gc_grace(std::time::Duration::ZERO);
+        let mut toggled = None;
+        repo.load_chunk_index_under_lock().unwrap();
+        crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
+        repo.save_state().unwrap();
+        assert!(
+            repo.index_head().unwrap().segments.is_empty(),
+            "append_only={append_only}: the write folds"
+        );
+        assert_eq!(debris.exists(), append_only, "append_only={append_only}");
+
+        repo.load_chunk_index_under_lock().unwrap();
+        crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
+        repo.save_state().unwrap();
+        drop(repo);
+        check_clean(&c.config);
+    }
+}
+
 /// The file called `name` somewhere below `dir`.
 fn find(dir: &Path, name: &str) -> PathBuf {
     fn walk(dir: &Path, name: &str) -> Option<PathBuf> {

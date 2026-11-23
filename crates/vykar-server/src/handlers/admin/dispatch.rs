@@ -113,7 +113,8 @@ pub async fn repo_action_dispatch(
 /// operation fields (`object_sizes`, `list_tree`, `verify_packs`, `repack`)
 /// let a client gate on them; `repack_trailer` says a repack operation may
 /// carry a trailer (protocol version 3), which older servers would not append.
-pub async fn health() -> impl IntoResponse {
+/// `append_only` reports the `--append-only` flag; older servers omit it.
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -131,5 +132,6 @@ pub async fn health() -> impl IntoResponse {
         "verify_packs": true,
         "repack": true,
         "repack_trailer": true,
+        "append_only": state.inner.config.append_only,
     }))
 }

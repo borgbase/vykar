@@ -26,7 +26,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 |--------|------|---------|-------|
 | `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. `GET /index` honours `If-None-Match: "<BLAKE3 hex>"`: it answers `304` with `ETag` when the value names the digest verified on the last `PUT /index` (`X-Content-BLAKE3`; a BLAKE2b-verified PUT leaves no record) and the file that PUT produced is still in place. The record is held in server memory, so the first conditional GET after a restart is a `200`. Other keys ignore the header, and so does a `Range` read. An `index` corrupted in place (same inode, size and mtime) still gets a `304`, so the client proceeds on its own good copy where a plain GET would fail to decode; `check` always reads `index` unconditionally. |
 | `HEAD` | `/{*path}` | `exists(key)` | Returns `200` with metadata or `404`. |
-| `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (format-v3 packs, and non-pack objects to a server advertising `blake3`) or `X-Content-BLAKE2b` (format-v2 packs, and non-pack objects to a pre-0.20 server); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. `If-None-Match: *` makes it a create-only PUT (put-if-absent): `201` when it created the key, `412` when the key exists, decided atomically by a no-clobber rename, so of concurrent creators exactly one gets `201`. The existence check comes before the append-only check, so an existing immutable key answers `412`, not `403`; it also comes before the body is read, so for a body near the size cap the client may see the connection reset instead of the `412` and fail after its retries. Any other `If-None-Match` value is a `400`, and part uploads and completions refuse the header with `400`. `501` when the data directory's filesystem cannot rename without replacing. A plain PUT still replaces an object created this way. |
+| `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (format-v3 packs, and non-pack objects to a server advertising `blake3`) or `X-Content-BLAKE2b` (format-v2 packs, and non-pack objects to a pre-0.20 server); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. `If-None-Match: *` makes it a create-only PUT (put-if-absent): `201` when it created the key, `412` when the key exists, decided atomically by a no-clobber rename, so of concurrent creators exactly one gets `201`. The existence check comes before the append-only check, so an existing immutable key answers `412`, not `403`; it also comes before the body is read, so for a body near the size cap the client may see the connection reset instead of the `412` and fail after its retries. Any other `If-None-Match` value is a `400`, and part uploads and completions refuse the header with `400`. `501` when the data directory's filesystem cannot rename without replacing. A plain PUT still replaces an object created this way, except under `index.d/` and `index.h/`. In every mode, a PUT of `index.d/<id>` is refused with `409` unless `<id>` is the BLAKE3 of the body (whatever digest header it carries), and a PUT onto an existing `index.d/` object stores nothing and answers `204` (its mtime is not renewed). `index.h/<gen>` is write-once in every mode: a plain PUT onto an existing head answers `204` without a write when the bytes are identical, `409` otherwise. Both are published with a no-clobber rename; on a filesystem without one, a plain PUT of these keys falls back to an existence check and a replacing rename. |
 | `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode unless the key class allows it (see [Append-Only Enforcement](#append-only-enforcement)). |
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. `&sized` returns `{"key","size"}` objects instead (`list_sized`), and `&sized&mtime` adds `mtime_ms`, the last modification in ms since the Unix epoch by the server's clock (`list_meta`). Servers that predate a flag ignore it, which a client reads as "not reported". |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
@@ -61,16 +61,20 @@ When `append_only = true`, `PUT` of an existing key, `DELETE` and `/?batch-delet
 | Class | Keys | Overwrite | Delete |
 |-------|------|-----------|--------|
 | Write-once | `config`, `keys/*`, `snapshots/*`, `packs/<xx>/<id>`, `index.h/<gen>`, `packmaps/<id>`, legacy `pending_index/*` | no | no |
-| Content-addressed | `index.d/<id>` | yes | yes |
+| Content-addressed | `index.d/<id>` | same bytes only (no write) | no |
 | Legacy mutable | `index`, `index.gen`, `manifest` | yes | no |
 | Ephemeral | `locks/*`, `sessions/*` | yes | yes |
 | Temp | leftover temporary upload files (`.tmp.*`, `.repack_tmp.*`) | — | yes |
 
 Keys are classified after trimming leading and trailing slashes, as path resolution does. Directories and keys outside the schema have no class and are refused.
 
+Independently of append-only, `index.h/<gen>` is write-once and `index.d/<id>` is checked against its BLAKE3 name in every mode (see the `PUT` row above). A PUT onto an existing head with other bytes is therefore a `409`, not a `403`, in append-only mode too.
+
 - `/?batch-delete` is refused as a whole, with nothing deleted, if any key's class refuses deletion
 - A part upload of an existing pack is refused with `403` at its first part; a completion that finds the pack already present succeeds only if the stored object carries the expected digest (nothing is overwritten), and fsyncs the directory before answering
 - `/?repack` operations that delete old packs are rejected
+
+Old index heads, index objects and pack maps therefore accumulate on an append-only server until a maintenance window removes them.
 
 This protects existing history from a compromised client while still allowing normal backup commits. In particular, snapshot blobs under `snapshots/` are immutable — a compromised client cannot hide historical backups by overwriting or deleting them.
 
@@ -155,8 +159,10 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 `GET /health` is unauthenticated and advertises what the server supports:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":3,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true,"repack_trailer":true}
+{"status":"ok","version":"0.20.0","protocol_version":3,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true,"repack_trailer":true,"append_only":false}
 ```
+
+`append_only` reports whether the server runs with `--append-only`, so a client can skip deletes the server would refuse. Older servers omit it, which a client reads as `false`: "not known to be append-only".
 
 `conditional_put` says the server honours `If-None-Match: *` on `PUT` (see the `PUT` row above). Older servers omit it and would ignore the header and overwrite, so a client sends a conditional PUT only to a server that advertises it.
 

@@ -44,7 +44,7 @@ pub struct Cli {
     #[arg(short, long, default_value = "/var/lib/vykar")]
     data_dir: String,
 
-    /// Append-only mode: only index/index.gen/locks/sessions are mutable; all other objects are immutable once written
+    /// Append-only mode: committed objects are neither overwritten nor deleted; locks, sessions and the legacy index/index.gen stay mutable, index.d objects may be re-PUT with their own bytes, and only temp files, locks and sessions can be deleted
     #[arg(long, default_value_t = false)]
     append_only: bool,
 

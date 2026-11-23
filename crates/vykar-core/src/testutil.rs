@@ -489,6 +489,7 @@ pub(crate) fn fake_server_caps() -> vykar_protocol::ServerCapabilities {
         verify_packs: true,
         repack: true,
         repack_trailer: false,
+        append_only: false,
     }
 }
 

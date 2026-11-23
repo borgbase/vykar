@@ -24,7 +24,7 @@ pub(super) async fn batch_delete(
     }
 
     // Append-only permits what single DELETE permits (the key-class table):
-    // temp files, index objects, locks and sessions. Fail fast — name the
+    // temp files, locks and sessions. Fail fast — name the
     // first refused key and delete nothing.
     if state.inner.config.append_only
         && let Some(key) = keys
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_only_batch_delete_index_objects() {
+    async fn append_only_batch_delete_refuses_index_objects() {
         let (router, _state, tmp) = setup_app_append_only(0);
         let obj = format!("index.d/{}", "c3".repeat(32));
         std::fs::create_dir_all(tmp.path().join("index.d")).unwrap();
@@ -200,10 +200,11 @@ mod tests {
         assert_status(&resp, StatusCode::FORBIDDEN);
         assert!(tmp.path().join(&obj).exists());
 
+        // Alone: refused as well (03 step 1a), the object survives.
         let keys = serde_json::to_vec(&serde_json::json!([obj])).unwrap();
         let resp = authed_post(router, "/?batch-delete", keys).await;
-        assert_status(&resp, StatusCode::NO_CONTENT);
-        assert!(!tmp.path().join(&obj).exists());
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert!(tmp.path().join(&obj).exists());
         assert!(tmp.path().join("snapshots").join("abc").exists());
     }
 

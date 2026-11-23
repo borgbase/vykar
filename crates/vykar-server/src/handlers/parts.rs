@@ -20,7 +20,6 @@
 //! Only `packs/<xx>/<id>` keys accept parts. The temp file, quota
 //! reservation and abandoned-upload expiry live in [`crate::uploads`].
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use axum::http::{HeaderMap, StatusCode};
@@ -30,11 +29,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio_util::io::StreamReader;
 
 use super::objects::ObjectQuery;
-use super::objects::{digest_mismatch, ensure_parent_dir, fsync_dir_async, parse_expected_digest};
+use super::objects::{
+    ack_committed, digest_mismatch, digest_of, ensure_parent_dir, fsync_dir_async, hash_reader,
+    parse_expected_digest,
+};
 use crate::error::ServerError;
 use crate::state::AppState;
 use crate::uploads::{Completion, PartUpload, Take};
-use vykar_types::hash::{HashAlgorithm, Hasher256};
+use vykar_types::hash::HashAlgorithm;
 
 /// Resolve the final path of a pack key and the temp path of upload `token`.
 fn resolve(state: &AppState, key: &str, token: &str) -> Result<(PathBuf, PathBuf), ServerError> {
@@ -306,57 +308,12 @@ async fn finish(
     Ok(status.into_response())
 }
 
-/// Acknowledge an object some request already committed under `file_path`.
-/// Its contents were fdatasync'ed before their rename, but the rename is only
-/// durable once the directory is fsync'ed — which that request may not have
-/// done (it failed) or finished (it is still running). Sync it here, so no
-/// `204` is sent before the object is durable under its final name.
-async fn ack_committed(file_path: &Path) -> Result<Response, ServerError> {
-    let parent = file_path
-        .parent()
-        .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
-    fsync_dir_async(parent.to_path_buf())
-        .await
-        .map_err(ServerError::from)?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
 async fn path_exists(path: &Path) -> Result<bool, ServerError> {
     match tokio::fs::metadata(path).await {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(ServerError::from(e)),
     }
-}
-
-/// Digest of the committed object at `path`, or `None` if there is none.
-async fn digest_of(path: &Path, algo: HashAlgorithm) -> Result<Option<String>, ServerError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || match std::fs::File::open(&path) {
-        Ok(file) => hash_reader(&file, algo).map(|(_, digest)| Some(digest)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    })
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))?
-    .map_err(ServerError::from)
-}
-
-fn hash_reader(mut reader: impl Read, algo: HashAlgorithm) -> std::io::Result<(u64, String)> {
-    let mut hasher = Hasher256::new(algo);
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut len: u64 = 0;
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        hasher.update(buf.get(..n).expect("n <= buf.len()"));
-        len += n as u64;
-    }
-    Ok((len, hasher.finalize_hex()))
 }
 
 #[cfg(test)]
@@ -458,6 +415,14 @@ mod tests {
         assert!(caps.object_sizes && caps.list_tree && caps.verify_packs && caps.repack);
         assert!(caps.repack_trailer);
         assert_eq!(caps.protocol_version, vykar_protocol::PROTOCOL_VERSION);
+        assert!(!caps.append_only);
+
+        let (router, _state, _tmp) = setup_app_append_only(0);
+        let resp = send(router, "GET", "/health", &[], Vec::new()).await;
+        assert_status(&resp, StatusCode::OK);
+        let caps: vykar_protocol::ServerCapabilities =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(caps.append_only);
     }
 
     #[tokio::test]

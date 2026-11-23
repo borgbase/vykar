@@ -1,0 +1,193 @@
+{
+  "name": "aged-lock-packs-collected",
+  "note": "Second campaign of phase F part 2 (random-1867481925586694457): a time jump past the 6 h lock staleness, compact reaps the backup's lock and its stale session marker and deletes its packs as orphans (and its segment), the backup's head then publishes entries naming them and its next backup's fold carries them on: the index names absent packs. Fixed by 04 steps 5 and 8.",
+  "expect": [
+    "AgedLockReaped",
+    "AgedLockPacksCollected"
+  ],
+  "at": [
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ]
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        },
+        {
+          "Backup": {
+            "shared": false,
+            "fold": true
+          }
+        }
+      ],
+      [
+        "Compact"
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ]
+    ],
+    "faults": [],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      3,
+      0,
+      0,
+      0,
+      3,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      3
+    ],
+    "policy": "First"
+  }
+}

@@ -30,6 +30,7 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         crash: false,
         advances: true,
         choices: vec![],
+        policy: Policy::First,
     }
 }
 

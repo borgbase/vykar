@@ -1,0 +1,173 @@
+//! Regression seeds of the simulation (08 step 5): driver cases under
+//! `crates/vykar-core/tests/sim-regressions/*.json`, each with the exact
+//! damage signatures it must show and the decisions its choices took when it
+//! was saved. A protocol fix that removes a hazard makes its seeds fail
+//! until their `expect` is updated; a machine that gained or lost a step
+//! makes them fail as drifted. `VYKAR_SIM_PROMOTE=<trace file>` prints a
+//! seed for a trace (name from `VYKAR_SIM_PROMOTE_NAME`, else the file
+//! stem).
+
+// Printing a seed is the point of the promotion helper; every other path
+// asserts.
+#![allow(clippy::print_stderr)]
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::sim::driver::*;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Seed {
+    /// The file stem.
+    name: String,
+    /// Where it came from, and which plan fixes the hazard it shows.
+    note: String,
+    /// The exact signature set the case must give. Never contains Unknown.
+    expect: BTreeSet<Signature>,
+    /// What the decisions 0..case.choices.len() did when the seed was saved:
+    /// the action and the label of what ran. A seed whose schedule no longer
+    /// means the same (a machine gained or lost a step) fails as drifted
+    /// instead of silently testing something else.
+    at: Vec<(Action, String)>,
+    case: Case,
+}
+
+fn seed_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sim-regressions")
+}
+
+/// The decisions of `o` that `choices` covered.
+fn taken(o: &Outcome, choices: usize) -> Vec<(Action, String)> {
+    o.trace
+        .entries
+        .iter()
+        .take(choices)
+        .map(|e| (e.action.clone(), e.label.clone()))
+        .collect()
+}
+
+/// The plan that removes a signature's hazard, as its doc comment names it.
+fn fixed_by(s: Signature) -> &'static str {
+    match s {
+        Signature::TwoLockHolders | Signature::SessionReaped => "04 step 1",
+        Signature::AgedSessionReaped | Signature::AgedLockReaped => "04 step 5",
+        Signature::OrphanLockKey
+        | Signature::LateHeadWrite
+        | Signature::LateSnapshotWrite
+        | Signature::LateIndexWrite
+        | Signature::LateHeadSegmentCollected => "04 step 8",
+        Signature::LateHeadThenCompact
+        | Signature::AgedLockSegmentCollected
+        | Signature::AgedLockPacksCollected => "04 steps 5 and 8",
+        Signature::Unknown => "nothing: Unknown is never expected",
+    }
+}
+
+#[test]
+fn regression_seeds_hold() {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(seed_dir())
+        .expect("read the seed directory")
+        .map(|e| e.expect("seed directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no seeds in {}", seed_dir().display());
+    let template = Template::new();
+    let mut failures = Vec::new();
+    for path in &paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(path).unwrap();
+        let seed: Seed = match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                failures.push(format!("seed {stem}: does not parse: {e}"));
+                continue;
+            }
+        };
+        if seed.name != stem {
+            failures.push(format!("seed {stem}: its name is {:?}", seed.name));
+        }
+        if seed.expect.contains(&Signature::Unknown) {
+            failures.push(format!("seed {stem}: expects Unknown"));
+            continue;
+        }
+        let o = run_case(&template, &seed.case);
+        if seed.case.choices.len() > o.trace.entries.len() {
+            failures.push(format!(
+                "seed {stem}: {} choices but only {} decisions ran; trim the choices",
+                seed.case.choices.len(),
+                o.trace.entries.len()
+            ));
+            continue;
+        }
+        let at = taken(&o, seed.case.choices.len());
+        if at != seed.at {
+            failures.push(format!(
+                "seed {stem} drifted: its choices now select {at:?} instead of {:?}; \
+                 re-derive it from its note\n{}",
+                seed.at,
+                o.trace.render()
+            ));
+            continue;
+        }
+        if o.signatures != seed.expect {
+            let gone: Vec<String> = seed
+                .expect
+                .difference(&o.signatures)
+                .map(|s| format!("{s:?} (fixed by {})", fixed_by(*s)))
+                .collect();
+            failures.push(format!(
+                "seed {stem}: signatures {:?}, expected {:?}; a protocol fix removed {}? \
+                 update expect and the note\n{}",
+                o.signatures,
+                seed.expect,
+                gone.join(", "),
+                o.trace.render()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds fail:\n{}",
+        failures.len(),
+        paths.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// `VYKAR_SIM_PROMOTE=<trace file>`: run the trace's case and print it as a
+/// seed (note "TODO", expect = the signatures found, choices that no
+/// decision read trimmed). A no-op otherwise.
+#[test]
+fn promote_from_env() {
+    let Some(path) = std::env::var_os("VYKAR_SIM_PROMOTE").map(PathBuf::from) else {
+        return;
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut case = case_from_trace(&text).unwrap();
+    let o = run_case(&Template::new(), &case);
+    case.choices.truncate(o.trace.entries.len());
+    assert!(
+        !o.signatures.contains(&Signature::Unknown),
+        "an unexplained case is classified or fixed first, never committed as a seed:\n{}",
+        o.trace.render()
+    );
+    let name = std::env::var("VYKAR_SIM_PROMOTE_NAME").unwrap_or_else(|_| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let seed = Seed {
+        name,
+        note: "TODO".into(),
+        expect: o.signatures.clone(),
+        at: taken(&o, case.choices.len()),
+        case,
+    };
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(&seed).expect("seed serializes")
+    );
+}

@@ -35,9 +35,14 @@ fn general_cases(default: u32) -> u32 {
 /// Shrinking is bounded by iterations only (no real-time bound, which would
 /// make the shrunk case depend on the machine's load).
 fn runner(cases: u32) -> TestRunner {
+    runner_with(cases, seed())
+}
+
+/// [`runner`] with its own seed (the campaign's).
+pub(super) fn runner_with(cases: u32, seed: u64) -> TestRunner {
     TestRunner::new(Config {
         cases,
-        rng_seed: RngSeed::Fixed(seed()),
+        rng_seed: RngSeed::Fixed(seed),
         failure_persistence: None,
         max_shrink_iters: 200,
         ..Config::default()
@@ -114,7 +119,7 @@ fn one_delete(mut clients: Vec<Vec<Command>>) -> Vec<Vec<Command>> {
 
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
 /// faults of any class and kind, a crash or not, any hosts.
-fn general() -> impl Strategy<Value = Case> {
+pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
         .prop_flat_map(|n| {
             (
@@ -132,6 +137,7 @@ fn general() -> impl Strategy<Value = Case> {
             crash,
             advances: true,
             choices,
+            policy: Policy::First,
         })
 }
 
@@ -153,6 +159,7 @@ fn h1_family() -> impl Strategy<Value = Case> {
         crash: false,
         advances: false,
         choices,
+        policy: Policy::First,
     })
 }
 
@@ -176,6 +183,7 @@ fn h3_family() -> impl Strategy<Value = Case> {
         crash: false,
         advances: true,
         choices,
+        policy: Policy::First,
     })
 }
 

@@ -1,0 +1,41 @@
+name: sim
+
+on:
+  schedule:
+    - cron: "0 5 * * 0" # Weekly, Sunday 05:00 UTC (an hour after fuzz)
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Campaign length in seconds"
+        required: false
+        default: "3600"
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    # Build plus SIM_SECONDS, with room: a job stopped by this timeout is
+    # cancelled, and a cancelled job uploads no traces.
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      SIM_SECONDS: ${{ inputs.seconds || '3600' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Simulation campaign
+        run: make sim-campaign SIM_SECONDS="$SIM_SECONDS" SIM_TRACE_DIR="$GITHUB_WORKSPACE/sim-traces"
+
+      - name: Upload failing traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sim-traces
+          path: sim-traces/
+          if-no-files-found: ignore

@@ -215,12 +215,14 @@ struct InFlight {
     done: Arc<AtomicBool>,
 }
 
-/// Sets its flag when dropped: on return and on unwind.
-struct DoneOnDrop(Arc<AtomicBool>);
+/// Sets its flag when dropped: on return and on unwind; then wakes the
+/// gate waiters, so `poll_paused` sees the end at once.
+struct DoneOnDrop(Arc<AtomicBool>, SimStore);
 
 impl Drop for DoneOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+        self.1.notify_gates();
     }
 }
 
@@ -555,7 +557,7 @@ impl Sim {
         let handle = std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                let _done = DoneOnDrop(done);
+                let _done = DoneOnDrop(done, store.clone());
                 let Started { cfg, dir, env, .. } = started;
                 let result = body(&store, cfg, &dir, index, env);
                 finish_run(&store, &hosts, c, index, false, first_step, result)
@@ -610,7 +612,12 @@ impl Sim {
         let client = self.store.gate_client(gate).expect("unknown gate");
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(p) = self.store.wait_gate(gate, Duration::from_millis(20)) {
+            let done = self.in_flight.get(&client).map(|f| Arc::clone(&f.done));
+            let ended_now = || done.as_ref().is_none_or(|d| d.load(Ordering::SeqCst));
+            if let Some(p) = self
+                .store
+                .wait_gate_or(gate, Duration::from_millis(20), &ended_now)
+            {
                 return Ok(Some(p));
             }
             if !self.store.gate_armed(gate) {

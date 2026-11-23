@@ -651,17 +651,41 @@ impl SimStore {
     /// Block (real time, at most `timeout`) until the gate holds an operation.
     /// None on timeout, or if the gate is Open or Missed.
     pub fn wait_gate(&self, id: GateId, timeout: std::time::Duration) -> Option<Paused> {
+        self.wait_gate_or(id, timeout, &|| false)
+    }
+
+    /// [`Self::wait_gate`], also ending early once `stop()` holds. `stop`
+    /// is judged under the state lock, so a thread that makes it true and
+    /// then calls [`Self::notify_gates`] is never missed.
+    pub(crate) fn wait_gate_or(
+        &self,
+        id: GateId,
+        timeout: std::time::Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Paused> {
         let st = self.state();
         let (st, _) = self
             .shared
             .gate_cv
             .wait_timeout_while(st, timeout, |s| {
-                s.gates
-                    .iter()
-                    .any(|g| g.id == id && matches!(g.phase, GatePhase::Armed { .. }))
+                !stop()
+                    && s.gates
+                        .iter()
+                        .any(|g| g.id == id && matches!(g.phase, GatePhase::Armed { .. }))
             })
             .unwrap();
         gate_paused_in(&st, id)
+    }
+
+    /// Wake every gate waiter, so it judges its `stop` again.
+    /// Poison-tolerant: it runs in a drop guard, also on unwind.
+    pub(crate) fn notify_gates(&self) {
+        let _st = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.shared.gate_cv.notify_all();
     }
 
     /// Paused: let the operation proceed. Armed: disarm, so it never fires.

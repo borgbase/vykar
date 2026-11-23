@@ -15,6 +15,8 @@
 //!   `interleavings` holds the ones that need two clients in flight at once.
 //! - `driver`: the deterministic driver over the steppable commit machines
 //!   (08 step 4): cases, choice sequences, traces and damage signatures.
+//! - `explore`: bounded exhaustive search over the driver's decisions, with
+//!   at most K preemptions (08 step 5).
 //!
 //! Test support, not API: a panic is a test failure. Compiled for this
 //! crate's tests and with the `sim` feature; never enable it in a product
@@ -32,6 +34,7 @@
 pub mod checker;
 pub mod driver;
 pub mod env;
+pub mod explore;
 pub mod fault;
 pub mod gate;
 pub mod hazards;
@@ -43,10 +46,11 @@ pub mod store;
 
 pub use checker::{Invariant, Report, Violation, ViolationKind, check_invariants};
 pub use driver::{
-    Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, Outcome, Signature, Template,
-    Trace, TraceEntry, case_from_trace, run_case,
+    Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, LABEL_LOCKED, Outcome, Policy,
+    Signature, Template, Trace, TraceEntry, case_from_trace, free_actions, run_case,
 };
 pub use env::{SimClock, SimHosts, SimTime, TimeMode, Waiter};
+pub use explore::{Bound, Control, Exploration, Point, Search, dfs, explore, explore_with};
 pub use fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedEffect,
     ParkedId, RuleId,

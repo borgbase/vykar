@@ -11,6 +11,7 @@
 	fuzz-check \
 	fuzz-list \
 	lint \
+	sim-campaign \
 	test \
 	test-all \
 	pre-commit
@@ -74,6 +75,17 @@ fuzz-check:
 fuzz-list:
 	$(FUZZ_TARGETS_GUARD)
 	@echo $(FUZZ_TARGETS)
+
+# Long protocol-simulation campaign (08 step 5): SIM_SECONDS of bounded
+# searches and random cases. Failing traces, and each worker's case in
+# progress, go to SIM_TRACE_DIR. Fails if any case shows damage of an
+# unknown shape.
+SIM_SECONDS ?= 3600
+SIM_TRACE_DIR ?= $(CURDIR)/target/sim-campaign
+
+sim-campaign:
+	VYKAR_SIM_CAMPAIGN_SECS=$(SIM_SECONDS) VYKAR_SIM_TRACE_DIR="$(SIM_TRACE_DIR)" \
+		cargo test -p vykar-core --lib tests::sim_campaign::campaign -- --exact --nocapture
 
 docs-build:
 	cd docs && pnpm install --frozen-lockfile && pnpm build

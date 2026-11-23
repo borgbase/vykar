@@ -165,8 +165,55 @@ pub struct Case {
     /// Offer `Advance` actions.
     #[serde(default = "yes")]
     pub advances: bool,
-    /// Consumed one per decision; past the end, 0.
+    /// Consumed one per decision; past the end, as `policy` says.
     pub choices: Vec<u16>,
+    /// What the driver does past the end of `choices`.
+    #[serde(default)]
+    pub policy: Policy,
+}
+
+/// What the driver does past the end of a case's choices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Policy {
+    /// Action 0: the first client's next step.
+    #[default]
+    First,
+    /// The first action [`free_actions`] marks free: the client that stepped
+    /// last continues; when it has no step, or its last step found the lock
+    /// taken or ended its command, the lowest client with a step; when no
+    /// client has work, `Stop`. The bounded search (`sim::explore`) runs
+    /// cases with it.
+    Continue,
+}
+
+/// The label of a lock attempt that found the lock taken.
+pub const LABEL_LOCKED: &str = "lock (locked)";
+
+/// Which of `actions` are free under preemption bounding, given the
+/// decisions before it (`previous`): the pick-0 step of the client that
+/// stepped last, if it has one and its last step neither was labelled
+/// [`LABEL_LOCKED`] (it yields) nor ended its command (a switch at a
+/// command's end is no preemption); otherwise every client's pick-0 step;
+/// and `Stop`. Releases, time jumps, crashes, picks other than 0, and steps
+/// of another client while the last one can continue are not free.
+pub fn free_actions(actions: &[Action], previous: &[TraceEntry]) -> Vec<bool> {
+    let last = previous.iter().rev().find_map(|e| match e.action {
+        Action::Step { client, .. } => Some((client, e)),
+        _ => None,
+    });
+    let continuing = last.and_then(|(client, e)| {
+        let yielded = e.label == LABEL_LOCKED || e.ended;
+        let can_step = actions.contains(&Action::Step { client, pick: 0 });
+        (!yielded && can_step).then_some(client)
+    });
+    actions
+        .iter()
+        .map(|a| match a {
+            Action::Stop => true,
+            Action::Step { client, pick: 0 } => continuing.is_none_or(|c| c == *client),
+            _ => false,
+        })
+        .collect()
 }
 
 impl Case {
@@ -243,7 +290,8 @@ pub enum Action {
 /// evaluation without a cascading signature, adds `Unknown` next to the
 /// named ones. Most signatures claim narrowly: the lock-exclusion violation
 /// they are derived from, or the violations of one run and its snapshot.
-/// `TwoLockHolders`, `LateHeadWrite` and `LateHeadThenCompact` cascade:
+/// `TwoLockHolders`, `LateHeadWrite`, `LateHeadThenCompact` and
+/// `LateHeadSegmentCollected` cascade:
 /// they leave real damage that later commands fail on, so each claims every
 /// violation not known to come before its hazard event (the reap, the
 /// released head write), and every skipped evaluation. A violation with a
@@ -256,7 +304,12 @@ pub enum Action {
 pub enum Signature {
     /// H1: a protected write by a client whose live lock another client on
     /// the same hostname (another boot ID) reaped while it was younger than
-    /// the stale age. Fixed by 04 step 1 (installation ID).
+    /// the stale age. Also derived, without a checker violation, when the
+    /// victim's run makes an ordinary (not released) write to `index.d/`,
+    /// `index.h/` or `snapshots/` after a young reap: a delayed or
+    /// duplicated lock PUT of the victim's can recreate the reaped key, so
+    /// the checker sees a holder (seed `h1-duplicated-lock`). Fixed by 04
+    /// step 1 (installation ID).
     TwoLockHolders,
     /// H1-session: a live backup's session marker deleted by another client
     /// (same hostname, other boot ID) while younger than the session
@@ -294,16 +347,65 @@ pub enum Signature {
     /// is derived from.
     OrphanLockKey,
     /// H3: a released write of `index.h/` (a head PUT that timed out and
-    /// landed after the lock was released), and a snapshot of a backup that
-    /// returned Ok lost its index coverage. Fixed by 04 step 8.
+    /// landed after the lock was released), and a committed snapshot lost
+    /// its index coverage: one whose backup returned Ok, whose
+    /// `snapshots/` PUT applied before the release, or whose backup's own
+    /// head the release overwrote before its (not delayed) snapshot PUT.
+    /// Fixed by 04 step 8.
     LateHeadWrite,
     /// H3-compact: a released write of `index.h/`, and the index names an
     /// absent pack. Fixed by 04 steps 5 and 8.
     LateHeadThenCompact,
+    /// H3 meeting index GC (04 "Current issues" 2 and 3): a head PUT that
+    /// timed out names a segment of its failed commit; before the late
+    /// write lands, a later publisher's `collect_index_garbage` (any
+    /// publisher, not only compact) deletes that segment, which no head
+    /// named and which was older than `INDEX_GC_GRACE` after a jump of
+    /// time. The released head then names an absent segment. Requires a
+    /// released `index.h/` write at step h and a `HeadObjectAbsent` whose
+    /// object had an applied delete before h and after that head PUT was
+    /// issued (while it was in flight), or, when the delete came
+    /// after h (the deleter's GC judged by its own head at the generation
+    /// the release then overwrote), an object written by the released
+    /// head's own run; cascades from h like `LateHeadWrite`. Fixed by 04
+    /// step 8 (create-if-absent commits: the late head finds its
+    /// generation taken).
+    LateHeadSegmentCollected,
+    /// 04 "Current issues" 3 with the second holder coming from the 6 h
+    /// lock staleness: victim V wrote an `index.d/` segment S under its
+    /// lock; a jump of time ages the lock past the stale age (and S past
+    /// `INDEX_GC_GRACE`); another client reaps the lock and its index GC
+    /// deletes S, which no head names yet (the limit
+    /// `collect_index_garbage`'s doc names); V's head PUT, outside any
+    /// lock, then names S. Requires all of: an aged reap of V's lock at
+    /// step r, an applied PUT of S by V, an applied delete of S by another
+    /// client after r, a later non-released `index.h/` PUT by V that
+    /// violates lock exclusion, and S named absent (`HeadObjectAbsent`,
+    /// or a run's `DisallowedError` when a later fold of V's published a
+    /// head without S). Claims that
+    /// `HeadObjectAbsent`, the `ChainUnloadable` naming S, the
+    /// `DisallowedError` naming S of runs that end after V's head PUT, and
+    /// the skipped evaluations; the head PUT's own lock violation stays
+    /// `AgedLockReaped`'s. Fixed by 04 steps 5 (server-clock lock ages)
+    /// and 8 (create-if-absent commits take the lock off the commit path).
+    AgedLockSegmentCollected,
+    /// The same aged reap with packs instead of a segment: victim V's lock
+    /// and session marker age past their staleness in one jump of time;
+    /// another client's compact reaps both and deletes V's uploaded packs
+    /// as orphans; V's head PUT, outside any lock, then publishes entries
+    /// naming them (directly, or through a later fold of V's that carries
+    /// them). Requires an aged reap of V's lock at step r, an applied
+    /// delete after r by another client of a pack V PUT, and a later
+    /// non-released `index.h/` PUT by V that violates lock exclusion;
+    /// claims the `IndexNamesAbsentPack` of those packs. Fixed by 04 steps
+    /// 5 (server-clock ages for locks, markers and orphan packs) and 8.
+    AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
-    /// chunks: invariant 1 fails with no released `index.h/` write and no
-    /// lock violation. Claims the violations of the snapshot whose PUT was
-    /// the released write. Fixed by 04 step 8 (the commit point is the head).
+    /// chunks: invariant 1 fails with no lock violation other than late
+    /// index writes (`LateIndexWrite`) and writes beside an orphan lock
+    /// key (`OrphanLockKey`). Claims the violations of the
+    /// snapshot whose PUT was the released write. Fixed by 04 step 8 (the
+    /// commit point is the head).
     LateSnapshotWrite,
     /// A released write of `index.h/` or `index.d/` that landed outside
     /// the lock and damaged nothing else (invariant 7 only): the late-write
@@ -321,7 +423,10 @@ impl Signature {
     pub fn cascades(self) -> bool {
         matches!(
             self,
-            Signature::TwoLockHolders | Signature::LateHeadWrite | Signature::LateHeadThenCompact
+            Signature::TwoLockHolders
+                | Signature::LateHeadWrite
+                | Signature::LateHeadThenCompact
+                | Signature::LateHeadSegmentCollected
         )
     }
 
@@ -345,6 +450,11 @@ pub struct TraceEntry {
     pub ops: Vec<String>,
     /// Store steps of the decision: `(first, last]`.
     pub steps: (u64, u64),
+    /// The actions offered at this decision, in the driver's order.
+    pub actions: Vec<Action>,
+    /// A `Step` that ended its client's command (a finish, a whole
+    /// command, a failed upload, a lock attempt that gave up).
+    pub ended: bool,
     /// The store clock after the decision.
     pub clock: DateTime<Utc>,
 }
@@ -629,16 +739,35 @@ impl<'c> Driver<'c> {
                 self.trace_text()
             );
             let actions = self.actions();
-            let choice = self.case.choices.get(n).copied().unwrap_or(0);
-            let action = actions[usize::from(choice) % actions.len()].clone();
+            let index = match (self.case.choices.get(n), self.case.policy) {
+                (Some(c), _) => usize::from(*c) % actions.len(),
+                (None, Policy::First) => 0,
+                (None, Policy::Continue) => free_actions(&actions, &self.entries)
+                    .iter()
+                    .position(|f| *f)
+                    .unwrap_or_else(|| {
+                        panic!("no free action among {actions:?}:\n{}", self.trace_text())
+                    }),
+            };
+            // Under `First` the raw choice, as given; under `Continue` the
+            // index taken.
+            let choice = match self.case.policy {
+                Policy::First => self.case.choices.get(n).copied().unwrap_or(0),
+                Policy::Continue => u16::try_from(index).expect("fewer than 2^16 actions"),
+            };
+            let action = actions[index].clone();
             let first = self.sim.store().step();
+            let mut ended = false;
             let label = match &action {
                 Action::Stop => {
-                    self.push_entry(n, choice, actions.len(), action, "stop".into(), first);
+                    self.push_entry(n, choice, actions, action, "stop".into(), first, false);
                     return;
                 }
                 Action::Step { client, pick } => {
-                    self.step_actor(usize::from(*client), usize::from(*pick))
+                    let i = usize::from(*client);
+                    let label = self.step_actor(i, usize::from(*pick));
+                    ended = matches!(self.actors[i].phase, Phase::Idle);
+                    label
                 }
                 Action::Release { parked } => {
                     self.sim.release(ParkedId(*parked));
@@ -656,29 +785,33 @@ impl<'c> Driver<'c> {
                 }
             };
             self.settle();
-            self.push_entry(n, choice, actions.len(), action, label, first);
+            self.push_entry(n, choice, actions, action, label, first, ended);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_entry(
         &mut self,
         n: usize,
         choice: u16,
-        options: usize,
+        actions: Vec<Action>,
         action: Action,
         label: String,
         first: u64,
+        ended: bool,
     ) {
         let store = self.sim.store();
         self.entries.push(TraceEntry {
             n,
             choice,
-            options,
+            options: actions.len(),
             action,
             label,
             ops: Vec::new(),
             steps: (first, store.step()),
             clock: store.now(),
+            actions,
+            ended,
         });
     }
 
@@ -820,7 +953,7 @@ impl<'c> Driver<'c> {
             Err(VykarError::Locked(_)) if w.attempts + 1 < LOCK_ATTEMPTS => {
                 w.attempts += 1;
                 self.actors[i].phase = Phase::Lock(w);
-                "lock (locked)".into()
+                LABEL_LOCKED.into()
             }
             Err(e) => {
                 let LockWait { run, pending, .. } = *w;
@@ -995,6 +1128,28 @@ fn lock_key_time(key: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(micros.parse().ok()?)
 }
 
+/// A lock key deleted by a client other than its writer.
+struct Reap {
+    /// The store step of the delete.
+    step: u64,
+    /// The key's writer.
+    victim: ClientId,
+    /// The writer's run.
+    run: Option<usize>,
+    /// The lock's age in seconds at the delete, from the key's name.
+    age: Option<i64>,
+}
+
+impl Reap {
+    fn young(&self) -> bool {
+        self.age.is_some_and(|a| a <= STALE_LOCK_SECS)
+    }
+
+    fn aged(&self) -> bool {
+        self.age.is_some_and(|a| a > STALE_LOCK_SECS)
+    }
+}
+
 /// Which violations a case's signatures explain. A signature is inserted
 /// only with at least one violation it claims; a violation, or a skipped
 /// evaluation, that no signature claims inserts `Unknown`.
@@ -1002,6 +1157,8 @@ struct Claims<'r> {
     report: &'r Report,
     claimed: Vec<bool>,
     sigs: BTreeSet<Signature>,
+    /// A non-cascading signature explains the skipped evaluations.
+    skipped: bool,
 }
 
 impl<'r> Claims<'r> {
@@ -1010,6 +1167,7 @@ impl<'r> Claims<'r> {
             report,
             claimed: vec![false; report.violations.len()],
             sigs: BTreeSet::new(),
+            skipped: false,
         }
     }
 
@@ -1042,7 +1200,8 @@ impl<'r> Claims<'r> {
 
     fn finish(mut self) -> BTreeSet<Signature> {
         let cascading = self.sigs.iter().any(|s| s.cascades());
-        if self.claimed.iter().any(|c| !c) || (!cascading && !self.report.not_evaluated.is_empty())
+        if self.claimed.iter().any(|c| !c)
+            || (!cascading && !self.skipped && !self.report.not_evaluated.is_empty())
         {
             self.sigs.insert(Signature::Unknown);
         }
@@ -1071,35 +1230,47 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
     };
     let mut claims = Claims::new(report);
 
-    // Lock keys deleted by a client other than their writer: (step, the
-    // writer, the lock's age in seconds then). The age is taken from the
-    // acquisition time in the key's name, not from the refreshed
+    // Lock keys deleted by a client other than their writer, with the
+    // lock's age then. The age is taken from the acquisition time in the
+    // key's name, not from the refreshed
     // `LockEntry.time` production compares: a refreshed lock reads older
     // here than to the reaper, so the error only goes towards "aged" (a
     // refreshed lock a same-hostname client reaped young can read as
     // `AgedLockReaped` instead of `TwoLockHolders`, never the reverse).
-    let mut writers: BTreeMap<&str, ClientId> = BTreeMap::new();
-    let mut reaps: Vec<(u64, ClientId, Option<i64>)> = Vec::new();
+    let mut writers: BTreeMap<&str, (ClientId, Option<usize>)> = BTreeMap::new();
+    let mut reaps: Vec<Reap> = Vec::new();
     for r in &log {
         if r.op.is_write() && r.applied() && is_lock_key(&r.key) {
-            writers.insert(&r.key, r.client);
+            writers.insert(&r.key, (r.client, r.run));
         }
         for k in r.deleted_keys() {
-            if let Some(w) = writers.get(k).copied()
+            if let Some((w, run)) = writers.get(k).copied()
                 && w != r.client
             {
                 let age = lock_key_time(k)
                     .zip(clock_at(r.step))
                     .map(|(t, now)| (now - t).num_seconds());
-                reaps.push((r.step, w, age));
+                reaps.push(Reap {
+                    step: r.step,
+                    victim: w,
+                    run,
+                    age,
+                });
             }
         }
     }
+    let lock_violation_at = |step: u64| {
+        report
+            .violations
+            .iter()
+            .any(|v| v.invariant == Invariant::LockExclusion && v.step == Some(step))
+    };
 
     // Lock-exclusion violations at a write that was not a release: each is
     // claimed by the lock hazard it follows from. `TwoLockHolders` then
     // cascades from its earliest reap.
     let mut two_holders: Option<u64> = None;
+    let mut orphan_key_violations: BTreeSet<usize> = BTreeSet::new();
     for (i, v) in report.violations.iter().enumerate() {
         if v.invariant != Invariant::LockExclusion {
             continue;
@@ -1111,30 +1282,146 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
             // A late index write: judged below.
             continue;
         }
-        let reaped: Vec<(u64, Option<i64>)> = reaps
+        let reaped: Vec<&Reap> = reaps
             .iter()
-            .filter(|(s, victim, _)| *s < rec.step && *victim == rec.client)
-            .map(|(s, _, age)| (*s, *age))
+            .filter(|x| x.step < rec.step && x.victim == rec.client)
             .collect();
-        let young = reaped
-            .iter()
-            .filter(|(_, a)| a.is_some_and(|a| a <= STALE_LOCK_SECS))
-            .map(|(s, _)| *s)
-            .min();
-        if let Some(s) = young {
+        let young_reap = reaped.iter().filter(|x| x.young()).map(|x| x.step).min();
+        if let Some(s) = young_reap {
             claims.claim_index(Signature::TwoLockHolders, i);
             two_holders = Some(two_holders.map_or(s, |h| h.min(s)));
-        } else if reaped
-            .iter()
-            .any(|(_, a)| a.is_some_and(|a| a > STALE_LOCK_SECS))
-        {
+        } else if reaped.iter().any(|x| x.aged()) {
             claims.claim_index(Signature::AgedLockReaped, i);
         } else if log
             .iter()
             .any(|r| r.step < rec.step && r.op.is_write() && released(r) && is_lock_key(&r.key))
         {
             claims.claim_index(Signature::OrphanLockKey, i);
+            orphan_key_violations.insert(i);
         }
+    }
+
+    // A young reap whose victim's run goes on to make a protected write
+    // (an ordinary write, so the run was live at the reap; a released one
+    // is a late write and judged as such)
+    // is H1 even when the checker saw the victim as a holder: a delayed or
+    // duplicated lock PUT of the victim's, released after the reap,
+    // recreated the reaped key, so the victim's writes are not lock
+    // violations while the reaper's are under two locks. Cascades from the
+    // reap like the violations above.
+    for reap in reaps.iter().filter(|x| x.young()) {
+        let writes_on = log.iter().any(|r| {
+            r.step > reap.step
+                && r.client == reap.victim
+                && r.run == reap.run
+                && r.op.is_write()
+                && r.applied()
+                && !released(r)
+                && ["index.d/", "index.h/", "snapshots/"]
+                    .iter()
+                    .any(|p| r.key.starts_with(p))
+        });
+        if writes_on {
+            two_holders = Some(two_holders.map_or(reap.step, |h| h.min(reap.step)));
+        }
+    }
+
+    // An aged reap of V's lock, another client's index GC deleting V's
+    // segment S after it, and V's head PUT outside the lock naming S.
+    for reap in reaps.iter().filter(|x| x.aged()) {
+        for seg in log.iter().filter(|r| {
+            r.client == reap.victim
+                && r.op.is_write()
+                && r.applied()
+                && r.key.starts_with("index.d/")
+        }) {
+            let s = seg.key.as_str();
+            let collected = log.iter().any(|r| {
+                r.step > reap.step && r.client != reap.victim && r.deleted_keys().contains(&s)
+            });
+            let head = log
+                .iter()
+                .filter(|r| {
+                    r.step > reap.step
+                        && r.step > seg.step
+                        && r.client == reap.victim
+                        && r.op.is_write()
+                        && r.applied()
+                        && !released(r)
+                        && r.key.starts_with("index.h/")
+                        && lock_violation_at(r.step)
+                })
+                .map(|r| r.step)
+                .min();
+            // S named absent: by the end state's head, or by a run that
+            // failed on it before a later fold of V's published a head
+            // without it.
+            let absent = report.violations.iter().any(|v| match v.kind {
+                ViolationKind::HeadObjectAbsent => v.subject == s,
+                ViolationKind::DisallowedError => v.detail.contains(s),
+                _ => false,
+            });
+            let Some(head) = head.filter(|_| collected && absent) else {
+                continue;
+            };
+            // Runs that read the chain after the head PUT and failed on S.
+            let later: BTreeSet<String> = runs
+                .iter()
+                .filter(|x| x.last_step > head)
+                .map(run_subject)
+                .collect();
+            if claims.claim(Signature::AgedLockSegmentCollected, |v| match v.kind {
+                ViolationKind::HeadObjectAbsent => v.subject == s,
+                ViolationKind::ChainUnloadable => v.detail.contains(s),
+                ViolationKind::DisallowedError => {
+                    later.contains(&v.subject) && v.detail.contains(s)
+                }
+                _ => false,
+            }) {
+                claims.skipped = true;
+            }
+        }
+    }
+
+    // An aged reap of V's lock, another client's compact deleting V's packs
+    // after it (V's session marker aged too, so they were orphans), and V's
+    // head PUT outside the lock publishing entries that name them.
+    for reap in reaps.iter().filter(|x| x.aged()) {
+        let collected: Vec<(&str, u64)> = log
+            .iter()
+            .filter(|r| {
+                r.client == reap.victim
+                    && r.op.is_write()
+                    && r.applied()
+                    && r.key.starts_with("packs/")
+            })
+            .filter_map(|p| {
+                log.iter()
+                    .find(|r| {
+                        r.step > reap.step
+                            && r.client != reap.victim
+                            && r.deleted_keys().contains(&p.key.as_str())
+                    })
+                    .map(|r| (p.key.as_str(), r.step))
+            })
+            .collect();
+        let named = |pack: &str| {
+            collected.iter().any(|(k, deleted)| {
+                *k == pack
+                    && log.iter().any(|r| {
+                        r.step > *deleted
+                            && r.client == reap.victim
+                            && r.op.is_write()
+                            && r.applied()
+                            && !released(r)
+                            && r.key.starts_with("index.h/")
+                            && lock_violation_at(r.step)
+                    })
+            })
+        };
+        claims.claim(Signature::AgedLockPacksCollected, |v| {
+            v.kind == ViolationKind::IndexNamesAbsentPack && named(&v.subject)
+        });
     }
 
     // Session markers deleted by another client while their writer's run
@@ -1182,17 +1469,51 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
         }
     }
 
-    // A released head write cascades from its step when it left an
-    // acknowledged snapshot without index coverage, or the index naming
-    // an absent pack.
+    // A released head write cascades from its step when it left a
+    // committed snapshot without index coverage, or the index naming an
+    // absent pack. Committed: its backup returned Ok, or its `snapshots/`
+    // PUT applied and either came before the release, or was not itself a
+    // release and the late head overwrote the backup's own head (a backup
+    // that crashed or failed after its snapshot PUT).
     let late_head = first_released_write("index.h/");
     if let Some(hazard) = late_head {
+        let snapshot_of = |run: Option<usize>| match run
+            .and_then(|i| runs.iter().find(|x| x.index == i))
+            .map(|x| &x.op)
+        {
+            Some(ClientOp::Backup { snapshot }) => Some(snapshot.as_str()),
+            _ => None,
+        };
+        let late_key = log
+            .iter()
+            .find(|r| r.step == hazard)
+            .map_or("", |r| r.key.as_str());
+        // The run's own head, at the key the release then overwrote.
+        let head_before = |run: Option<usize>| {
+            log.iter().any(|r| {
+                r.step < hazard
+                    && r.run == run
+                    && r.op.is_write()
+                    && r.applied()
+                    && r.key == late_key
+            })
+        };
         let acknowledged: BTreeSet<&str> = runs
             .iter()
             .filter_map(|r| match (&r.op, &r.outcome) {
                 (ClientOp::Backup { snapshot }, RunOutcome::Ok { .. }) => Some(snapshot.as_str()),
                 _ => None,
             })
+            .chain(
+                log.iter()
+                    .filter(|r| {
+                        r.op.is_write()
+                            && r.applied()
+                            && r.key.starts_with("snapshots/")
+                            && (r.step < hazard || (!released(r) && head_before(r.run)))
+                    })
+                    .filter_map(|r| snapshot_of(r.run)),
+            )
             .collect();
         let after = |v: &Violation| v.step.is_none_or(|s| s >= hazard);
         if report.violations.iter().any(|v| {
@@ -1213,12 +1534,68 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
             claims.cascade(Signature::LateHeadThenCompact, hazard);
         }
     }
+    // A released head write over a collected segment: cascades from the
+    // first released head after a delete of an object a head names absent,
+    // or, when the delete came after it, from a released head whose own
+    // run wrote that object (the deleter's GC judged by the head it had
+    // just written at the generation the release then overwrote).
+    // (first delete, writer's run) of each object a head names absent.
+    let absent_deleted: Vec<(u64, Option<usize>)> = report
+        .violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::HeadObjectAbsent)
+        .filter_map(|v| {
+            let deleted = log
+                .iter()
+                .filter(|r| r.deleted_keys().contains(&v.subject.as_str()))
+                .map(|r| r.step)
+                .min()?;
+            let writer = log
+                .iter()
+                .find(|r| r.op.is_write() && r.applied() && r.key == v.subject)
+                .and_then(|r| r.run);
+            Some((deleted, writer))
+        })
+        .collect();
+    // The step a released write was issued (parked) at: the delete must
+    // fall while the head was in flight, or any earlier loss of a named
+    // object would be excused by an unrelated late head.
+    let parked_at = |r: &OpRecord| match r.outcome {
+        OpOutcome::Released(id) => log
+            .iter()
+            .find(|p| matches!(p.outcome, OpOutcome::Parked(pid, _) if pid == id))
+            .map(|p| p.step),
+        _ => None,
+    };
+    if let Some(hazard) = log
+        .iter()
+        .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("index.h/"))
+        .filter(|r| {
+            let issued = parked_at(r);
+            absent_deleted.iter().any(|(d, w)| {
+                (*d < r.step && issued.is_some_and(|p| p < *d)) || (w.is_some() && *w == r.run)
+            })
+        })
+        .map(|r| r.step)
+        .min()
+    {
+        claims.cascade(Signature::LateHeadSegmentCollected, hazard);
+    }
     if let Some(hazard) = two_holders {
         claims.cascade(Signature::TwoLockHolders, hazard);
     }
 
-    // A released snapshot PUT: the violations of the snapshot it wrote.
-    if late_head.is_none() && !report.violated(Invariant::LockExclusion) {
+    // A released snapshot PUT: the violations of the snapshot it wrote,
+    // when no lock violation is one of two holders: each is a late index
+    // write (judged below) or a write beside an orphan lock key.
+    let no_second_holder = report.violations.iter().enumerate().all(|(i, v)| {
+        v.invariant != Invariant::LockExclusion
+            || orphan_key_violations.contains(&i)
+            || v.step
+                .and_then(|s| log.iter().find(|r| r.step == s))
+                .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
+    });
+    if no_second_holder {
         for r in log
             .iter()
             .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("snapshots/"))

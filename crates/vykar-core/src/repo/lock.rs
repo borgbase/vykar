@@ -6,11 +6,17 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::ages::{CLOCK_PROBE_DEBRIS_AGE, CLOCK_PROBE_PREFIX, StoreClock};
+use super::ages::{
+    CLOCK_PROBE_DEBRIS_AGE, CLOCK_PROBE_PREFIX, HEAD_LANDING_ALLOWANCE, MARGIN, PACK_AGE_LIMIT,
+    StoreClock,
+};
 use super::control::CancelToken;
 use super::host_env::{Clock, HostEnv, StopSignal};
 use vykar_storage::{ListedObject, StorageBackend, StoreNow};
-use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
+use vykar_types::error::{
+    ActiveSessionDetails, ActiveSessionInfo, ActiveSessionList, LockHolder, LockHolderDetails,
+    Result, VykarError,
+};
 
 /// A simple advisory lock stored in `locks/<uuid>.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -770,12 +776,20 @@ pub struct SessionEntry {
     pub installation_id: Option<String>,
     #[serde(default)]
     pub pid_ns: Option<u64>,
+    /// Time since the session's start (t0: its registration, pulled back by
+    /// the store age of the oldest journal pack it recovered), suspend
+    /// included, rounded up to a second, when this body was built. Compact
+    /// reads it as the horizon mtime − elapsed_secs − M (04 "Compact" 3).
+    /// `None` from writers before 04 step 7: their horizon is unknown (−∞).
+    #[serde(default)]
+    pub elapsed_secs: Option<u64>,
 }
 
 impl SessionEntry {
     /// The marker of `env`'s process, registered at `registered_at`, last
     /// written at `last_refresh`. The one place that fills the identity
-    /// fields.
+    /// fields. `elapsed_secs` is 0: registration's key is written before
+    /// the session's start is stamped.
     pub(crate) fn new(
         env: &HostEnv,
         registered_at: DateTime<Utc>,
@@ -789,8 +803,14 @@ impl SessionEntry {
             boot_id: env.host.boot_id.clone(),
             installation_id: env.host.installation_id.clone(),
             pid_ns: env.host.pid_ns,
+            elapsed_secs: Some(0),
         }
     }
+}
+
+/// `d` in whole seconds, rounded up.
+fn ceil_secs(d: std::time::Duration) -> u64 {
+    d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0))
 }
 
 /// When a marker write completed, on every clock a gap is measured with.
@@ -950,10 +970,17 @@ pub(crate) const MARKER_GAP_LIMIT: std::time::Duration = std::time::Duration::fr
 /// not atomic can pass the new key's position before its PUT, but then
 /// reaches the old key, which still exists. The one assumption left is that a LIST does not miss a key that
 /// existed for its whole duration.
+///
+/// Every key carries its own `elapsed_secs`: the time since the session's
+/// start ([`Self::elapsed`] when its body was built), so compact can read a
+/// live session's horizon (mtime − elapsed − M) from its newest key alone.
+/// Generation 0's body is registration's, with `"elapsed_secs":0`.
 pub(crate) struct SessionMarker {
     session_id: String,
     /// Identity and `registered_at` of every key this session writes.
     entry: SessionEntry,
+    /// The session's start (t0): when its registration key was written.
+    started: MarkerStamp,
     state: std::sync::Mutex<MarkerState>,
 }
 
@@ -982,6 +1009,14 @@ struct MarkerState {
     missing: bool,
     refreshes: u32,
     failed_refreshes: u32,
+    /// Marker PUTs that took longer than `MARGIN` to return: a key that
+    /// lands that late may carry a horizon later than the session's start,
+    /// so the record no longer counts as continuous.
+    slow_puts: u32,
+    /// How far the session's start is pulled back: the store age of the
+    /// oldest journal pack it recovered or stored pack it accepted
+    /// (`existing_pack`; `Duration::MAX` for one of unknown age).
+    pullback: std::time::Duration,
 }
 
 impl MarkerState {
@@ -1021,13 +1056,19 @@ pub(crate) struct MarkerReport {
     pub unchecked: usize,
     pub refreshes: u32,
     pub failed_refreshes: u32,
+    /// Marker PUTs that took longer than `MARGIN` to return.
+    pub slow_puts: u32,
 }
 
 impl MarkerReport {
-    /// Never missing, every superseded key checked, and never unrefreshed
-    /// longer than [`MARKER_GAP_LIMIT`].
+    /// Never missing, every superseded key checked, never unrefreshed
+    /// longer than [`MARKER_GAP_LIMIT`], and no marker PUT slower than
+    /// `MARGIN`.
     pub(crate) fn continuous(&self) -> bool {
-        !self.missing && self.unchecked == 0 && self.longest_gap <= MARKER_GAP_LIMIT
+        !self.missing
+            && self.unchecked == 0
+            && self.longest_gap <= MARKER_GAP_LIMIT
+            && self.slow_puts == 0
     }
 }
 
@@ -1046,6 +1087,11 @@ pub(crate) enum RefreshOutcome {
     /// The new key's PUT failed (it may exist). Nothing about the past is
     /// learned; the gap stays open.
     Failed(VykarError),
+    /// New key written and every superseded key confirmed present, but the
+    /// PUT took `took`, longer than `MARGIN`: the record is no longer
+    /// continuous, and the heartbeat refreshes again at its next poll so
+    /// the newest key's horizon is right again.
+    Slow { took: std::time::Duration },
 }
 
 impl SessionMarker {
@@ -1053,6 +1099,7 @@ impl SessionMarker {
         Self {
             session_id: registration.session_id.clone(),
             entry: registration.entry.clone(),
+            started: registration.written,
             state: std::sync::Mutex::new(MarkerState {
                 current: 0,
                 current_written: registration.written,
@@ -1065,8 +1112,36 @@ impl SessionMarker {
                 missing: false,
                 refreshes: 0,
                 failed_refreshes: 0,
+                slow_puts: 0,
+                pullback: std::time::Duration::ZERO,
             }),
         }
+    }
+
+    /// Pull the session's start back by `age` (the store age of a
+    /// recovered journal pack, or of a pack an append-only server already
+    /// held, `existing_pack`); keeps the largest. The next refresh writes
+    /// it.
+    pub(crate) fn pull_back(&self, age: std::time::Duration) {
+        let mut st = self.lock();
+        st.pullback = st.pullback.max(age);
+    }
+
+    /// Time since the session's start: from registration's write to now,
+    /// suspend included ([`MarkerStamp::until`]), plus the pull-back;
+    /// saturating (a pull-back by an unknown age is `Duration::MAX`).
+    pub(crate) fn elapsed(&self, clock: &dyn Clock) -> std::time::Duration {
+        let now = MarkerStamp::now(clock);
+        self.started
+            .until(&now)
+            .saturating_add(self.lock().pullback)
+    }
+
+    /// The commit's probe found the current key gone: record the marker as
+    /// missing, so every later check of the record (the fence before and
+    /// after the head PUT) sees it.
+    pub(crate) fn note_missing(&self) {
+        self.lock().missing = true;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MarkerState> {
@@ -1110,8 +1185,12 @@ impl SessionMarker {
         };
         let entry = SessionEntry {
             last_refresh: clock.now_utc().to_rfc3339(),
+            elapsed_secs: Some(ceil_secs(self.elapsed(clock))),
             ..self.entry.clone()
         };
+        // On the suspend-aware clock, as `elapsed_secs`: a suspend during
+        // the PUT delays the key's mtime past the instant its body was built.
+        let put_start = MarkerStamp::now(clock);
         let put = serde_json::to_vec(&entry)
             .map_err(|e| VykarError::Other(format!("session serialize: {e}")))
             .and_then(|data| storage.put(&self.key(generation), &data));
@@ -1120,6 +1199,8 @@ impl SessionMarker {
             return RefreshOutcome::Failed(e);
         }
         let written = MarkerStamp::now(clock);
+        let took = put_start.until(&written);
+        let slow = took > MARGIN;
         let checks: Vec<(u64, Result<bool>)> = to_check
             .into_iter()
             .map(|g| (g, storage.exists(&self.key(g))))
@@ -1153,10 +1234,16 @@ impl SessionMarker {
             } else {
                 // Every check answered, so every superseded key is settled.
                 st.refreshes += 1;
-                RefreshOutcome::Refreshed {
-                    gap: st.close_gap(),
+                let gap = st.close_gap();
+                if slow {
+                    RefreshOutcome::Slow { took }
+                } else {
+                    RefreshOutcome::Refreshed { gap }
                 }
             };
+            if slow {
+                st.slow_puts = st.slow_puts.saturating_add(1);
+            }
             (outcome, to_delete)
         };
 
@@ -1253,6 +1340,7 @@ impl SessionMarker {
             unchecked: st.unchecked.len(),
             refreshes: st.refreshes,
             failed_refreshes: st.failed_refreshes,
+            slow_puts: st.slow_puts,
         }
     }
 
@@ -1263,74 +1351,127 @@ impl SessionMarker {
     }
 }
 
-/// 04 "Why markers carry weight", as far as today's protocol needs it. In
-/// order: a marker recorded missing refuses whatever the probe says; a
-/// current key found gone refuses (no key is written twice, so that is
-/// conclusive); a current key found present commits once every superseded
-/// key is checked (a gap over [`MARKER_GAP_LIMIT`] is logged; refusing on
-/// it needs the pack ages of 04's `T_pack` rule), and refuses while one is
-/// unchecked, since its reap cannot be ruled out; a failed probe commits
-/// only if the record is [continuous](MarkerReport::continuous).
+/// 04 "Why markers carry weight" and I8. The marker record is sound when
+/// the probe found the current key and the record is
+/// [continuous](MarkerReport::continuous), or the probe failed and the
+/// record is continuous. A backup whose record is not sound (a marker
+/// recorded missing, a current key found gone, a superseded key unchecked,
+/// a gap over [`MARKER_GAP_LIMIT`] or a slow marker write) commits only
+/// while `elapsed` + [`HEAD_LANDING_ALLOWANCE`] <= [`PACK_AGE_LIMIT`]: none
+/// of its packs (its uploads, and recovered packs through the pull-back)
+/// can be old enough for compact yet, and compact's age guard protects
+/// them where the marker cannot. Otherwise it refuses:
+/// `StaleChunksDuringCommit` for a missing marker, a current key found gone
+/// or a gap; `Other` for an unchecked superseded key; the probe's error for
+/// a failed probe.
 pub(crate) fn commit_marker_check(
     session_id: &str,
     probe: Result<bool>,
     report: &MarkerReport,
+    elapsed: std::time::Duration,
 ) -> Result<()> {
-    if report.missing {
+    let (refusal, reason) = if report.missing {
+        (
+            VykarError::StaleChunksDuringCommit,
+            "the session marker was missing at a refresh",
+        )
+    } else {
+        match probe {
+            Ok(false) => (
+                VykarError::StaleChunksDuringCommit,
+                "the session marker was reaped before the commit",
+            ),
+            Ok(true) if report.unchecked > 0 => (
+                VykarError::Other(format!(
+                    "session {session_id}: {} superseded marker key(s) could not be checked for a reap",
+                    report.unchecked
+                )),
+                "a superseded session marker key could not be checked for a reap",
+            ),
+            Ok(true) if !report.continuous() => (
+                VykarError::StaleChunksDuringCommit,
+                "the session marker went unrefreshed for a while (machine suspended?) or a marker write was slow",
+            ),
+            Ok(true) => return Ok(()),
+            Err(e) if report.continuous() => {
+                warn!(
+                    session_id,
+                    error = %e,
+                    "could not probe the session marker; refreshed without a gap, proceeding"
+                );
+                return Ok(());
+            }
+            Err(e) => (
+                e,
+                "could not probe the session marker and its refreshes are not continuous",
+            ),
+        }
+    };
+    pack_age_term(
+        session_id,
+        reason,
+        refusal,
+        report,
+        elapsed,
+        HEAD_LANDING_ALLOWANCE,
+    )
+}
+
+/// The commit rule's pack-age term at the fences around the head PUT, from
+/// the record alone (no probe): `Err(StaleChunksDuringCommit)` when the
+/// record is not continuous and `elapsed` + `allowance` >
+/// [`PACK_AGE_LIMIT`]. Before the head PUT `allowance` is
+/// [`HEAD_LANDING_ALLOWANCE`] (an early refusal); after it returned, zero
+/// (the binding check: the head has landed by then).
+pub(crate) fn head_landing_check(
+    session_id: &str,
+    report: &MarkerReport,
+    elapsed: std::time::Duration,
+    allowance: std::time::Duration,
+) -> Result<()> {
+    if report.continuous() || elapsed.saturating_add(allowance) <= PACK_AGE_LIMIT {
+        return Ok(());
+    }
+    pack_age_term(
+        session_id,
+        "the session marker record is not continuous",
+        VykarError::StaleChunksDuringCommit,
+        report,
+        elapsed,
+        allowance,
+    )
+}
+
+/// Commit (with a warning) while `elapsed` + `allowance` <=
+/// [`PACK_AGE_LIMIT`], else `Err(refusal)`; `reason`: why the marker
+/// record is not sound.
+fn pack_age_term(
+    session_id: &str,
+    reason: &str,
+    refusal: VykarError,
+    report: &MarkerReport,
+    elapsed: std::time::Duration,
+    allowance: std::time::Duration,
+) -> Result<()> {
+    if elapsed.saturating_add(allowance) <= PACK_AGE_LIMIT {
         warn!(
             session_id,
-            "session marker was missing at a refresh; retry the backup"
+            reason,
+            elapsed_secs = elapsed.as_secs(),
+            "the session marker cannot protect this backup's uploads, but they are young enough to be kept by age; committing"
         );
-        return Err(VykarError::StaleChunksDuringCommit);
+        return Ok(());
     }
-    match probe {
-        Ok(false) => {
-            warn!(
-                session_id,
-                "session marker reaped before commit; retry the backup"
-            );
-            Err(VykarError::StaleChunksDuringCommit)
-        }
-        Ok(true) if report.unchecked > 0 => {
-            warn!(
-                session_id,
-                unchecked = report.unchecked,
-                "a superseded session marker key could not be checked; refusing to commit"
-            );
-            Err(VykarError::Other(format!(
-                "session {session_id}: {} superseded marker key(s) could not be checked for a reap",
-                report.unchecked
-            )))
-        }
-        Ok(true) => {
-            if report.longest_gap > MARKER_GAP_LIMIT {
-                info!(
-                    session_id,
-                    gap_secs = report.longest_gap.as_secs(),
-                    "session marker went unrefreshed for a while (machine suspended?); it is still present"
-                );
-            }
-            Ok(())
-        }
-        Err(e) if report.continuous() => {
-            warn!(
-                session_id,
-                error = %e,
-                "could not probe the session marker; refreshed without a gap, proceeding"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            warn!(
-                session_id,
-                error = %e,
-                gap_secs = report.longest_gap.as_secs(),
-                unchecked = report.unchecked,
-                "could not probe the session marker and its refreshes are not continuous; refusing to commit"
-            );
-            Err(e)
-        }
-    }
+    warn!(
+        session_id,
+        reason,
+        elapsed_secs = elapsed.as_secs(),
+        allowance_secs = allowance.as_secs(),
+        gap_secs = report.longest_gap.as_secs(),
+        unchecked = report.unchecked,
+        "the session marker cannot protect this backup's uploads and they may be old enough for compact to delete; refusing to commit, retry the backup"
+    );
+    Err(refusal)
 }
 
 /// How often the heartbeat refreshes the session marker.
@@ -1408,7 +1549,12 @@ impl HeartbeatSchedule {
                 return;
             }
             self.failed_puts = 0;
-            self.due = REFRESH_INTERVAL;
+            // A slow PUT: write a key with a right horizon at the next poll.
+            self.due = if matches!(outcome, RefreshOutcome::Slow { .. }) {
+                HEARTBEAT_POLL
+            } else {
+                REFRESH_INTERVAL
+            };
         }
         self.recheck = matches!(outcome, RefreshOutcome::Unchecked(_));
     }
@@ -1512,6 +1658,12 @@ impl SessionGuard {
                         RefreshOutcome::Failed(e) => {
                             warn!(session_id, error = %e, "failed to refresh session marker");
                         }
+                        RefreshOutcome::Slow { took } => warn!(
+                            session_id,
+                            took_secs = took.as_secs(),
+                            "a session marker write took longer than the margin; \
+                             refreshing again, and a commit of this session must pass the pack-age rule"
+                        ),
                     }
                     schedule.record(action, &outcome);
                 }
@@ -1556,8 +1708,8 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// maintenance lock's key). The timestamps inside a marker are used only
 /// when the listing reports no mtime; with an mtime but no `now` nothing is
 /// stale by age (fail closed). A malformed marker (unparseable JSON or bad
-/// timestamps) is judged by its mtime alone: it is preserved, and blocks
-/// maintenance, while younger than `max_age`, and is reaped like any stale
+/// timestamps) is judged by its mtime alone: it is preserved, and keeps
+/// compact from deleting orphan packs, while younger than `max_age`, and is reaped like any stale
 /// marker after that; without an mtime it is preserved.
 ///
 /// `.index` journals for cleaned sessions are **preserved** so the next backup
@@ -1577,12 +1729,27 @@ pub fn cleanup_stale_sessions(
     env: &HostEnv,
     now: Option<StoreNow>,
 ) -> Result<Vec<String>> {
+    cleanup_stale_sessions_keeping(storage, max_age, env, now).map(|(cleaned, _)| cleaned)
+}
+
+/// [`cleanup_stale_sessions`], also returning the sessions it kept, in
+/// ascending session ID order, from the same listing and GETs of each
+/// session's newest key: one whose newest key is malformed, or gone since
+/// the LIST, has `entry: None` (no horizon). Maintenance uses it so
+/// `sessions/` is listed once.
+pub(crate) fn cleanup_stale_sessions_keeping(
+    storage: &dyn StorageBackend,
+    max_age: Duration,
+    env: &HostEnv,
+    now: Option<StoreNow>,
+) -> Result<(Vec<String>, Vec<LiveSession>)> {
     let local_now = env.now_utc();
     let listing = storage.list_meta(SESSIONS_PREFIX)?;
     let mtimes: std::collections::HashMap<&str, Option<std::time::SystemTime>> =
         listing.iter().map(|o| (o.key.as_str(), o.mtime)).collect();
     let keys: Vec<String> = listing.iter().map(|o| o.key.clone()).collect();
     let mut cleaned = Vec::new();
+    let mut kept = Vec::new();
     // Track which session IDs survived the first pass (not deleted).
     let mut surviving_markers: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Track session IDs cleaned in this invocation — their .index files get
@@ -1595,10 +1762,16 @@ pub fn cleanup_stale_sessions(
             continue;
         };
         let mtime = mtimes.get(newest).copied().flatten();
+        let keep = |entry: Option<SessionEntry>| LiveSession {
+            session_id: session_id.to_string(),
+            entry,
+            mtime,
+        };
         let Some(data) = storage.get(newest)? else {
             // Gone since the LIST (a rotation or a deregistration): the
             // session may still be live, so its journal is kept.
             surviving_markers.insert(session_id.to_string());
+            kept.push(keep(None));
             continue;
         };
         let entry = serde_json::from_slice::<SessionEntry>(&data).ok();
@@ -1614,8 +1787,8 @@ pub fn cleanup_stale_sessions(
         let (Some(entry), Some(_)) = (entry, ts) else {
             // Unparseable .json or a bad timestamp: we cannot read who wrote
             // it. Judged by its mtime alone; while young (or without an
-            // mtime) it is preserved so `with_maintenance_lock` reports it as
-            // a blocking session (fail-closed), together with its `.index`.
+            // mtime) it is preserved, so compact's horizon is −∞ while it is
+            // young (fail-closed), together with its `.index`.
             if matches!(age, EntryAge::Store(_)) && age.exceeds(max_age) {
                 debug!(
                     session_id,
@@ -1629,6 +1802,7 @@ pub fn cleanup_stale_sessions(
                 cleaned.push(session_id.to_string());
             } else {
                 surviving_markers.insert(session_id.to_string());
+                kept.push(keep(None));
             }
             continue;
         };
@@ -1665,6 +1839,7 @@ pub fn cleanup_stale_sessions(
             cleaned.push(session_id.to_string());
         } else {
             surviving_markers.insert(session_id.to_string());
+            kept.push(keep(Some(entry)));
         }
     }
 
@@ -1683,7 +1858,7 @@ pub fn cleanup_stale_sessions(
         }
     }
 
-    Ok(cleaned)
+    Ok((cleaned, kept))
 }
 
 /// List all sessions with their parsed marker, one per session, in
@@ -1708,6 +1883,55 @@ pub fn list_session_entries(
         entries.push((session_id.to_string(), entry));
     }
     Ok(entries)
+}
+
+/// A session whose marker survived the stale-session cleanup, as one
+/// listing of `sessions/` and a GET of its newest key saw it.
+#[derive(Clone, Debug)]
+pub struct LiveSession {
+    pub session_id: String,
+    /// The newest key's body; `None` when it does not parse or vanished
+    /// since the listing.
+    pub entry: Option<SessionEntry>,
+    /// The newest key's mtime on the store's clock; `None` when the listing
+    /// reports none.
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+impl LiveSession {
+    /// 04 "Compact" 3: mtime − elapsed_secs − `MARGIN`. `None` (−∞: no
+    /// orphan pack may go) when the body, its `elapsed_secs` or the mtime
+    /// is unknown, or the subtraction underflows.
+    pub(crate) fn horizon(&self) -> Option<std::time::SystemTime> {
+        let elapsed = self.entry.as_ref()?.elapsed_secs?;
+        let back = std::time::Duration::from_secs(elapsed).checked_add(MARGIN)?;
+        self.mtime?.checked_sub(back)
+    }
+}
+
+/// Build an [`ActiveSessionList`] from raw `list_session_entries` output.
+///
+/// Parseable entries are rendered with host/pid/age; entries with `None`
+/// (malformed JSON) are passed through as `ActiveSessionInfo { details: None }`
+/// so `ActiveSessionList`'s `Display` surfaces them to the operator instead
+/// of silently dropping them — the fail-closed policy of
+/// `Repository::refuse_live_sessions`.
+pub(crate) fn build_active_session_list(
+    entries: Vec<(String, Option<SessionEntry>)>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> ActiveSessionList {
+    let infos = entries
+        .into_iter()
+        .map(|(id, entry)| ActiveSessionInfo {
+            id,
+            details: entry.map(|e| ActiveSessionDetails {
+                hostname: e.hostname,
+                pid: e.pid,
+                age: format_age(now, &e.last_refresh),
+            }),
+        })
+        .collect();
+    ActiveSessionList(infos)
 }
 
 /// Delete all files under `sessions/` regardless of parse result.
@@ -1781,12 +2005,16 @@ fn retry_while_locked<T>(
 
 /// How long a backup commit waits for the repository lock.
 ///
-/// While our session marker exists, maintenance cannot hold the lock for long
-/// (`with_maintenance_lock` refuses on active sessions), so legitimate holders
-/// are other backups' commits, which are short because packs are uploaded
-/// before the lock is taken. A crashed holder's lock is only reaped after 6 h,
-/// so waiting longer than this would mostly be waiting on a dead process.
-pub const COMMIT_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Compact, prune and delete run beside live backups (04 step 7) and hold
+/// the lock for their whole run, hours for a compact of a large repository;
+/// a backup that finishes uploading meanwhile waits for it rather than fail
+/// after all its uploads. A backup that *starts* during maintenance still
+/// fails `Locked` after its registration probe's few seconds of retries.
+/// Other holders are backups' commits, short because packs are uploaded
+/// before the lock is taken. The cost: a backup waiting on a crashed holder
+/// on another host waits this long before failing (same-host dead holders
+/// are reaped at once; a 6 h stale lock by the waiter's own attempts).
+pub const COMMIT_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
 
 /// Longest single sleep between `shutdown` checks.
 const LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(500);

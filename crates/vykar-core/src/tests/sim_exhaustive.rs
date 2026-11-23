@@ -138,10 +138,18 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         .map(|(name, c)| (format!("{name}-k2"), c.clone(), 2))
         .collect();
     out.push(("pair-distinct-k3".into(), bases[0].1.clone(), 3));
-    // The compact bases with compact gate-stepped, at K = 2; never with
-    // time jumps or crashes (see `Maintenance`).
+    // The compact bases with compact gate-stepped, at K = 2, and at K = 1
+    // with time jumps (none inside the stepped compact, see `Maintenance`)
+    // and with crashes: the cases that exercise compact beside live
+    // backups, I8 and the journal rule (04 step 7).
     for (name, c) in bases.iter().filter(|(n, _)| !n.starts_with("pair")) {
         out.push((format!("{name}-stepped-k2"), stepped(c.clone()), 2));
+        let mut jumps = stepped(c.clone());
+        jumps.advances = true;
+        out.push((format!("{name}-stepped-advances-k1"), jumps, 1));
+        let mut crash = stepped(c.clone());
+        crash.crash = true;
+        out.push((format!("{name}-stepped-crash-k1"), crash, 1));
     }
     for (name, c) in &bases {
         let mut c = c.clone();
@@ -244,13 +252,20 @@ fn lock_pair_on_one_hostname_is_clean() {
 
 /// A backup against delete + compact, compact one protocol-key operation at
 /// a time (`Maintenance::Stepped`) against every boundary of the backup:
-/// before its registration (compact removes c0's chunks and the backup
-/// uploads the shared file anew); between upload and lock compact still
-/// refuses with `ActiveSessions` at its session check (allowed; the second
-/// half of 04 step 7 removes the refusal); a backup whose registration probe
-/// meets compact's lock fails `Locked` (allowed); inside the commit window
-/// compact fails `Locked`; after the finish. At K = 1 57 runs in about
-/// 0.55 s, against 48 runs in 0.4 s with the compact whole.
+/// before its registration (compact removes c0's chunks, the backup
+/// uploads the shared file anew); between upload and lock compact
+/// proceeds (04 step 7): it keeps the backup's uploads (young, and inside
+/// its horizon) and, when the delete of c0 came first, sweeps c0's
+/// chunks, so the backup fails its reuse re-check as
+/// `StaleChunksDuringCommit` (allowed), or commits when nothing it reused
+/// was swept; a backup whose registration probe meets compact's lock fails
+/// `Locked`; inside the commit window compact fails `Locked`; after the
+/// finish. The driver never refreshes markers, so a search exercises the
+/// age guard and I8, not the horizon
+/// (`tests::sim::a_refreshed_marker_keeps_uploads_older_than_t_pack` does).
+/// The same search with time jumps (none inside the stepped compact) is
+/// campaign-only (`compact-distinct-stepped-advances-k1`): 297 runs, all
+/// clean, in about 3.7 s, over the pre-commit budget.
 #[test]
 fn backup_against_compact_is_clean() {
     assert_clean(

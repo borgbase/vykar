@@ -442,6 +442,7 @@ fn write_session_marker_with_host(
         boot_id: None,
         installation_id: None,
         pid_ns: None,
+        elapsed_secs: None,
     };
     let data = serde_json::to_vec(&entry).unwrap();
     storage.put(&key, &data).unwrap();
@@ -789,6 +790,8 @@ struct FaultyBackend {
     faults: std::sync::Mutex<Faults>,
     exists_calls: std::sync::Mutex<Vec<String>>,
     before_exists: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs before every PUT.
+    before_put: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Default for FaultyBackend {
@@ -798,6 +801,7 @@ impl Default for FaultyBackend {
             faults: Default::default(),
             exists_calls: Default::default(),
             before_exists: Default::default(),
+            before_put: Default::default(),
         }
     }
 }
@@ -835,6 +839,9 @@ impl StorageBackend for FaultyBackend {
         self.inner.get(key)
     }
     fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+        if let Some(hook) = self.before_put.lock().unwrap().as_ref() {
+            hook();
+        }
         self.inner.put(key, data)?;
         if self.faults().put_lands_then_fails.contains(key) {
             return Err(injected(key));
@@ -1113,7 +1120,7 @@ fn a_reap_behind_a_failed_check_is_found_later() {
         let report = marker.report(env.clock.as_ref());
         assert!(report.missing, "at_probe {at_probe}: {report:?}");
         assert_eq!(
-            commit_marker_check("hid", Ok(true), &report)
+            commit_marker_check("hid", Ok(true), &report, OLD)
                 .unwrap_err()
                 .to_string(),
             vykar_types::error::VykarError::StaleChunksDuringCommit.to_string()
@@ -1189,49 +1196,401 @@ fn gap_is_measured_on_suspend_aware_time() {
     assert!(marker.report(clock).continuous());
 }
 
-#[test]
-fn commit_marker_check_rules() {
-    let report = |missing: bool, gap_min: u32| MarkerReport {
+/// A backup an hour into its session: young enough for the pack-age term.
+const YOUNG: std::time::Duration = std::time::Duration::from_secs(3600);
+/// 11 h 30 min: past `PACK_AGE_LIMIT` − `HEAD_LANDING_ALLOWANCE`.
+const OLD: std::time::Duration = std::time::Duration::from_secs(11 * 3600 + 30 * 60);
+
+fn marker_report(missing: bool, gap_min: u32) -> MarkerReport {
+    MarkerReport {
         missing,
         longest_gap: gap_min * MIN,
         unchecked: 0,
         refreshes: 0,
         failed_refreshes: 0,
-    };
-    let stale = |r: vykar_types::error::Result<()>| {
-        matches!(
-            r,
-            Err(vykar_types::error::VykarError::StaleChunksDuringCommit)
-        )
-    };
+        slow_puts: 0,
+    }
+}
+
+fn is_stale(r: &vykar_types::error::Result<()>) -> bool {
+    matches!(
+        r,
+        Err(vykar_types::error::VykarError::StaleChunksDuringCommit)
+    )
+}
+
+/// 04 "Why markers carry weight" and I8: a sound record commits at any age;
+/// an unsound one commits while its packs are young and refuses, with its
+/// own error, once they may be old.
+#[test]
+fn commit_marker_check_rules() {
+    use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
     let probe_err = || Err(injected("sessions/x.json"));
-    assert!(stale(commit_marker_check("s", Ok(true), &report(true, 0))));
-    assert!(stale(commit_marker_check(
-        "s",
-        Ok(false),
-        &report(false, 0)
-    )));
-    assert!(commit_marker_check("s", Ok(true), &report(false, 120)).is_ok());
-    assert!(commit_marker_check("s", probe_err(), &report(false, 15)).is_ok());
-    let err = commit_marker_check("s", probe_err(), &report(false, 31)).unwrap_err();
-    assert!(err.to_string().contains("injected fault"), "{err}");
-    assert!(stale(commit_marker_check(
-        "s",
-        probe_err(),
-        &report(true, 0)
-    )));
+    for elapsed in [YOUNG, OLD] {
+        assert!(commit_marker_check("s", Ok(true), &marker_report(false, 15), elapsed).is_ok());
+        assert!(commit_marker_check("s", probe_err(), &marker_report(false, 15), elapsed).is_ok());
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Refusal {
+        Stale,
+        Other,
+        Probe,
+    }
     let unchecked = MarkerReport {
         unchecked: 1,
-        ..report(false, 1)
+        ..marker_report(false, 1)
     };
-    assert!(commit_marker_check("s", probe_err(), &unchecked).is_err());
-    // A1: a key still unchecked after the probe refuses even when the
-    // current key was found, and not as stale: the reap is not proven.
-    let err = commit_marker_check("s", Ok(true), &unchecked).unwrap_err();
-    assert!(
-        !matches!(err, vykar_types::error::VykarError::StaleChunksDuringCommit),
-        "{err}"
+    let slow = MarkerReport {
+        slow_puts: 1,
+        ..marker_report(false, 1)
+    };
+    type Probe = Box<dyn Fn() -> vykar_types::error::Result<bool>>;
+    let cases: Vec<(&str, Probe, MarkerReport, Refusal)> = vec![
+        (
+            "missing",
+            Box::new(|| Ok(true)),
+            marker_report(true, 0),
+            Refusal::Stale,
+        ),
+        (
+            "key gone",
+            Box::new(|| Ok(false)),
+            marker_report(false, 0),
+            Refusal::Stale,
+        ),
+        (
+            "gap",
+            Box::new(|| Ok(true)),
+            marker_report(false, 31),
+            Refusal::Stale,
+        ),
+        ("slow put", Box::new(|| Ok(true)), slow, Refusal::Stale),
+        // A key still unchecked after the probe refuses, and not as stale:
+        // the reap is not proven.
+        (
+            "unchecked",
+            Box::new(|| Ok(true)),
+            unchecked.clone(),
+            Refusal::Other,
+        ),
+        (
+            "unchecked, probe failed",
+            Box::new(probe_err),
+            unchecked,
+            Refusal::Probe,
+        ),
+        (
+            "probe failed, gap",
+            Box::new(probe_err),
+            marker_report(false, 31),
+            Refusal::Probe,
+        ),
+        (
+            "probe failed, missing",
+            Box::new(probe_err),
+            marker_report(true, 0),
+            Refusal::Stale,
+        ),
+    ];
+    for (name, probe, report, refusal) in &cases {
+        assert!(
+            commit_marker_check("s", probe(), report, YOUNG).is_ok(),
+            "{name}: young packs commit"
+        );
+        let r = commit_marker_check("s", probe(), report, OLD);
+        let got = match &r {
+            Ok(()) => panic!("{name}: old packs must refuse"),
+            Err(vykar_types::error::VykarError::StaleChunksDuringCommit) => Refusal::Stale,
+            Err(e) if e.to_string().contains("injected fault") => Refusal::Probe,
+            Err(_) => Refusal::Other,
+        };
+        assert_eq!(&got, refusal, "{name}: {r:?}");
+    }
+
+    // The boundary: elapsed + allowance = PACK_AGE_LIMIT commits.
+    let edge = PACK_AGE_LIMIT - HEAD_LANDING_ALLOWANCE;
+    let gap = marker_report(false, 31);
+    assert!(commit_marker_check("s", Ok(true), &gap, edge).is_ok());
+    let one_more = edge + std::time::Duration::from_secs(1);
+    assert!(is_stale(&commit_marker_check(
+        "s",
+        Ok(true),
+        &gap,
+        one_more
+    )));
+}
+
+/// The term at the fences around the head PUT: from the record alone, with
+/// the landing allowance before the PUT and none after it.
+#[test]
+fn head_landing_check_rules() {
+    use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
+    use crate::repo::lock::head_landing_check;
+    let zero = std::time::Duration::ZERO;
+    let one = std::time::Duration::from_secs(1);
+    let sound = marker_report(false, 15);
+    let gap = marker_report(false, 31);
+    let missing = marker_report(true, 0);
+    for allowance in [HEAD_LANDING_ALLOWANCE, zero] {
+        assert!(head_landing_check("s", &sound, OLD + allowance, allowance).is_ok());
+        for report in [&gap, &missing] {
+            assert!(head_landing_check("s", report, YOUNG, allowance).is_ok());
+            let edge = PACK_AGE_LIMIT - allowance;
+            assert!(head_landing_check("s", report, edge, allowance).is_ok());
+            assert!(is_stale(&head_landing_check(
+                "s",
+                report,
+                edge + one,
+                allowance
+            )));
+        }
+    }
+}
+
+/// B1: a current key the judgement's probe found gone is recorded, so the
+/// fence before the head PUT sees an unsound record even when no refresh
+/// noticed the reap.
+#[test]
+fn a_gone_key_found_at_the_judgement_refuses_at_the_fence() {
+    use crate::repo::ages::HEAD_LANDING_ALLOWANCE;
+    use crate::repo::lock::head_landing_check;
+    let storage = MemoryBackend::new();
+    let (_time, env) = sim_env();
+    let clock = env.clock.as_ref();
+    let marker = registered(&storage, "judged", &env);
+    storage.delete(&session_marker_key("judged")).unwrap();
+    let probe = marker.probe(&storage);
+    assert!(matches!(probe, Ok(false)));
+    // Before the commit machine notes it, the record alone reads continuous.
+    assert!(marker.report(clock).continuous());
+    marker.note_missing();
+    let report = marker.report(clock);
+    assert!(commit_marker_check("judged", probe, &report, YOUNG).is_ok());
+    assert!(is_stale(&head_landing_check(
+        "judged",
+        &report,
+        OLD,
+        HEAD_LANDING_ALLOWANCE
+    )));
+}
+
+/// Registration writes `"elapsed_secs":0`; without that key its body is
+/// the one written before 04 step 7.
+#[test]
+fn registration_writes_elapsed_zero() {
+    let storage = MemoryBackend::new();
+    let (_time, env) = sim_env();
+    let _marker = registered(&storage, "zero", &env);
+    let bytes = storage.get(&session_marker_key("zero")).unwrap().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["elapsed_secs"], serde_json::json!(0));
+    value.as_object_mut().unwrap().remove("elapsed_secs");
+    let entry = entry_at(&storage, &session_marker_key("zero"));
+    let before = serde_json::json!({
+        "hostname": entry.hostname,
+        "pid": entry.pid,
+        "registered_at": entry.registered_at,
+        "last_refresh": entry.last_refresh,
+        "boot_id": entry.boot_id,
+        "installation_id": entry.installation_id,
+        "pid_ns": entry.pid_ns,
+    });
+    assert_eq!(value, before);
+}
+
+/// A clock whose uptime can run on while the monotonic clock stands still
+/// (a suspend).
+struct SuspendClock {
+    start: std::time::Instant,
+    /// (monotonic offset, uptime)
+    at: std::sync::Mutex<(std::time::Duration, std::time::Duration)>,
+}
+
+impl SuspendClock {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            at: std::sync::Mutex::new((
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1000),
+            )),
+        }
+    }
+    fn run(&self, d: std::time::Duration) {
+        let mut at = self.at.lock().unwrap();
+        at.0 += d;
+        at.1 += d;
+    }
+    fn suspend(&self, d: std::time::Duration) {
+        self.at.lock().unwrap().1 += d;
+    }
+}
+
+impl Clock for SuspendClock {
+    fn now_utc(&self) -> chrono::DateTime<Utc> {
+        SystemClock.now_utc()
+    }
+    fn monotonic(&self) -> std::time::Instant {
+        self.start + self.at.lock().unwrap().0
+    }
+    fn sleep(&self, d: std::time::Duration) {
+        self.run(d);
+    }
+    fn wait_timeout(&self, _signal: &StopSignal, timeout: std::time::Duration) -> bool {
+        self.run(timeout);
+        false
+    }
+    fn uptime(&self) -> Option<std::time::Duration> {
+        Some(self.at.lock().unwrap().1)
+    }
+}
+
+/// Each refresh writes the time since registration, suspend included, plus
+/// the pull-back of recovered journal packs, rounded up to a second.
+#[test]
+fn refresh_writes_elapsed_since_registration() {
+    let storage = MemoryBackend::new();
+    let clock = Arc::new(SuspendClock::new());
+    let env = HostEnv::system().with_clock(clock.clone()).with_host(me());
+    let marker = registered(&storage, "el", &env);
+    clock.run(15 * MIN);
+    marker.refresh(&storage, clock.as_ref());
+    assert_eq!(
+        entry_at(&storage, &session_marker_key_at("el", 1)).elapsed_secs,
+        Some(900)
     );
+    marker.pull_back(120 * MIN);
+    marker.pull_back(30 * MIN); // the largest pull-back is kept
+    clock.run(15 * MIN);
+    marker.refresh(&storage, clock.as_ref());
+    let written = entry_at(&storage, &session_marker_key_at("el", 2)).elapsed_secs;
+    assert!(written >= Some(150 * 60), "{written:?}");
+    // A suspend: uptime runs on, the monotonic clock does not.
+    clock.suspend(60 * MIN);
+    clock.run(std::time::Duration::from_millis(1500));
+    marker.refresh(&storage, clock.as_ref());
+    let written = entry_at(&storage, &session_marker_key_at("el", 3)).elapsed_secs;
+    assert_eq!(written, Some((30 + 120 + 60) * 60 + 2), "rounded up");
+}
+
+/// B6: a marker PUT slower than MARGIN breaks continuity, and the heartbeat
+/// refreshes again at its next poll.
+#[test]
+fn a_slow_marker_put_breaks_continuity() {
+    let (time, env) = sim_env();
+    let storage = FaultyBackend::default();
+    let slow_by = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+    {
+        let (time, slow_by) = (Arc::clone(&time), Arc::clone(&slow_by));
+        *storage.before_put.lock().unwrap() =
+            Some(Box::new(move || time.advance(*slow_by.lock().unwrap())));
+    }
+    let clock = env.clock.as_ref();
+    let marker = registered(&storage, "slow", &env);
+    time.advance(15 * MIN);
+    *slow_by.lock().unwrap() = 11 * MIN;
+    let outcome = marker.refresh(&storage, clock);
+    assert!(
+        matches!(outcome, RefreshOutcome::Slow { .. }),
+        "{outcome:?}"
+    );
+    let report = marker.report(clock);
+    assert_eq!(report.slow_puts, 1);
+    assert!(!report.continuous(), "{report:?}");
+    let mut schedule = HeartbeatSchedule::new();
+    schedule.record(HeartbeatAction::Refresh, &outcome);
+    assert_eq!(
+        schedule.poll(),
+        HeartbeatAction::Refresh,
+        "again at the next poll"
+    );
+    // A fast PUT afterwards does not restore continuity.
+    *slow_by.lock().unwrap() = std::time::Duration::ZERO;
+    let outcome = marker.refresh(&storage, clock);
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    assert!(!marker.report(clock).continuous());
+
+    // A suspend during the PUT: the monotonic clock stands still, the
+    // suspend-aware clock (the one `elapsed_secs` is measured on) runs on.
+    let suspend = Arc::new(SuspendClock::new());
+    let env = HostEnv::system()
+        .with_clock(suspend.clone())
+        .with_host(me());
+    let storage = FaultyBackend::default();
+    let marker = registered(&storage, "suspended", &env);
+    {
+        let suspend = Arc::clone(&suspend);
+        *storage.before_put.lock().unwrap() = Some(Box::new(move || suspend.suspend(11 * MIN)));
+    }
+    suspend.run(15 * MIN);
+    let outcome = marker.refresh(&storage, suspend.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Slow { .. }),
+        "{outcome:?}"
+    );
+    assert!(!marker.report(suspend.as_ref()).continuous());
+}
+
+/// 04 "Compact" 3: a live session's horizon is its newest key's mtime minus
+/// `elapsed_secs` minus MARGIN; unknown without either.
+#[test]
+fn horizon_is_mtime_minus_elapsed_minus_margin() {
+    use crate::repo::ages::MARGIN;
+    use crate::repo::lock::LiveSession;
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let entry = |elapsed: Option<u64>| SessionEntry {
+        elapsed_secs: elapsed,
+        ..session_entry(&me(), &Utc::now().to_rfc3339())
+    };
+    let live = |entry: Option<SessionEntry>, mtime: Option<std::time::SystemTime>| LiveSession {
+        session_id: "h".into(),
+        entry,
+        mtime,
+    };
+    assert_eq!(
+        live(Some(entry(Some(3600))), Some(mtime)).horizon(),
+        Some(mtime - std::time::Duration::from_secs(3600) - MARGIN)
+    );
+    assert_eq!(live(None, Some(mtime)).horizon(), None, "no body");
+    assert_eq!(
+        live(Some(entry(None)), Some(mtime)).horizon(),
+        None,
+        "no field"
+    );
+    assert_eq!(live(Some(entry(Some(0))), None).horizon(), None, "no mtime");
+    assert_eq!(
+        live(Some(entry(Some(u64::MAX))), Some(mtime)).horizon(),
+        None,
+        "underflow"
+    );
+}
+
+/// D1: a body without `elapsed_secs` (0.24, and builds before 04 step 7)
+/// reads as `None`; a new body still parses as 0.24's four-field marker.
+#[test]
+fn old_and_new_marker_bodies_parse_both_ways() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code, reason = "parsed only")]
+    struct SessionEntryV024 {
+        hostname: String,
+        pid: u32,
+        registered_at: String,
+        last_refresh: String,
+    }
+    let old = br#"{"hostname":"h","pid":7,"registered_at":"2026-01-01T00:00:00+00:00","last_refresh":"2026-01-01T00:00:00+00:00"}"#;
+    let parsed: SessionEntry = serde_json::from_slice(old).unwrap();
+    assert_eq!(parsed.elapsed_secs, None);
+    let new = SessionEntry {
+        elapsed_secs: Some(42),
+        ..session_entry(&me(), &Utc::now().to_rfc3339())
+    };
+    let bytes = serde_json::to_vec(&new).unwrap();
+    let v024: SessionEntryV024 = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v024.pid, new.pid);
 }
 
 /// F1 (A1): a superseded key whose check fails at the refresh and again at
@@ -1265,7 +1624,7 @@ fn a_key_that_stays_unchecked_refuses_the_commit() {
         );
         let report = marker.report(env.clock.as_ref());
         assert_eq!((report.missing, report.unchecked), (false, 1));
-        let err = commit_marker_check("unk", probe, &report).unwrap_err();
+        let err = commit_marker_check("unk", probe, &report, OLD).unwrap_err();
         assert_eq!(err.to_string(), probe_text, "reaped {reaped}");
     }
 }
@@ -1300,7 +1659,7 @@ fn a_reap_after_the_check_is_refused_by_maintenance_and_not_recorded() {
     );
     let report = marker.report(env.clock.as_ref());
     assert!(report.continuous(), "{report:?}");
-    assert!(commit_marker_check("after", marker.probe(&storage), &report).is_ok());
+    assert!(commit_marker_check("after", marker.probe(&storage), &report, OLD).is_ok());
 }
 
 /// Polls until the heartbeat's next refresh, counting the poll that
@@ -1528,6 +1887,7 @@ fn session_entry(host: &HostIdentity, at: &str) -> SessionEntry {
         boot_id: host.boot_id.clone(),
         installation_id: host.installation_id.clone(),
         pid_ns: host.pid_ns,
+        elapsed_secs: None,
     }
 }
 
@@ -2286,6 +2646,7 @@ mod store_clock {
             boot_id: None,
             installation_id: None,
             pid_ns: None,
+            elapsed_secs: None,
         };
         storage
             .put(
@@ -2556,7 +2917,7 @@ mod store_clock {
         let err = acquire_lock_with_deadline(
             &hb,
             &env_b,
-            crate::repo::lock::COMMIT_LOCK_MAX_WAIT,
+            std::time::Duration::from_secs(10 * 60),
             500,
             &CancelToken::new(),
             |_| {},

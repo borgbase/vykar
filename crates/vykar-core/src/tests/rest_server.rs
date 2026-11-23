@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{backup_single_source, make_test_config};
+use super::helpers::{backup_single_source, make_test_config, try_backup_single_source};
 use crate::commands;
 use crate::config::VykarConfig;
 use crate::index::head::IndexHead;
@@ -1011,4 +1011,124 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     assert_eq!(entries(&cold), before);
     c.write("d", "delta");
     backup_single_source(&cold, &c.source, "src", "s4");
+}
+
+/// Every file under `packs/` on the server, made `age` old by its mtime.
+fn age_server_packs(server: &Server, age: std::time::Duration) -> Vec<PathBuf> {
+    let mut packs = Vec::new();
+    for shard in std::fs::read_dir(server.data.path().join("packs")).unwrap() {
+        let shard = shard.unwrap().path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for pack in std::fs::read_dir(&shard).unwrap() {
+            let pack = pack.unwrap().path();
+            std::fs::File::options()
+                .write(true)
+                .open(&pack)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            packs.push(pack);
+        }
+    }
+    packs
+}
+
+/// 04 "Crash-recovery journals" on an append-only server: a backup that
+/// uploaded its packs and wrote its journal ends without committing; seven
+/// hours later its journal is too old to adopt, so the next backup of the
+/// same plaintext tree seals the same packs again and the server refuses
+/// their PUTs (the keys exist). The stored packs have the sealed size, so
+/// the backup uses them and commits, and the snapshot restores. When a
+/// stored pack has another size, the refusal stays the backup's error.
+#[test]
+fn a_pack_the_append_only_server_already_holds_is_used() {
+    for tampered in [false, true] {
+        let server = Server::start(true);
+        let c = Client::init(&server);
+        c.write("a", &"alpha ".repeat(4096));
+        let source_paths = vec![c.source.to_string_lossy().into_owned()];
+        let req = commands::backup::BackupRequest {
+            snapshot_name: "s1",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "src",
+            exclude_patterns: &[],
+            exclude_if_present: &[],
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: crate::compress::Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        };
+        let pending = commands::backup::upload(
+            &c.config,
+            &req,
+            &mut None,
+            &CancelToken::new(),
+            None,
+            crate::repo::HostEnv::system(),
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        pending.abandon();
+        let journals: Vec<_> = std::fs::read_dir(server.data.path().join("sessions"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".index")
+            })
+            .collect();
+        assert_eq!(journals.len(), 1, "the abandoned backup's journal");
+        let packs = age_server_packs(&server, std::time::Duration::from_secs(7 * 3600));
+        assert!(!packs.is_empty());
+        if tampered {
+            for pack in &packs {
+                let mut bytes = std::fs::read(pack).unwrap();
+                bytes.push(0);
+                std::fs::write(pack, bytes).unwrap();
+            }
+        }
+        server.take_requests();
+
+        let result = try_backup_single_source(&c.config, &c.source, "src", "s2");
+        let refused_packs: Vec<_> = server
+            .take_requests()
+            .into_iter()
+            .filter(|(m, uri, status)| {
+                *m == axum::http::Method::PUT
+                    && request_key(uri).starts_with("packs/")
+                    && *status == 403
+            })
+            .collect();
+        assert!(!refused_packs.is_empty(), "tampered={tampered}");
+        if tampered {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("403"), "{err}");
+            continue;
+        }
+        result.unwrap();
+        check_clean(&c.config);
+        let dest = c.tmp.path().join("restore");
+        commands::restore::run(
+            &c.config,
+            None,
+            "s2",
+            dest.to_str().unwrap(),
+            None,
+            false,
+            true,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(find(&dest, "a")).unwrap(),
+            "alpha ".repeat(4096)
+        );
+    }
 }

@@ -119,8 +119,8 @@ fn one_delete(mut clients: Vec<Vec<Command>>) -> Vec<Vec<Command>> {
 }
 
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
-/// faults of any class and kind, a crash or not, any hosts; compact whole,
-/// or gate-stepped in a case without crashes and time jumps (see
+/// faults of any class and kind, a crash or not, any hosts, time jumps;
+/// compact whole or gate-stepped (no jump inside a stepped compact, see
 /// `Maintenance`; shrinking prefers whole).
 pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
@@ -138,8 +138,8 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
             hosts,
             clients: one_delete(clients),
             faults,
-            crash: crash && !stepped,
-            advances: !stepped,
+            crash,
+            advances: true,
             choices,
             policy: Policy::First,
             skews: vec![],

@@ -124,14 +124,15 @@ pub const REGRESSIONS: &[Regression] = &[
     },
     Regression {
         id: "H1-session",
-        summary: "same hostname: a live backup's marker is kept, compact refuses with \
-                  ActiveSessions",
+        summary: "same hostname: a live backup's marker is kept; compact proceeds beside it \
+                  and keeps its uploads",
         run: interleavings::h1_session_regression,
     },
     Regression {
         id: "H2-marker",
         summary: "a reaped session marker is never written again; the refresh finds it \
-                  missing and the backup refuses as stale",
+                  missing; the backup commits while its uploads are young (I8) and its \
+                  snapshot restores",
         run: interleavings::h2_marker_regression,
     },
     Regression {

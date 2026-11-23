@@ -3019,11 +3019,11 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2 verification: SessionGuard blocks maintenance
+// Bug 2, since 04 step 7: maintenance runs beside a live SessionGuard
 // ---------------------------------------------------------------------------
 
 #[test]
-fn session_guard_blocks_maintenance() {
+fn maintenance_runs_beside_a_live_session_guard() {
     use vykar_core::commands::util::with_maintenance_lock;
     use vykar_core::repo::lock;
 
@@ -3058,27 +3058,19 @@ fn session_guard_blocks_maintenance() {
     )
     .unwrap();
 
-    // with_maintenance_lock must refuse while the session is active
+    // Since 04 step 7 maintenance proceeds while the session is live, and
+    // leaves its marker.
     let mut repo2 = open_local_repo_cached(&repo_dir, None);
-    let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
-    match &err {
-        vykar_types::error::VykarError::ActiveSessions(list) => {
-            assert_eq!(list.0.len(), 1, "exactly one active session expected");
-            let info = &list.0[0];
-            assert_eq!(info.id, session_id);
-            let d = info.details.as_ref().expect("parseable marker");
-            assert!(!d.hostname.is_empty(), "hostname should be populated");
-            assert!(d.pid > 0, "pid should be populated");
-            assert!(!d.age.is_empty(), "age should be populated");
-            assert!(!list.has_malformed());
-        }
-        other => panic!("expected ActiveSessions, got: {other}"),
-    }
+    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
+    let live = lock::list_session_entries(storage.as_ref()).unwrap();
+    assert_eq!(live.len(), 1, "the live session's marker is kept");
+    assert_eq!(live[0].0, session_id);
+    assert_eq!(live[0].1.as_ref().unwrap().elapsed_secs, Some(0));
 
     // Drop the guard — session deregistered
     drop(guard);
+    assert!(lock::list_sessions(storage.as_ref()).unwrap().is_empty());
 
-    // Maintenance should now succeed
     let mut repo3 = open_local_repo_cached(&repo_dir, None);
     with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
 }
@@ -3145,7 +3137,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
 }
 
 #[test]
-fn maintenance_blocks_on_malformed_session_marker() {
+fn maintenance_runs_beside_a_malformed_session_marker() {
     use vykar_core::commands::util::with_maintenance_lock;
 
     init_test_environment();
@@ -3172,29 +3164,11 @@ fn maintenance_blocks_on_malformed_session_marker() {
     let marker_path = sessions_dir.join("corrupt-session.json");
     std::fs::write(&marker_path, b"this is not json at all").unwrap();
 
-    // Maintenance must fail-close: the marker is unreadable and young by
-    // its mtime, so it blocks as an active session with placeholder
-    // host/pid (once 45 min old by its mtime it would be reaped).
+    // Maintenance proceeds (04 step 7). The marker is unreadable and young
+    // by its mtime, so it is kept, and compact's horizon is unknown: no
+    // orphan pack goes in that run (once 45 min old it is reaped).
     let mut repo2 = open_local_repo_cached(&repo_dir, None);
-    let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
-    match &err {
-        vykar_types::error::VykarError::ActiveSessions(list) => {
-            assert_eq!(list.0.len(), 1);
-            let info = &list.0[0];
-            assert_eq!(info.id, "corrupt-session");
-            assert!(
-                info.details.is_none(),
-                "malformed marker must surface as details=None, got: {info:?}"
-            );
-            assert!(list.has_malformed());
-        }
-        other => panic!("expected ActiveSessions for malformed marker, got: {other}"),
-    }
-    // The rendered error must mention the malformed-marker state and the
-    // remediation command.
-    let rendered = err.to_string();
-    assert!(rendered.contains("malformed marker"));
-    assert!(rendered.contains("break-lock --sessions"));
+    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
 
     // Marker must still be on disk — cleanup does not delete it.
     assert!(

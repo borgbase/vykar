@@ -852,8 +852,10 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
     }
 }
 
+/// Since 04 step 7 prune runs beside a live backup session: it deletes
+/// the policy's snapshots and still reads no index.
 #[test]
-fn prune_loads_index_after_session_check() {
+fn prune_runs_beside_a_live_session() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11)]);
@@ -871,7 +873,7 @@ fn prune_loads_index_after_session_check() {
         let reads = Arc::new(IndexReads::default());
         let mut repo = env.open(env.counting(&reads), OpenOptions::new());
         assert_eq!(reads.counts(), OPEN_READS, "{format:?}: open");
-        let err = commands::prune::run_on_repo(
+        let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
             false,
@@ -880,12 +882,9 @@ fn prune_loads_index_after_session_check() {
             &[],
             &CancelToken::new(),
         )
-        .err()
         .unwrap();
-        assert!(
-            matches!(err, VykarError::ActiveSessions(_)),
-            "expected ActiveSessions, got: {err}"
-        );
+        assert_eq!(stats.pruned, 1, "{format:?}");
         assert_eq!(reads.counts(), OPEN_READS, "{format:?}: prune");
+        assert_eq!(env.open_fresh().manifest().snapshots.len(), 1);
     }
 }

@@ -20,7 +20,11 @@
 //! Compact is one decision (`Maintenance::Whole`, every seed recorded
 //! before 04 step 7) or one decision per protocol-key operation
 //! (`Stepped`: gate-stepped on its own thread; the commit machines are
-//! steppable, compact is not a machine; see [`is_maintenance_step`]).
+//! steppable, compact is not a machine; see [`is_maintenance_step`]). No
+//! time jump is offered while a stepped compact is in flight: it holds the
+//! maintenance lock for its whole run, and a jump inside it would make it
+//! the victim of an aged-lock reap (H4's family), which no signature
+//! describes. Jumps before and after it, and crashes, are offered.
 //! Delete is one decision. Both run their index writes through the same
 //! publish machine, driven to the end inside the command.
 //!
@@ -53,7 +57,7 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::VykarError;
 
 /// Single attempts at the commit lock before a backup gives up with
-/// `Locked` (production waits up to 10 minutes of real time instead).
+/// `Locked` (production waits up to 2 hours of real time instead).
 pub const LOCK_ATTEMPTS: u32 = 3;
 
 /// More decisions than this in one case is a harness bug.
@@ -201,15 +205,19 @@ pub struct Case {
 
 /// How the driver runs a Compact command.
 ///
-/// Searches and the campaign draw `Stepped` only in cases without time
-/// jumps and without crashes: a compact held between its fence check and
-/// its head PUT, or between the head PUT and its pack deletes, across a
-/// 6 h jump becomes the aged-lock victim itself, and the signatures
-/// describe backups as victims. [`run_case`] refuses a `Stepped` case
-/// with time jumps; a crash stays possible (`crash_inside_a_stepped_compact`
-/// crashes the compact's client: without a jump no lock it leaves is
-/// reaped). 04 step 7's second half (maintenance beside live backups) and
-/// 04 step 8 lift that restriction.
+/// Since 04 step 7 (phase F part 8b) `Stepped` is drawn in cases with time
+/// jumps and with crashes, but the driver offers no jump while a stepped
+/// compact is in flight: one held between its fence check and its head
+/// PUT, or between the head PUT and its pack deletes, across a 6 h jump
+/// would become the aged-lock victim itself (H4's family, a known hazard
+/// with its own scripted scenario), and the signatures describe backups as
+/// victims. 8b's mechanisms need no jump inside compact: the horizon is
+/// read at the session listing, the age at the pack listing, I8 at the
+/// commit. That a jump between compact's listings only makes its "now"
+/// (the lock key's mtime) older, which errs young, is argued, not searched.
+/// A crash of the compact's client stays as before
+/// (`crash_inside_a_stepped_compact`). 04 step 8 makes maintenance heads
+/// put-if-absent and can offer jumps inside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Maintenance {
     /// One decision for the whole command (every seed recorded before 04
@@ -447,6 +455,13 @@ pub enum Signature {
     /// error (seed `aged-session-reaped-late-marker-write`). Every marker
     /// key is written once by the client, so "young" is judged by the write
     /// time of the key that was deleted.
+    ///
+    /// Since 04 step 7 (phase F part 8b) compact runs beside live sessions
+    /// and keeps their orphan uploads inside their marker's horizon as well
+    /// as by age; a reaped marker leaves only the age guard, and a victim
+    /// whose marker record is broken commits only while its packs are
+    /// younger than T_pack − M − 30 min (I8). Packs the compact's own sweep
+    /// emptied still go at once (until young index segments).
     SessionReaped,
     /// A live backup's session marker deleted as stale by another client
     /// after a jump of virtual time past the session staleness (a suspended
@@ -461,8 +476,13 @@ pub enum Signature {
     /// its damage narrows: compact keeps the victim's orphan uploads younger
     /// than T_pack. Packs the compact's own sweep emptied still go at once:
     /// a victim that published its head but not yet its snapshot loses them
-    /// (seed `aged-session-reaped-swept-packs`). Bounded by 04 step 7 (the
-    /// marker horizon) and I8.
+    /// (seed `aged-session-reaped-swept-packs`). Since 04 step 7 (phase F
+    /// part 8b) compact runs beside live sessions and keeps their orphan
+    /// uploads inside their marker's horizon as well as by age; a reaped
+    /// marker leaves only the age guard, and a victim whose marker record
+    /// is broken commits only while its packs are younger than T_pack − M
+    /// − 30 min (I8). Packs the compact's own sweep emptied still go at
+    /// once (young index segments narrow that).
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
     /// age (not written for more than the 6 h stale age: the driver's time
@@ -491,7 +511,17 @@ pub enum Signature {
     /// past T_idx too, so the compact's index GC takes it and the case shows
     /// `LateHeadSegmentCollected` instead; the packs must age before the
     /// segment is written (jumps between the uploads and the commit lock,
-    /// seed `late-head-then-compact-old-packs`). Fixed by 04 step 8.
+    /// seed `late-head-then-compact-old-packs`). Since 04 step 7 (phase F
+    /// part 8b) I8 narrows it further: a backup whose marker went
+    /// unrefreshed commits only while its packs are younger than T_pack − M
+    /// − 30 min at its fence, so the packs must age 40 to 60 min after the
+    /// fence while the segment stays younger than T_idx, which the driver's
+    /// jumps cannot make (that seed now shows its commit refusing). A
+    /// backup whose marker is refreshed throughout passes I8 at any age, so
+    /// production still reaches it; the driver never refreshes markers (its
+    /// clock moves only by jumps), and the scripted test
+    /// `a_late_head_of_a_refreshed_backup_names_packs_compact_deleted`
+    /// (tests/sim.rs) covers it. Fixed by 04 step 8.
     LateHeadThenCompact,
     /// H3 meeting index GC (04 "Current issues" 2 and 3): a head PUT that
     /// timed out names a segment of its failed commit; before the late
@@ -539,7 +569,11 @@ pub enum Signature {
     /// V's packs must be at least T_pack (12 h) old on the store's clock at
     /// the compact: a jump between V's uploads and its commit lock, one
     /// before its fence (which refreshes the lock) and one after (seed
-    /// `aged-lock-packs-collected-old-packs`). Fixed by 04 step 8.
+    /// `aged-lock-packs-collected-old-packs`). Since 04 step 7 (phase F
+    /// part 8b) I8 narrows it: V's head must pass its fence before its
+    /// packs are T_pack − M − 30 min old (11 h 20 min), so the last jump
+    /// must come after the fence (a stall after it, the lost-lock hazard).
+    /// Fixed by 04 step 8.
     AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
     /// chunks: invariant 1 fails with no lock violation other than late
@@ -704,12 +738,6 @@ pub struct Outcome {
 
 /// Run `case` on a fork of `template`'s store and judge the end state.
 pub fn run_case(template: &Template, case: &Case) -> Outcome {
-    assert!(
-        !(case.maintenance == Maintenance::Stepped && case.advances),
-        "a Stepped compact runs only in cases without time jumps (advances: false) until \
-         04 step 7's second half: held across a jump it becomes the aged-lock victim \
-         itself, which no signature describes"
-    );
     let mut d = Driver::new(template, case);
     d.run();
     d.verdict()
@@ -903,7 +931,12 @@ impl<'c> Driver<'c> {
             }
         }
         out.extend(parked);
-        if self.case.advances && self.advances < MAX_ADVANCES {
+        // No jump inside a stepped compact (see `Maintenance`).
+        let in_maint = self
+            .actors
+            .iter()
+            .any(|a| matches!(a.phase, Phase::Maint(_)));
+        if self.case.advances && self.advances < MAX_ADVANCES && !in_maint {
             out.extend(ADVANCES.iter().map(|&secs| Action::Advance { secs }));
         }
         if self.case.crash && !self.crashed {
@@ -1393,6 +1426,8 @@ impl<'c> Driver<'c> {
             Invariant::IndexIntegrity,
             Invariant::AllowedErrors,
             Invariant::LockExclusion,
+            Invariant::OrphanGrace,
+            Invariant::MarkerGapCommit,
         ]);
         let signatures = classify(&self.sim, &report, &self.entries);
         let trace = self.trace(&report, &signatures);

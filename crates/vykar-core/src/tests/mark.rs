@@ -834,9 +834,12 @@ fn report_is_cancellable() {
     assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
 }
 
+/// Since 04 step 7 the report runs beside a live session, and the session
+/// changes nothing in it.
 #[test]
-fn report_refuses_while_a_session_is_active() {
+fn report_runs_beside_a_live_session() {
     let fx = two_snapshots(false);
+    let without = fx.report().unwrap();
     let sessions = fx.repo_dir.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -847,8 +850,8 @@ fn report_refuses_while_a_session_is_active() {
         ),
     )
     .unwrap();
-    let err = fx.report().unwrap_err();
-    assert!(matches!(err, VykarError::ActiveSessions(_)), "got {err:?}");
+    let with = fx.report().unwrap();
+    assert_eq!(format!("{with:?}"), format!("{without:?}"));
 }
 
 // ---------------------------------------------------------------------------

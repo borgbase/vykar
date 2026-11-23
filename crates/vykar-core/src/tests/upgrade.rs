@@ -223,6 +223,44 @@ fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     v
 }
 
+/// B7 (04 step 7): upgrade rewrites the index and does not run beside a
+/// backup. Through the production path the refusal runs under the lock
+/// (inside `run_under_fence`), after the stale-session cleanup; nothing
+/// is upgraded and the session's marker is kept.
+#[test]
+fn upgrade_refuses_with_a_live_session() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let before = fx.decoded_config();
+    let sessions = fx.repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let marker = sessions.join("deadbeef-1234-5678-9abc-def012345678.json");
+    std::fs::write(
+        &marker,
+        format!(
+            r#"{{"hostname":"other-host","pid":99999,"registered_at":"{now}","last_refresh":"{now}","elapsed_secs":0}}"#
+        ),
+    )
+    .unwrap();
+    let err = commands::upgrade::run(&fx.config, None).unwrap_err();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::ActiveSessions(_)),
+        "got {err}"
+    );
+    assert!(marker.exists());
+    assert_eq!(format!("{:?}", fx.decoded_config()), format!("{before:?}"));
+    assert!(
+        std::fs::read_dir(fx.repo_dir.join("locks"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+            == 0,
+        "the lock is released"
+    );
+}
+
 /// v2 and v3 → v6 (UPG-1): one base, no segments, a head at
 /// `index.h/1`, the same index; `index`, `index.gen` and the local blob
 /// copy gone; later backups append segments, and a second upgrade does

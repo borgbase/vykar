@@ -140,6 +140,9 @@ pub(crate) struct WriteSessionState {
     pub(crate) rollback_tracker: Option<RollbackTracker>,
     /// Diagnostic counters for the backup's debug summary.
     pub(crate) metrics: WriteMetrics,
+    /// Accepts a pack upload an append-only server refused because the pack
+    /// is stored already; set by `begin_write_session`.
+    pub(crate) existing_packs: Option<std::sync::Arc<super::existing_pack::ExistingPacks>>,
 }
 
 /// The index state a write session dedups against, captured at its begin
@@ -189,6 +192,7 @@ impl WriteSessionState {
             session_id: DEFAULT_SESSION_ID.to_string(),
             rollback_tracker: None,
             metrics: WriteMetrics::default(),
+            existing_packs: None,
         }
     }
 
@@ -374,6 +378,7 @@ impl WriteSessionState {
         chunk_index: &LiveIndex,
         width: usize,
         clock: &dyn Clock,
+        cancel: &super::control::CancelToken,
     ) -> Result<PendingIndexRecovery> {
         journal_recovery::recover_pending_index(
             storage,
@@ -384,6 +389,7 @@ impl WriteSessionState {
             width,
             &mut RecoveryTarget {
                 clock,
+                cancel,
                 recovered_chunks: &mut self.recovered_chunks,
                 recovered_index_keys: &mut self.recovered_index_keys,
                 journal: &mut self.journal.entries,

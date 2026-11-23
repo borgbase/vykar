@@ -3,6 +3,7 @@ pub(crate) mod blob_read;
 pub(crate) mod bounded;
 pub(crate) mod coalesce;
 pub mod control;
+pub(crate) mod existing_pack;
 pub mod file_cache;
 pub mod format;
 pub mod host_env;
@@ -580,6 +581,9 @@ pub struct Repository {
     /// the ages this lock holder judges. `None` outside a lock, or when the
     /// storage reports no mtime.
     lock_store_time: Option<vykar_storage::StoreNow>,
+    /// The sessions the maintenance lock found live, for compact's horizon;
+    /// `None` outside `with_maintenance_lock`.
+    live_sessions: Option<Vec<lock::LiveSession>>,
     /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
     /// (zero turns the guard off, so a test double without mtimes deletes).
     pack_grace: std::time::Duration,
@@ -740,6 +744,34 @@ impl Repository {
     pub fn clear_lock_fence(&mut self) {
         self.lock_fence = None;
         self.lock_store_time = None;
+        self.live_sessions = None;
+    }
+
+    /// Record the sessions the maintenance lock found live.
+    pub(crate) fn set_live_sessions(&mut self, s: Option<Vec<lock::LiveSession>>) {
+        self.live_sessions = s;
+    }
+
+    /// The sessions the maintenance lock found live; empty outside it.
+    pub(crate) fn live_sessions(&self) -> &[lock::LiveSession] {
+        self.live_sessions.as_deref().unwrap_or_default()
+    }
+
+    /// `Err(ActiveSessions)` listing them when any session is live: for the
+    /// maintenance actions that must not run beside a backup (repair,
+    /// upgrade).
+    pub(crate) fn refuse_live_sessions(&self) -> Result<()> {
+        let live = self.live_sessions();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let entries = live
+            .iter()
+            .map(|s| (s.session_id.clone(), s.entry.clone()))
+            .collect();
+        Err(vykar_types::error::VykarError::ActiveSessions(
+            lock::build_active_session_list(entries, &self.host_env.now_utc()),
+        ))
     }
 
     /// Record the store's clock reading of the lock this handle works under.

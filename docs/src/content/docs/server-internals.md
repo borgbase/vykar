@@ -73,6 +73,7 @@ Independently of append-only, `index.h/<gen>` is write-once and `index.d/<id>` i
 - `/?batch-delete` is refused as a whole, with nothing deleted, if any key's class refuses deletion
 - A part upload of an existing pack is refused with `403` at its first part; a completion that finds the pack already present succeeds only if the stored object carries the expected digest (nothing is overwritten), and fsyncs the directory before answering
 - `/?repack` operations that delete old packs are rejected
+- A backup that seals a pack the server already holds (a plaintext re-upload after an interrupted backup whose journal was not adopted) gets `403` for it; when the server advertises `append_only` and the stored object has the pack's size, the client uses the stored copy and pulls its session's start back by the object's age (architecture, "Crash Recovery")
 
 Old index heads, index objects and pack maps therefore accumulate on an append-only server until a maintenance window removes them.
 

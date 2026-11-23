@@ -670,6 +670,7 @@ fn upload_prepared(
         progress,
         shutdown,
         &mut dataless,
+        session.marker(),
     );
 
     // On Phase 1 error: flush packs, then deregister (`session` drops at the return).

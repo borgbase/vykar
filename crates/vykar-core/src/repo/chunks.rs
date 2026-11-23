@@ -366,13 +366,19 @@ impl Repository {
         let storage = Arc::clone(&self.storage);
         let key = pack_id.storage_key();
         let put_nanos = Arc::clone(&self.ws().metrics.upload_put_nanos);
+        let existing = self.ws().existing_packs.clone();
         self.ws_mut()
             .spawn_upload(pack_id, journal_chunks, bytes, move |held| {
                 let _span = tracing::debug_span!("pack_upload").entered();
                 let start = Instant::now();
                 let result = data.put_to(&*storage, &key, move || held.release());
                 put_nanos.fetch_add(duration_nanos(start.elapsed()), Ordering::Relaxed);
-                result
+                match (result, existing) {
+                    (Err(e), Some(existing)) => {
+                        existing.settle_refused(&*storage, &key, pack_bytes, e)
+                    }
+                    (result, _) => result,
+                }
             });
 
         Ok(())

@@ -23,6 +23,9 @@ pub struct OpRecord {
     /// (`SimStore::set_label`); a
     /// released effect keeps the label of its issue.
     pub label: Option<&'static str>,
+    /// The store's clock when the record was logged (for a release: when
+    /// it applied). Harness-only: not in canonical traces or seeds.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 impl OpRecord {

@@ -20,7 +20,9 @@ vykar prune --compact
 
 `delete` and `prune` free no space: they only delete snapshot objects. `compact` reclaims it. On every run it first marks every live snapshot and removes the index entries none of them references (the sweep), then rewrites and deletes packs.
 
-Restores, listings, `find`, `diff` and `check` running elsewhere do not hold compact (or `prune`, `delete`) back: readers register nothing, and read what compact moved from its new place. A restore of a snapshot that is deleted and compacted meanwhile fails and says so. A snapshot that `prune` or `delete` removes while `check` or `find` runs is skipped with a warning; `diff` of such a snapshot fails with "snapshot not found". Running backups still make compact refuse.
+Restores, listings, `find`, `diff` and `check` running elsewhere do not hold compact (or `prune`, `delete`) back: readers register nothing, and read what compact moved from its new place. A restore of a snapshot that is deleted and compacted meanwhile fails and says so. A snapshot that `prune` or `delete` removes while `check` or `find` runs is skipped with a warning; `diff` of such a snapshot fails with "snapshot not found".
+
+Compact, `prune` and `delete` also run while backups upload. Compact keeps what a running backup has uploaded (orphan packs younger than 12 hours, and those a live backup may still need; the summary counts the ones it kept for a running backup), and also keeps the uploads of a crashed backup until they are 12 hours old. A backup that finishes uploading while a compact runs waits for it, up to 2 hours, then commits; a backup that starts while maintenance holds the lock fails with "locked" after a few seconds, as before. A backup that reused data a concurrent compact removed fails and asks to be retried.
 
 Compact fails closed: when a snapshot object cannot be read or decoded, an object under `snapshots/` is not a snapshot, or a listing chunk or a data reference is missing from the index, it refuses with "compact refused: the live snapshots could not be marked, nothing was changed". Every compact refuses until `vykar check --repair` removes the object. A snapshot written by a newer vykar also makes compact refuse, and repair deliberately does not remove it: upgrade vykar instead. Compact also refuses when no snapshot is listed while the index still holds chunks (it does not sweep a repository to empty; `vykar delete` removes a repository).
 
@@ -38,7 +40,7 @@ vykar compact --report-unreferenced
 `--report-unreferenced` reads every snapshot and prints how many index entries
 no snapshot references (what the next compact sweeps), their size and the packs
 that hold them. It takes the
-maintenance lock, so it refuses while backups run, and fails rather than
+maintenance lock (it runs while backups upload), and fails rather than
 reporting anything when a snapshot or a listing chunk cannot be read.
 
 ## Verify repository integrity
@@ -146,7 +148,7 @@ vykar upgrade -R <repo> --yes    # for scripts
 ```
 
 - **One-way.** vykar releases before 0.25 can no longer read or write the repository afterwards. Upgrade vykar on every host that uses it, and stop all of them, before upgrading.
-- **No active backups.** The upgrade takes the maintenance lock and refuses while backup sessions are active, like `compact` and `prune`.
+- **No active backups.** The upgrade takes the maintenance lock and refuses while backup sessions are active, like `check --repair` (unlike `compact` and `prune`, which run beside them).
 - **Append-only servers.** The upgrade rewrites `config` and deletes `index`, which an append-only `vykar-server` refuses; it fails before changing anything. The procedure: turn append-only off for the repository (restart `vykar-server` without `--append-only`), run `vykar upgrade`, then turn append-only on again.
 - **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, every other command refuses and names `vykar upgrade`. If the interrupted upgrade left a damaged index, `vykar upgrade` still completes the switch to the new format and then reports the damage: run `vykar check --repair` (with `--dry-run` first to see what it would change). If `index` turns out to be a damaged pre-0.25 index instead, the upgrade changes nothing and says so; restore `index` from a copy of the repository.
 - **Before the switch, older clients still work.** An upgrade that stopped before switching `config` leaves the repository in its old format with extra directories beside it (`packmaps/`, and possibly `index.h/` and `index.d/`). Clients before 0.25 ignore them, but a `vykar-server` before 0.25 refuses to start on a data directory that contains them ("contains unexpected entries"). Run `vykar upgrade` again to finish; to stay on the old format instead, remove those directories while `config` is still the old one.

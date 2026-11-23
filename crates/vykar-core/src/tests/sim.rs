@@ -454,17 +454,13 @@ fn containers_sharing_a_hostname_reap_by_age_only() {
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     let marker = crash_backup_leaving_marker(&mut sim, a);
 
-    let r = sim.compact(c);
-    assert_eq!(
-        r.error_class(),
-        Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
-        "{}",
-        r.detail()
-    );
+    // Since 04 step 7 compact runs beside the young marker and keeps it.
+    sim.compact(c).expect_ok();
+    assert!(sim.store().object(&marker).is_some());
     sim.advance(Duration::from_secs(46 * 60));
     sim.compact(c).expect_ok();
     assert!(sim.store().object(&marker).is_none());
-    sim.check_invariants(Invariant::STEP1).assert_clean();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// A lock in the format of 0.24 and older (no installation ID) from c's
@@ -522,25 +518,76 @@ fn crash_backup_leaving_marker(sim: &mut Sim, a: ClientId) -> String {
     markers.into_iter().next().unwrap()
 }
 
+/// `a`'s backup crashes at its commit lock's PUT, after every pack is
+/// uploaded, leaving its marker and journal behind. Returns the marker key
+/// and a's packs.
+fn crash_backup_after_upload(
+    sim: &mut Sim,
+    a: ClientId,
+    tree: &SourceTree,
+) -> (String, Vec<String>) {
+    sim.fault(FaultRule::new(OpMatch::AnyWrite, KeyMatch::LockKey, FaultAction::Crash).client(a));
+    let r = sim.backup(a, "x1", tree);
+    assert!(allowed_as(&r, AllowedError::Injected), "{}", r.detail());
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
+    assert!(sim.store().object(&marker).is_some(), "the marker is left");
+    let packs = sim.store().keys_written_by(a, "packs/");
+    assert!(!packs.is_empty(), "a uploaded before the crash");
+    (marker, packs)
+}
+
+/// The count `name` of a compact run's detail ("packs 4 ... live 0").
+fn compact_stat(detail: &str, name: &str) -> u64 {
+    let words: Vec<&str> = detail.split_whitespace().collect();
+    words
+        .iter()
+        .position(|w| *w == name)
+        .and_then(|i| words.get(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in {detail:?}"))
+}
+
+/// 04 step 7's done criterion: a crashed backup no longer blocks compact.
+/// Compact runs at once and keeps the crashed backup's uploads (young, and
+/// inside its live marker's horizon); 46 min later the marker is reaped
+/// and the uploads are still kept (young); T_pack later they go.
 #[test]
-fn foreign_session_blocks_compact_until_stale() {
+fn a_crashed_backup_no_longer_blocks_compact() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    let marker = crash_backup_leaving_marker(&mut sim, a);
+    let (marker, packs) = crash_backup_after_upload(&mut sim, a, &tree("x1"));
 
     let r = sim.compact(b);
-    assert_eq!(
-        r.error_class(),
-        Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
+    r.expect_ok();
+    let kept = compact_stat(r.detail(), "young") + compact_stat(r.detail(), "live");
+    assert!(kept >= packs.len() as u64, "{}", r.detail());
+    assert!(sim.store().object(&marker).is_some());
+
+    sim.advance(Duration::from_secs(46 * 60));
+    let r = sim.compact(b);
+    r.expect_ok();
+    assert!(sim.store().object(&marker).is_none(), "reaped once stale");
+    assert!(
+        compact_stat(r.detail(), "young") >= packs.len() as u64,
         "{}",
         r.detail()
     );
+    for k in &packs {
+        assert!(sim.store().object(k).is_some(), "{k} deleted while young");
+    }
 
-    sim.advance(Duration::from_secs(46 * 60));
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
     sim.compact(b).expect_ok();
-    assert!(sim.store().object(&marker).is_none());
-    sim.check_invariants(Invariant::STEP1).assert_clean();
+    for k in &packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept once old");
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 #[test]
@@ -1177,11 +1224,50 @@ fn allowed_as(run: &crate::sim::history::RunRecord, e: AllowedError) -> bool {
     run.error_class() == Some(&ErrorClass::Allowed(e))
 }
 
-/// SIM-1: a compact while a backup is between its uploads and its commit
-/// refuses (the session is live) and touches no pack and no index object;
-/// the backup then commits.
+/// A live marker written before 04 step 7 (no `elapsed_secs`) gives compact
+/// no horizon: it deletes no orphan pack, not even a crashed backup's 12 h
+/// old ones, while the packs its own sweep emptied, and repack, go on.
 #[test]
-fn sweep_against_a_live_backup_refuses() {
+fn an_unknown_horizon_keeps_every_orphan_but_not_swept_packs() {
+    let mut sim = Sim::new();
+    let (x, c) = (sim.client("x"), sim.client("c"));
+    let (_marker, packs) = crash_backup_after_upload(&mut sim, x, &tree("x1"));
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
+    sweepable(&mut sim, c);
+    let now = sim.time().now_utc().to_rfc3339();
+    let body = serde_json::json!({
+        "hostname": "elsewhere",
+        "pid": 4242,
+        "registered_at": now,
+        "last_refresh": now,
+    });
+    sim.tamper_put(
+        "sessions/old-writer.json",
+        &serde_json::to_vec(&body).unwrap(),
+    );
+    let r = sim.compact(c);
+    r.expect_ok();
+    let d = r.detail();
+    assert!(compact_stat(d, "unreferenced") > 0, "{d}");
+    assert!(compact_stat(d, "live") >= packs.len() as u64, "{d}");
+    assert!(
+        compact_stat(d, "repacked") + compact_stat(d, "deleted_empty") > 0,
+        "{d}"
+    );
+    for k in &packs {
+        assert!(
+            sim.store().object(k).is_some(),
+            "{k} deleted without a horizon"
+        );
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// SIM-1: a compact while a backup is between its uploads and its commit
+/// runs beside it (04 step 7) and deletes none of its packs; the backup
+/// then commits and restores.
+#[test]
+fn a_sweep_beside_a_live_backup_keeps_its_uploads() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
@@ -1194,20 +1280,19 @@ fn sweep_against_a_live_backup_refuses() {
         },
     );
     sim.expect_paused(gb, "b's commit-lock sweep");
-    assert!(!sim.store().keys_written_by(b, "packs/").is_empty());
+    let b_packs = sim.store().keys_written_by(b, "packs/");
+    assert!(!b_packs.is_empty());
     let ra = sim.compact(a);
+    ra.expect_ok();
+    let deleted = mutations_under(&sim, a, ra.index, &["packs/"]);
     assert!(
-        allowed_as(&ra, AllowedError::ActiveSessions),
-        "{:?}",
-        ra.outcome
-    );
-    assert!(
-        mutations_under(&sim, a, ra.index, &["packs/", "index.h/", "index.d/"]).is_empty(),
-        "compact mutated under a live session"
+        b_packs.iter().all(|k| !deleted.contains(k)),
+        "compact deleted a live backup's pack: {deleted:?}"
     );
     sim.resume(gb);
     sim.join(sb).expect_ok();
-    sim.check_invariants(interleavings::CHECKED).assert_clean();
+    sim.restore(c, "b1").expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// c0, t0 and t1 (t1 shares t0's first file), then t0 deleted: a compact
@@ -1314,7 +1399,7 @@ fn a_crash_at_every_write_of_the_sweep_is_recoverable() {
             assert!(report.is_clean(), "{case} at {faulted:?}: {report}");
             let again = sim.compact(c);
             assert!(
-                again.detail().ends_with("unreferenced 0"),
+                again.detail().contains(" unreferenced 0 "),
                 "{case} at {faulted:?}: {}",
                 again.detail()
             );
@@ -1509,13 +1594,15 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
     sim.check_invariants(interleavings::CHECKED).assert_clean();
 }
 
-/// 04 step 2, A1: the registration key's presence check fails at the
-/// heartbeat's refresh and again at the commit's probe. Whether a reaper
-/// deleted the key after the refresh's PUT or not, the commit refuses with
-/// the probe's error (not as stale: the reap is not proven) and the backup
-/// writes no index or snapshot.
+/// 04 step 2, A1, with 04 step 7's pack-age term: the registration key's
+/// presence check fails at the heartbeat's refresh and again at the
+/// commit's probe. Whether a reaper deleted the key after the refresh's
+/// PUT or not, the record is not sound; the backup's uploads are minutes
+/// old, young enough to be kept by compact's age guard, so it commits and
+/// its snapshot restores. (With old packs it refuses with the probe's
+/// error: `tests::lock::commit_marker_check_rules`.)
 #[test]
-fn a_marker_key_that_stays_unchecked_stops_the_commit() {
+fn a_marker_key_that_stays_unchecked_commits_while_young() {
     const WAIT: Duration = Duration::from_secs(5);
     for reaped in [true, false] {
         let mut sim = Sim::new();
@@ -1573,23 +1660,13 @@ fn a_marker_key_that_stays_unchecked_stops_the_commit() {
 
         sim.resume(g_main);
         let ra = sim.join(sa);
-        assert!(!ra.is_ok(), "reaped {reaped}: {:?}", ra.outcome);
+        assert!(ra.is_ok(), "reaped {reaped}: {:?}", ra.outcome);
         assert!(
-            !allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
-            "reaped {reaped}: {:?}",
-            ra.outcome
+            !sim.store().keys_written_by(a, "snapshots/").is_empty(),
+            "reaped {reaped}: a wrote its snapshot"
         );
-        assert!(
-            ra.detail().contains(&format!("Exists {gen0}")),
-            "reaped {reaped}: {}",
-            ra.detail()
-        );
-        for prefix in ["index.d/", "index.h/", "snapshots/"] {
-            assert!(
-                sim.store().keys_written_by(a, prefix).is_empty(),
-                "reaped {reaped}: a wrote {prefix}"
-            );
-        }
+        sim.restore(c, "a1").expect_ok();
+        sim.check_invariants(Invariant::STEP7).assert_clean();
     }
 }
 
@@ -1684,11 +1761,17 @@ fn marker_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(a, backup_call("a1"));
     sim.expect_paused(ga, "a's commit-lock sweep");
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
     let rb = sim.compact(b);
+    rb.expect_ok();
     assert!(
-        allowed_as(&rb, AllowedError::ActiveSessions),
-        "{:?}",
-        rb.outcome
+        sim.store().object(&marker).is_some(),
+        "a's live marker reaped"
     );
     sim.resume(ga);
     sim.join(sa).expect_ok();
@@ -1804,24 +1887,41 @@ fn a_store_clock_step_ages_every_object() {
     let _ = sim.join(sa);
 }
 
-/// A malformed marker blocks maintenance while young and is reaped once
-/// 45 min old by its mtime; invariant 9 no longer skips it.
+/// A young malformed marker gives compact no horizon: compact runs but
+/// deletes no orphan pack, not even one older than T_pack (a crashed
+/// backup's); once 45 min old by its mtime it is reaped and the next
+/// compact deletes the orphans. Invariant 9 no longer skips it.
 #[test]
 fn malformed_marker_ages_out() {
     let mut sim = Sim::new();
-    let c = sim.client("c");
+    let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let (_marker, packs) = crash_backup_after_upload(&mut sim, a, &tree("x1"));
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
     sim.tamper_put("sessions/x.json", b"{");
     let r = sim.compact(c);
+    r.expect_ok();
     assert!(
-        allowed_as(&r, AllowedError::ActiveSessions),
-        "{:?}",
-        r.outcome
+        compact_stat(r.detail(), "live") >= packs.len() as u64,
+        "{}",
+        r.detail()
     );
+    for k in &packs {
+        assert!(
+            sim.store().object(k).is_some(),
+            "{k} deleted without a horizon"
+        );
+    }
     sim.advance(Duration::from_secs(46 * 60));
     sim.compact(c).expect_ok();
     assert!(sim.store().object("sessions/x.json").is_none());
-    let report = sim.check_invariants(Invariant::STEP3);
+    for k in &packs {
+        assert!(
+            sim.store().object(k).is_none(),
+            "{k} kept once the marker aged out"
+        );
+    }
+    let report = sim.check_invariants(Invariant::STEP7);
     assert!(
         !report.not_evaluated_for(Invariant::NoPermanentWedge, "sessions/x.json"),
         "{report}"
@@ -2070,4 +2170,461 @@ fn check_skips_a_snapshot_deleted_during_the_check() {
     run.expect_ok();
     assert!(run.detail().starts_with("0 errors"), "{}", run.detail());
     sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+// ── Maintenance beside backups (04 step 7) ──────────────────────────────
+
+/// a's session marker key (generation 0).
+fn marker_of(sim: &Sim, a: ClientId) -> String {
+    sim.store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker")
+}
+
+/// Spawn a's backup of `a1` and hold it at its commit lock's stale-lock
+/// sweep, after every pack is uploaded.
+fn hold_after_upload(
+    sim: &mut Sim,
+    a: ClientId,
+) -> (crate::sim::GateId, crate::sim::runner::Spawned) {
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let sa = sim.spawn(a, backup_call("a1"));
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    assert!(!sim.store().keys_written_by(a, "packs/").is_empty());
+    (ga, sa)
+}
+
+/// 04 step 7's done criterion: compact runs during a backup. b deletes c0
+/// (a's tree shares nothing with it) and compacts while a is between its
+/// uploads and its commit: compact sweeps c0's chunks, keeps a's packs and
+/// leaves a's marker; a commits and restores.
+#[test]
+fn compact_runs_during_a_backup() {
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "c0", &tree("c0")).expect_ok();
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    let marker = marker_of(&sim, a);
+    sim.delete(b, &["c0"]).expect_ok();
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    assert!(
+        compact_stat(rb.detail(), "unreferenced") > 0,
+        "{}",
+        rb.detail()
+    );
+    for k in &a_packs {
+        assert!(
+            sim.store().object(k).is_some(),
+            "{k} deleted under a live backup"
+        );
+    }
+    assert!(sim.store().object(&marker).is_some());
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    sim.restore(b, "a1").expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// A live marker's horizon keeps orphan packs older than T_pack: a
+/// session that says it has run for 13 h covers a crashed backup's 12 h
+/// old packs until the marker goes.
+#[test]
+fn the_horizon_keeps_uploads_older_than_t_pack() {
+    let mut sim = Sim::new();
+    let (x, b) = (sim.client("x"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    let (_marker, packs) = crash_backup_after_upload(&mut sim, x, &tree("x1"));
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
+    let now = sim.time().now_utc().to_rfc3339();
+    let body = serde_json::json!({
+        "hostname": "elsewhere",
+        "pid": 4242,
+        "registered_at": now,
+        "last_refresh": now,
+        "elapsed_secs": 13 * 3600,
+    });
+    let live = "sessions/longrunning.json";
+    sim.tamper_put(live, &serde_json::to_vec(&body).unwrap());
+    let r = sim.compact(b);
+    r.expect_ok();
+    assert!(
+        compact_stat(r.detail(), "live") >= packs.len() as u64,
+        "{}",
+        r.detail()
+    );
+    for k in &packs {
+        assert!(
+            sim.store().object(k).is_some(),
+            "{k} deleted inside a live horizon"
+        );
+    }
+    assert!(sim.tamper_delete(live));
+    sim.compact(b).expect_ok();
+    for k in &packs {
+        assert!(
+            sim.store().object(k).is_none(),
+            "{k} kept with no horizon over it"
+        );
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// B8: the horizon end to end. a is held after its uploads while its
+/// heartbeat refreshes the marker every 15 min for more than 12 h; b's
+/// compact then finds a's packs older than T_pack and keeps them by a's
+/// horizon alone; a commits with a sound record and restores.
+#[test]
+fn a_refreshed_marker_keeps_uploads_older_than_t_pack() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    let polls = (crate::repo::ages::T_PACK.as_secs() + 30 * 60) / 30;
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    for _ in 0..polls {
+        sim.advance(Duration::from_secs(30));
+        assert!(
+            sim.time().wait_for_waiters(1, WAIT),
+            "the heartbeat waits again"
+        );
+    }
+    let refreshes = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .iter()
+        .filter(|k| k.ends_with(".json"))
+        .count();
+    assert!(refreshes > 48, "{refreshes} marker keys");
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    assert!(
+        compact_stat(rb.detail(), "live") >= a_packs.len() as u64,
+        "{}",
+        rb.detail()
+    );
+    for k in &a_packs {
+        assert!(
+            sim.store().object(k).is_some(),
+            "{k} deleted inside a's horizon"
+        );
+    }
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    sim.restore(b, "a1").expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// LateHeadThenCompact with a sound marker record: a is held after its
+/// uploads for more than T_pack while its heartbeat refreshes the marker,
+/// so I8 lets it commit; its head PUT is delayed and the commit fails
+/// (its session, and with it its horizon, ends). b's compact deletes a's
+/// packs as orphans older than T_pack and keeps a's segment (younger than
+/// T_idx); the late head then lands and names that segment, so the index
+/// names absent packs. The driver's verdict on this store claims it as
+/// exactly `LateHeadThenCompact` (fixed by 04 step 8).
+#[test]
+fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
+    use crate::sim::driver::{Signature, classify as classify_case};
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("index.h/".into()),
+            FaultAction::Delay,
+        )
+        .client(a),
+    );
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    let polls = (crate::repo::ages::T_PACK.as_secs() + 30 * 60) / 30;
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    for _ in 0..polls {
+        sim.advance(Duration::from_secs(30));
+        assert!(
+            sim.time().wait_for_waiters(1, WAIT),
+            "the heartbeat waits again"
+        );
+    }
+    let refreshes = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .iter()
+        .filter(|k| k.ends_with(".json"))
+        .count();
+    assert!(refreshes > 48, "{refreshes} marker keys");
+    sim.resume(ga);
+    let ra = sim.join(sa);
+    assert!(allowed_as(&ra, AllowedError::Injected), "{:?}", ra.outcome);
+    assert!(
+        !sim.store().keys_written_by(a, "index.d/").is_empty(),
+        "a's segment"
+    );
+    sim.compact(b).expect_ok();
+    for k in &a_packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept");
+    }
+    assert_eq!(sim.release_all().len(), 1, "a's head PUT");
+    let report = sim.check_invariants(&[
+        Invariant::CommittedSnapshotsRestore,
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::AllowedErrors,
+        Invariant::LockExclusion,
+        Invariant::OrphanGrace,
+        Invariant::MarkerGapCommit,
+    ]);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::IndexNamesAbsentPack),
+        "{report:?}"
+    );
+    assert_eq!(
+        classify_case(&sim, &report, &[]),
+        BTreeSet::from([Signature::LateHeadThenCompact]),
+        "{report:?}"
+    );
+}
+
+/// I8 at the judgement: a's marker went unrefreshed for 11 h 30 min (one
+/// poll: a gap, no reap), so its uploads may be old enough for compact;
+/// the commit refuses before writing anything.
+#[test]
+fn a_broken_marker_record_with_old_packs_refuses_at_the_judgement() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(11 * 3600 + 30 * 60));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.resume(ga);
+    let ra = sim.join(sa);
+    assert!(
+        allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    for prefix in ["index.d/", "index.h/", "snapshots/"] {
+        assert!(
+            sim.store().keys_written_by(a, prefix).is_empty(),
+            "a wrote {prefix}"
+        );
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// A reaped marker with young uploads: b's compact 46 min later reaps a's
+/// marker as stale and keeps its packs by age; a's commit finds the marker
+/// gone and commits (I8: its packs are young); a1 restores.
+#[test]
+fn a_broken_marker_record_with_young_packs_commits() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let marker = marker_of(&sim, a);
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(46 * 60));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.compact(b).expect_ok();
+    assert!(sim.store().object(&marker).is_none(), "a's marker reaped");
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    sim.restore(b, "a1").expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// I8 at the fence before the head PUT: a's judgement passed at 11 h (a
+/// gap, packs young enough), then 30 min pass while a is held at its
+/// segment PUT; the fence refuses, and a writes no head.
+#[test]
+fn the_fence_before_the_head_put_applies_the_pack_age_term() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let gs = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyWrite,
+        KeyMatch::Prefix("index.d/".into()),
+    ));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(11 * 3600));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.resume(ga);
+    sim.expect_paused(gs, "a's segment PUT");
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(30 * 60));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.resume(gs);
+    let ra = sim.join(sa);
+    assert!(
+        allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    assert!(
+        sim.store().keys_written_by(a, "index.h/").is_empty(),
+        "a wrote a head"
+    );
+    assert!(sim.store().keys_written_by(a, "snapshots/").is_empty());
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// B2, the binding check: a's fence before the head PUT passed at 11 h 10
+/// min; its head PUT lands 45 min later, when the packs may be T_pack − M
+/// old; the check after it refuses the snapshot. The head stays without
+/// its snapshot.
+#[test]
+fn a_head_that_lands_late_writes_no_snapshot() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let gh = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyWrite,
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(11 * 3600 + 10 * 60));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.resume(ga);
+    sim.expect_paused(gh, "a's head PUT");
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(Duration::from_secs(45 * 60));
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.resume(gh);
+    let ra = sim.join(sa);
+    assert!(
+        allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    assert!(
+        !sim.store().keys_written_by(a, "index.h/").is_empty(),
+        "a wrote its head"
+    );
+    assert!(
+        sim.store().keys_written_by(a, "snapshots/").is_empty(),
+        "no snapshot"
+    );
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// `x`'s backup fails at its segment PUT: its session ends, its journal
+/// stays (`flush_on_abort`) and its packs are orphans. Returns them.
+fn fail_backup_leaving_journal(sim: &mut Sim, x: ClientId, tree: &SourceTree) -> Vec<String> {
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("index.d/".into()),
+            FaultAction::Fail,
+        )
+        .client(x),
+    );
+    let r = sim.backup(x, "x1", tree);
+    assert!(allowed_as(&r, AllowedError::Injected), "{}", r.detail());
+    assert!(
+        sim.store()
+            .keys("sessions/")
+            .iter()
+            .any(|k| k.ends_with(".index")),
+        "x's journal"
+    );
+    let packs = sim.store().keys_written_by(x, "packs/");
+    assert!(!packs.is_empty());
+    packs
+}
+
+/// The journal rule: a journal whose packs are older than T_pack/2 is not
+/// recovered; the next backup of the same tree uploads its chunks again,
+/// and the old packs stay as orphans for compact.
+#[test]
+fn a_journal_older_than_half_t_pack_is_not_recovered() {
+    let mut sim = Sim::new();
+    let (x, b, c) = (sim.client("x"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let x_packs = fail_backup_leaving_journal(&mut sim, x, &tree("x1"));
+    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.backup(b, "b1", &tree("x1")).expect_ok();
+    let b_packs = sim.store().keys_written_by(b, "packs/");
+    assert!(
+        b_packs.iter().any(|k| x_packs.contains(k)),
+        "b uploaded x's chunks again: x {x_packs:?}, b {b_packs:?}"
+    );
+    for k in &x_packs {
+        assert!(sim.store().object(k).is_some(), "{k} is left as an orphan");
+    }
+    sim.restore(c, "b1").expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// A recovered journal pulls the session's start back: b recovers x's 46
+/// min old packs, and its first refresh writes an `elapsed_secs` of at
+/// least the refresh interval plus their age.
+#[test]
+fn a_recovered_journal_pulls_the_marker_back() {
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut sim = Sim::new();
+    let (x, b, c) = (sim.client("x"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let x_packs = fail_backup_leaving_journal(&mut sim, x, &tree("x1"));
+    sim.advance(Duration::from_secs(46 * 60));
+    let gb = sim.gate(GateRule::new(b, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let sb = sim.spawn(
+        b,
+        Call::Backup {
+            snapshot: "b1".into(),
+            tree: tree("x1"),
+        },
+    );
+    sim.expect_paused(gb, "b's commit-lock sweep");
+    let b_packs = sim.store().keys_written_by(b, "packs/");
+    assert!(
+        b_packs.iter().all(|k| !x_packs.contains(k)),
+        "b recovered x's packs: x {x_packs:?}, b {b_packs:?}"
+    );
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    for _ in 0..30 {
+        sim.advance(Duration::from_secs(30));
+        assert!(sim.time().wait_for_waiters(1, WAIT));
+    }
+    let gen1 = sim
+        .store()
+        .keys_written_by(b, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".1.json"))
+        .expect("b's first refresh");
+    let entry: crate::repo::lock::SessionEntry =
+        serde_json::from_slice(&sim.store().object(&gen1).unwrap().data).unwrap();
+    let floor = (15 + 46) * 60;
+    assert!(
+        entry.elapsed_secs >= Some(floor),
+        "{:?}",
+        entry.elapsed_secs
+    );
+    sim.resume(gb);
+    sim.join(sb).expect_ok();
+    for k in &x_packs {
+        assert!(sim.store().object(k).is_some());
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }

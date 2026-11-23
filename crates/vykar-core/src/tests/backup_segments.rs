@@ -221,7 +221,8 @@ fn the_second_session_omits_chunks_the_first_committed() {
 /// commits; the recovered pack is not in its segment.
 #[test]
 fn a_recovered_pack_that_is_not_used_stays_out_of_the_segment() {
-    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    // A store with mtimes: recovery adopts journal packs by their age.
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::with_mtimes());
     let mut repo = init(&mem);
     repo.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
@@ -249,9 +250,16 @@ fn a_recovered_pack_that_is_not_used_stays_out_of_the_segment() {
     );
 
     let mut repo = open(&mem);
-    repo.begin_write_session(&WriteSessionOptions::default())
+    repo.begin_write_session(&WriteSessionOptions {
+        session_id: "recovering".into(),
+        ..WriteSessionOptions::default()
+    })
+    .unwrap();
+    // The recovering session's own marker gives recovery "now".
+    mem.put("sessions/recovering.json", b"{}").unwrap();
+    let recovered = repo
+        .recover_pending_index(&crate::repo::control::CancelToken::new())
         .unwrap();
-    let recovered = repo.recover_pending_index().unwrap();
     assert_eq!(recovered.recovered_chunks, 1);
     let new = store(&mut repo, b"a chunk of this session");
     commit(&mut repo, "s1");

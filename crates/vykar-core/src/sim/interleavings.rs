@@ -63,7 +63,7 @@ pub enum Hosts {
     LateNamesake,
 }
 
-/// The checked set for these scenarios: STEP1 and invariant 7.
+/// The checked set for these scenarios: STEP1 and invariants 7, 10 and 11.
 pub const CHECKED: &[Invariant] = &[
     Invariant::CommittedSnapshotsRestore,
     Invariant::AcknowledgedCommitsDurable,
@@ -71,6 +71,8 @@ pub const CHECKED: &[Invariant] = &[
     Invariant::IndexIntegrity,
     Invariant::AllowedErrors,
     Invariant::LockExclusion,
+    Invariant::OrphanGrace,
+    Invariant::MarkerGapCommit,
 ];
 
 const FILE_SIZE: usize = 64 * 1024;
@@ -396,7 +398,8 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
 /// placement reproduces it.
 ///
 /// A backs up a1 and is held at its commit lock's stale-lock sweep, after
-/// phase 1 uploaded its packs. B compacts. Then A resumes.
+/// phase 1 uploaded its packs. B compacts beside A's live backup (since 04
+/// step 7 it proceeds, keeping A's uploads). Then A resumes.
 pub fn h1_session_with(hosts: Hosts) -> HazardOutcome {
     settle(h1_session_scenario(hosts))
 }
@@ -442,8 +445,10 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     Ok(
         if marker_reaped && packs_deleted && allowed(&ra, AllowedError::StaleChunksDuringCommit) {
             HazardOutcome::Reproduced { evidence }
-        } else if allowed(&rb, AllowedError::ActiveSessions)
+        } else if !marker_reaped
+            && rb.is_ok()
             && ra.is_ok()
+            && !a_packs.iter().any(|k| b_deleted.contains(k))
             && !report.violated_for(Invariant::CommittedSnapshotsRestore, "a1")
         {
             HazardOutcome::NotReproduced { evidence }
@@ -592,12 +597,15 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerReap {
     /// Compact reaps the 46-min-old marker while the heartbeat is held
-    /// before its refresh PUT; compact runs (no live marker); the refresh
-    /// then writes the next key and finds the old one gone.
+    /// before its refresh PUT; compact runs (no live marker) and keeps a's
+    /// uploads by age; the refresh then writes the next key and finds the
+    /// old one gone. A reaped session marker is never written again; the
+    /// backup commits while its uploads are young (I8) and its snapshot
+    /// restores.
     BeforeRefresh,
     /// The refresh PUT of the next key has landed, its presence check of the
     /// old key has not: compact judges a's session by its newest key, which
-    /// is fresh, reaps nothing and refuses with ActiveSessions; the check
+    /// is fresh, reaps nothing and runs beside it (04 step 7); the check
     /// then finds the old key present and a commits.
     AfterPut,
 }
@@ -719,28 +727,23 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
          {rewrites:?}; a's markers left: {left:?}\n{report}",
         outcomes(&ra, &rb)
     );
+    let restores = !report.violated_for(Invariant::CommittedSnapshotsRestore, "a1");
     let held = match reap {
-        MarkerReap::BeforeRefresh => {
-            !reaped.is_empty() && rb.is_ok() && allowed(&ra, AllowedError::StaleChunksDuringCommit)
-        }
-        MarkerReap::AfterPut => {
-            reaped.is_empty() && allowed(&rb, AllowedError::ActiveSessions) && ra.is_ok()
-        }
+        MarkerReap::BeforeRefresh => !reaped.is_empty() && rb.is_ok() && ra.is_ok() && restores,
+        MarkerReap::AfterPut => reaped.is_empty() && rb.is_ok() && ra.is_ok() && restores,
     };
-    Ok(
-        if !reaped.is_empty() && (!rewrites.is_empty() || ra.is_ok()) {
-            HazardOutcome::Reproduced { evidence }
-        } else if held && rewrites.is_empty() && left.is_empty() {
-            HazardOutcome::NotReproduced { evidence }
-        } else if reap == MarkerReap::BeforeRefresh && reaped.is_empty() {
-            broken(format!(
-                "B did not reap A's marker; check the advance against the staleness \
+    Ok(if !reaped.is_empty() && !rewrites.is_empty() {
+        HazardOutcome::Reproduced { evidence }
+    } else if held && rewrites.is_empty() && left.is_empty() {
+        HazardOutcome::NotReproduced { evidence }
+    } else if reap == MarkerReap::BeforeRefresh && reaped.is_empty() {
+        broken(format!(
+            "B did not reap A's marker; check the advance against the staleness \
              constants\n{evidence}"
-            ))
-        } else {
-            different_damage(evidence)
-        },
-    )
+        ))
+    } else {
+        different_damage(evidence)
+    })
 }
 
 // ── H4 ──────────────────────────────────────────────────────────────────

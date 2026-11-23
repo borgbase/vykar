@@ -640,6 +640,9 @@ pub(crate) fn run_with_repair_on_repo(
     } else {
         // Apply: maintenance lock, re-scan under lock, mutate state.
         crate::commands::util::with_maintenance_lock(repo, |repo| {
+            // Repair rebuilds or rewrites the index and deletes snapshots:
+            // it does not run beside a backup.
+            repo.refuse_live_sessions()?;
             let load = repo.load_chunk_index_for_repair(shutdown)?;
             repo.refresh_snapshot_list()?;
 

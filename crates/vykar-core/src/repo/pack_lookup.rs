@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
 use super::control::CancelToken;
+use super::pack_listing::PACKS_PREFIX;
 use tracing::debug;
 use vykar_storage::{ServerOp, StorageBackend};
 use vykar_types::error::Result;
@@ -143,6 +144,48 @@ pub(crate) fn lookup(
             });
         }
     }
+    out.into_inner().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Store-clock mtimes of `ids`: one `list_meta("packs/<xx>/")` per shard
+/// they fall in, up to `width` at once, none started once `cancel` fires. A
+/// pack the listings do not name, or name without an mtime, maps to `None`;
+/// a failed shard listing maps its packs to `None`, and a pack whose shard
+/// was not listed (cancelled) has no entry (callers treat both as unknown
+/// age). That is min(packs, 256) listings, each paged at
+/// `LIST_PAGE_KEYS`: a journal of a few packs touches a few shards, one of
+/// thousands touches all 256. Per shard rather than one tree listing
+/// (vykar-server's `ListTree` fills mtimes too): a tree listing returns
+/// every pack of the repository however few the journal names.
+pub(crate) fn pack_mtimes(
+    storage: &dyn StorageBackend,
+    ids: &[PackId],
+    width: usize,
+    cancel: &CancelToken,
+) -> HashMap<PackId, Option<std::time::SystemTime>> {
+    let mut by_shard: HashMap<String, Vec<PackId>> = HashMap::new();
+    for id in ids {
+        by_shard
+            .entry(format!("{PACKS_PREFIX}{}/", id.shard_prefix()))
+            .or_default()
+            .push(*id);
+    }
+    let groups: Vec<(String, Vec<PackId>)> = by_shard.into_iter().collect();
+    let out = Mutex::new(HashMap::with_capacity(ids.len()));
+    super::bounded::for_each_bounded(width.max(1), &groups, cancel, |(prefix, ids)| {
+        let listed: HashMap<String, Option<std::time::SystemTime>> = match storage.list_meta(prefix)
+        {
+            Ok(objs) => objs.into_iter().map(|o| (o.key, o.mtime)).collect(),
+            Err(e) => {
+                debug!(shard = %prefix, error = %e, "shard listing failed; pack ages unknown");
+                HashMap::new()
+            }
+        };
+        let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+        for id in ids {
+            out.insert(*id, listed.get(&id.storage_key()).copied().flatten());
+        }
+    });
     out.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 

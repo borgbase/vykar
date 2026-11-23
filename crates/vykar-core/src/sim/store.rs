@@ -179,6 +179,7 @@ impl State {
             len,
             outcome,
             label,
+            at: self.clock,
         });
     }
 

@@ -1081,8 +1081,9 @@ fn cross_session_pending_index_recovery() {
     };
 
     // Session 1: init repo, store chunks, flush, write pending index, then drop.
+    // A store with mtimes: recovery adopts journal packs by their age.
     let mut repo = Repository::init(
-        Box::new(MemoryBackend::new()),
+        Box::new(MemoryBackend::with_mtimes()),
         EncryptionMode::None,
         ChunkerParams::default(),
         None,
@@ -1134,8 +1135,15 @@ fn cross_session_pending_index_recovery() {
             ..Default::default()
         })
         .unwrap();
+    // The recovering session's own marker: its mtime is "now" on the
+    // store's clock, which the journal packs' ages are judged against.
+    repo2.storage.put("sessions/bbb.json", b"{}").unwrap();
 
-    let recovery = repo2.recover_pending_index().unwrap();
+    let recovery = repo2
+        .recover_pending_index(&crate::repo::control::CancelToken::new())
+        .unwrap();
+    assert_eq!(recovery.packs_too_old, 0);
+    assert!(recovery.oldest_pack_age.is_some());
     assert!(
         recovery.recovered_chunks > 0,
         "should recover chunks from session aaa's journal, got {}",

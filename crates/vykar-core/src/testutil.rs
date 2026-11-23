@@ -116,6 +116,9 @@ pub struct MemoryBackend {
     /// (`vykar_protocol::KeyClass`). Keys outside the server's schema are
     /// refused an overwrite and allowed a delete, as before.
     append_only: bool,
+    /// `Some`: `list_meta` reports each key's mtime, the time of its last
+    /// put or what [`Self::set_mtime`] set. `None`: no mtimes.
+    mtimes: Option<Mutex<HashMap<String, std::time::SystemTime>>>,
 }
 
 impl MemoryBackend {
@@ -123,7 +126,27 @@ impl MemoryBackend {
         Self {
             data: Mutex::new(HashMap::new()),
             append_only: false,
+            mtimes: None,
         }
+    }
+
+    /// A backend whose `list_meta` reports an mtime per key: the time of its
+    /// last put (`SystemTime::now()`), or what [`Self::set_mtime`] set.
+    pub fn with_mtimes() -> Self {
+        Self {
+            mtimes: Some(Mutex::new(HashMap::new())),
+            ..Self::new()
+        }
+    }
+
+    /// Set `key`'s mtime. Panics on a backend without mtimes.
+    pub fn set_mtime(&self, key: &str, mtime: std::time::SystemTime) {
+        self.mtimes
+            .as_ref()
+            .expect("set_mtime needs MemoryBackend::with_mtimes")
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), mtime);
     }
 
     /// A backend that permits creation and applies the append-only key-class
@@ -132,6 +155,14 @@ impl MemoryBackend {
         Self {
             append_only: true,
             ..Self::new()
+        }
+    }
+
+    /// [`Self::append_only`] with the mtimes of [`Self::with_mtimes`].
+    pub fn append_only_with_mtimes() -> Self {
+        Self {
+            append_only: true,
+            ..Self::with_mtimes()
         }
     }
 }
@@ -163,6 +194,12 @@ impl StorageBackend for MemoryBackend {
             )));
         }
         map.insert(key.to_string(), data.to_vec());
+        if let Some(mtimes) = &self.mtimes {
+            mtimes
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), std::time::SystemTime::now());
+        }
         Ok(())
     }
 
@@ -174,7 +211,21 @@ impl StorageBackend for MemoryBackend {
         }
         let mut map = self.data.lock().unwrap();
         map.remove(key);
+        if let Some(mtimes) = &self.mtimes {
+            mtimes.lock().unwrap().remove(key);
+        }
         Ok(())
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        let mut listed = self.list_sized(prefix)?;
+        if let Some(mtimes) = &self.mtimes {
+            let mtimes = mtimes.lock().unwrap();
+            for o in &mut listed {
+                o.mtime = mtimes.get(&o.key).copied();
+            }
+        }
+        Ok(listed)
     }
 
     fn exists(&self, key: &str) -> Result<bool> {

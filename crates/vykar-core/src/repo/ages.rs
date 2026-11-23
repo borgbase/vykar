@@ -2,6 +2,14 @@
 //! age a protocol decision uses is (store now − object mtime), where "now"
 //! is the mtime of an object this client has just written; client durations
 //! use the local monotonic clock; no step compares two machines' clocks.
+//!
+//! Who reads which constant: compact keeps an orphan pack younger than
+//! [`T_PACK`] and one inside a live backup's marker horizon (its marker's
+//! mtime − `elapsed_secs` − [`MARGIN`]); a backup whose marker record is
+//! not sound commits only while its packs stay younger than
+//! [`PACK_AGE_LIMIT`] at its head's landing ([`HEAD_LANDING_ALLOWANCE`]
+//! before the head PUT, none after it); journal recovery adopts packs
+//! younger than [`RECOVERY_MAX_PACK_AGE`].
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -18,8 +26,26 @@ pub(crate) const T_PACK: Duration = Duration::from_secs(12 * 3600);
 /// Grace for unreferenced `index.d/` objects and old heads.
 pub(crate) const T_IDX: Duration = Duration::from_secs(3600);
 /// Margin M against request timeouts and clock resolution.
-#[allow(dead_code, reason = "read from 04 step 7 (phase F part 8)")]
 pub(crate) const MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// Time this client allows from the pack-age check before a commit's head
+/// PUT (at the fence immediately before it) to the head landing: the early
+/// refusal (04 "Backup commit" 6). It does not bound a head PUT: at the
+/// default retry policy one PUT can take 6 attempts × 300 s response wait
+/// plus back-off, about 31.5 min, and longer when every phase stalls (about
+/// 100 min). The binding check is the one after the head PUT returned,
+/// with no allowance: a commit whose packs may be [`PACK_AGE_LIMIT`] old
+/// by then does not write its snapshot.
+pub(crate) const HEAD_LANDING_ALLOWANCE: Duration = Duration::from_secs(30 * 60);
+
+/// Oldest journal pack a backup recovers, on the store's clock (04
+/// "Crash-recovery journals": T_pack/2).
+pub(crate) const RECOVERY_MAX_PACK_AGE: Duration = Duration::from_secs(T_PACK.as_secs() / 2);
+
+/// What the commit rule lets a backup with a broken marker record publish:
+/// packs younger than T_pack − M at its head's landing.
+pub(crate) const PACK_AGE_LIMIT: Duration =
+    Duration::from_secs(T_PACK.as_secs() - MARGIN.as_secs());
 
 // 04's relations: T_pack − M (the commit refusal, I8) and T_idx − M (segment
 // renewal) are positive and leave room; the journal window T_pack/2 outlasts
@@ -27,6 +53,9 @@ pub(crate) const MARGIN: Duration = Duration::from_secs(10 * 60);
 const _: () = assert!(T_PACK.as_secs() > 2 * MARGIN.as_secs());
 const _: () = assert!(T_IDX.as_secs() > MARGIN.as_secs());
 const _: () = assert!(T_PACK.as_secs() / 2 > SESSION_STALE_SECS as u64 + MARGIN.as_secs());
+const _: () = assert!(
+    PACK_AGE_LIMIT.as_secs() > HEAD_LANDING_ALLOWANCE.as_secs() + RECOVERY_MAX_PACK_AGE.as_secs()
+);
 
 /// Key prefix of a clock probe. Not `.json`, so no lock reader (this
 /// binary's `is_lock_key`, or 0.24's `list_lock_keys`) takes it for a lock.

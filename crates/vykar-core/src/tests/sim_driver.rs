@@ -938,17 +938,93 @@ fn stepped_compact_steps_in_this_order() {
     assert_eq!(labels, STEPPED_COMPACT_LABELS, "{}", o.trace.render());
 }
 
-/// A4: the driver refuses a stepped compact in a case with time jumps.
-#[test]
-#[should_panic(expected = "runs only in cases without time jumps")]
-fn stepped_compact_with_time_jumps_is_refused() {
-    let c = Case {
+/// Stepped-compact cases with time jumps and crashes (since 04 step 7),
+/// on pseudo-random schedules.
+fn stepped_cases_with_jumps_and_crashes() -> Vec<(String, Case)> {
+    let base = Case {
         advances: true,
+        crash: true,
         ..stepped(&super::sim_exhaustive::commit_vs_compact(
             HostPlan::Distinct,
         ))
     };
-    run_case(&Template::new(), &c);
+    let mut state: u64 = 0x8b8b;
+    (0..16)
+        .map(|k| {
+            let choices = (0..40)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 33) as u16 % 10
+                })
+                .collect();
+            (
+                format!("jumps-crashes-{k}"),
+                Case {
+                    choices,
+                    ..base.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+/// A4 lifted (04 step 7): a stepped compact in cases with time jumps and
+/// crashes replays identically.
+#[test]
+fn stepped_compact_with_jumps_and_crashes_is_deterministic() {
+    let t = Template::new();
+    for (name, c) in stepped_cases_with_jumps_and_crashes() {
+        let a = run_case(&t, &c);
+        let b = run_case(&t, &c);
+        assert_eq!(
+            a.trace.canonical(),
+            b.trace.canonical(),
+            "{name}:\n{}\n{}",
+            a.trace.render(),
+            b.trace.render()
+        );
+        assert!(
+            !a.signatures.contains(&Signature::Unknown),
+            "{name}:\n{}",
+            a.trace.render()
+        );
+    }
+}
+
+/// Every decision taken while a stepped compact is in flight offers no
+/// time jump: it holds the maintenance lock for its whole run.
+#[test]
+fn no_jump_is_offered_inside_a_stepped_compact() {
+    let t = Template::new();
+    let mut inside_seen = 0;
+    for (name, c) in stepped_cases_with_jumps_and_crashes() {
+        let o = run_case(&t, &c);
+        let mut inside: Option<u8> = None;
+        for e in &o.trace.entries {
+            if inside.is_some() {
+                inside_seen += 1;
+                assert!(
+                    !e.actions
+                        .iter()
+                        .any(|a| matches!(a, Action::Advance { .. })),
+                    "{name}: decision {} offers a jump inside the compact:\n{}",
+                    e.n,
+                    o.trace.render()
+                );
+            }
+            match e.action {
+                Action::Step { client, .. } if e.label == "compact start" => {
+                    inside = Some(client);
+                }
+                Action::Step { client, .. } if inside == Some(client) && e.ended => inside = None,
+                Action::Crash { client } if inside == Some(client) => inside = None,
+                _ => {}
+            }
+        }
+    }
+    assert!(inside_seen > 0, "no decision ran inside a stepped compact");
 }
 
 /// A crash of b inside a stepped compact, after its head PUT and before
@@ -997,9 +1073,8 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact List index.h/",
     "compact Get index.h/",
     // (the maintenance lock is taken in the decision before) the session
-    // check
+    // cleanup, whose listing also gives the live sessions
     "compact ListMeta sessions/",
-    "compact List sessions/",
     // index load under the lock, marks
     "compact List index.h/",
     "compact Get index.h/",

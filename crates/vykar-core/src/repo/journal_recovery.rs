@@ -10,12 +10,16 @@ use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
+use vykar_types::pack_id::PackId;
 
+use super::ages::RECOVERY_MAX_PACK_AGE;
+use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::host_env::Clock;
 use super::lock::{
     SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, parse_session_marker_key, session_index_key,
 };
+use super::pack_lookup::pack_mtimes;
 use super::pack_recovery::verify_journal_packs_trailers;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
 
@@ -25,6 +29,13 @@ pub struct PendingIndexRecovery {
     pub recovered_chunks: usize,
     /// Session IDs whose journals were successfully recovered.
     pub recovered_sessions: Vec<String>,
+    /// Store age of the oldest pack adopted (`None` when none was): the
+    /// session's start is pulled back by it.
+    pub oldest_pack_age: Option<std::time::Duration>,
+    /// Journal packs not adopted because they are older than
+    /// `RECOVERY_MAX_PACK_AGE` or of unknown age; their chunks are uploaded
+    /// again.
+    pub packs_too_old: usize,
 }
 
 /// Result of attempting to recover a single session's pending index journal.
@@ -33,8 +44,13 @@ enum RecoverResult {
     NotFound,
     /// Journal was corrupt (decrypt/decompress/deserialize failed).
     Corrupt,
-    /// Successfully recovered N chunk entries (may be 0 if all already indexed).
-    Ok(usize),
+    /// Successfully recovered `chunks` chunk entries (may be 0 if all
+    /// already indexed, or every pack was too old).
+    Ok {
+        chunks: usize,
+        packs_too_old: usize,
+        oldest_pack_age: Option<std::time::Duration>,
+    },
     /// Versioned journal from a newer binary. Left in storage untouched so
     /// that binary can still recover it.
     UnknownVersion,
@@ -67,6 +83,9 @@ pub(crate) struct RecoveryTarget<'a> {
     /// Read once, right after the LIST of `sessions/`; used only for markers
     /// listed without an mtime.
     pub(crate) clock: &'a dyn Clock,
+    /// The session's cancel token: stops the pack age lookups (a pack not
+    /// looked up is of unknown age, so not adopted).
+    pub(crate) cancel: &'a CancelToken,
     pub(crate) recovered_chunks: &'a mut StdHashMap<ChunkId, RecoveredChunkEntry>,
     pub(crate) recovered_index_keys: &'a mut Vec<String>,
     /// Seeded with every accepted pack so a re-interruption preserves it.
@@ -85,6 +104,13 @@ pub(crate) struct RecoveryTarget<'a> {
 /// clock: its mtime against the newest mtime of this session's own marker
 /// keys in the same listing). Active sessions and sessions with unreadable
 /// markers are skipped.
+///
+/// A journal pack is adopted only while it is at most
+/// `RECOVERY_MAX_PACK_AGE` (T_pack/2) old on the same clock (04
+/// "Crash-recovery journals"); one older, or of unknown age (no mtime, or
+/// this session's own marker not listed), stays an orphan for compact and
+/// its chunks are uploaded again. The oldest adopted pack's age is returned
+/// so the caller pulls the session's start back by it.
 ///
 /// Must be called inside the repo lock, before any chunk is stored.
 /// Returns the total number of recovered chunk entries. `persisted_packs` and
@@ -166,6 +192,8 @@ pub(crate) fn recover_pending_index(
 
     let mut total_recovered = 0usize;
     let mut recovered_sessions = Vec::new();
+    let mut packs_too_old = 0usize;
+    let mut oldest_pack_age: Option<std::time::Duration> = None;
     for (index_key, session_id) in &index_keys {
         match marker_states.get(session_id) {
             None => {}                     // orphan — no .json, recoverable
@@ -179,14 +207,21 @@ pub(crate) fn recover_pending_index(
             crypto,
             chunk_index,
             index_key,
+            store_now,
             persisted_packs,
             width,
             target,
         ) {
-            Ok(RecoverResult::Ok(n)) => {
+            Ok(RecoverResult::Ok {
+                chunks,
+                packs_too_old: too_old,
+                oldest_pack_age: oldest,
+            }) => {
                 target.recovered_index_keys.push(index_key.clone());
                 recovered_sessions.push(session_id.clone());
-                total_recovered += n;
+                total_recovered += chunks;
+                packs_too_old += too_old;
+                oldest_pack_age = oldest_pack_age.max(oldest);
             }
             Ok(RecoverResult::Corrupt) => {
                 // Only delete the corrupt .index — never touch .json markers.
@@ -221,6 +256,8 @@ pub(crate) fn recover_pending_index(
     Ok(PendingIndexRecovery {
         recovered_chunks: total_recovered,
         recovered_sessions,
+        oldest_pack_age,
+        packs_too_old,
     })
 }
 
@@ -252,11 +289,13 @@ fn marker_state(
 }
 
 /// Attempt to recover a single session's pending index journal.
+#[allow(clippy::too_many_arguments)]
 fn recover_single_index(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     chunk_index: &LiveIndex,
     key: &str,
+    store_now: Option<vykar_storage::StoreNow>,
     persisted_packs: usize,
     width: usize,
     target: &mut RecoveryTarget<'_>,
@@ -309,13 +348,49 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let accepted = verify_journal_packs_trailers(
+    let mut accepted = verify_journal_packs_trailers(
         storage,
         crypto.is_encrypting(),
         &wire,
         persisted_packs,
         width,
     );
+    // 04 "Crash-recovery journals": only packs at most T_pack/2 old on the
+    // store's clock; unknown age is too old (fail closed).
+    let ids: Vec<PackId> = accepted.keys().copied().collect();
+    let mtimes = pack_mtimes(storage, &ids, width, target.cancel);
+    let mut packs_too_old = 0usize;
+    let mut oldest_pack_age: Option<std::time::Duration> = None;
+    accepted.retain(|id, _| {
+        let age = store_now
+            .zip(mtimes.get(id).copied().flatten())
+            .map(|(now, mtime)| now.age_of(mtime));
+        match age {
+            Some(age) if age <= RECOVERY_MAX_PACK_AGE => {
+                oldest_pack_age = oldest_pack_age.max(Some(age));
+                true
+            }
+            _ => {
+                packs_too_old += 1;
+                false
+            }
+        }
+    });
+    let none_adopted = packs_too_old > 0 && accepted.is_empty();
+    if none_adopted {
+        warn!(
+            key = %key,
+            "pending index journal not adopted ({packs_too_old} packs too old or of unknown age); \
+             their chunks are uploaded again"
+        );
+    } else if packs_too_old > 0 {
+        warn!(
+            key = %key,
+            packs = packs_too_old,
+            "journal pack(s) older than T_pack/2 or of unknown age are not recovered; \
+             their chunks are uploaded again"
+        );
+    }
 
     let mut recovered = 0usize;
     let pack_count = wire.len();
@@ -349,13 +424,19 @@ fn recover_single_index(
             .record_pack(pack_entry.pack_id, pack_entry.chunks);
     }
 
-    debug!(
-        key = %key,
-        packs = pack_count,
-        recovered_chunks = recovered,
-        "recovered pending_index entries"
-    );
-    Ok(RecoverResult::Ok(recovered))
+    if !none_adopted {
+        debug!(
+            key = %key,
+            packs = pack_count,
+            recovered_chunks = recovered,
+            "recovered pending_index entries"
+        );
+    }
+    Ok(RecoverResult::Ok {
+        chunks: recovered,
+        packs_too_old,
+        oldest_pack_age,
+    })
 }
 
 /// Delete recovered `.index` files from storage after successful commit.
@@ -445,12 +526,23 @@ mod tests {
         write_journal(storage, crypto, key, Wire::V2)
     }
 
+    /// Recover as session "current", whose marker is written first: its
+    /// mtime is "now" on the store's clock, without which no pack is old
+    /// enough to judge and none is adopted.
     fn recover_from(storage: &dyn StorageBackend) -> (WriteSessionState, PendingIndexRecovery) {
+        own_marker(storage, "current");
         let crypto = test_crypto();
         let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(storage, &crypto, &LiveIndex::empty(), 1, &SystemClock)
+            .recover_pending_index(
+                storage,
+                &crypto,
+                &LiveIndex::empty(),
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         (ws, recovery)
     }
@@ -476,9 +568,15 @@ mod tests {
             boot_id: None,
             installation_id: None,
             pid_ns: None,
+            elapsed_secs: None,
         };
         let data = serde_json::to_vec(&entry).unwrap();
         storage.put(&key, &data).unwrap();
+    }
+
+    /// The recovering session's own marker, written now.
+    fn own_marker(storage: &dyn StorageBackend, session_id: &str) {
+        write_session_marker(storage, session_id, &fresh_timestamp());
     }
 
     fn stale_timestamp() -> String {
@@ -493,7 +591,8 @@ mod tests {
     #[test]
     fn recover_orphan_index_from_different_session() {
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
+        own_marker(&storage, "new");
         let crypto = test_crypto();
         let chunk_index = LiveIndex::empty();
 
@@ -506,7 +605,14 @@ mod tests {
         ws.session_id = "new".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -520,12 +626,17 @@ mod tests {
     #[test]
     fn recover_stale_index() {
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
         let crypto = test_crypto();
         let chunk_index = LiveIndex::empty();
+        own_marker(&storage, "current");
 
         // Write a stale .json marker and companion .index.
         write_session_marker(&storage, "stale", &stale_timestamp());
+        storage.set_mtime(
+            &session_marker_key("stale"),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600),
+        );
         let index_key = session_index_key("stale");
         write_valid_journal(&storage, &crypto, &index_key);
 
@@ -533,7 +644,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -566,7 +684,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -594,7 +719,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -713,7 +845,8 @@ mod tests {
     #[test]
     fn mixed_valid_and_corrupt_journals() {
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
+        own_marker(&storage, "current");
         let crypto = test_crypto();
         let chunk_index = LiveIndex::empty();
 
@@ -729,7 +862,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -765,7 +905,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let _recovered = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
 
         // Corrupt .index should be deleted.
@@ -798,7 +945,14 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &chunk_index,
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
             .unwrap();
         assert_eq!(recovery.recovered_chunks, 0, "all chunks already indexed");
         assert_eq!(recovery.recovered_sessions, vec!["old"]);
@@ -851,7 +1005,7 @@ mod tests {
     #[test]
     fn v2_journal_with_exact_length_is_recovered() {
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
         let crypto = test_crypto();
         let (pack_id, chunk_id) =
             write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
@@ -868,7 +1022,7 @@ mod tests {
         use crate::index::PendingChunkEntry;
         use crate::repo::pack::{PackType, PackWriter};
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
         let crypto = test_crypto();
         let chunk_id = ChunkId::from_bytes([0x42; 32]);
         let mut writer = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake2b);
@@ -937,7 +1091,7 @@ mod tests {
     fn v2_journal_trusts_length_without_reading_content() {
         // Same-length but different bytes: v2 skips the content check.
         init_test_environment();
-        let storage = MemoryBackend::new();
+        let storage = MemoryBackend::with_mtimes();
         let crypto = test_crypto();
         let (pack_id, mut data, entry) = fake_pack(0x11);
         data[20] ^= 0xFF;
@@ -990,8 +1144,9 @@ mod tests {
         assert_eq!(recovery.recovered_chunks, 0);
     }
 
-    /// Counts `size()` calls and listings under `packs/`. `MemoryBackend`
-    /// uses the default `list_sized` (no sizes).
+    /// Counts `size()` calls and listings under `packs/` of the size lookup.
+    /// `MemoryBackend` uses the default `list_sized` (no sizes); `list_meta`
+    /// (the pack ages) goes to it uncounted.
     struct LookupCountingBackend {
         inner: MemoryBackend,
         size_calls: std::sync::atomic::AtomicUsize,
@@ -1001,7 +1156,7 @@ mod tests {
     impl LookupCountingBackend {
         fn new() -> Self {
             Self {
-                inner: MemoryBackend::new(),
+                inner: MemoryBackend::with_mtimes(),
                 size_calls: Default::default(),
                 pack_lists: Default::default(),
             }
@@ -1035,7 +1190,7 @@ mod tests {
             &self,
             prefix: &str,
         ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
-            self.list_sized(prefix)
+            self.inner.list_meta(prefix)
         }
 
         fn size(&self, key: &str) -> Result<Option<u64>> {
@@ -1108,11 +1263,19 @@ mod tests {
                 Wire::V2,
             );
 
+            own_marker(&storage, "current");
             let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
             ws.session_id = "current".to_string();
             ws.persisted_pack_count = persisted;
             let recovery = ws
-                .recover_pending_index(&storage, &crypto, &LiveIndex::empty(), 1, &SystemClock)
+                .recover_pending_index(
+                    &storage,
+                    &crypto,
+                    &LiveIndex::empty(),
+                    1,
+                    &SystemClock,
+                    &CancelToken::new(),
+                )
                 .unwrap();
             assert_eq!(recovery.recovered_chunks, 3, "{persisted}");
             assert_eq!(storage.counts(), expected, "{persisted}");
@@ -1178,5 +1341,77 @@ mod tests {
             MarkerState::Active
         );
         assert_eq!(marker_state(None, None, None, local), MarkerState::Unknown);
+    }
+
+    // ── The journal rule (04 "Crash-recovery journals") ──────────────────
+
+    /// A journal pack older than T_pack/2 on the store's clock is not
+    /// adopted (counted, its chunks uploaded again); a younger one is, and
+    /// its age is reported for the pull-back.
+    #[test]
+    fn packs_older_than_half_t_pack_are_not_recovered() {
+        init_test_environment();
+        for (age_secs, adopted) in [(6 * 3600 + 60, false), (5 * 3600, true)] {
+            let storage = MemoryBackend::with_mtimes();
+            let crypto = test_crypto();
+            let (pack_id, chunk_id) =
+                write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
+            storage.set_mtime(
+                &pack_id.storage_key(),
+                std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+            );
+            let (ws, recovery) = recover_from(&storage);
+            assert_eq!(recovery.recovered_sessions, vec!["old"], "{age_secs}");
+            if adopted {
+                assert_eq!(recovery.recovered_chunks, 1);
+                assert_eq!(ws.recovered_chunks[&chunk_id].pack_id, pack_id);
+                assert_eq!(recovery.packs_too_old, 0);
+                let age = recovery.oldest_pack_age.expect("an adopted pack's age");
+                assert!(
+                    age >= std::time::Duration::from_secs(age_secs)
+                        && age < std::time::Duration::from_secs(age_secs + 60),
+                    "{age:?}"
+                );
+            } else {
+                assert_eq!(recovery.recovered_chunks, 0);
+                assert!(ws.recovered_chunks.is_empty());
+                assert!(ws.journal.entries.is_empty(), "not re-seeded");
+                assert_eq!(recovery.packs_too_old, 1);
+                assert_eq!(recovery.oldest_pack_age, None);
+                assert!(
+                    storage.exists(&pack_id.storage_key()).unwrap(),
+                    "stays an orphan"
+                );
+            }
+        }
+    }
+
+    /// No reading of "now" (the own marker not listed) or no pack mtime:
+    /// unknown age, nothing adopted.
+    #[test]
+    fn unknown_age_is_not_recovered() {
+        init_test_environment();
+        let crypto = test_crypto();
+        // Mtimes, but no own marker.
+        let storage = MemoryBackend::with_mtimes();
+        write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
+        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        ws.session_id = "current".to_string();
+        let recovery = ws
+            .recover_pending_index(
+                &storage,
+                &crypto,
+                &LiveIndex::empty(),
+                1,
+                &SystemClock,
+                &CancelToken::new(),
+            )
+            .unwrap();
+        assert_eq!((recovery.recovered_chunks, recovery.packs_too_old), (0, 1));
+        // An own marker, but a storage without mtimes.
+        let storage = MemoryBackend::new();
+        write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
+        let (_ws, recovery) = recover_from(&storage);
+        assert_eq!((recovery.recovered_chunks, recovery.packs_too_old), (0, 1));
     }
 }

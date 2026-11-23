@@ -126,6 +126,12 @@ fn print_compact_warnings(stats: &commands::compact::CompactStats) {
                 stats.packs_orphan_unknown_age,
             );
         }
+        if stats.packs_orphan_live > 0 {
+            eprintln!(
+                "  {} of them kept: they may belong to a backup that is still running",
+                stats.packs_orphan_live,
+            );
+        }
     }
     if stats.temp_files_removed > 0 {
         eprintln!(

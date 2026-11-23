@@ -8,6 +8,9 @@
 //! - segment: [record] → segment → fence → head;
 //! - fold: [list heads] → [base] → [record] → fence → head → garbage
 //!   collection.
+//!
+//! A backup's write also runs the commit rule's pack-age term at its fence
+//! ([`HeadCheck`]), the last step before the head PUT on every path.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -16,6 +19,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::index_store::{self, PackedObject};
+use super::lock::{self, SessionMarker};
 use super::machine::{Machine, StepCx, StepKind, bad_pick};
 use crate::index::LiveIndex;
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, ObjectName, SegmentRef};
@@ -37,8 +41,35 @@ pub(crate) struct PublishMachine {
     /// A fold added a backup's additions to the index as edits: an error
     /// before the head PUT drops them again.
     added: bool,
+    /// A backup's pack-age term, run at the fence before the head PUT.
+    head_check: Option<HeadCheck>,
+    /// The head PUT returned.
+    wrote_head: bool,
     start: std::time::Instant,
     state: State,
+}
+
+/// What a backup's index write checks at its fence, after the lock fence:
+/// the commit rule's pack-age term against the session's marker record.
+pub(crate) struct HeadCheck {
+    pub(crate) session_id: String,
+    pub(crate) marker: Arc<SessionMarker>,
+}
+
+impl HeadCheck {
+    /// [`lock::head_landing_check`] with [`HEAD_LANDING_ALLOWANCE`]: the
+    /// fence is the last step before the head PUT on every path.
+    ///
+    /// [`HEAD_LANDING_ALLOWANCE`]: super::ages::HEAD_LANDING_ALLOWANCE
+    fn run(&self, repo: &super::Repository) -> Result<()> {
+        let clock = repo.host_env().clock.as_ref();
+        lock::head_landing_check(
+            &self.session_id,
+            &self.marker.report(clock),
+            self.marker.elapsed(clock),
+            super::ages::HEAD_LANDING_ALLOWANCE,
+        )
+    }
 }
 
 enum State {
@@ -121,6 +152,8 @@ impl PublishMachine {
             publish: Some(fold),
             backup,
             added: false,
+            head_check: None,
+            wrote_head: false,
             start: std::time::Instant::now(),
             state: State::Start { prev, seg },
         }
@@ -132,6 +165,8 @@ impl PublishMachine {
             publish: None,
             backup: false,
             added: false,
+            head_check: None,
+            wrote_head: false,
             start: std::time::Instant::now(),
             state: State::FoldBody(Box::new(FoldPrep {
                 prev,
@@ -139,6 +174,17 @@ impl PublishMachine {
                 removes,
             })),
         }
+    }
+
+    /// Apply `check` at the fence before the head PUT (backups only).
+    pub(crate) fn with_head_check(mut self, check: Option<HeadCheck>) -> Self {
+        self.head_check = check;
+        self
+    }
+
+    /// Whether this write's head PUT returned.
+    pub(crate) fn wrote_head(&self) -> bool {
+        self.wrote_head
     }
 
     fn fold(&self) -> bool {
@@ -158,7 +204,10 @@ impl PublishMachine {
             State::FoldHead(base, generation) => fold_head(repo, *base, generation)?,
             State::Write(mut w) => match w.steps.pop_front() {
                 Some(kind) => {
-                    write_step(repo, &mut w, kind)?;
+                    write_step(repo, &mut w, kind, self.head_check.as_ref())?;
+                    if kind == StepKind::PutHead {
+                        self.wrote_head = true;
+                    }
                     State::Write(w)
                 }
                 None => State::Done(Some(self.finish(repo, *w))),
@@ -476,7 +525,12 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
 }
 
 /// One storage step of a write.
-fn write_step(repo: &mut super::Repository, w: &mut Writes, kind: StepKind) -> Result<()> {
+fn write_step(
+    repo: &mut super::Repository,
+    w: &mut Writes,
+    kind: StepKind,
+    head_check: Option<&HeadCheck>,
+) -> Result<()> {
     let missing = || {
         VykarError::Other(format!(
             "BUG: index write step {kind:?} has nothing to write"
@@ -500,7 +554,13 @@ fn write_step(repo: &mut super::Repository, w: &mut Writes, kind: StepKind) -> R
             w.segment_written = Some(obj.size());
             Ok(())
         }
-        StepKind::Fence => repo.check_lock_fence(),
+        StepKind::Fence => {
+            repo.check_lock_fence()?;
+            match head_check {
+                Some(check) => check.run(repo),
+                None => Ok(()),
+            }
+        }
         StepKind::PutHead => {
             match w.packed_head.take() {
                 Some(packed) => repo

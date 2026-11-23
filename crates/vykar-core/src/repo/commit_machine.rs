@@ -18,9 +18,13 @@
 //!    [`PublishMachine`], stepped from here). A pack found missing while
 //!    the session's marker is gone is `StaleChunksDuringCommit`: compact
 //!    deleted the packs of a reaped session.
-//! 5. Check the fence and PUT the snapshot.
+//!    The publish's fence before the head PUT also runs the commit rule's
+//!    pack-age term ([`HeadCheck`]).
+//! 5. Check the fence (and, when a head was written, the pack-age term
+//!    again with no allowance: the binding check) and PUT the snapshot.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
@@ -32,7 +36,7 @@ use super::machine::{
     Machine, StepCx, StepKind, bad_pick, emit_stage, join_scoped, log_stage_elapsed,
 };
 use super::manifest::SnapshotEntry;
-use super::publish_machine::PublishMachine;
+use super::publish_machine::{HeadCheck, PublishMachine};
 use super::snapshot_cache::{self, SnapshotRefresh};
 use super::write_session::SessionView;
 use crate::index::IndexDelta;
@@ -57,6 +61,9 @@ pub(crate) struct BackupCommit {
     marker: Option<Arc<SessionMarker>>,
     /// The open `CommitEvent::Stage`, closed with `log_stage_elapsed`.
     stage: Option<(std::time::Instant, &'static str)>,
+    /// This commit's index write PUT a head: the fence before the snapshot
+    /// PUT runs the pack-age term again, with no allowance.
+    wrote_head: bool,
     state: CommitState,
 }
 
@@ -186,6 +193,7 @@ impl BackupCommit {
             session_id: repo.ws().session_id.clone(),
             marker,
             stage: None,
+            wrote_head: false,
             state: CommitState::Flush,
         }
     }
@@ -244,6 +252,7 @@ impl BackupCommit {
                     None => m.step_all(cx)?,
                 }
                 if m.enabled().is_empty() {
+                    self.wrote_head = m.wrote_head();
                     m.take_output().ok_or_else(|| {
                         VykarError::Other("BUG: the index write finished without a head".into())
                     })?;
@@ -262,6 +271,7 @@ impl BackupCommit {
             CommitState::Fence => {
                 self.open_stage(cx, "write snapshot");
                 cx.repo.check_lock_fence()?;
+                self.check_landed_head(cx.repo)?;
                 CommitState::PutSnapshot
             }
             CommitState::PutSnapshot => {
@@ -279,6 +289,25 @@ impl BackupCommit {
             }
         };
         Ok(())
+    }
+
+    /// The binding pack-age check (04 I8): once this commit's head PUT has
+    /// returned, a session whose marker record is not sound and whose packs
+    /// may be [`PACK_AGE_LIMIT`](super::ages::PACK_AGE_LIMIT) old by now does not write its snapshot.
+    /// The head stays without its snapshot, the state of a commit whose
+    /// snapshot PUT failed: the error is `StaleChunksDuringCommit`, and a
+    /// retry uploads the backup's chunks again.
+    fn check_landed_head(&self, repo: &Repository) -> Result<()> {
+        let (true, Some(m)) = (self.wrote_head, &self.marker) else {
+            return Ok(());
+        };
+        let clock = repo.host_env().clock.as_ref();
+        lock::head_landing_check(
+            &self.session_id,
+            &m.report(clock),
+            m.elapsed(clock),
+            Duration::ZERO,
+        )
     }
 
     /// Step 1. The "refresh snapshots" stage starts whether or not the
@@ -382,8 +411,15 @@ impl BackupCommit {
         // probe falls through only when the record is continuous; the reuse
         // check is still a safety net.
         if let (Slot::Done(probe), Some(m)) = (marker, &self.marker) {
-            let report = m.report(repo.host_env().clock.as_ref());
-            lock::commit_marker_check(&self.session_id, probe, &report)?;
+            let clock = repo.host_env().clock.clone();
+            let report = m.report(clock.as_ref());
+            // A current key found gone is recorded, so the checks at the
+            // fences around the head PUT see it too. After the report, so
+            // this judgement names the probe's finding, not a refresh's.
+            if matches!(probe, Ok(false)) {
+                m.note_missing();
+            }
+            lock::commit_marker_check(&self.session_id, probe, &report, m.elapsed(clock.as_ref()))?;
         }
         match refresh {
             Slot::Done(refresh) => repo.apply_snapshot_refresh(refresh?),
@@ -526,12 +562,13 @@ impl BackupCommit {
             relocations: Vec::new(),
             pack_trailers,
         };
-        Ok(CommitState::Publish(Box::new(PublishMachine::publish(
-            repo,
-            Some(head),
-            Some(seg),
-            true,
-        ))))
+        let check = self.marker.as_ref().map(|marker| HeadCheck {
+            session_id: self.session_id.clone(),
+            marker: Arc::clone(marker),
+        });
+        Ok(CommitState::Publish(Box::new(
+            PublishMachine::publish(repo, Some(head), Some(seg), true).with_head_check(check),
+        )))
     }
 }
 

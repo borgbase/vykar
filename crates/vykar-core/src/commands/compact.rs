@@ -13,6 +13,7 @@ use crate::repo::OpenOptions;
 use crate::repo::control::CancelToken;
 use crate::repo::index_store;
 use crate::repo::index_write::PendingSweep;
+use crate::repo::lock::LiveSession;
 use crate::repo::pack::PackWriter;
 use crate::repo::pack_listing::{ListedPack, list_packs};
 use crate::repo::pack_trailer::{
@@ -50,6 +51,11 @@ pub struct CompactStats {
     /// too). On a storage that reports no modification times this is
     /// every orphan pack, every run.
     pub packs_orphan_unknown_age: u64,
+    /// Orphan packs kept because they lie inside a live backup's horizon
+    /// (its marker's mtime − elapsed − M), or because a live marker gives no
+    /// horizon (counted in `packs_orphan` too; not in the young or
+    /// unknown-age counts).
+    pub packs_orphan_live: u64,
     /// Stale `.tmp.*` upload debris removed by the sweep.
     pub temp_files_removed: u64,
     /// Snapshots the mark covered.
@@ -84,6 +90,20 @@ fn old_enough(
     match (mtime, now) {
         (Some(mtime), Some(now)) => now.age_of(mtime) >= grace,
         _ => false,
+    }
+}
+
+/// Whether an orphan with mtime `mtime` lies before every live session's
+/// horizon (04 "Compact" 3): always with no live session; never when a
+/// horizon is unknown (`None`) or the pack has no mtime.
+fn before_horizons(
+    mtime: Option<std::time::SystemTime>,
+    horizons: &Option<Vec<std::time::SystemTime>>,
+) -> bool {
+    match horizons {
+        Some(h) if h.is_empty() => true,
+        Some(h) => mtime.is_some_and(|m| h.iter().all(|h| m < *h)),
+        None => false,
     }
 }
 
@@ -696,12 +716,27 @@ fn compact_packs(
     let packs_orphan = AtomicU64::new(0);
     let packs_orphan_young = AtomicU64::new(0);
     let packs_orphan_unknown_age = AtomicU64::new(0);
+    let packs_orphan_live = AtomicU64::new(0);
     let blobs_live = AtomicU64::new(0);
     // "Now" on the store's clock: the maintenance lock's own key's mtime.
     // Read at acquisition, before this listing: a pack written since has an
-    // mtime after it and is the youngest possible.
+    // mtime after it and is the youngest possible. The horizons need no
+    // "now": each is a marker key's mtime moved back.
     let store_now = repo.lock_store_time();
     let pack_grace = repo.pack_grace();
+    // 04 "Compact" 3: an orphan goes only before every live session's
+    // horizon. None = some horizon is unknown: no orphan goes this run.
+    let horizons: Option<Vec<std::time::SystemTime>> = repo
+        .live_sessions()
+        .iter()
+        .map(LiveSession::horizon)
+        .collect();
+    if horizons.is_none() {
+        warn!(
+            "compact: a live backup session's marker gives no horizon (malformed, or written \
+             by an older vykar); no orphan pack is deleted this run"
+        );
+    }
 
     let storage = repo.storage.as_ref();
     crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |p: &ListedPack| {
@@ -789,7 +824,9 @@ fn compact_packs(
             // 04 step 5: a pack no entry of the loaded head named may belong
             // to an upload not yet committed; it goes only once it is T_pack
             // old on the store's clock. A pack whose entries this run's
-            // sweep removed was committed, and goes now.
+            // sweep removed was committed, and goes now, whatever its age and
+            // the live horizons (narrower than 04's I1 read literally; young
+            // index segments, 04 step 7's second half, close that).
             if !swept_packs.contains(pack_id) && !old_enough(p.mtime, store_now, pack_grace) {
                 if p.mtime.is_none() || store_now.is_none() {
                     packs_orphan_unknown_age.fetch_add(1, Ordering::Relaxed);
@@ -797,6 +834,12 @@ fn compact_packs(
                     packs_orphan_young.fetch_add(1, Ordering::Relaxed);
                 }
                 debug!(%pack_id, "keeping a young orphan pack");
+                return;
+            }
+            // 04 "Compact" 3: not while a live backup may still name it.
+            if !swept_packs.contains(pack_id) && !before_horizons(p.mtime, &horizons) {
+                packs_orphan_live.fetch_add(1, Ordering::Relaxed);
+                debug!(%pack_id, "keeping an orphan pack inside a live backup's horizon");
                 return;
             }
 
@@ -821,6 +864,7 @@ fn compact_packs(
     stats.packs_orphan = packs_orphan.load(Ordering::Relaxed);
     stats.packs_orphan_young = packs_orphan_young.load(Ordering::Relaxed);
     stats.packs_orphan_unknown_age = packs_orphan_unknown_age.load(Ordering::Relaxed);
+    stats.packs_orphan_live = packs_orphan_live.load(Ordering::Relaxed);
     stats.blobs_live = blobs_live.load(Ordering::Relaxed);
     let unknown_age = stats.packs_orphan_unknown_age;
     if unknown_age > 0 {

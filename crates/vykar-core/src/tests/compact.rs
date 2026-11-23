@@ -1653,3 +1653,81 @@ mod store_clock_ages {
         assert!(keys.iter().all(|k| repo.storage.exists(k).unwrap()));
     }
 }
+
+/// A repository on a store with mtimes, and the store.
+fn repo_with_mtimes() -> (
+    crate::repo::Repository,
+    std::sync::Arc<crate::testutil::MemoryBackend>,
+) {
+    crate::testutil::init_test_environment();
+    let mem = std::sync::Arc::new(crate::testutil::MemoryBackend::with_mtimes());
+    let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> = mem.clone();
+    let mut repo = crate::repo::Repository::init(
+        Box::new(storage),
+        crate::repo::EncryptionMode::None,
+        crate::repo::ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+        .unwrap();
+    (repo, mem)
+}
+
+/// 04 "Compact" 3: an orphan pack goes only before every live session's
+/// horizon (its marker's mtime − elapsed − M), at zero grace too. An hour
+/// old orphan is inside the horizon of a session that has run for 2 h, and
+/// outside that of one that just started.
+#[test]
+fn orphans_inside_a_live_horizon_are_kept() {
+    use crate::repo::lock::{LiveSession, SessionEntry};
+    let now = std::time::SystemTime::now();
+    for (elapsed_hours, kept) in [(2u64, true), (0, false)] {
+        let (mut repo, mem) = repo_with_mtimes();
+        let (id, _, _) = repo
+            .store_chunk(
+                b"an orphan of a live backup",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+        repo.save_state().unwrap();
+        let pack = repo.chunk_index().get(&id).unwrap().pack_id;
+        repo.chunk_index_mut().remove(&id);
+        repo.save_state().unwrap();
+        repo.set_pack_grace(std::time::Duration::ZERO);
+        mem.set_mtime(
+            &pack.storage_key(),
+            now - std::time::Duration::from_secs(3600),
+        );
+        let stamp = chrono::Utc::now().to_rfc3339();
+        repo.set_live_sessions(Some(vec![LiveSession {
+            session_id: "live".into(),
+            entry: Some(SessionEntry {
+                hostname: "elsewhere".into(),
+                pid: 1,
+                registered_at: stamp.clone(),
+                last_refresh: stamp,
+                boot_id: None,
+                installation_id: None,
+                pid_ns: None,
+                elapsed_secs: Some(elapsed_hours * 3600),
+            }),
+            mtime: Some(now),
+        }]));
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        assert_eq!(stats.packs_orphan, 1);
+        if kept {
+            assert_eq!(stats.packs_orphan_live, 1);
+            assert_eq!(stats.packs_deleted_empty, 0);
+            assert!(repo.storage.exists(&pack.storage_key()).unwrap());
+        } else {
+            assert_eq!(stats.packs_orphan_live, 0);
+            assert_eq!(stats.packs_deleted_empty, 1);
+            assert!(!repo.storage.exists(&pack.storage_key()).unwrap());
+        }
+    }
+}

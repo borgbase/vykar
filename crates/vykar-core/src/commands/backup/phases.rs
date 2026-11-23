@@ -54,7 +54,7 @@ impl BackupSession {
     }
 
     /// The session's marker record; `None` once the guard was handed off.
-    fn marker(&self) -> Option<Arc<lock::SessionMarker>> {
+    pub(super) fn marker(&self) -> Option<Arc<lock::SessionMarker>> {
         self.guard.as_ref().map(lock::SessionGuard::marker)
     }
 
@@ -86,6 +86,7 @@ pub(super) fn phase1_upload(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     dataless: &mut DatalessTally,
+    marker: Option<Arc<lock::SessionMarker>>,
 ) -> Result<Phase1Output> {
     let env = repo.host_env().clone();
     let clock = Arc::clone(&env.clock);
@@ -128,15 +129,28 @@ pub(super) fn phase1_upload(
     // `pending_index`, upload limits, staging), so command dumps already run
     // under the backup's upload limits.
     repo.begin_write_session(session_opts)?;
+    if let Some(m) = &marker {
+        repo.attach_session_marker(Arc::clone(m));
+    }
 
     // Recover chunk→pack mappings from a previous interrupted session.
-    match repo.recover_pending_index() {
+    match repo.recover_pending_index(shutdown) {
         Ok(recovery) => {
             if recovery.recovered_chunks > 0 {
                 info!(
                     recovered_chunks = recovery.recovered_chunks,
                     sessions = recovery.recovered_sessions.len(),
                     "recovered pending index from interrupted session"
+                );
+            }
+            // The recovered packs are as old as the session's start must
+            // be for compact's horizon and the commit rule (04 "Backup
+            // commit" 1).
+            if let (Some(age), Some(m)) = (recovery.oldest_pack_age, &marker) {
+                m.pull_back(age);
+                info!(
+                    age_secs = age.as_secs(),
+                    "recovered journal packs pull the session start back"
                 );
             }
         }

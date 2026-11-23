@@ -8,38 +8,10 @@ use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
 use crate::repo::control::CancelToken;
 use crate::repo::lock;
-use crate::repo::lock::SessionEntry;
 use crate::repo::{OpenOptions, OpenRequest, Repository, identity};
 use crate::storage;
 use vykar_storage::StorageBackend;
-use vykar_types::error::{
-    ActiveSessionDetails, ActiveSessionInfo, ActiveSessionList, Result, VykarError,
-};
-
-/// Build an [`ActiveSessionList`] from raw `list_session_entries` output.
-///
-/// Parseable entries are rendered with host/pid/age; entries with `None`
-/// (malformed JSON) are passed through as `ActiveSessionInfo { details: None }`
-/// so [`ActiveSessionList::Display`] surfaces them to the operator instead
-/// of silently dropping them — the fail-closed policy required by
-/// [`with_maintenance_lock`].
-pub(crate) fn build_active_session_list(
-    entries: Vec<(String, Option<SessionEntry>)>,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> ActiveSessionList {
-    let infos = entries
-        .into_iter()
-        .map(|(id, entry)| ActiveSessionInfo {
-            id,
-            details: entry.map(|e| ActiveSessionDetails {
-                hostname: e.hostname,
-                pid: e.pid,
-                age: lock::format_age(now, &e.last_refresh),
-            }),
-        })
-        .collect();
-    ActiveSessionList(infos)
-}
+use vykar_types::error::{Result, VykarError};
 
 /// Extract the cache_dir override from config as a PathBuf.
 pub(crate) fn cache_dir_from_config(config: &VykarConfig) -> Option<PathBuf> {
@@ -203,8 +175,10 @@ fn run_under_fence<T>(
 
 /// Open a repository and execute a maintenance operation while holding the lock.
 ///
-/// Unlike `with_repo_lock`, this first cleans up stale sessions and
-/// refuses to proceed if active (non-stale) backup sessions exist.
+/// Unlike `with_repo_lock`, this first cleans up stale sessions, and the
+/// action refuses (`ActiveSessions`, under the lock) while backup sessions
+/// are live: upgrade, its one caller, rewrites the index and must not run
+/// beside a backup.
 pub fn with_open_repo_maintenance_lock<T>(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -213,7 +187,10 @@ pub fn with_open_repo_maintenance_lock<T>(
 ) -> Result<T> {
     // Upgrade, the only caller, has no token.
     let mut repo = open_repo(config, passphrase, opts, &CancelToken::new())?;
-    with_maintenance_lock(&mut repo, action)
+    with_maintenance_lock(&mut repo, |repo| {
+        repo.refuse_live_sessions()?;
+        action(repo)
+    })
 }
 
 /// `Err(AppendOnlyServer { command })` when the repository's server
@@ -232,12 +209,18 @@ pub(crate) fn refuse_on_append_only_server(
 /// Execute a maintenance operation while holding an advisory lock.
 ///
 /// Acquires the lock, cleans up stale sessions (no marker written for 45 min
-/// by the store's clock), then refuses to run if any non-stale sessions
-/// remain. This prevents maintenance from deleting packs that active backups
-/// depend on. Malformed markers (unparseable JSON or bad timestamps) are
-/// judged by their mtime: while younger than 45 minutes they are preserved
-/// and surfaced in the blocking list, after that they are reaped like any
-/// stale marker (`break-lock --sessions` clears them at once).
+/// by the store's clock), lists the sessions that remain live (for compact's
+/// horizon, `Repository::live_sessions`), installs the lock fence, runs the
+/// action and releases the lock. It does not refuse on live sessions:
+/// compact, prune and delete run beside backups (04 step 7), compact keeping
+/// their uploads by age and inside their markers' horizons. Actions that
+/// must not run beside a backup refuse themselves with
+/// `Repository::refuse_live_sessions` (`check --repair`, upgrade).
+/// Malformed markers (unparseable JSON or bad timestamps) are judged by
+/// their mtime: while younger than 45 minutes they are preserved and give
+/// compact no horizon (no orphan pack is deleted), after that they are
+/// reaped like any stale marker (`break-lock --sessions` clears them at
+/// once). A failed listing refuses.
 pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
@@ -248,15 +231,18 @@ pub fn with_maintenance_lock<T>(
     // the old probes its acquisition listed (best effort).
     guard.remove_probe_debris(repo.storage.as_ref());
 
-    // Clean up stale sessions before checking for active ones.
+    // Clean up stale sessions; the ones kept are live. Backups may run
+    // beside maintenance (04 step 7): compact keeps their uploads by age and
+    // by their marker's horizon. Fail closed: without the listing compact
+    // would not know whose uploads to keep.
     let stale_threshold = lock::default_stale_session_duration();
-    match lock::cleanup_stale_sessions(
+    let live = match lock::cleanup_stale_sessions_keeping(
         repo.storage.as_ref(),
         stale_threshold,
         &env,
         guard.store_time(),
     ) {
-        Ok(cleaned) => {
+        Ok((cleaned, live)) => {
             if !cleaned.is_empty() {
                 info!(
                     count = cleaned.len(),
@@ -264,6 +250,7 @@ pub fn with_maintenance_lock<T>(
                     "cleaned up stale backup sessions"
                 );
             }
+            live
         }
         Err(e) => {
             let _ = lock::release_lock(repo.storage.as_ref(), guard);
@@ -272,35 +259,20 @@ pub fn with_maintenance_lock<T>(
                  refusing maintenance to avoid data loss"
             )));
         }
+    };
+    if !live.is_empty() {
+        info!(
+            count = live.len(),
+            "backup sessions are live; maintenance runs beside them"
+        );
     }
-
-    // Check for active (non-stale) sessions. Fail-closed: if we can't
-    // list sessions, refuse to run rather than risk deleting active packs.
-    // Malformed markers are surfaced in the blocking list via
-    // `build_active_session_list` — they are NOT silently filtered.
-    match lock::list_session_entries(repo.storage.as_ref()) {
-        Ok(entries) if !entries.is_empty() => {
-            let list = build_active_session_list(entries, &env.now_utc());
-            let _ = lock::release_lock(repo.storage.as_ref(), guard);
-            return Err(VykarError::ActiveSessions(list));
-        }
-        Err(e) => {
-            let _ = lock::release_lock(repo.storage.as_ref(), guard);
-            return Err(VykarError::Other(format!(
-                "cannot verify no active backup sessions (storage error: {e}); \
-                 refusing maintenance to avoid data loss"
-            )));
-        }
-        _ => {}
-    }
-
-    // Session checks passed — hand off to the shared fence/flush/release epilogue.
+    repo.set_live_sessions(Some(live));
     run_under_fence(repo, guard, action)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::repo::lock::{SessionEntry, build_active_session_list};
 
     fn entry(hostname: &str, pid: u32, last_refresh: &str) -> SessionEntry {
         SessionEntry {
@@ -311,6 +283,7 @@ mod tests {
             boot_id: None,
             installation_id: None,
             pid_ns: None,
+            elapsed_secs: None,
         }
     }
 

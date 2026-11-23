@@ -113,6 +113,9 @@ impl Repository {
         ws.persisted_pack_count = num_packs;
         ws.session_id.clone_from(&opts.session_id);
         ws.stream_data_packs = opts.stream_data_packs;
+        ws.existing_packs = Some(std::sync::Arc::new(
+            super::existing_pack::ExistingPacks::new(self.host_env.clone()),
+        ));
         ws.view = self.chunk_index.view().map(|view| SessionView {
             view,
             state: self.chunk_index.state().clone(),
@@ -129,6 +132,22 @@ impl Repository {
         });
         self.write_session = Some(ws);
         Ok(())
+    }
+
+    /// The backup's session marker, pulled back by the age of every pack
+    /// upload an append-only server refuses because the pack is stored
+    /// already (`existing_pack`). No-op without an active write session.
+    pub(crate) fn attach_session_marker(
+        &mut self,
+        marker: std::sync::Arc<super::lock::SessionMarker>,
+    ) {
+        if let Some(existing) = self
+            .write_session
+            .as_ref()
+            .and_then(|ws| ws.existing_packs.as_ref())
+        {
+            existing.attach_marker(marker);
+        }
     }
 
     /// Independent read-only requests worth issuing at once against this
@@ -270,8 +289,11 @@ impl Repository {
     ///
     /// Must be called inside the repo lock, before any chunk is stored.
     /// Pack lookups use the backend's request width
-    /// (`BackendProfile::request_width`).
-    pub fn recover_pending_index(&mut self) -> Result<PendingIndexRecovery> {
+    /// (`BackendProfile::request_width`) and stop when `cancel` fires.
+    pub fn recover_pending_index(
+        &mut self,
+        cancel: &super::control::CancelToken,
+    ) -> Result<PendingIndexRecovery> {
         let width = self.request_width();
         active_mut(&mut self.write_session).recover_pending_index(
             &*self.storage,
@@ -279,6 +301,7 @@ impl Repository {
             &self.chunk_index,
             width,
             self.host_env.clock.as_ref(),
+            cancel,
         )
     }
 

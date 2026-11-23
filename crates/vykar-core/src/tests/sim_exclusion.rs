@@ -3,7 +3,7 @@
 //! They assert what `tests/lock.rs` asserted with hooked backends.
 
 use crate::sim::history::{AllowedError, ErrorClass};
-use crate::sim::{Call, ClientId, GateRule, KeyMatch, OpMatch, RunRecord, Sim, SourceTree};
+use crate::sim::{Call, ClientId, GateRule, KeyMatch, OpKind, OpMatch, RunRecord, Sim, SourceTree};
 
 /// Lock keys only: a contended acquire's clock probe
 /// (`locks/vykar-clock-*`) is neither gated nor counted.
@@ -117,9 +117,11 @@ fn late_key_after_precheck_blocks() {
 }
 
 /// The session marker is written, then the backup is held before its
-/// probe LIST. Maintenance must see the marker and refuse.
+/// probe LIST. Maintenance must see the marker: since 04 step 7 it runs
+/// beside the session (it reads the marker for its horizon and keeps it);
+/// then the probe finds no lock and the backup commits.
 #[test]
-fn session_registered_first_blocks_maintenance() {
+fn session_registered_first_is_seen_by_maintenance() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
@@ -132,7 +134,19 @@ fn session_registered_first_blocks_maintenance() {
         },
     );
     sim.expect_paused(g, "a's registration probe");
-    assert_allowed(&sim.compact(b), AllowedError::ActiveSessions);
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    let read = sim.store().log().iter().any(|r| {
+        r.client == b && r.run == Some(rb.index) && r.op == OpKind::Get && r.key == marker
+    });
+    assert!(read, "b's compact did not read a's marker");
+    assert!(sim.store().object(&marker).is_some());
     assert!(sim.store().keys("locks/").is_empty());
     sim.resume(g);
     sim.join(sa).expect_ok();

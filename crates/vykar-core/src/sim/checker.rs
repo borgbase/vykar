@@ -10,22 +10,23 @@
 //!
 //! | 04 | Here |
 //! |---|---|
-//! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist); the age and horizon parts not yet |
+//! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist), plus 10: no never-committed pack deleted younger than T_pack or while its own session's marker was live. Packs a compact's own sweep emptied are excused (their writer published a head) until 04 step 7's young index segments tighten clause 10 |
 //! | I2 (every retained head names only objects that exist) | 4, for the latest head |
 //! | I3 (heads immutable, one per generation) | not yet; 7 (lock exclusion) stands in on today's protocol |
 //! | I4 (every listed snapshot covered by some retained head) | 1, against the latest head |
 //! | I5 (no removal without a completed mark) | not yet (the H5 regression is scripted) |
 //! | I6 (no snapshot references a chunk missing from its commit head) | 1 approximates it against the latest head |
 //! | I7 (a reader returns correct data or a typed error) | 1 (restore against the source), 8 |
-//! | I8 (a marker gap with an old pack does not commit) | not yet |
+//! | I8 (a marker gap with an old pack does not commit) | 11 |
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use vykar_types::chunk_id::ChunkId;
 
-use super::fault::ClientId;
+use super::fault::{ClientId, OpKind};
 use super::history::{ClientOp, ErrorClass, History, ObservationCause, RunOutcome, RunRecord};
+use super::log::{OpOutcome, OpRecord};
 use super::runner::SourceTree;
 use super::store::SimStore;
 use crate::commands::list;
@@ -33,6 +34,7 @@ use crate::commands::restore::{self, RestoreOptions};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository, index_store};
 use crate::snapshot::item::ItemType;
+use chrono::{DateTime, Utc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Invariant {
@@ -49,6 +51,18 @@ pub enum Invariant {
     /// Once every lock and marker has aged out, a new client can back up
     /// and compact. Needs [`Sim::check_invariants`](super::runner::Sim::check_invariants).
     NoPermanentWedge = 9,
+    /// I1's age and horizon parts, from the op log: a pack no head can
+    /// have named yet (no run that wrote it, or read its writer's journal,
+    /// published a head after its PUT) is deleted only once T_PACK old,
+    /// and not while its writer's run is in flight with a marker key
+    /// present.
+    OrphanGrace = 10,
+    /// I8: a backup whose marker key was deleted by another client, or not
+    /// written for more than MARKER_GAP_LIMIT, before its head PUT, and
+    /// whose oldest own pack was older than PACK_AGE_LIMIT −
+    /// HEAD_LANDING_ALLOWANCE at the last op it issued before that PUT,
+    /// publishes no head.
+    MarkerGapCommit = 11,
 }
 
 impl Invariant {
@@ -70,6 +84,19 @@ impl Invariant {
         Invariant::AllowedErrors,
         Invariant::LockExclusion,
         Invariant::NoPermanentWedge,
+    ];
+
+    /// STEP3 plus invariants 10 and 11 (04 step 7).
+    pub const STEP7: &'static [Invariant] = &[
+        Invariant::CommittedSnapshotsRestore,
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::AllowedErrors,
+        Invariant::LockExclusion,
+        Invariant::NoPermanentWedge,
+        Invariant::OrphanGrace,
+        Invariant::MarkerGapCommit,
     ];
 }
 
@@ -109,6 +136,16 @@ pub enum ViolationKind {
     // 9
     WedgedBackup,
     WedgedCompact,
+    // 10
+    /// A pack no head named was deleted younger than T_PACK.
+    YoungOrphanDeleted,
+    /// A pack no head named was deleted while its writer's run was in
+    /// flight with a marker key present.
+    LiveSessionPackDeleted,
+    // 11
+    /// A backup published a head after a marker reap or gap with packs
+    /// past the commit rule's age limit.
+    OldPackCommittedAfterMarkerGap,
 }
 
 impl ViolationKind {
@@ -135,6 +172,8 @@ impl ViolationKind {
                 Invariant::LockExclusion
             }
             K::WedgedBackup | K::WedgedCompact => Invariant::NoPermanentWedge,
+            K::YoungOrphanDeleted | K::LiveSessionPackDeleted => Invariant::OrphanGrace,
+            K::OldPackCommittedAfterMarkerGap => Invariant::MarkerGapCommit,
         }
     }
 }
@@ -728,6 +767,236 @@ fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report
     }
 }
 
+fn is_marker_key(key: &str) -> bool {
+    key.starts_with("sessions/") && key.ends_with(".json")
+}
+
+fn is_journal_key(key: &str) -> bool {
+    key.starts_with("sessions/") && key.ends_with(".index")
+}
+
+fn is_head_key(key: &str) -> bool {
+    key.starts_with("index.h/")
+}
+
+fn applied_write(r: &OpRecord) -> bool {
+    r.applied() && r.op.is_write()
+}
+
+/// A record of an operation issued, not of a parked effect landing.
+fn issued(r: &OpRecord) -> bool {
+    !matches!(
+        r.outcome,
+        OpOutcome::Released(_) | OpOutcome::ReleasedRefused(_)
+    )
+}
+
+fn violation(kind: ViolationKind, subject: String, step: u64, detail: String) -> Violation {
+    Violation {
+        invariant: kind.invariant(),
+        kind,
+        subject,
+        detail,
+        step: Some(step),
+    }
+}
+
+/// `b − a` as a std duration, zero when negative.
+fn between(a: DateTime<Utc>, b: DateTime<Utc>) -> std::time::Duration {
+    (b - a).to_std().unwrap_or_default()
+}
+
+/// Invariant 10 over the op log. Every applied delete of a `packs/` key by
+/// a run (tamper deletes are outside runs) is judged against the latest
+/// applied write of the key before it: when no head can have named the
+/// pack, it must have been at least `T_PACK` old, and its writer's run
+/// must not have been in flight with one of its marker keys present.
+///
+/// "Named" is a proxy that errs towards not flagging: after the pack's PUT
+/// and before the delete, the writer's run, or a run that had read one of
+/// the writer's journal keys (recovery), applied an `index.h/` write. Only
+/// the writer's own session is checked for the horizon: the driver never
+/// refreshes markers, so no other session's horizon reaches further back
+/// than its own registration.
+pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violation> {
+    let t_pack = crate::repo::ages::T_PACK;
+    let mut out = Vec::new();
+    // Marker keys present, replayed from applied writes and deletes.
+    let mut present: BTreeSet<&str> = BTreeSet::new();
+    for (pos, del) in log.iter().enumerate() {
+        if del.run.is_some() {
+            for key in del.deleted_keys() {
+                if !key.starts_with("packs/") {
+                    continue;
+                }
+                let Some(put_pos) = log[..pos]
+                    .iter()
+                    .rposition(|r| applied_write(r) && r.key == key)
+                else {
+                    continue;
+                };
+                let put = &log[put_pos];
+                let Some(writer) = put.run else {
+                    continue;
+                };
+                let journals: BTreeSet<&str> = log[..pos]
+                    .iter()
+                    .filter(|r| r.run == Some(writer) && applied_write(r) && is_journal_key(&r.key))
+                    .map(|r| r.key.as_str())
+                    .collect();
+                let mut naming_runs: BTreeSet<usize> = BTreeSet::from([writer]);
+                let mut named = false;
+                for r in &log[put_pos + 1..pos] {
+                    if r.op == OpKind::Get
+                        && journals.contains(r.key.as_str())
+                        && let Some(run) = r.run
+                    {
+                        naming_runs.insert(run);
+                    }
+                    if applied_write(r)
+                        && is_head_key(&r.key)
+                        && r.run.is_some_and(|run| naming_runs.contains(&run))
+                    {
+                        named = true;
+                        break;
+                    }
+                }
+                if named {
+                    continue;
+                }
+                let age = between(put.at, del.at);
+                let subject = format!("run {writer} {key}");
+                if age < t_pack {
+                    out.push(violation(
+                        ViolationKind::YoungOrphanDeleted,
+                        subject,
+                        del.step,
+                        format!(
+                            "step {} deleted {key} {} s after its PUT (step {}), no head named it",
+                            del.step,
+                            age.as_secs(),
+                            put.step
+                        ),
+                    ));
+                    continue;
+                }
+                let in_flight = runs
+                    .iter()
+                    .find(|r| r.index == writer)
+                    .is_none_or(|r| r.first_step <= del.step && del.step <= r.last_step);
+                let marker_present = log[..pos]
+                    .iter()
+                    .filter(|r| r.run == Some(writer) && applied_write(r) && is_marker_key(&r.key))
+                    .any(|r| present.contains(r.key.as_str()));
+                if in_flight && marker_present {
+                    out.push(violation(
+                        ViolationKind::LiveSessionPackDeleted,
+                        subject,
+                        del.step,
+                        format!(
+                            "step {} deleted {key} while its writer's run was in flight with a marker key present",
+                            del.step
+                        ),
+                    ));
+                }
+            }
+        }
+        if del.applied() {
+            if del.op.is_write() && is_marker_key(&del.key) {
+                present.insert(del.key.as_str());
+            }
+            for k in del.deleted_keys() {
+                present.remove(k);
+            }
+        }
+    }
+    out
+}
+
+/// Invariant 11 over the op log and the backup runs: per applied
+/// `index.h/` write `h` of a backup run, the marker was bad (an applied
+/// delete of one of its marker keys by another client before `h`, or `h`
+/// more than `MARKER_GAP_LIMIT` after its latest applied marker write)
+/// and its packs were too old (the `at` of the last op it issued before
+/// `h` was issued, minus the earliest of its applied pack PUTs, plus
+/// `HEAD_LANDING_ALLOWANCE`, exceeds `PACK_AGE_LIMIT`).
+pub(crate) fn marker_gap_commit(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violation> {
+    use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
+    use crate::repo::lock::MARKER_GAP_LIMIT;
+    let mut out = Vec::new();
+    for run in runs {
+        if !matches!(run.op, ClientOp::Backup { .. }) {
+            continue;
+        }
+        let mine = |r: &&OpRecord| r.run == Some(run.index);
+        for (h_pos, h) in log.iter().enumerate() {
+            if !(mine(&h) && applied_write(h) && is_head_key(&h.key)) {
+                continue;
+            }
+            let before = &log[..h_pos];
+            let markers: BTreeSet<&str> = before
+                .iter()
+                .filter(mine)
+                .filter(|r| applied_write(r) && is_marker_key(&r.key))
+                .map(|r| r.key.as_str())
+                .collect();
+            let reaped = before.iter().any(|r| {
+                r.client != run.client && r.deleted_keys().iter().any(|k| markers.contains(k))
+            });
+            let last_marker = before
+                .iter()
+                .filter(mine)
+                .filter(|r| applied_write(r) && is_marker_key(&r.key))
+                .map(|r| r.at)
+                .max();
+            let gap = last_marker.is_some_and(|m| between(m, h.at) > MARKER_GAP_LIMIT);
+            if !(reaped || gap) {
+                continue;
+            }
+            let issue_pos = match h.outcome {
+                OpOutcome::Released(id) => log
+                    .iter()
+                    .position(|r| matches!(r.outcome, OpOutcome::Parked(p, _) if p == id))
+                    .unwrap_or(h_pos),
+                _ => h_pos,
+            };
+            let Some(t_last) = log[..issue_pos]
+                .iter()
+                .rev()
+                .find(|r| mine(r) && issued(r))
+                .map(|r| r.at)
+            else {
+                continue;
+            };
+            let Some(oldest) = before
+                .iter()
+                .filter(mine)
+                .filter(|r| applied_write(r) && r.key.starts_with("packs/"))
+                .map(|r| r.at)
+                .min()
+            else {
+                continue;
+            };
+            let age = between(oldest, t_last);
+            if age + HEAD_LANDING_ALLOWANCE > PACK_AGE_LIMIT {
+                out.push(violation(
+                    ViolationKind::OldPackCommittedAfterMarkerGap,
+                    run_subject(run),
+                    h.step,
+                    format!(
+                        "step {} wrote {} with a {} marker; its oldest pack was {} s old at its last op",
+                        h.step,
+                        h.key,
+                        if reaped { "reaped" } else { "gapped" },
+                        age.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) -> Report {
     let mut report = Report::default();
     let tmp = tempfile::tempdir().expect("checker scratch");
@@ -792,6 +1061,17 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
     if want(Invariant::LockExclusion) {
         check_lock_exclusion(store, history, &mut report);
     }
+    if want(Invariant::OrphanGrace) || want(Invariant::MarkerGapCommit) {
+        let log = store.log();
+        if want(Invariant::OrphanGrace) {
+            report.violations.extend(orphan_grace(&log, &history.runs));
+        }
+        if want(Invariant::MarkerGapCommit) {
+            report
+                .violations
+                .extend(marker_gap_commit(&log, &history.runs));
+        }
+    }
     if want(Invariant::NoPermanentWedge) {
         report.skip(
             Invariant::NoPermanentWedge,
@@ -800,4 +1080,228 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
         );
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::history::{ClientOp, RunOutcome, RunRecord};
+
+    const BACKUP: ClientId = ClientId(2);
+    const OTHER: ClientId = ClientId(3);
+
+    fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn mins(m: i64) -> DateTime<Utc> {
+        t0() + chrono::Duration::minutes(m)
+    }
+
+    /// A hand-built log: records in step order.
+    #[derive(Default)]
+    struct Log(Vec<OpRecord>);
+
+    impl Log {
+        fn op(&mut self, client: ClientId, run: usize, op: OpKind, key: &str, at: DateTime<Utc>) {
+            let step = self.0.len() as u64 + 1;
+            self.0.push(OpRecord {
+                step,
+                client,
+                run: Some(run),
+                thread: "t".into(),
+                op,
+                key: key.into(),
+                keys: Vec::new(),
+                absent: Vec::new(),
+                len: None,
+                outcome: OpOutcome::Ok,
+                label: None,
+                at,
+            });
+        }
+    }
+
+    fn run(index: usize, client: ClientId, op: ClientOp, last_step: u64) -> RunRecord {
+        RunRecord {
+            index,
+            client,
+            op,
+            first_step: 0,
+            last_step,
+            outcome: RunOutcome::Ok {
+                removed: Vec::new(),
+                detail: String::new(),
+            },
+        }
+    }
+
+    fn backup_run(last_step: u64) -> RunRecord {
+        run(
+            0,
+            BACKUP,
+            ClientOp::Backup {
+                snapshot: "a1".into(),
+            },
+            last_step,
+        )
+    }
+
+    fn kinds(v: &[Violation]) -> Vec<ViolationKind> {
+        v.iter().map(|v| v.kind).collect()
+    }
+
+    const PACK: &str = "packs/aa/aa00";
+
+    #[test]
+    fn checker_flags_a_young_orphan_delete() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(60));
+        let runs = [backup_run(1), run(1, OTHER, ClientOp::Compact, 2)];
+        assert_eq!(
+            kinds(&orphan_grace(&log.0, &runs)),
+            [ViolationKind::YoungOrphanDeleted]
+        );
+    }
+
+    #[test]
+    fn checker_flags_a_live_sessions_pack_delete() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(13 * 60));
+        // The backup's run is still in flight at the delete.
+        let runs = [backup_run(100), run(1, OTHER, ClientOp::Compact, 3)];
+        assert_eq!(
+            kinds(&orphan_grace(&log.0, &runs)),
+            [ViolationKind::LiveSessionPackDeleted]
+        );
+        // Not once its marker is gone.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(OTHER, 1, OpKind::Delete, "sessions/s.json", mins(13 * 60));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(13 * 60));
+        assert!(orphan_grace(&log.0, &runs).is_empty());
+    }
+
+    #[test]
+    fn checker_excuses_a_swept_pack() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(60));
+        let runs = [backup_run(2), run(1, OTHER, ClientOp::Compact, 3)];
+        assert!(orphan_grace(&log.0, &runs).is_empty());
+    }
+
+    #[test]
+    fn checker_excuses_a_recovered_then_swept_pack() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "sessions/x.index", mins(0));
+        // Run 2 recovers the crashed run's journal and commits.
+        log.op(OTHER, 2, OpKind::Get, "sessions/x.index", mins(5));
+        log.op(OTHER, 2, OpKind::Put, "index.h/2", mins(6));
+        log.op(OTHER, 3, OpKind::Delete, PACK, mins(60));
+        let runs = [
+            backup_run(2),
+            run(
+                2,
+                OTHER,
+                ClientOp::Backup {
+                    snapshot: "b1".into(),
+                },
+                4,
+            ),
+            run(3, OTHER, ClientOp::Compact, 5),
+        ];
+        assert!(orphan_grace(&log.0, &runs).is_empty());
+        // Without the journal read the pack was a young orphan.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "sessions/x.index", mins(0));
+        log.op(OTHER, 2, OpKind::Put, "index.h/2", mins(6));
+        log.op(OTHER, 3, OpKind::Delete, PACK, mins(60));
+        assert_eq!(
+            kinds(&orphan_grace(&log.0, &runs)),
+            [ViolationKind::YoungOrphanDeleted]
+        );
+    }
+
+    #[test]
+    fn checker_flags_an_old_pack_commit_after_a_marker_gap() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(
+            BACKUP,
+            0,
+            OpKind::Exists,
+            "locks/l.json",
+            mins(11 * 60 + 30),
+        );
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 30));
+        let runs = [backup_run(4)];
+        assert_eq!(
+            kinds(&marker_gap_commit(&log.0, &runs)),
+            [ViolationKind::OldPackCommittedAfterMarkerGap]
+        );
+        // Young packs: the same gap commits.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Exists, "locks/l.json", mins(60));
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(60));
+        assert!(marker_gap_commit(&log.0, &runs).is_empty());
+        // A reap by another client counts like a gap.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(
+            BACKUP,
+            0,
+            OpKind::Put,
+            "sessions/s.1.json",
+            mins(11 * 60 + 25),
+        );
+        log.op(
+            OTHER,
+            1,
+            OpKind::Delete,
+            "sessions/s.json",
+            mins(11 * 60 + 26),
+        );
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 30));
+        assert_eq!(
+            kinds(&marker_gap_commit(&log.0, &runs)),
+            [ViolationKind::OldPackCommittedAfterMarkerGap]
+        );
+    }
+
+    #[test]
+    fn checker_accepts_an_old_pack_commit_with_fresh_marker_writes() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(
+            BACKUP,
+            0,
+            OpKind::Put,
+            "sessions/s.1.json",
+            mins(11 * 60 + 25),
+        );
+        log.op(
+            BACKUP,
+            0,
+            OpKind::Exists,
+            "locks/l.json",
+            mins(11 * 60 + 30),
+        );
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 30));
+        assert!(marker_gap_commit(&log.0, &[backup_run(5)]).is_empty());
+    }
 }

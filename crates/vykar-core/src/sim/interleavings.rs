@@ -863,6 +863,9 @@ fn h4_runs(
     let t1 = SourceTree::new().file("f000.bin", seeded_bytes("x/0", FILE_SIZE));
     ok(&sim.backup(c, "t1", &t1), "setup backup t1")?;
     ok(&sim.delete(c, &["t0"]), "setup delete t0")?;
+    // t0's segment is old, so A's sweep takes t0's entries and its repack
+    // has t0's pack to merge (04 step 7 keeps young segments' additions).
+    sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
     let (a, b) = pair(&mut sim, hosts);
     let head = || KeyMatch::Prefix("index.h/".into());
     // A's first head is its sweep's; the second follows the repack batch.

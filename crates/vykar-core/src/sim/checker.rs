@@ -10,7 +10,7 @@
 //!
 //! | 04 | Here |
 //! |---|---|
-//! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist), plus 10: no never-committed pack deleted younger than T_pack or while its own session's marker was live. Packs a compact's own sweep emptied are excused (their writer published a head) until 04 step 7's young index segments tighten clause 10 |
+//! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist), plus 10: no pack deleted younger than T_pack or while its own session's marker was live, repack sources excepted |
 //! | I2 (every retained head names only objects that exist) | 4, for the latest head |
 //! | I3 (heads immutable, one per generation) | not yet; 7 (lock exclusion) stands in on today's protocol |
 //! | I4 (every listed snapshot covered by some retained head) | 1, against the latest head |
@@ -51,11 +51,10 @@ pub enum Invariant {
     /// Once every lock and marker has aged out, a new client can back up
     /// and compact. Needs [`Sim::check_invariants`](super::runner::Sim::check_invariants).
     NoPermanentWedge = 9,
-    /// I1's age and horizon parts, from the op log: a pack no head can
-    /// have named yet (no run that wrote it, or read its writer's journal,
-    /// published a head after its PUT) is deleted only once T_PACK old,
-    /// and not while its writer's run is in flight with a marker key
-    /// present.
+    /// I1's age and horizon parts, from the op log: a pack (never
+    /// committed, or emptied by a sweep; repack sources excepted) is deleted
+    /// only once T_PACK old, and not while its writer's run is in flight
+    /// with a marker key present.
     OrphanGrace = 10,
     /// I8: a backup whose marker key was deleted by another client, or not
     /// written for more than MARKER_GAP_LIMIT, before its head PUT, and
@@ -771,10 +770,6 @@ fn is_marker_key(key: &str) -> bool {
     key.starts_with("sessions/") && key.ends_with(".json")
 }
 
-fn is_journal_key(key: &str) -> bool {
-    key.starts_with("sessions/") && key.ends_with(".index")
-}
-
 fn is_head_key(key: &str) -> bool {
     key.starts_with("index.h/")
 }
@@ -808,14 +803,18 @@ fn between(a: DateTime<Utc>, b: DateTime<Utc>) -> std::time::Duration {
 
 /// Invariant 10 over the op log. Every applied delete of a `packs/` key by
 /// a run (tamper deletes are outside runs) is judged against the latest
-/// applied write of the key before it: when no head can have named the
-/// pack, it must have been at least `T_PACK` old, and its writer's run
-/// must not have been in flight with one of its marker keys present.
+/// applied write of the key before it: the pack must have been at least
+/// `T_PACK` old, and its writer's run must not have been in flight with
+/// one of its marker keys present. Whether a head ever named the pack does
+/// not matter (04 I1 in full since phase F part 8c: a pack a sweep empties
+/// obeys the same rule as one never committed).
 ///
-/// "Named" is a proxy that errs towards not flagging: after the pack's PUT
-/// and before the delete, the writer's run, or a run that had read one of
-/// the writer's journal keys (recovery), applied an `index.h/` write. Only
-/// the writer's own session is checked for the horizon: the driver never
+/// A repack source is not judged: the deleting run read the pack (`Get`
+/// or `GetRange` with outcome `Ok`) before the delete, as a client-side
+/// repack does with its sources and an orphan delete never does (the
+/// simulator's store offers no server-side repack). Its live entries were
+/// relocated by chunk ID before the delete (04 step 7 D9). Only the
+/// writer's own session is checked for the horizon: the driver never
 /// refreshes markers, so no other session's horizon reaches further back
 /// than its own registration.
 pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violation> {
@@ -839,29 +838,13 @@ pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violatio
                 let Some(writer) = put.run else {
                     continue;
                 };
-                let journals: BTreeSet<&str> = log[..pos]
-                    .iter()
-                    .filter(|r| r.run == Some(writer) && applied_write(r) && is_journal_key(&r.key))
-                    .map(|r| r.key.as_str())
-                    .collect();
-                let mut naming_runs: BTreeSet<usize> = BTreeSet::from([writer]);
-                let mut named = false;
-                for r in &log[put_pos + 1..pos] {
-                    if r.op == OpKind::Get
-                        && journals.contains(r.key.as_str())
-                        && let Some(run) = r.run
-                    {
-                        naming_runs.insert(run);
-                    }
-                    if applied_write(r)
-                        && is_head_key(&r.key)
-                        && r.run.is_some_and(|run| naming_runs.contains(&run))
-                    {
-                        named = true;
-                        break;
-                    }
-                }
-                if named {
+                let repack_source = log[put_pos + 1..pos].iter().any(|r| {
+                    r.run == del.run
+                        && matches!(r.op, OpKind::Get | OpKind::GetRange)
+                        && r.outcome == OpOutcome::Ok
+                        && r.key == key
+                });
+                if repack_source {
                     continue;
                 }
                 let age = between(put.at, del.at);
@@ -872,7 +855,7 @@ pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violatio
                         subject,
                         del.step,
                         format!(
-                            "step {} deleted {key} {} s after its PUT (step {}), no head named it",
+                            "step {} deleted {key} {} s after its PUT (step {}), not a repack source",
                             del.step,
                             age.as_secs(),
                             put.step
@@ -1189,17 +1172,50 @@ mod tests {
     }
 
     #[test]
-    fn checker_excuses_a_swept_pack() {
+    fn checker_flags_a_young_swept_pack() {
         let mut log = Log::default();
         log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
         log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
         log.op(OTHER, 1, OpKind::Delete, PACK, mins(60));
         let runs = [backup_run(2), run(1, OTHER, ClientOp::Compact, 3)];
+        assert_eq!(
+            kinds(&orphan_grace(&log.0, &runs)),
+            [ViolationKind::YoungOrphanDeleted]
+        );
+    }
+
+    #[test]
+    fn checker_accepts_an_old_swept_pack() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(13 * 60));
+        let runs = [backup_run(2), run(1, OTHER, ClientOp::Compact, 3)];
         assert!(orphan_grace(&log.0, &runs).is_empty());
     }
 
     #[test]
-    fn checker_excuses_a_recovered_then_swept_pack() {
+    fn checker_excuses_a_repack_source() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
+        log.op(OTHER, 1, OpKind::GetRange, PACK, mins(60));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(60));
+        let runs = [backup_run(2), run(1, OTHER, ClientOp::Compact, 4)];
+        assert!(orphan_grace(&log.0, &runs).is_empty());
+        // A read by another run does not make it one.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        log.op(BACKUP, 0, OpKind::Get, PACK, mins(1));
+        log.op(OTHER, 1, OpKind::Delete, PACK, mins(60));
+        assert_eq!(
+            kinds(&orphan_grace(&log.0, &runs)),
+            [ViolationKind::YoungOrphanDeleted]
+        );
+    }
+
+    #[test]
+    fn checker_flags_a_young_recovered_then_swept_pack() {
         let mut log = Log::default();
         log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
         log.op(BACKUP, 0, OpKind::Put, "sessions/x.index", mins(0));
@@ -1219,13 +1235,6 @@ mod tests {
             ),
             run(3, OTHER, ClientOp::Compact, 5),
         ];
-        assert!(orphan_grace(&log.0, &runs).is_empty());
-        // Without the journal read the pack was a young orphan.
-        let mut log = Log::default();
-        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
-        log.op(BACKUP, 0, OpKind::Put, "sessions/x.index", mins(0));
-        log.op(OTHER, 2, OpKind::Put, "index.h/2", mins(6));
-        log.op(OTHER, 3, OpKind::Delete, PACK, mins(60));
         assert_eq!(
             kinds(&orphan_grace(&log.0, &runs)),
             [ViolationKind::YoungOrphanDeleted]

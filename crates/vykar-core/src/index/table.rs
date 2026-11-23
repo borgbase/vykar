@@ -759,6 +759,14 @@ pub(crate) fn read_cached_segment(dir: &Path, r: &SegmentRef) -> Option<Vec<u8>>
     None
 }
 
+/// Whether `dir` holds a file for segment `r` of its size: a presence
+/// check that reads nothing. [`read_cached_segment`] verifies the bytes
+/// when they are used.
+pub(crate) fn cached_segment_present(dir: &Path, r: &SegmentRef) -> bool {
+    std::fs::metadata(segment_cache_path(dir, &r.name))
+        .is_ok_and(|m| m.is_file() && m.len() == r.size)
+}
+
 /// Cache the bytes of segment `name` in `dir` (written once through a temp
 /// file, never over an existing file). Best-effort.
 pub(crate) fn write_cached_segment(dir: &Path, name: &ObjectName, bytes: &[u8]) {

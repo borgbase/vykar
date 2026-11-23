@@ -71,6 +71,9 @@ fn lifecycle_delete_compact_check_and_restore() {
         .expect("delete returned no stats");
     assert_eq!(stats.snapshot_name, "snap-v1");
 
+    // snap-v1's backup segment and packs are old: the sweep takes its
+    // entries (compact keeps those of segments younger than T_pack).
+    common::age_repo_objects(&repo_dir, &["index.d", "packs"], common::PAST_T_PACK);
     let compact_stats =
         commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(compact_stats.chunks_unreferenced > 0);
@@ -184,6 +187,8 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     assert!(list_entries.iter().any(|e| e.action == "prune"));
     assert!(list_entries.iter().any(|e| e.action == "keep"));
 
+    // The pruned snapshot's segment and packs are old (see above).
+    common::age_repo_objects(&repo_dir, &["index.d", "packs"], common::PAST_T_PACK);
     let compact_stats =
         commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(

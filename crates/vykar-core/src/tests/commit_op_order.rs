@@ -8,7 +8,10 @@
 // replays, the measurement); every other path asserts.
 #![allow(clippy::print_stderr)]
 
+use std::time::Duration;
+
 use crate::compress::Compression;
+use crate::repo::ages::T_PACK;
 use crate::repo::pack::PackType;
 use crate::repo::{OpenOptions, Repository, WriteSessionOptions};
 use crate::sim::log::key_class;
@@ -251,6 +254,9 @@ fn compact_after_delete_writes_a_record_and_a_segment() {
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     sim.backup(c, "t1", &tree("t1")).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
+    // t0's segment and packs are old: its entries are swept, its packs go
+    // (04 step 7).
+    sim.advance(T_PACK + Duration::from_secs(60));
     let r = sim.compact(c);
     r.expect_ok();
     check(
@@ -267,6 +273,7 @@ fn compact_after_delete_writes_a_record_and_a_segment() {
             "Get snapshots/ ok",
             "List index.h/ ok x2",
             "List snapshots/ ok",
+            "ListMeta index.d/ ok",
             "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
             "Put index.d/ ok x2",
@@ -312,6 +319,7 @@ fn compact_with_nothing_to_remove_writes_a_head_only() {
             "Get snapshots/ ok",
             "List index.h/ ok x2",
             "List snapshots/ ok",
+            "ListMeta index.d/ ok",
             "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
             "Put index.d/ ok",
@@ -333,6 +341,9 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
+    // t0's segment is old, so the fold folds it (04 step 7); the
+    // fold-prefix step lists index.d/ for its age.
+    sim.advance(T_PACK + Duration::from_secs(60));
     let r = sim.custom(c, "fold", |repo: &mut Repository| {
         repo.load_chunk_index_under_lock()?;
         repo.request_index_fold();
@@ -352,6 +363,7 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
             "Put locks/ ok",
             "Get index.h/ ok x2",
             "List index.h/ ok x2",
+            "ListMeta index.d/ ok",
             "ListMeta locks/ ok",
             "Put index.d/ ok",
             "Exists locks/ ok",

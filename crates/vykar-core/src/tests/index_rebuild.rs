@@ -93,7 +93,7 @@ impl Fx {
     fn fold(&self) {
         let mut repo = self.open();
         commands::util::with_maintenance_lock(&mut repo, |repo| {
-            repo.request_index_fold();
+            repo.request_full_index_fold();
             repo.mark_index_dirty();
             repo.save_state()
         })
@@ -312,6 +312,12 @@ fn three_backups_and_a_compact(encrypted: bool) -> Fx {
     let p = pass(&fx.config);
     commands::delete::run(&fx.config, p, &["s1"], false, &CancelToken::new()).unwrap();
     fx.trees.remove("s1");
+    // s1's segment and packs are old: its entries are swept (04 step 7).
+    super::helpers::age_repo_objects(
+        &fx.repo_dir,
+        &["index.d", "packs"],
+        super::helpers::PAST_T_PACK,
+    );
     let stats =
         commands::compact::run(&fx.config, p, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(stats.packs_repacked > 0, "{stats:?}");

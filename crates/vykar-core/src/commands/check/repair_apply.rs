@@ -515,7 +515,7 @@ pub(super) fn execute_repair(
     // the repair as a sweep (`sweep.gen`), keeping the last sweep record.
     // Written also when the sweep removed nothing.
     repo.mark_index_dirty();
-    repo.request_index_fold();
+    repo.request_full_index_fold();
     repo.set_pending_sweep(crate::repo::index_write::PendingSweep::Repair);
     repo.save_state()?;
 

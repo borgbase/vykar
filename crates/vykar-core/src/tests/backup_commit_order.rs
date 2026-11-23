@@ -1114,7 +1114,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
             )
             .unwrap();
             crate::commands::util::with_maintenance_lock(&mut repo, |repo| {
-                repo.request_index_fold();
+                repo.request_full_index_fold();
                 repo.mark_index_dirty();
                 repo.save_state()
             })
@@ -1165,6 +1165,13 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 assert!(
                     !storage.exists(key).unwrap(),
                     "maintenance reaped the marker"
+                );
+                // s1's segment is old, so the sweep takes its chunks (04
+                // step 7 keeps those of segments younger than T_pack).
+                crate::tests::helpers::age_repo_objects(
+                    &repo_dir,
+                    &["index.d"],
+                    crate::tests::helpers::PAST_T_PACK,
                 );
                 let swept = crate::commands::compact::run(
                     &other,

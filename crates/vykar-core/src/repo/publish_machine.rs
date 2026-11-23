@@ -7,7 +7,12 @@
 //!   head;
 //! - segment: [record] → segment → fence → head;
 //! - fold: [list heads] → [base] → [record] → fence → head → garbage
-//!   collection.
+//!   collection;
+//! - partial fold (04 step 7): [fold-prefix] → [base] → [record] →
+//!   [segment] → fence → head → garbage collection. The base holds the
+//!   longest foldable prefix of the chain; the young backup segments after
+//!   it stay named by the head, followed by the write's own segment when it
+//!   is not foldable.
 //!
 //! A backup's write also runs the commit rule's pack-age term at its fence
 //! ([`HeadCheck`]), the last step before the head PUT on every path.
@@ -19,12 +24,15 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::index_store::{self, PackedObject};
+use super::index_write::FoldRequest;
 use super::lock::{self, SessionMarker};
 use super::machine::{Machine, StepCx, StepKind, bad_pick};
 use crate::index::LiveIndex;
-use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, ObjectName, SegmentRef};
+use crate::index::head::{
+    BaseRef, HEAD_LAYOUT_VERSION, IndexHead, ObjectName, SegmentKind, SegmentRef,
+};
 use crate::index::segment_v2::SegmentBody;
-use crate::index::table::{self, ChunkTable, TableFileWriter};
+use crate::index::table::{self, ChunkTable, IndexState, TableFileWriter};
 use vykar_types::error::{Result, VykarError};
 
 /// One index write, from the state to publish to the head that names it.
@@ -33,10 +41,13 @@ use vykar_types::error::{Result, VykarError};
 /// (`Repository::put_base`); its output is the head written, or the
 /// previous head when nothing was.
 pub(crate) struct PublishMachine {
-    /// `Some(fold)`: a publish, which took `fold` from the repository's
-    /// `fold_requested` and ORs it back on error, and which updates the
-    /// repository's head bookkeeping. `None`: a base write alone.
-    publish: Option<bool>,
+    /// `Some(request)`: a publish, which took `request` from the
+    /// repository's `fold_requested` and restores it on error, and which
+    /// updates the repository's head bookkeeping. `None`: a base write
+    /// alone.
+    publish: Option<FoldRequest>,
+    /// The fold asked for: a publish's request, or a base write's.
+    request: FoldRequest,
     backup: bool,
     /// A fold added a backup's additions to the index as edits: an error
     /// before the head PUT drops them again.
@@ -78,6 +89,10 @@ enum State {
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
     },
+    /// A fold of the foldable prefix over a chain with backup segments:
+    /// list the segments' ages, decide, and fetch what a partial fold
+    /// needs (`FoldPrefix`).
+    FoldPrefix(Box<PrefixPrep>),
     /// Fold: write the base body (`Local`).
     FoldBody(Box<FoldPrep>),
     /// Fold without a previous head: LIST `index.h/` for the generation.
@@ -90,10 +105,39 @@ enum State {
     Failed,
 }
 
+/// A fold candidate whose foldable prefix is still to be judged.
+struct PrefixPrep {
+    prev: IndexHead,
+    /// The write's own change (non-empty) and its packed segment.
+    own: Option<(SegmentBody, PackedObject)>,
+    removes: bool,
+    /// A fold was asked for: fold whatever is foldable, limits or not.
+    forced: bool,
+}
+
 struct FoldPrep {
     prev: Option<IndexHead>,
     seg: Option<SegmentBody>,
     removes: bool,
+    mode: FoldMode,
+}
+
+/// What a fold writes into its base.
+enum FoldMode {
+    /// Every segment and the write's own change: the base is the index's
+    /// full state (a backup's additions added as edits first).
+    Full,
+    /// The first `k` segments of `prev` (04 step 7). The others stay
+    /// segments, followed by `appended` (the write's own segment) when
+    /// given. With `k` = the chain's length the base is the index's loaded
+    /// state; otherwise the table plus the first `k` segments.
+    Partial {
+        k: usize,
+        /// Per segment of `prev`: its bytes when the local cache lacks
+        /// them (fetched), `None` when the cache holds them.
+        bytes: Vec<Option<Vec<u8>>>,
+        appended: Option<PackedObject>,
+    },
 }
 
 /// A fold's base, written to a local table, not yet published.
@@ -104,6 +148,11 @@ struct FoldBase {
     table: ChunkTable,
     obj: Option<PackedObject>,
     entries: u64,
+    /// Segments of `prev` the head keeps after the new base, with their
+    /// bytes when the local cache lacks them.
+    kept: Vec<(SegmentRef, Option<Vec<u8>>)>,
+    /// The write's own segment, listed after the kept ones.
+    appended: Option<(PackedObject, SegmentBody)>,
 }
 
 /// The rest of a write: storage steps in order, then the finish.
@@ -125,31 +174,43 @@ enum Finish {
     Unchanged,
     /// Apply the segment (backup) or mark the edits written.
     Segment { name: ObjectName, seg: SegmentBody },
-    /// The base becomes the repository's table.
-    Fold {
-        dir: Option<PathBuf>,
-        table: ChunkTable,
-        name: Option<ObjectName>,
-        bytes: u64,
-        gc: index_store::IndexGcStats,
-    },
+    /// The base becomes the repository's table, with the kept segments
+    /// and the appended one applied over it.
+    Fold(Box<FoldFinish>),
+}
+
+/// What a fold's finish installs.
+struct FoldFinish {
+    dir: Option<PathBuf>,
+    table: ChunkTable,
+    name: Option<ObjectName>,
+    bytes: u64,
+    gc: index_store::IndexGcStats,
+    /// The kept segments, with their bytes when the local cache lacks them.
+    kept: Vec<(SegmentRef, Option<Vec<u8>>)>,
+    /// The write's own segment, applied last.
+    appended: Option<(ObjectName, SegmentBody)>,
 }
 
 impl PublishMachine {
-    /// Publish `seg` as the successor of `prev`: as a segment, or as a
-    /// base (a fold) when there is no `prev`, the hard limit is reached, a
-    /// fold was requested or the packed segment's name is already named by
-    /// `prev` (plaintext repeat). Takes `repo.fold_requested`. See
-    /// `Repository::publish_index_state` for `backup` and the errors.
+    /// Publish `seg` as the successor of `prev`: as a segment, or with a
+    /// fold. A full fold when there is no `prev`, a full fold was requested
+    /// or the packed segment's name is already named by `prev` (plaintext
+    /// repeat); a fold of the foldable prefix when a fold was requested or
+    /// the foldable prefix (with the write's own segment, when foldable)
+    /// reaches the hard limit, and there is something to fold. Takes
+    /// `repo.fold_requested`. See `Repository::publish_index_state` for
+    /// `backup` and the errors.
     pub(crate) fn publish(
         repo: &mut super::Repository,
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
         backup: bool,
     ) -> Self {
-        let fold = std::mem::take(&mut repo.fold_requested);
+        let request = std::mem::take(&mut repo.fold_requested);
         Self {
-            publish: Some(fold),
+            publish: Some(request),
+            request,
             backup,
             added: false,
             head_check: None,
@@ -159,20 +220,30 @@ impl PublishMachine {
         }
     }
 
-    /// A fold of the index's current state (`Repository::put_base`).
-    pub(crate) fn base(prev: Option<IndexHead>, removes: bool) -> Self {
+    /// A fold of the index's current state (`Repository::put_base`):
+    /// `Full` (or no `prev`) folds every segment, `Eligible` the foldable
+    /// prefix of `prev`'s chain; with nothing foldable it writes nothing
+    /// and outputs `prev`.
+    pub(crate) fn base(prev: Option<IndexHead>, removes: bool, request: FoldRequest) -> Self {
+        let state = if prev.is_some() && request != FoldRequest::Full {
+            State::Start { prev, seg: None }
+        } else {
+            State::FoldBody(Box::new(FoldPrep {
+                prev,
+                seg: None,
+                removes,
+                mode: FoldMode::Full,
+            }))
+        };
         Self {
             publish: None,
+            request: request.max(FoldRequest::Eligible),
             backup: false,
             added: false,
             head_check: None,
             wrote_head: false,
             start: std::time::Instant::now(),
-            state: State::FoldBody(Box::new(FoldPrep {
-                prev,
-                seg: None,
-                removes,
-            })),
+            state,
         }
     }
 
@@ -187,15 +258,12 @@ impl PublishMachine {
         self.wrote_head
     }
 
-    fn fold(&self) -> bool {
-        self.publish.unwrap_or(false)
-    }
-
     fn run(&mut self, cx: &mut StepCx<'_>) -> Result<()> {
         let repo = &mut *cx.repo;
         let state = std::mem::replace(&mut self.state, State::Failed);
         self.state = match state {
             State::Start { prev, seg } => self.start(repo, prev, seg)?,
+            State::FoldPrefix(prep) => self.fold_prefix(repo, *prep)?,
             State::FoldBody(prep) => self.fold_body(repo, *prep)?,
             State::FoldGeneration(base) => {
                 let generation = repo.next_head_gen(None)?;
@@ -227,33 +295,12 @@ impl PublishMachine {
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
     ) -> Result<State> {
-        let fold = self.fold();
+        let request = self.request;
         if let (Some(prev), Some(seg)) = (prev.as_ref(), seg.as_ref())
             && seg.is_empty()
-            && !fold
+            && request == FoldRequest::None
         {
-            if repo.pending_sweep.is_none() {
-                debug!("index unchanged, nothing to write");
-                return Ok(State::Done(Some(self.bookkeeping(
-                    repo,
-                    prev.clone(),
-                    true,
-                ))));
-            }
-            // A head-only write: the same state, a new generation and the
-            // pending sweep.
-            let mut head = prev.successor();
-            let (sweep, record) = repo.next_sweep(Some(prev), head.generation, false)?;
-            head.sweep = sweep;
-            head.validate()?;
-            return Ok(State::Write(Box::new(Writes::new(
-                head,
-                None,
-                None,
-                record,
-                None,
-                Finish::Unchanged,
-            ))));
+            return self.unchanged(repo, prev.clone());
         }
 
         let removes = seg.as_ref().is_some_and(|s| !s.removals.is_empty());
@@ -262,64 +309,315 @@ impl PublishMachine {
             .filter(|s| !s.is_empty())
             .map(|s| index_store::pack_segment_v2(s, repo.crypto.as_ref()))
             .transpose()?;
+        let full = |prev, seg| {
+            Ok(State::FoldBody(Box::new(FoldPrep {
+                prev,
+                seg,
+                removes,
+                mode: FoldMode::Full,
+            })))
+        };
+        let Some(prev) = prev else {
+            return full(None, seg);
+        };
+        if request == FoldRequest::Full {
+            return full(Some(prev), seg);
+        }
         // On a plaintext repository the same change from the same state
         // packs to the same bytes, so its name may already be in the head
-        // (a state the chain returned to); an object is named only once.
-        match (prev, seg, packed) {
-            (Some(prev), Some(seg), Some(obj))
-                if !fold
-                    && !repo.fold_policy.hard.reached(&prev, 1, obj.size())
-                    && !prev.named_objects().any(|n| n == obj.name) =>
-            {
-                let mut head = prev.successor();
-                head.segments.push(SegmentRef {
-                    name: obj.name,
-                    size: obj.size(),
-                    kind: seg.kind,
-                    entries: seg.entries(),
-                });
-                let (sweep, record) = repo.next_sweep(Some(&prev), head.generation, removes)?;
-                head.sweep = sweep;
-                head.validate()?;
-                let packed_head = index_store::pack_head(&head, repo.crypto.as_ref())?;
-                let finish = Finish::Segment {
-                    name: obj.name,
-                    seg,
-                };
-                Ok(State::Write(Box::new(Writes::new(
-                    head,
-                    Some(packed_head),
-                    None,
-                    record,
-                    Some(obj),
-                    finish,
-                ))))
+        // (a state the chain returned to); an object is named only once, so
+        // the write folds every segment, young ones too (04 step 7 D7).
+        if let Some(obj) = packed.as_ref()
+            && prev.named_objects().any(|n| n == obj.name)
+        {
+            let backups = prev
+                .segments
+                .iter()
+                .filter(|s| s.kind == SegmentKind::Backup)
+                .count();
+            if backups > 0 && !repo.segment_grace().is_zero() {
+                tracing::info!(
+                    backup_segments = backups,
+                    "an index write repeats an object the head names; folding every segment"
+                );
             }
-            (prev, seg, _) => Ok(State::FoldBody(Box::new(FoldPrep { prev, seg, removes }))),
+            return full(Some(prev), seg);
+        }
+        let own = match (seg, packed) {
+            (Some(seg), Some(obj)) => Some((seg, obj)),
+            _ => None,
+        };
+        let forced = request == FoldRequest::Eligible;
+        // An upper bound of the prefix check: the whole chain, and the own
+        // segment when it can be folded. No listing when it is not reached.
+        let own_extra = own
+            .as_ref()
+            .filter(|(seg, _)| own_foldable(repo, seg))
+            .map(|(_, obj)| obj.size());
+        if !forced
+            && !(own.is_some()
+                && repo
+                    .fold_policy
+                    .hard
+                    .reached(prev.base.as_ref(), &prev.segments, own_extra))
+        {
+            return match own {
+                Some((seg, obj)) => segment_writes(repo, prev, seg, obj, removes),
+                None => self.unchanged(repo, prev),
+            };
+        }
+        let prep = PrefixPrep {
+            prev,
+            own,
+            removes,
+            forced,
+        };
+        let judged = !repo.segment_grace().is_zero()
+            && prep
+                .prev
+                .segments
+                .iter()
+                .any(|s| s.kind == SegmentKind::Backup);
+        if judged {
+            return Ok(State::FoldPrefix(Box::new(prep)));
+        }
+        // Every segment of the chain is foldable.
+        let k = prep.prev.segments.len();
+        self.decide(repo, prep, k)
+    }
+
+    /// The fold-prefix step: the segments' ages (one listing per lock
+    /// hold; a failed listing means unknown, so young), the decision, and
+    /// the bytes a partial fold needs that the local cache lacks.
+    fn fold_prefix(&mut self, repo: &mut super::Repository, prep: PrefixPrep) -> Result<State> {
+        if repo.needs_segment_ages(&prep.prev.segments)
+            && let Err(e) = repo.load_segment_ages()
+        {
+            // 04 step 7, fail closed: no age is known, so no backup segment
+            // is folded; a write never fails on it.
+            warn!("cannot list index.d/ for the segments' ages ({e}); keeping them as segments");
+        }
+        // Under the lock no named object is deleted, so a backup segment
+        // the head names and the listing lacks is damage: it reads young
+        // and stays named, so this client carries on while no cold client
+        // can load the chain. Not refused here (part 9 decides).
+        if let Some(ages) = repo.segment_ages() {
+            let unlisted: Vec<String> = prep
+                .prev
+                .segments
+                .iter()
+                .filter(|s| s.kind == SegmentKind::Backup && !ages.listed(&s.name))
+                .map(|s| index_store::object_key(&s.name))
+                .collect();
+            if !unlisted.is_empty() {
+                warn!(
+                    segments = ?unlisted,
+                    "the index head names segments the listing of index.d/ lacks; \
+                     keeping them as segments; the chain may not load elsewhere and is \
+                     not folded past them until `vykar check --repair` rewrites it"
+                );
+            }
+        }
+        let k = repo.foldable_prefix(&prep.prev.segments);
+        let state = self.decide(repo, prep, k)?;
+        let State::FoldBody(mut fold) = state else {
+            return Ok(state);
+        };
+        let fetched = match (&fold.mode, fold.prev.as_ref()) {
+            (FoldMode::Partial { k, .. }, Some(prev)) if *k < prev.segments.len() => {
+                segment_bytes(repo, &prev.segments, *k)
+            }
+            _ => return Ok(State::FoldBody(fold)),
+        };
+        match fetched {
+            Ok(b) => {
+                if let FoldMode::Partial { bytes, .. } = &mut fold.mode {
+                    *bytes = b;
+                }
+                Ok(State::FoldBody(fold))
+            }
+            // A backup never fails on a fold it can skip: its segment alone.
+            Err(e) if self.backup && !matches!(e, VykarError::IndexObjectMissing { .. }) => {
+                let FoldPrep {
+                    prev,
+                    seg,
+                    removes,
+                    mode,
+                    ..
+                } = *fold;
+                match (prev, seg, mode) {
+                    (
+                        Some(prev),
+                        Some(seg),
+                        FoldMode::Partial {
+                            appended: Some(obj),
+                            ..
+                        },
+                    ) => {
+                        warn!("cannot read the index segments for a fold ({e}); writing a segment");
+                        segment_writes(repo, prev, seg, obj, removes)
+                    }
+                    _ => Err(e),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 
-    /// Fold: a backup's additions become edits of the index, whose state is
-    /// written as the base body into a local table.
-    fn fold_body(&mut self, repo: &mut super::Repository, prep: FoldPrep) -> Result<State> {
-        let FoldPrep { prev, seg, removes } = prep;
-        if self.backup
-            && let Some(seg) = seg.as_ref()
-        {
-            self.added = true;
-            for (id, loc) in &seg.additions {
-                repo.chunk_index
-                    .add(*id, loc.stored_size, loc.pack_id, loc.pack_offset);
+    /// Fold the first `k` (foldable) segments of `prep.prev`, when that
+    /// folds something and the fold was asked for or the prefix reaches the
+    /// hard limit; otherwise the write's own segment, or nothing.
+    fn decide(
+        &mut self,
+        repo: &mut super::Repository,
+        prep: PrefixPrep,
+        k: usize,
+    ) -> Result<State> {
+        let PrefixPrep {
+            prev,
+            own,
+            removes,
+            forced,
+        } = prep;
+        let len = prev.segments.len();
+        let own_folds = own.as_ref().is_none_or(|(seg, _)| own_foldable(repo, seg));
+        let extra = own
+            .as_ref()
+            .filter(|_| k == len && own_folds)
+            .map(|(_, obj)| obj.size());
+        let something = k > 0 || extra.is_some();
+        let prefix = prev.segments.get(..k).unwrap_or_default();
+        let fold = something
+            && (forced
+                || repo
+                    .fold_policy
+                    .hard
+                    .reached(prev.base.as_ref(), prefix, extra));
+        if !fold {
+            if forced {
+                debug!("requested fold: no segment old enough; writing a segment");
             }
-            for (pack, trailer_len) in &seg.pack_trailers {
-                repo.chunk_index.set_pack_trailer(*pack, *trailer_len);
-            }
+            return match own {
+                Some((seg, obj)) => segment_writes(repo, prev, seg, obj, removes),
+                None if self.publish.is_some() => self.unchanged(repo, prev),
+                None => Ok(State::Done(Some(prev))),
+            };
         }
+        let (seg, obj) = match own {
+            Some((seg, obj)) => (Some(seg), Some(obj)),
+            None => (None, None),
+        };
+        let mode = if k == len && own_folds {
+            FoldMode::Full
+        } else {
+            FoldMode::Partial {
+                k,
+                bytes: Vec::new(),
+                appended: obj,
+            }
+        };
+        Ok(State::FoldBody(Box::new(FoldPrep {
+            prev: Some(prev),
+            seg,
+            removes,
+            mode,
+        })))
+    }
+
+    /// An empty change: nothing to write, or a head only when a sweep is
+    /// pending (the same state, a new generation and the sweep).
+    fn unchanged(&mut self, repo: &mut super::Repository, prev: IndexHead) -> Result<State> {
+        if repo.pending_sweep.is_none() {
+            debug!("index unchanged, nothing to write");
+            return Ok(State::Done(Some(self.bookkeeping(repo, prev, true))));
+        }
+        let mut head = prev.successor();
+        let (sweep, record) = repo.next_sweep(Some(&prev), head.generation, false)?;
+        head.sweep = sweep;
+        head.validate()?;
+        Ok(State::Write(Box::new(Writes::new(
+            head,
+            None,
+            None,
+            record,
+            None,
+            Finish::Unchanged,
+        ))))
+    }
+
+    /// Fold: the base body written into a local table. A full fold first
+    /// adds a backup's additions to the index as edits and writes the
+    /// index's state; a partial fold writes the index's loaded state (the
+    /// whole chain) or the table plus the foldable prefix, and leaves the
+    /// index untouched until the finish.
+    fn fold_body(&mut self, repo: &mut super::Repository, prep: FoldPrep) -> Result<State> {
+        let FoldPrep {
+            prev,
+            seg,
+            removes,
+            mode,
+        } = prep;
         let dir = repo.cache_dir();
         let anchor = index_store::cache_anchor(dir.as_deref());
-        let (w, entries) = repo
-            .chunk_index
-            .write_base_body(TableFileWriter::new_beside(&anchor)?)?;
+        let writer = TableFileWriter::new_beside(&anchor)?;
+        let (w, entries, kept, appended) = match mode {
+            FoldMode::Full => {
+                if self.backup
+                    && let Some(seg) = seg.as_ref()
+                {
+                    self.added = true;
+                    for (id, loc) in &seg.additions {
+                        repo.chunk_index
+                            .add(*id, loc.stored_size, loc.pack_id, loc.pack_offset);
+                    }
+                    for (pack, trailer_len) in &seg.pack_trailers {
+                        repo.chunk_index.set_pack_trailer(*pack, *trailer_len);
+                    }
+                }
+                let (w, entries) = repo.chunk_index.write_base_body(writer)?;
+                (w, entries, Vec::new(), None)
+            }
+            FoldMode::Partial {
+                k,
+                mut bytes,
+                appended,
+            } => {
+                let prev = prev.as_ref().ok_or_else(|| {
+                    VykarError::Other("BUG: a partial fold without a previous head".into())
+                })?;
+                if *repo.chunk_index.state() != IndexState::of_head(prev) {
+                    return Err(VykarError::Other(
+                        "BUG: a partial fold over an index not at its head".into(),
+                    ));
+                }
+                let (w, entries) = if k == prev.segments.len() {
+                    repo.chunk_index.write_base_body(writer)?
+                } else {
+                    let table = repo.chunk_index.table().ok_or_else(|| {
+                        VykarError::Other("BUG: a partial fold over an unloaded index".into())
+                    })?;
+                    let mut prefix = LiveIndex::from_table(Arc::clone(table));
+                    for (r, b) in prev.segments.iter().zip(bytes.iter_mut()).take(k) {
+                        // A fetched segment's bytes go as soon as it is
+                        // decoded.
+                        let fetched = b.take();
+                        let body = segment_body(repo, dir.as_deref(), r, fetched.as_deref())?;
+                        drop(fetched);
+                        prefix.apply_segment(r.name, &body)?;
+                    }
+                    prefix.write_base_body(writer)?
+                };
+                let kept = prev
+                    .segments
+                    .iter()
+                    .cloned()
+                    .zip(bytes.into_iter().chain(std::iter::repeat_with(|| None)))
+                    .skip(k)
+                    .collect();
+                let appended = appended.zip(seg);
+                (w, entries, kept, appended)
+            }
+        };
         let table = ChunkTable::install(w.finish()?, None, None)?;
         let obj = (entries > 0)
             .then(|| index_store::pack_base_body(table.body(), repo.crypto.as_ref()))
@@ -332,6 +630,8 @@ impl PublishMachine {
             table,
             obj,
             entries,
+            kept,
+            appended,
         });
         Ok(match next {
             Some(generation) => State::FoldHead(base, generation),
@@ -340,7 +640,9 @@ impl PublishMachine {
     }
 
     /// The last step: the repository's index and, for a publish, its head
-    /// bookkeeping. Nothing here fails: the head is published.
+    /// bookkeeping. Nothing here fails the write: the head is published. (A
+    /// kept segment whose cached copy does not verify is fetched again; if
+    /// that fails the index is emptied with a warning and reloads.)
     fn finish(&mut self, repo: &mut super::Repository, w: Writes) -> IndexHead {
         let Writes { head, finish, .. } = w;
         match finish {
@@ -362,16 +664,20 @@ impl PublishMachine {
                     repo.chunk_index.mark_written(name);
                 }
             }
-            Finish::Fold {
-                dir,
-                table,
-                name,
-                bytes,
-                gc,
-            } => {
+            Finish::Fold(fold) => {
+                let FoldFinish {
+                    dir,
+                    table,
+                    name,
+                    bytes,
+                    gc,
+                    kept,
+                    appended,
+                } = *fold;
                 debug!(
                     bytes,
                     generation = head.generation,
+                    kept = kept.len(),
                     heads_deleted = gc.heads_deleted,
                     objects_deleted = gc.objects_deleted,
                     "index folded into a new base"
@@ -385,6 +691,23 @@ impl PublishMachine {
                     None => ChunkTable::empty(),
                 };
                 repo.chunk_index = LiveIndex::from_table(Arc::new(table));
+                // The segments the head keeps after the base, then the
+                // write's own: one decoded at a time.
+                let rebuilt = (|| -> Result<()> {
+                    for (r, b) in &kept {
+                        let body = segment_body(repo, dir.as_deref(), r, b.as_deref())?;
+                        repo.chunk_index.apply_segment(r.name, &body)?;
+                    }
+                    if let Some((name, seg)) = &appended {
+                        repo.chunk_index.apply_segment(*name, seg)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = rebuilt {
+                    // The head is published; the next load syncs to it.
+                    warn!("cannot rebuild the index after a fold: {e}");
+                    repo.chunk_index = LiveIndex::empty();
+                }
                 index_store::prune_local_files(dir.as_deref(), &head);
             }
         }
@@ -427,8 +750,8 @@ impl PublishMachine {
             // additions were its only edits.
             repo.chunk_index.discard_edits();
         }
-        if let Some(fold) = self.publish {
-            repo.fold_requested |= fold;
+        if let Some(request) = self.publish {
+            repo.fold_requested = repo.fold_requested.max(request);
         }
     }
 }
@@ -456,7 +779,7 @@ impl Writes {
         }
         steps.push_back(StepKind::Fence);
         steps.push_back(StepKind::PutHead);
-        if matches!(finish, Finish::Fold { .. }) {
+        if matches!(finish, Finish::Fold(_)) {
             steps.push_back(StepKind::CollectGarbage);
         }
         Self {
@@ -472,8 +795,136 @@ impl Writes {
     }
 }
 
-/// Fold: the sweep, the head naming the base alone with `prev`'s live
-/// objects as retired, and its bytes.
+/// The segment path: `seg` as one more segment after `prev`'s chain.
+fn segment_writes(
+    repo: &mut super::Repository,
+    prev: IndexHead,
+    seg: SegmentBody,
+    obj: PackedObject,
+    removes: bool,
+) -> Result<State> {
+    let mut head = prev.successor();
+    head.segments.push(SegmentRef {
+        name: obj.name,
+        size: obj.size(),
+        kind: seg.kind,
+        entries: seg.entries(),
+    });
+    let (sweep, record) = repo.next_sweep(Some(&prev), head.generation, removes)?;
+    head.sweep = sweep;
+    head.validate()?;
+    let packed_head = index_store::pack_head(&head, repo.crypto.as_ref())?;
+    let finish = Finish::Segment {
+        name: obj.name,
+        seg,
+    };
+    Ok(State::Write(Box::new(Writes::new(
+        head,
+        Some(packed_head),
+        None,
+        record,
+        Some(obj),
+        finish,
+    ))))
+}
+
+/// Whether the write's own segment can go into a base: a maintenance
+/// segment, or any at zero grace (a backup's own segment is age 0).
+fn own_foldable(repo: &super::Repository, seg: &SegmentBody) -> bool {
+    seg.kind == SegmentKind::Maintenance || repo.segment_grace().is_zero()
+}
+
+/// A partial fold's bytes of `segments` (all of them: the first `k` are
+/// decoded into the base, the rest re-applied after the head PUT): `None`
+/// where the local cache holds a file of the segment's size (checked by
+/// metadata, not read: [`segment_body`] reads and verifies it once, when
+/// it is decoded); the others fetched in one batch. A fetched kept segment
+/// goes into the cache when there is one, and is held only without one.
+/// Under the lock a named object is never deleted, so an absent one is
+/// damage.
+fn segment_bytes(
+    repo: &super::Repository,
+    segments: &[SegmentRef],
+    k: usize,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let dir = repo.cache_dir();
+    let cached: Vec<bool> = segments
+        .iter()
+        .map(|r| {
+            dir.as_deref()
+                .is_some_and(|d| table::cached_segment_present(d, r))
+        })
+        .collect();
+    let wanted: Vec<usize> = (0..segments.len())
+        .filter(|&i| !cached.get(i).copied().unwrap_or(false))
+        .collect();
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; segments.len()];
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let keys: Vec<String> = wanted
+        .iter()
+        .filter_map(|&i| segments.get(i))
+        .map(|r| index_store::object_key(&r.name))
+        .collect();
+    match index_store::fetch_all(repo.storage.as_ref(), &keys, repo.request_width())? {
+        index_store::Fetched::All(fetched) => {
+            for (&i, b) in wanted.iter().zip(fetched) {
+                match (dir.as_deref(), segments.get(i)) {
+                    (Some(d), Some(r)) if i >= k => table::write_cached_segment(d, &r.name, &b),
+                    _ => {
+                        if let Some(slot) = out.get_mut(i) {
+                            *slot = Some(b);
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+        index_store::Fetched::Absent(j) => {
+            let key = keys.get(j).cloned().unwrap_or_default();
+            Err(VykarError::IndexObjectMissing {
+                kind: "segment",
+                key,
+            })
+        }
+    }
+}
+
+/// The decoded body of segment `r`: from `bytes`, else the local cache's
+/// verified copy, else (a cached file that [`segment_bytes`] saw but that
+/// does not verify, or went since) one GET from the store.
+fn segment_body(
+    repo: &super::Repository,
+    dir: Option<&std::path::Path>,
+    r: &SegmentRef,
+    bytes: Option<&[u8]>,
+) -> Result<SegmentBody> {
+    let held;
+    let bytes = match bytes {
+        Some(b) => b,
+        None => {
+            held = match dir.and_then(|d| table::read_cached_segment(d, r)) {
+                Some(b) => b,
+                None => {
+                    let key = index_store::object_key(&r.name);
+                    repo.storage
+                        .get(&key)?
+                        .ok_or(VykarError::IndexObjectMissing {
+                            kind: "segment",
+                            key,
+                        })?
+                }
+            };
+            &held
+        }
+    };
+    index_store::decode_segment_v2(r, bytes, repo.crypto.as_ref())
+}
+
+/// Fold: the sweep, the head naming the base, the kept segments and the
+/// appended one, with `prev`'s other live objects as retired, and its
+/// bytes.
 fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> Result<State> {
     let FoldBase {
         prev,
@@ -482,7 +933,24 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
         table,
         obj,
         entries,
+        kept,
+        appended,
     } = base;
+    let mut segments: Vec<SegmentRef> = kept.iter().map(|(r, _)| r.clone()).collect();
+    let (segment, appended) = match appended {
+        Some((seg_obj, seg)) => {
+            segments.push(SegmentRef {
+                name: seg_obj.name,
+                size: seg_obj.size(),
+                kind: seg.kind,
+                entries: seg.entries(),
+            });
+            let name = seg_obj.name;
+            (Some(seg_obj), Some((name, seg)))
+        }
+        None => (None, None),
+    };
+    let kept_names: Vec<ObjectName> = segments.iter().map(|s| s.name).collect();
     let (sweep, record) = repo.next_sweep(prev.as_ref(), generation, removes)?;
     let head = IndexHead {
         layout: HEAD_LAYOUT_VERSION,
@@ -493,13 +961,15 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
             size: obj.size(),
             entries,
         }),
-        segments: Vec::new(),
-        // The same state written again (plaintext) has the same name.
+        segments,
+        // The same state written again (plaintext) has the same name; the
+        // kept segments stay live.
         retired: prev
             .as_ref()
             .map(|p| {
                 p.live_objects()
                     .filter(|n| obj.as_ref().is_none_or(|o| *n != o.name))
+                    .filter(|n| !kept_names.contains(n))
                     .collect()
             })
             .unwrap_or_default(),
@@ -507,19 +977,21 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
     };
     head.validate()?;
     let packed_head = index_store::pack_head(&head, repo.crypto.as_ref())?;
-    let finish = Finish::Fold {
+    let finish = Finish::Fold(Box::new(FoldFinish {
         dir,
         table,
         name: obj.as_ref().map(|o| o.name),
         bytes: obj.as_ref().map_or(0, PackedObject::size),
         gc: index_store::IndexGcStats::default(),
-    };
+        kept,
+        appended,
+    }));
     Ok(State::Write(Box::new(Writes::new(
         head,
         Some(packed_head),
         obj,
         record,
-        None,
+        segment,
         finish,
     ))))
 }
@@ -590,8 +1062,8 @@ fn write_step(
                 warn!("failed to delete old index objects: {e}");
                 Default::default()
             });
-            if let Finish::Fold { gc: slot, .. } = &mut w.finish {
-                *slot = gc;
+            if let Finish::Fold(fold) = &mut w.finish {
+                fold.gc = gc;
             }
             Ok(())
         }
@@ -608,6 +1080,7 @@ impl Machine for PublishMachine {
         match &self.state {
             State::FoldGeneration(_) => vec![StepKind::ListHeads],
             State::Write(w) => vec![w.steps.front().copied().unwrap_or(StepKind::Local)],
+            State::FoldPrefix(_) => vec![StepKind::FoldPrefix],
             State::Start { .. } | State::FoldBody(_) | State::FoldHead(..) => {
                 vec![StepKind::Local]
             }

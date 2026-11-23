@@ -900,7 +900,7 @@ impl Sim {
                             Vec::new(),
                             format!(
                                 "packs {} repacked {} deleted_empty {} orphan {} young {} \
-                                 unknown_age {} corrupt {} unreferenced {} live {}",
+                                 unknown_age {} corrupt {} unreferenced {} live {} kept-young {}",
                                 s.packs_total,
                                 s.packs_repacked,
                                 s.packs_deleted_empty,
@@ -909,7 +909,8 @@ impl Sim {
                                 s.packs_orphan_unknown_age,
                                 s.packs_corrupt,
                                 s.chunks_unreferenced,
-                                s.packs_orphan_live
+                                s.packs_orphan_live,
+                                s.chunks_unreferenced_young
                             ),
                         ))
                     },

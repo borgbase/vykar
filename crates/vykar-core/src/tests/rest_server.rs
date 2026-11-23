@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{backup_single_source, make_test_config, try_backup_single_source};
+use super::helpers::{
+    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, set_store_now,
+    try_backup_single_source,
+};
 use crate::commands;
 use crate::config::VykarConfig;
 use crate::index::head::IndexHead;
@@ -211,6 +214,9 @@ fn v6_backup_sweep_fold_and_compact_through_the_server() {
                 .exists()
         })
     };
+    // The backups' segments and packs are old: s1's entries are swept and
+    // every segment is foldable (04 step 7).
+    age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
     compact();
     let folded = head(&c.config);
     assert!(folded.segments.is_empty(), "past the soft limit");
@@ -263,8 +269,11 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     c.write("a", "alpha");
     c.write("b", "bravo");
     c.backup("s1");
+    // s1's segment is old, so the chain is foldable (04 step 7).
+    age_repo_objects(server.data.path(), &["index.d"], PAST_T_PACK);
 
     let mut repo = open(&c.config);
+    set_store_now(&mut repo);
     let mut policy = FoldPolicy::default();
     policy.hard.segments = 3;
     policy.hard.percent = 100_000;
@@ -401,14 +410,18 @@ fn a_backup_against_an_append_only_server_issues_no_refused_delete() {
         let c = Client::init(&server);
         c.write("a", "alpha");
         c.backup("s1");
+        // s1's segment is old, so s2's commit folds it (04 step 7).
+        age_repo_objects(server.data.path(), &["index.d"], PAST_T_PACK);
         let debris = plant_old_debris(&server);
         c.write("b", "bravo");
         server.take_requests();
         backup_with_fold(&c, "s2");
         let reqs = server.take_requests();
+        let folded = head(&c.config);
         assert!(
-            head(&c.config).segments.is_empty(),
-            "append_only={append_only}: the commit folds"
+            folded.base.is_some() && folded.segments.len() == 1,
+            "append_only={append_only}: the commit folds s1's segment and keeps its own: \
+             {folded:?}"
         );
         if append_only {
             assert!(debris.exists(), "the GC is skipped");
@@ -890,6 +903,7 @@ fn trailer_packs_through_the_server() {
     );
 
     commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
     let mut repo = open(&c.config);
     let stats =
         commands::compact::run_on_repo(&mut repo, 1.0, None, false, &CancelToken::new()).unwrap();
@@ -942,6 +956,9 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     c.write("c", "charlie");
     c.backup("s3");
     commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    // s1's segment is old: the compact sweeps its entries, as the repair
+    // below does (it keeps none for young segments).
+    age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
     commands::compact::run(&c.config, None, 0.0, None, false, &CancelToken::new()).unwrap();
     let before = entries(&c.config);
     let packs = server_packs(&server).len();

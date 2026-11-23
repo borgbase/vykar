@@ -1,9 +1,8 @@
 {
   "name": "late-snapshot-beside-aged-lock-reap",
-  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8.",
+  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; AgedLockReaped remains. Fixed by 04 step 8.",
   "expect": [
-    "AgedLockReaped",
-    "LateSnapshotWrite"
+    "AgedLockReaped"
   ],
   "at": [
     [

@@ -39,6 +39,7 @@ pub(crate) fn run_compact(
                 format_bytes(stats.bytes_unreferenced),
             );
         }
+        print_young_unreferenced(&stats);
         print_compact_warnings(&stats);
     } else {
         print_compact_summary(&stats);
@@ -96,7 +97,22 @@ pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {
             format_bytes(stats.bytes_unreferenced),
         );
     }
+    print_young_unreferenced(stats);
     print_compact_warnings(stats);
+}
+
+/// Unreferenced chunks the sweep kept because recent backups added them
+/// (04 step 7), on stdout.
+fn print_young_unreferenced(stats: &commands::compact::CompactStats) {
+    if stats.chunks_unreferenced_young > 0 {
+        println!(
+            "  {} unreferenced chunks ({}) kept: added by backups in the last {} h; a later \
+             compact removes them",
+            stats.chunks_unreferenced_young,
+            format_bytes(stats.bytes_unreferenced_young),
+            commands::compact::ORPHAN_PACK_GRACE.as_secs() / 3600,
+        );
+    }
 }
 
 /// Corrupt/orphan pack notices. Reported after a dry run too — the scan that
@@ -115,7 +131,7 @@ fn print_compact_warnings(stats: &commands::compact::CompactStats) {
         );
         if stats.packs_orphan_young > 0 {
             eprintln!(
-                "  {} of them kept: younger than {} h (uploads not yet committed)",
+                "  {} of them kept: younger than {} h (uploads not yet committed, or emptied by this run's sweep)",
                 stats.packs_orphan_young,
                 commands::compact::ORPHAN_PACK_GRACE.as_secs() / 3600,
             );

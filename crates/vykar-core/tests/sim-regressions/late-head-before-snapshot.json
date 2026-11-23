@@ -1,6 +1,6 @@
 {
   "name": "late-head-before-snapshot",
-  "note": "Second campaign of phase F part 2 (random-1867481859511672080): compact's head PUT is delayed, a backup puts its head, the late head lands over it at the same key, then the backup puts its snapshot and crashes before finish (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads).",
+  "note": "Second campaign of phase F part 2 (random-1867481859511672080): compact's head PUT is delayed, a backup puts its head, the late head lands over it at the same key, then the backup puts its snapshot and crashes before finish (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step, folds c0's segment and writes its own segment after the base; the released compact head still lands over it. Unchanged signatures.",
   "expect": [
     "LateHeadWrite"
   ],
@@ -84,7 +84,16 @@
           "pick": 0
         }
       },
-      "verify-packs +local +local +local"
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
     ],
     [
       {
@@ -94,6 +103,15 @@
         }
       },
       "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "put-segment"
     ],
     [
       {
@@ -191,6 +209,8 @@
     "crash": true,
     "advances": true,
     "choices": [
+      0,
+      0,
       0,
       0,
       0,

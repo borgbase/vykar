@@ -1075,9 +1075,10 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     // (the maintenance lock is taken in the decision before) the session
     // cleanup, whose listing also gives the live sessions
     "compact ListMeta sessions/",
-    // index load under the lock, marks
+    // index load under the lock; the segments' ages (04 step 7); marks
     "compact List index.h/",
     "compact Get index.h/",
+    "compact ListMeta index.d/",
     "compact List snapshots/",
     "compact Get snapshots/",
     // the sweep: head re-read, sweep record and segment, fence, head

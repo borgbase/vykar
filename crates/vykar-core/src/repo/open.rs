@@ -291,12 +291,14 @@ impl Repository {
             key_blob,
             index_head,
             fold_policy: Default::default(),
-            fold_requested: false,
+            fold_requested: super::index_write::FoldRequest::None,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,
             live_sessions: None,
             pack_grace: super::ages::T_PACK,
+            segment_grace: super::ages::T_PACK,
+            segment_ages: None,
             relocation: Default::default(),
         })
     }
@@ -513,12 +515,14 @@ impl Repository {
             key_blob,
             index_head,
             fold_policy: Default::default(),
-            fold_requested: false,
+            fold_requested: super::index_write::FoldRequest::None,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,
             live_sessions: None,
             pack_grace: super::ages::T_PACK,
+            segment_grace: super::ages::T_PACK,
+            segment_ages: None,
             relocation: Default::default(),
         };
         Ok((repo, file_cache_load))

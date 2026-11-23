@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    FailGet, FaultyPut, backup_single_source, is_base_put, is_head_put, latest_head_key,
-    make_test_config,
+    FailGet, FaultyPut, PAST_T_PACK, age_repo_objects, backup_single_source, is_base_put,
+    is_head_put, latest_head_key, make_test_config, set_store_now,
 };
 use crate::commands;
 use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
@@ -394,8 +394,11 @@ fn delete_and_compact_sweep_fold_and_collect_garbage() {
 }
 
 /// Compact with the soft limit at `segments` segments and no grace for
-/// index garbage.
+/// index garbage, every object aged past T_pack first: the segments are
+/// foldable and the deleted snapshots' entries sweepable (04 step 7 is not
+/// these tests' subject).
 fn compact(fx: &Fixture, segments: usize) {
+    age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = segments;
@@ -485,7 +488,10 @@ fn maintenance_writes_fold_at_the_hard_limit() {
     fx.write("a", "alpha");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s1");
+    // s1's segment is old, so the chain is foldable (04 step 7).
+    age_repo_objects(&fx.repo_dir, &["index.d"], PAST_T_PACK);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
+    set_store_now(&mut repo);
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.hard.segments = 3;
     policy.hard.percent = 100_000;
@@ -1003,6 +1009,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     fx.write("d", "delta");
     fx.backup(&fx.config, "s3");
     commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
 
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = Box::new(MutLog {
@@ -1373,6 +1380,7 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
     type Fail = fn(&str, &[u8]) -> bool;
     for (name, fail) in [("base", is_base_put as Fail), ("head", is_head_put as Fail)] {
         let fx = three_backups();
+        age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let live: Vec<_> = fx.head().live_objects().collect();
         let warm = sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index());
 
@@ -1406,6 +1414,79 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
         let head = fx.head();
         assert!(head.base.is_some() && head.segments.is_empty(), "{name}");
         assert!(fx.named_objects_exist(&head), "{name}");
+    }
+}
+
+/// A partial fold over [old b0, young b1] whose maintenance write fails at
+/// the base PUT, its own segment's PUT or the head PUT leaves the previous
+/// head and index in place; a retry on the same handle then succeeds, and
+/// the handle's index, a warm reopen and a cold one all hold the edited
+/// state.
+#[test]
+fn a_partial_fold_failing_before_its_head_retries_on_the_same_handle() {
+    type Fail = fn(&str, &[u8]) -> bool;
+    fn is_segment_put(key: &str, data: &[u8]) -> bool {
+        key.starts_with(INDEX_OBJECT_DIR) && data.first() == Some(&(ObjectType::IndexSegment as u8))
+    }
+    for (name, fail) in [
+        ("base", is_base_put as Fail),
+        ("segment", is_segment_put as Fail),
+        ("head", is_head_put as Fail),
+    ] {
+        let fx = fixture(RepoFormat::CURRENT);
+        fx.write("a", "alpha");
+        fx.write("b", "bravo");
+        fx.backup(&fx.config, "s0");
+        age_segment(&fx, &fx.head().segments[0].name);
+        fx.write("c", "charlie");
+        fx.backup(&fx.config, "s1");
+        let before = fx.head();
+        let unedited = sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index());
+
+        let armed = Arc::new(AtomicBool::new(true));
+        let on = Arc::clone(&armed);
+        let (storage, _ops) = faulty(&fx, move |k, d| on.load(Ordering::SeqCst) && fail(k, d));
+        let mut repo = fx
+            .open_with(storage, &fx.cache(), OpenOptions::new())
+            .unwrap();
+        set_store_now(&mut repo);
+        repo.load_chunk_index_under_lock().unwrap();
+        let mut toggled = None;
+        toggle_an_entry(&mut repo, &mut toggled);
+        repo.request_index_fold();
+        let want = sorted_entries(repo.chunk_index());
+        assert_ne!(want, unedited);
+        let err = repo.save_state().unwrap_err().to_string();
+        assert!(err.contains("injected failure"), "{name}: {err}");
+        assert_eq!(fx.head(), before, "{name}");
+        assert_eq!(
+            cold_index(&fx, &format!("cold-failed-{name}")),
+            unedited,
+            "{name}"
+        );
+
+        armed.store(false, Ordering::SeqCst);
+        repo.save_state().unwrap();
+        assert_eq!(sorted_entries(repo.chunk_index()), want, "{name}");
+        let head = fx.head();
+        head.validate().unwrap();
+        assert!(head.generation > before.generation, "{name}: {head:?}");
+        // A requested fold stays requested over a failed attempt: the retry
+        // folds the old segment into a new base and keeps the young one.
+        assert_ne!(head.base, before.base, "{name}: {head:?}");
+        assert_eq!(
+            head.segments.first(),
+            before.segments.get(1),
+            "{name}: {head:?}"
+        );
+        assert!(fx.named_objects_exist(&head), "{name}");
+        assert_eq!(cold_index(&fx, &format!("cold-{name}")), want, "{name}");
+        drop(repo);
+        assert_eq!(
+            sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index()),
+            want,
+            "{name}"
+        );
     }
 }
 
@@ -1890,4 +1971,450 @@ fn repair_refuses_a_newer_index() {
             assert_eq!(repo_state(&fx), before);
         }
     }
+}
+
+// ── Young segments and the partial fold (04 step 7) ─────────────────────
+
+/// Move segment `name`'s mtime back past T_pack: it is old on the store's
+/// clock.
+fn age_segment(fx: &Fixture, name: &ObjectName) {
+    let path = fx.repo_dir.join(INDEX_OBJECT_DIR).join(name.to_hex());
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime - PAST_T_PACK)
+        .unwrap();
+}
+
+/// Back up the fixture's source as `name` through the steppable commit,
+/// with `wrap` around its storage and `tweak` applied to its handle before
+/// the commit (a fold request, fold limits).
+fn backup_with(
+    fx: &Fixture,
+    name: &str,
+    wrap: Option<commands::backup::BackendWrapper<'_>>,
+    tweak: impl FnOnce(&mut Repository),
+) {
+    fn no_events(_: crate::repo::control::CommitEvent) {}
+    let source_paths = vec![fx.source.to_string_lossy().into_owned()];
+    let req = commands::backup::BackupRequest {
+        snapshot_name: name,
+        passphrase: None,
+        source_paths: &source_paths,
+        source_label: "src",
+        exclude_patterns: &[],
+        exclude_if_present: &[],
+        one_file_system: true,
+        git_ignore: false,
+        xattrs_enabled: false,
+        compression: crate::compress::Compression::None,
+        command_dumps: &[],
+        verbose: false,
+    };
+    let mut pending = commands::backup::upload(
+        &fx.config,
+        &req,
+        &mut None,
+        &CancelToken::new(),
+        wrap,
+        crate::repo::HostEnv::system(),
+    )
+    .map_err(|(_, e)| e)
+    .unwrap();
+    tweak(pending.repo_mut());
+    let guard = pending
+        .wait_for_lock(&mut None, &CancelToken::new())
+        .unwrap();
+    let mut commit = pending.begin_commit(guard);
+    let result = commit.drive(&no_events);
+    commit.finish(result, &mut None).unwrap();
+}
+
+/// A backup whose commit folds (requested: the hard limit's stand-in)
+/// writes into the new base only the old segment s1; s2, young, stays a
+/// segment, and so does the backup's own segment, after it. The head
+/// retires only what it folded; warm and cold indexes agree; every
+/// snapshot restores.
+#[test]
+fn a_backup_fold_keeps_young_segments_and_its_own() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    let before = fx.head();
+    let (s1, s2) = (before.segments[0].name, before.segments[1].name);
+    age_segment(&fx, &s1);
+
+    fx.write("c", "charlie");
+    backup_with(&fx, "s3", None, Repository::request_index_fold);
+    let head = fx.head();
+    head.validate().unwrap();
+    assert!(head.base.is_some(), "{head:?}");
+    assert_eq!(head.segments.len(), 2, "{head:?}");
+    assert_eq!(head.segments[0].name, s2);
+    let own = &head.segments[1];
+    assert_eq!(own.kind, SegmentKind::Backup);
+    assert!(!before.named_objects().any(|n| n == own.name));
+    assert_eq!(head.retired, vec![s1]);
+    assert!(fx.named_objects_exist(&head));
+    let warm = sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index());
+    assert_eq!(cold_index(&fx, "cold"), warm);
+    fx.check_clean(&fx.config);
+    for (snapshot, file, content) in [
+        ("s1", "a", "alpha"),
+        ("s2", "b", "bravo"),
+        ("s3", "c", "charlie"),
+    ] {
+        assert_eq!(
+            read_restored(&fx.restore(&fx.config, snapshot), file),
+            content
+        );
+    }
+}
+
+/// A requested fold over young backup segments only has nothing to fold:
+/// the commit writes its segment, no base, and collects no garbage.
+#[test]
+fn a_backup_fold_with_nothing_old_writes_a_segment() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    let before = fx.head();
+    fx.write("c", "charlie");
+    backup_with(&fx, "s3", None, Repository::request_index_fold);
+    let head = fx.head();
+    assert!(head.base.is_none(), "{head:?}");
+    assert_eq!(head.segments.len(), 3);
+    assert_eq!(head.segments[..2], before.segments[..]);
+    assert!(head.retired.is_empty());
+    assert_eq!(fx.index_objects(), 3, "no base");
+    assert_eq!(
+        cold_index(&fx, "cold"),
+        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
+    );
+}
+
+/// The hard limit counts only the foldable prefix: three young backup
+/// segments at a limit of two stay segments; once the first two are old,
+/// the next backup folds them and keeps s3 and its own segment.
+#[test]
+fn the_hard_limit_counts_only_old_segments() {
+    let fx = fixture(RepoFormat::CURRENT);
+    let limits = |repo: &mut Repository| {
+        let mut policy = crate::repo::index_write::FoldPolicy::default();
+        policy.hard.segments = 2;
+        policy.hard.percent = 100_000;
+        repo.set_fold_policy(policy);
+    };
+    for (n, name) in ["s1", "s2", "s3"].iter().enumerate() {
+        fx.write(&format!("f{n}"), name);
+        backup_with(&fx, name, None, limits);
+    }
+    let three = fx.head();
+    assert!(three.base.is_none(), "{three:?}");
+    assert_eq!(three.segments.len(), 3);
+
+    let names: Vec<ObjectName> = three.segments.iter().map(|s| s.name).collect();
+    age_segment(&fx, &names[0]);
+    age_segment(&fx, &names[1]);
+    fx.write("f3", "s4");
+    backup_with(&fx, "s4", None, limits);
+    let head = fx.head();
+    assert!(head.base.is_some(), "{head:?}");
+    assert_eq!(head.segments.len(), 2, "{head:?}");
+    assert_eq!(head.segments[0].name, names[2]);
+    assert_eq!(head.retired, names[..2].to_vec());
+    assert_eq!(
+        cold_index(&fx, "cold"),
+        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
+    );
+    fx.check_clean(&fx.config);
+}
+
+/// A maintenance write at the hard limit behind a young backup segment has
+/// nothing to fold and writes its segment; once the backup segment is old
+/// the whole chain and the edits fold. Behind an old backup segment and a
+/// young one, a requested fold writes the old one into the base and
+/// appends the write's own segment after the kept ones. The handle's
+/// rebuilt index equals a cold one each time.
+#[test]
+fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
+    let policy = {
+        let mut p = crate::repo::index_write::FoldPolicy::default();
+        p.hard.segments = 3;
+        p.hard.percent = 100_000;
+        p
+    };
+    let open = |fx: &Fixture| {
+        let mut repo = fx.open(&fx.cache(), false).unwrap();
+        set_store_now(&mut repo);
+        repo.set_fold_policy(policy);
+        repo
+    };
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s1");
+    let b1 = fx.head().segments[0].name;
+    let mut toggled = None;
+    let mut repo = open(&fx);
+    for _ in 0..2 {
+        repo.load_chunk_index_under_lock().unwrap();
+        toggle_an_entry(&mut repo, &mut toggled);
+        repo.save_state().unwrap();
+    }
+    let head = fx.head();
+    assert!(head.base.is_none(), "nothing old to fold: {head:?}");
+    assert_eq!(head.segments.len(), 3);
+    assert_eq!(cold_index(&fx, "cold1"), sorted_entries(repo.chunk_index()));
+    drop(repo);
+
+    age_segment(&fx, &b1);
+    let mut repo = open(&fx);
+    repo.load_chunk_index_under_lock().unwrap();
+    toggle_an_entry(&mut repo, &mut toggled);
+    repo.save_state().unwrap();
+    let head = fx.head();
+    assert!(head.base.is_some() && head.segments.is_empty(), "{head:?}");
+    assert_eq!(cold_index(&fx, "cold2"), sorted_entries(repo.chunk_index()));
+    drop(repo);
+
+    // [old b0, young b1, m1] and a requested fold.
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s0");
+    let b0 = fx.head().segments[0].name;
+    age_segment(&fx, &b0);
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s1");
+    let b1 = fx.head().segments[1].name;
+    let mut toggled = None;
+    let mut repo = open(&fx);
+    repo.load_chunk_index_under_lock().unwrap();
+    toggle_an_entry(&mut repo, &mut toggled);
+    repo.save_state().unwrap();
+    let m1 = fx.head().segments[2].name;
+    repo.load_chunk_index_under_lock().unwrap();
+    toggle_an_entry(&mut repo, &mut toggled);
+    repo.request_index_fold();
+    repo.save_state().unwrap();
+    let head = fx.head();
+    head.validate().unwrap();
+    assert!(head.base.is_some(), "{head:?}");
+    let names: Vec<ObjectName> = head.segments.iter().map(|s| s.name).collect();
+    assert_eq!(names.len(), 3, "{head:?}");
+    assert_eq!(names[..2], [b1, m1]);
+    assert_eq!(head.segments[2].kind, SegmentKind::Maintenance);
+    assert_eq!(head.retired, vec![b0]);
+    assert!(fx.named_objects_exist(&head));
+    assert_eq!(cold_index(&fx, "cold3"), sorted_entries(repo.chunk_index()));
+    assert_eq!(
+        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index()),
+        sorted_entries(repo.chunk_index())
+    );
+    // The second toggle put the removed entry back.
+    assert!(toggled.is_none());
+    drop(repo);
+    fx.check_clean(&fx.config);
+}
+
+/// `check --repair`'s fold is full: young backup segments go into the base
+/// too.
+#[test]
+fn a_full_fold_folds_young_segments() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    let before = fx.head();
+    let mut repo = fx.open(&fx.cache(), false).unwrap();
+    commands::util::with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        repo.request_full_index_fold();
+        repo.mark_index_dirty();
+        repo.save_state()
+    })
+    .unwrap();
+    let head = fx.head();
+    assert!(head.base.is_some() && head.segments.is_empty(), "{head:?}");
+    assert_eq!(head.retired, before.live_objects().collect::<Vec<_>>());
+    assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
+}
+
+/// A partial fold reads the segments the local cache lacks: here every
+/// cached segment file is removed after the index load; the fold fetches
+/// them, writes the base from the first one, re-applies the kept one after
+/// the head PUT and caches it again.
+#[test]
+fn a_partial_fold_fetches_what_the_cache_lacks() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    let before = fx.head();
+    age_segment(&fx, &before.segments[0].name);
+    let mut repo = fx.open(&fx.cache(), false).unwrap();
+    commands::util::with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        let dir = repo.cache_dir().unwrap();
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(table::SEGMENT_PREFIX))
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        repo.request_index_fold();
+        repo.mark_index_dirty();
+        repo.save_state()
+    })
+    .unwrap();
+    let head = fx.head();
+    assert!(head.base.is_some(), "{head:?}");
+    assert_eq!(head.segments, before.segments[1..]);
+    assert_eq!(head.retired, vec![before.segments[0].name]);
+    let dir = repo.cache_dir().unwrap();
+    assert!(table::read_cached_segment(&dir, &before.segments[1]).is_some());
+    assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
+}
+
+/// A cached segment file of the right size whose bytes do not verify is
+/// taken as present by the fold's presence check (metadata only); the fold
+/// then reads it once, finds it bad and GETs the segment instead.
+#[test]
+fn a_partial_fold_refetches_a_damaged_cached_segment() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    let before = fx.head();
+    age_segment(&fx, &before.segments[0].name);
+    let mut repo = fx.open(&fx.cache(), false).unwrap();
+    commands::util::with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        let dir = repo.cache_dir().unwrap();
+        for r in &before.segments {
+            let path = dir.join(format!("{}{}", table::SEGMENT_PREFIX, r.name.to_hex()));
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(len, r.size);
+            std::fs::write(&path, vec![0u8; len as usize]).unwrap();
+        }
+        repo.request_index_fold();
+        repo.mark_index_dirty();
+        repo.save_state()
+    })
+    .unwrap();
+    let head = fx.head();
+    assert!(head.base.is_some(), "{head:?}");
+    assert_eq!(head.segments, before.segments[1..]);
+    assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
+    assert_eq!(
+        sorted_entries(repo.chunk_index()),
+        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
+    );
+}
+
+/// Compact's soft fold counts only the foldable prefix: two young backup
+/// segments at a soft limit of two stay; once they are old, compact folds
+/// them and keeps the young third one after the new base.
+#[test]
+fn compact_soft_fold_keeps_young_segments() {
+    let fx = fixture(RepoFormat::CURRENT);
+    let compact = |fx: &Fixture| {
+        let mut repo = fx.open(&fx.cache(), false).unwrap();
+        let mut policy = crate::repo::index_write::FoldPolicy::default();
+        policy.soft.segments = 2;
+        repo.set_fold_policy(policy);
+        commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
+    };
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s2");
+    compact(&fx);
+    let head = fx.head();
+    assert!(head.base.is_none(), "{head:?}");
+    assert_eq!(head.segments.len(), 2);
+
+    age_segment(&fx, &head.segments[0].name);
+    age_segment(&fx, &head.segments[1].name);
+    fx.write("c", "charlie");
+    fx.backup(&fx.config, "s3");
+    let before = fx.head();
+    compact(&fx);
+    let head = fx.head();
+    assert!(head.base.is_some(), "{head:?}");
+    assert_eq!(head.segments[0], before.segments[2]);
+    assert_eq!(
+        head.retired,
+        before.live_objects().take(2).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        cold_index(&fx, "cold"),
+        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
+    );
+    fx.check_clean(&fx.config);
+}
+
+/// Fails every LIST of `index.d/` (the segments' ages).
+struct FailIndexListing {
+    inner: Box<dyn StorageBackend>,
+}
+
+impl InnerBackend for FailIndexListing {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for FailIndexListing;
+    except [list_meta];
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        if prefix == INDEX_OBJECT_DIR {
+            return Err(VykarError::Other("injected index.d/ listing failure".into()));
+        }
+        self.inner.list_meta(prefix)
+    }
+}
+
+/// A failed `index.d/` listing never fails a backup's commit: the ages are
+/// unknown, so young, and the folding commit writes a plain segment.
+/// Compact's sweep, which deletes by those ages, refuses instead.
+#[test]
+fn a_failed_segment_listing_never_fails_a_backup() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    age_segment(&fx, &fx.head().segments[0].name);
+    fx.write("b", "bravo");
+    let wrap = |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+        Box::new(FailIndexListing { inner })
+    };
+    backup_with(&fx, "s2", Some(&wrap), Repository::request_index_fold);
+    let head = fx.head();
+    assert!(head.base.is_none(), "{head:?}");
+    assert_eq!(head.segments.len(), 2);
+    fx.check_clean(&fx.config);
+
+    let mut repo = fx
+        .open_with(wrap(fx.storage()), &fx.cache(), OpenOptions::new())
+        .unwrap();
+    let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("injected index.d/ listing failure"), "{err}");
+    assert_eq!(fx.head(), head, "nothing written");
 }

@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected",
-  "note": "Shape B of the phase F part 2 campaign (random-2011594728773953191): a delayed head PUT, the commit fails, the client's next commit (a fold) collects the unnamed segment after a jump past INDEX_GC_GRACE, then the late head lands naming it (04 Current issues 2 meeting 3). Fixed by 04 step 8 (create-if-absent heads).",
+  "note": "Shape B of the phase F part 2 campaign (random-2011594728773953191): a delayed head PUT, the commit fails, the client's next commit (a fold) collects the unnamed segment after a jump past INDEX_GC_GRACE, then the late head lands naming it (04 Current issues 2 meeting 3). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the later backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's segment and keeps the young ones); its garbage collection still collects the segment the late head names. Unchanged signatures.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -201,7 +201,16 @@
           "pick": 0
         }
       },
-      "verify-packs +local +local +local"
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
     ],
     [
       {
@@ -211,6 +220,15 @@
         }
       },
       "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
     ],
     [
       {
@@ -367,6 +385,8 @@
       0,
       1,
       1,
+      0,
+      0,
       0,
       0,
       0,

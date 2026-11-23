@@ -30,6 +30,11 @@ enum Op {
     Sweep(u64),
     /// request_index_fold with no edit.
     Fold,
+    /// A backup commit storing `payload(b)` for each b: a backup segment.
+    Backup(Vec<u8>),
+    /// Move the k-th segment of the head (mod its count) past T_pack on the
+    /// store's clock, so folds take it (04 step 7).
+    Age(usize),
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -39,6 +44,8 @@ fn arb_op() -> impl Strategy<Value = Op> {
         1 => (any::<usize>(), any::<u8>(), 1..1000u32).prop_map(|(i, p, s)| Op::Relocate(i, p, s)),
         1 => any::<u64>().prop_map(Op::Sweep),
         1 => Just(Op::Fold),
+        2 => prop::collection::vec(0..12u8, 1..6).prop_map(Op::Backup),
+        2 => any::<usize>().prop_map(Op::Age),
     ]
 }
 
@@ -132,6 +139,76 @@ fn store(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
     ids
 }
 
+/// Store each `payload(b)` in one write session and commit it as a backup
+/// (a backup segment and a snapshot); returns the IDs.
+fn backup(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    let ids = bs
+        .iter()
+        .map(|&b| {
+            repo.store_chunk(&payload(b), Compression::None, PackType::Data)
+                .unwrap()
+                .0
+        })
+        .collect();
+    let id = vykar_types::snapshot_id::SnapshotId::generate();
+    let entry = crate::repo::manifest::SnapshotEntry {
+        name: format!("b-{}", hex::encode(id.as_bytes())),
+        id,
+        time: chrono::Utc::now(),
+        source_label: String::new(),
+        label: String::new(),
+        source_paths: Vec::new(),
+        hostname: String::new(),
+    };
+    repo.commit_session_blocking(
+        entry,
+        b"snapshot".to_vec(),
+        &mut crate::repo::file_cache::FileCache::new(),
+        &|_: crate::repo::control::CommitEvent| {},
+    )
+    .unwrap();
+    ids
+}
+
+/// Move the mtime of the head's k-th segment (mod the count) back past
+/// T_pack.
+fn age(repo: &Repository, repo_dir: &Path, k: usize) {
+    let segments = &repo.index_head().unwrap().segments;
+    if segments.is_empty() {
+        return;
+    }
+    let name = segments[k % segments.len()].name;
+    let path = repo_dir
+        .join(crate::repo::index_store::INDEX_OBJECT_DIR)
+        .join(name.to_hex());
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime - super::helpers::PAST_T_PACK)
+        .unwrap();
+}
+
+/// The IDs `op` removes from an index whose sorted IDs are `ids`.
+fn removed_by(op: &Op, ids: &[ChunkId]) -> Vec<ChunkId> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match *op {
+        Op::Remove(i) => vec![ids[i % ids.len()]],
+        Op::Sweep(seed) => ids
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| seed.rotate_right((k % 64) as u32) & 1 != 0)
+            .map(|(_, id)| *id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Apply a non-session op to `repo`. Returns false when it had nothing to pick.
 fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
     let ids = sorted_ids(repo.chunk_index());
@@ -139,9 +216,12 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
         return false;
     }
     match *op {
-        Op::Store(..) => unreachable!(),
-        Op::Remove(i) => {
-            repo.chunk_index_mut().remove(&ids[i % ids.len()]);
+        Op::Store(..) | Op::Backup(..) | Op::Age(..) => unreachable!(),
+        Op::Remove(..) | Op::Sweep(..) => {
+            let index = repo.chunk_index_mut();
+            for id in removed_by(op, &ids) {
+                index.remove(&id);
+            }
         }
         Op::Relocate(i, p, size) => {
             repo.chunk_index_mut()
@@ -153,14 +233,6 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
                 size,
             );
             assert!(moved);
-        }
-        Op::Sweep(seed) => {
-            let index = repo.chunk_index_mut();
-            for (k, id) in ids.iter().enumerate() {
-                if seed.rotate_right((k % 64) as u32) & 1 != 0 {
-                    index.remove(id);
-                }
-            }
         }
         Op::Fold => {
             repo.request_index_fold();
@@ -185,23 +257,67 @@ proptest! {
         let mut synthetic: HashSet<ChunkId> = HashSet::new();
 
         for op in &ops {
+            // A fresh reading of "now" for every write, as a new lock hold
+            // takes one: the ages are listed again.
+            t.repo.clear_lock_fence();
+            super::helpers::set_store_now(&mut t.repo);
+            // The entries before the op: a fold (or a fold that both the
+            // warm and the cold reader build from the same wrong base) must
+            // neither lose nor resurrect any.
+            let before = sorted_entries(t.repo.chunk_index());
+            let before_ids = sorted_ids(t.repo.chunk_index());
+            let removed = removed_by(op, &before_ids);
+            let mut added: Vec<ChunkId> = Vec::new();
+            let mut moved: Option<ChunkId> = None;
             match op {
+                Op::Backup(bs) => {
+                    added = backup(&mut t.repo, bs);
+                    for (id, &byte) in added.iter().zip(bs) {
+                        payloads.insert(*id, byte);
+                    }
+                }
+                Op::Age(k) => age(&t.repo, &t.repo_dir, *k),
                 Op::Store(bs) => {
-                    let ids = store(&mut t.repo, bs);
-                    for (id, &byte) in ids.iter().zip(bs) {
+                    added = store(&mut t.repo, bs);
+                    for (id, &byte) in added.iter().zip(bs) {
                         payloads.insert(*id, byte);
                     }
                 }
                 _ => {
                     let applied = apply_maintenance(&mut t.repo, op);
                     if let (Op::Relocate(i, ..), true) = (op, applied) {
-                        let ids = sorted_ids(t.repo.chunk_index());
                         // The pick was made before the op; relocation keeps the ID set.
-                        synthetic.insert(ids[i % ids.len()]);
+                        let id = before_ids[i % before_ids.len()];
+                        synthetic.insert(id);
+                        moved = Some(id);
                     }
                 }
             }
             synthetic.retain(|id| t.repo.chunk_index().contains(id));
+
+            // Equal after Fold and Age; plus exactly the new IDs after Store
+            // and Backup; minus exactly the removed IDs after Remove and
+            // Sweep; one entry changed after Relocate.
+            let after = sorted_entries(t.repo.chunk_index());
+            let after_map: HashMap<ChunkId, ChunkIndexEntry> = after.iter().cloned().collect();
+            let mut want: HashMap<ChunkId, ChunkIndexEntry> = before
+                .iter()
+                .filter(|(id, _)| !removed.contains(id))
+                .cloned()
+                .collect();
+            for id in &added {
+                let entry = after_map.get(id);
+                prop_assert!(entry.is_some(), "added {:?} missing", id);
+                want.entry(*id).or_insert(*entry.unwrap());
+            }
+            if let Some(id) = moved {
+                let entry = after_map.get(&id);
+                prop_assert!(entry.is_some(), "relocated {:?} missing", id);
+                want.insert(id, *entry.unwrap());
+            }
+            let mut want: Vec<(ChunkId, ChunkIndexEntry)> = want.into_iter().collect();
+            want.sort_unstable_by_key(|(id, _)| *id.as_bytes());
+            prop_assert_eq!(&after, &want, "after {:?}", op);
 
             let cold = cold(&t.repo_dir, &t.scratch);
             prop_assert_eq!(sorted_entries(&cold), sorted_entries(t.repo.chunk_index()));

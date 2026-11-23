@@ -35,6 +35,10 @@ pub(crate) enum StepKind {
     VerifyPacks,
     /// LIST `index.h/` (a fold without a previous head).
     ListHeads,
+    /// Compound: LIST_META `index.d/` (the segments' ages) unless this lock
+    /// hold listed it; then GET the segments a partial fold needs that the
+    /// local cache lacks (04 step 7).
+    FoldPrefix,
     /// PUT the sweep record `index.d/<name>`.
     PutSweepRecord,
     /// PUT a segment `index.d/<name>`.
@@ -77,6 +81,7 @@ const PERSIST_INDEX: &[(Access, &str)] = &[
     (List, "index.h/"),
     (Read, "index.h/"),
     (Write, "index.d/"),
+    (Read, "index.d/"),
     (Read, "locks/"),
     (Write, "locks/"),
     (Write, "index.h/"),
@@ -97,6 +102,7 @@ impl StepKind {
             StepKind::SyncIndex => "sync-index",
             StepKind::VerifyPacks => "verify-packs",
             StepKind::ListHeads => "list-heads",
+            StepKind::FoldPrefix => "fold-prefix",
             StepKind::PutSweepRecord => "put-sweep-record",
             StepKind::PutSegment => "put-segment",
             StepKind::PutBase => "put-base",
@@ -131,6 +137,7 @@ impl StepKind {
             StepKind::SyncIndex => &[(Read, "index.d/"), (List, "index.h/"), (Read, "index.h/")],
             StepKind::VerifyPacks => &[(Read, "packs/"), (List, "packs/"), (Read, "sessions/")],
             StepKind::ListHeads => &[(List, "index.h/")],
+            StepKind::FoldPrefix => &[(List, "index.d/"), (Read, "index.d/")],
             StepKind::PutSweepRecord | StepKind::PutSegment | StepKind::PutBase => {
                 &[(Write, "index.d/")]
             }
@@ -159,6 +166,7 @@ const ALL: &[StepKind] = &[
     StepKind::SyncIndex,
     StepKind::VerifyPacks,
     StepKind::ListHeads,
+    StepKind::FoldPrefix,
     StepKind::PutSweepRecord,
     StepKind::PutSegment,
     StepKind::PutBase,

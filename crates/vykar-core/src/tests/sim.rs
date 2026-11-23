@@ -46,7 +46,15 @@ fn baseline_clean() {
     assert_eq!(del.removed(), ["t0".to_string()]);
     sim.check_invariants(Invariant::STEP1).assert_clean();
 
-    sim.compact(c).expect_ok();
+    // t0's segment is seconds old: the sweep keeps its entries (04 step 7);
+    // check --repair then removes them (it runs without live sessions).
+    let compact = sim.compact(c);
+    compact.expect_ok();
+    assert!(
+        compact_stat(compact.detail(), "kept-young") > 0,
+        "{}",
+        compact.detail()
+    );
     sim.check_invariants(Invariant::STEP1).assert_clean();
     sim.check_repair(c).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();
@@ -1002,7 +1010,15 @@ fn step3_clean_on_sequential_flows() {
         },
     )
     .expect_ok();
-    sim.compact(c).expect_ok();
+    // The deleted and pruned snapshots' segments are young: their entries
+    // stay (04 step 7) until check --repair removes them.
+    let compact = sim.compact(c);
+    compact.expect_ok();
+    assert!(
+        compact_stat(compact.detail(), "kept-young") > 0,
+        "{}",
+        compact.detail()
+    );
     sim.check_repair(c).expect_ok();
     sim.break_lock(d, false).expect_ok();
     sim.check_invariants(Invariant::STEP3).assert_clean();
@@ -1226,9 +1242,10 @@ fn allowed_as(run: &crate::sim::history::RunRecord, e: AllowedError) -> bool {
 
 /// A live marker written before 04 step 7 (no `elapsed_secs`) gives compact
 /// no horizon: it deletes no orphan pack, not even a crashed backup's 12 h
-/// old ones, while the packs its own sweep emptied, and repack, go on.
+/// old ones, nor the old packs its own sweep emptied (since phase F part 8c
+/// those obey I1 like any orphan); repack goes on.
 #[test]
-fn an_unknown_horizon_keeps_every_orphan_but_not_swept_packs() {
+fn an_unknown_horizon_keeps_every_orphan() {
     let mut sim = Sim::new();
     let (x, c) = (sim.client("x"), sim.client("c"));
     let (_marker, packs) = crash_backup_after_upload(&mut sim, x, &tree("x1"));
@@ -1249,11 +1266,10 @@ fn an_unknown_horizon_keeps_every_orphan_but_not_swept_packs() {
     r.expect_ok();
     let d = r.detail();
     assert!(compact_stat(d, "unreferenced") > 0, "{d}");
-    assert!(compact_stat(d, "live") >= packs.len() as u64, "{d}");
-    assert!(
-        compact_stat(d, "repacked") + compact_stat(d, "deleted_empty") > 0,
-        "{d}"
-    );
+    // The crashed backup's packs and the ones the sweep emptied.
+    assert!(compact_stat(d, "live") > packs.len() as u64, "{d}");
+    assert_eq!(compact_stat(d, "deleted_empty"), 0, "{d}");
+    assert!(compact_stat(d, "repacked") > 0, "{d}");
     for k in &packs {
         assert!(
             sim.store().object(k).is_some(),
@@ -1295,8 +1311,8 @@ fn a_sweep_beside_a_live_backup_keeps_its_uploads() {
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
-/// c0, t0 and t1 (t1 shares t0's first file), then t0 deleted: a compact
-/// has t0's other chunks to sweep.
+/// c0, t0 and t1 (t1 shares t0's first file), then t0 deleted and T_pack
+/// passed: a compact has t0's other chunks to sweep.
 fn sweepable(sim: &mut Sim, c: ClientId) {
     sim.backup(c, "c0", &tree("c0")).expect_ok();
     let t0 = SourceTree::seeded("x", 3, 64 * KIB);
@@ -1307,6 +1323,8 @@ fn sweepable(sim: &mut Sim, c: ClientId) {
     );
     sim.backup(c, "t1", &t1).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
+    // t0's segment is old: the sweep takes its entries (04 step 7).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 }
 
 /// SIM-2: a backup that starts while a compact is between its sweep's
@@ -1408,8 +1426,10 @@ fn a_crash_at_every_write_of_the_sweep_is_recoverable() {
 }
 
 /// SIM-4: a reaped session that commits afterwards (H2-marker's net
-/// effect, modelled with tamper). The sweep removed t0's entries it reused,
-/// so its commit fails as stale and no snapshot is written. Its own packs,
+/// effect, modelled with tamper). t0 was deleted more than T_pack ago, so
+/// the sweep removed t0's entries it reused, and its commit fails as stale
+/// and no snapshot is written (contrast
+/// `a_dedup_hit_on_a_fresh_chunk_survives_a_concurrent_sweep`). Its own packs,
 /// seconds old, are orphans younger than T_pack: compact keeps them (04
 /// step 5).
 #[test]
@@ -1420,6 +1440,9 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
     let x = SourceTree::seeded("x", 3, 64 * KIB);
     sim.backup(c, "t0", &x).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
+    // t0's segment is old, so the sweep takes the entries a reuses (04
+    // step 7 keeps those of segments younger than T_pack).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 
     let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(
@@ -1835,28 +1858,231 @@ fn young_orphans_survive_a_compact_hours_ahead() {
     sim.check_invariants(interleavings::CHECKED).assert_clean();
 }
 
-/// Packs whose entries this compact's sweep removed were committed: they go
-/// at once, seconds old.
+// ── Young entries (04 step 7) ──────────────────────────────────────────
+
+/// The packs `c` wrote for its backup of `name` (`tree`).
+fn backup_packs(sim: &mut Sim, c: ClientId, name: &str, tree: &SourceTree) -> Vec<String> {
+    let before = sim.store().keys_written_by(c, "packs/");
+    sim.backup(c, name, tree).expect_ok();
+    let packs: Vec<String> = sim
+        .store()
+        .keys_written_by(c, "packs/")
+        .into_iter()
+        .filter(|k| !before.contains(k))
+        .collect();
+    assert!(!packs.is_empty(), "{name} wrote no pack");
+    packs
+}
+
+/// A sweep leaves the entries of a backup segment younger than T_pack: a
+/// snapshot deleted right after its backup keeps its chunks and packs
+/// through a compact. Once T_pack has passed, a compact sweeps them and
+/// deletes the packs it emptied (old by then).
 #[test]
-fn swept_packs_go_at_once() {
+fn young_backup_entries_survive_a_sweep() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let t0_packs = backup_packs(&mut sim, c, "t0", &tree("t0"));
+    sim.delete(c, &["t0"]).expect_ok();
+    let r = sim.compact(c);
+    r.expect_ok();
+    let d = r.detail();
+    assert!(compact_stat(d, "kept-young") > 0, "{d}");
+    assert_eq!(compact_stat(d, "unreferenced"), 0, "{d}");
+    for k in &t0_packs {
+        assert!(sim.store().object(k).is_some(), "{k} deleted young");
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
+    let r = sim.compact(c);
+    r.expect_ok();
+    let d = r.detail();
+    assert!(compact_stat(d, "unreferenced") > 0, "{d}");
+    assert_eq!(compact_stat(d, "kept-young"), 0, "{d}");
+    for k in &t0_packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept once old");
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// 04's motivating case: a backup that reuses chunks of a snapshot deleted
+/// minutes after its backup survives a compact beside it. The sweep keeps
+/// t0's entries (its segment is young), so a's reuse holds, no pack of a or
+/// t0 goes, and a commits and restores. Contrast SIM-4
+/// (`a_reaped_session_that_commits_afterwards_fails_as_stale`), where t0's
+/// segment is old.
+#[test]
+fn a_dedup_hit_on_a_fresh_chunk_survives_a_concurrent_sweep() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let x = SourceTree::seeded("x", 3, 64 * KIB);
+    let t0_packs = backup_packs(&mut sim, c, "t0", &x);
+    sim.delete(c, &["t0"]).expect_ok();
+
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let sa = sim.spawn(
+        a,
+        Call::Backup {
+            snapshot: "a1".into(),
+            tree: x.clone().file("new.bin", b"a file of its own".to_vec()),
+        },
+    );
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    assert!(!a_packs.is_empty());
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    let detail = rb.detail();
+    assert!(compact_stat(detail, "kept-young") > 0, "{detail}");
+    assert_eq!(compact_stat(detail, "unreferenced"), 0, "{detail}");
+    let deleted = mutations_under(&sim, b, rb.index, &["packs/"]);
+    assert!(
+        a_packs
+            .iter()
+            .chain(&t0_packs)
+            .all(|k| !deleted.contains(k)),
+        "{deleted:?}"
+    );
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    let restore = sim.restore(c, "a1");
+    restore.expect_ok();
+    let restored = SourceTree::read_from(&sim.restore_dir(&restore)).unwrap();
+    assert_eq!(restored, x.file("new.bin", b"a file of its own".to_vec()));
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// Packs a sweep empties obey I1 in full (phase F part 8c): a compact with
+/// no segment grace sweeps t0's fresh entries at once, and keeps t0's
+/// packs, now without entries, because they are younger than T_pack.
+/// T_pack later a normal compact deletes them.
+#[test]
+fn a_pack_the_sweep_empties_is_kept_while_young() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let t0_packs = backup_packs(&mut sim, c, "t0", &tree("t0"));
+    sim.delete(c, &["t0"]).expect_ok();
+    let mut stats = None;
+    sim.custom(
+        c,
+        "compact without segment grace",
+        |repo: &mut crate::repo::Repository| {
+            repo.load_chunk_index_under_lock()?;
+            repo.set_segment_grace(Duration::ZERO);
+            stats = Some(crate::commands::compact::compact_repo(
+                repo,
+                10.0,
+                None,
+                false,
+                1,
+                &crate::repo::control::CancelToken::new(),
+            )?);
+            Ok(())
+        },
+    )
+    .expect_ok();
+    let stats = stats.expect("the compact ran");
+    assert!(stats.chunks_unreferenced > 0, "{stats:?}");
+    assert_eq!(stats.chunks_unreferenced_young, 0, "{stats:?}");
+    assert!(
+        stats.packs_orphan_young >= t0_packs.len() as u64,
+        "{stats:?}"
+    );
+    for k in &t0_packs {
+        assert!(sim.store().object(k).is_some(), "{k} deleted young");
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
+    sim.compact(c).expect_ok();
+    for k in &t0_packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept once old");
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
+/// `compact --dry-run` applies the young-entries rule too: it counts the
+/// entries it would keep as the real run then keeps them, and writes
+/// nothing.
+#[test]
+fn compact_dry_run_counts_young_entries() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "c0", &tree("c0")).expect_ok();
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    let t0_packs: Vec<String> = sim
-        .store()
-        .keys_written_by(c, "packs/")
-        .into_iter()
-        .filter(|k| sim.store().object(k).is_some())
-        .collect();
     sim.delete(c, &["t0"]).expect_ok();
-    sim.compact(c).expect_ok();
-    let gone = t0_packs
-        .iter()
-        .filter(|k| sim.store().object(k).is_none())
-        .count();
-    assert!(gone > 0, "no pack of t0 deleted");
-    sim.check_invariants(Invariant::STEP1).assert_clean();
+    let data_keys = |sim: &Sim| {
+        let mut keys = Vec::new();
+        for p in ["index.h/", "index.d/", "packs/", "snapshots/"] {
+            keys.extend(sim.store().keys(p));
+        }
+        keys
+    };
+    let before = data_keys(&sim);
+    let mut dry = None;
+    sim.custom(
+        c,
+        "compact --dry-run",
+        |repo: &mut crate::repo::Repository| {
+            repo.load_chunk_index_under_lock()?;
+            dry = Some(crate::commands::compact::compact_repo(
+                repo,
+                10.0,
+                None,
+                true,
+                1,
+                &crate::repo::control::CancelToken::new(),
+            )?);
+            Ok(())
+        },
+    )
+    .expect_ok();
+    let dry = dry.expect("the dry run ran");
+    assert!(dry.chunks_unreferenced_young > 0, "{dry:?}");
+    assert_eq!(dry.chunks_unreferenced, 0, "{dry:?}");
+    assert_eq!(data_keys(&sim), before, "a dry run writes nothing");
+    let real = sim.compact(c);
+    real.expect_ok();
+    assert_eq!(
+        compact_stat(real.detail(), "kept-young"),
+        dry.chunks_unreferenced_young,
+        "{}",
+        real.detail()
+    );
+}
+
+/// D14, documented: on a plaintext repository an identical re-PUT of an
+/// `index.d/` key keeps its first mtime in the simulator's store (as on
+/// vykar-server), so a segment whose bytes repeat an older unnamed object
+/// reads as old as that object. Part 9 owns this (forward note 3).
+#[test]
+fn a_plaintext_segment_that_repeats_an_old_object_reads_old() {
+    use crate::index::head::ObjectName;
+    use crate::repo::ages::{SegmentAges, T_PACK};
+    use vykar_storage::StorageBackend;
+
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    let store = sim.store().handle(c);
+    let bytes = b"the same segment bytes".to_vec();
+    let name = ObjectName::of(&bytes);
+    let key = crate::repo::index_store::object_key(&name);
+    store.put(&key, &bytes).unwrap();
+    sim.advance(Duration::from_secs(13 * 3600));
+    store.put(&key, &bytes).unwrap();
+    store.put("locks/probe", b"now").unwrap();
+    let listing = store.list_meta("locks/").unwrap();
+    let now = vykar_storage::StoreNow::of_written(&listing, "locks/probe");
+    assert!(now.is_some());
+    let ages = SegmentAges::list(&store, now).unwrap();
+    assert!(
+        ages.is_old(&name, T_PACK),
+        "the re-PUT kept the first mtime"
+    );
 }
 
 /// D17: a forward step of the store's clock ages every object at once, a
@@ -1993,6 +2219,8 @@ fn restore_during_compact_reads_relocated_chunks() {
     let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
     sim.backup(c, "x", &two_file_tree()).expect_ok();
     sim.backup(c, "y", &one_file_tree()).expect_ok();
+    // x's segment is old: the compact sweeps it and repacks (04 step 7).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
     let planned: BTreeSet<String> = sim.store().keys("packs/").into_iter().collect();
 
     let gate = sim.gate(first_pack_read(r));
@@ -2039,6 +2267,8 @@ fn restore_of_a_snapshot_deleted_during_the_read_is_allowed() {
     let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
     sim.backup(c, "x", &two_file_tree()).expect_ok();
     sim.backup(c, "y", &one_file_tree()).expect_ok();
+    // x's segment is old: the compact sweeps it (04 step 7).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 
     let gate = sim.gate(first_pack_read(r));
     let spawned = sim.spawn(
@@ -2073,6 +2303,8 @@ fn check_during_compact_reports_no_damage() {
     let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
     sim.backup(c, "x", &two_file_tree()).expect_ok();
     sim.backup(c, "y", &one_file_tree()).expect_ok();
+    // x's segment is old: the compact sweeps it (04 step 7).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 
     let gate = sim.gate(GateRule::new(
         r,
@@ -2206,6 +2438,8 @@ fn compact_runs_during_a_backup() {
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "c0", &tree("c0")).expect_ok();
     sim.backup(b, "t0", &tree("t0")).expect_ok();
+    // c0's segment is old, so the sweep takes its chunks (04 step 7).
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
     let (ga, sa) = hold_after_upload(&mut sim, a);
     let a_packs = sim.store().keys_written_by(a, "packs/");
     let marker = marker_of(&sim, a);
@@ -2394,6 +2628,108 @@ fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
     assert_eq!(
         classify_case(&sim, &report, &[]),
         BTreeSet::from([Signature::LateHeadThenCompact]),
+        "{report:?}"
+    );
+}
+
+/// AgedLockPacksCollected (no seed reaches it since phase F part 8c): a
+/// is held after its uploads while 6 h 1 min pass (one heartbeat poll, so
+/// its marker goes stale), takes its commit lock and is held again at its
+/// head PUT, after the fence; another 6 h 1 min age its lock past the
+/// stale age and its packs past T_pack. b's compact reaps the lock and the
+/// marker and deletes a's packs as orphans; its index GC fails to delete
+/// a's segment (an injected delete fault), so a's head, published outside
+/// any lock, names a present segment whose entries name absent packs. The
+/// driver's verdict claims it as exactly `AgedLockReaped` (the head PUT)
+/// and `AgedLockPacksCollected` (fixed by 04 step 8). Without the fault
+/// the GC takes the segment (older than T_idx, named by no head), and the
+/// case is `AgedLockSegmentCollected`: the driver's seeds
+/// `aged-lock-packs-collected{,-old-packs}`.
+#[test]
+fn an_aged_lock_head_names_packs_compact_deleted() {
+    use crate::sim::driver::{Action, Signature, TraceEntry, classify as classify_case};
+    const WAIT: Duration = Duration::from_secs(5);
+    const JUMP: Duration = Duration::from_secs(6 * 3600 + 60);
+    // The classifier ages a reaped lock on the trace clock: one entry per
+    // stretch of store steps between the jumps, with the store clock then.
+    let mut entries: Vec<TraceEntry> = Vec::new();
+    let mut span = |sim: &Sim, label: &str| {
+        let first = entries.last().map_or(0, |e| e.steps.1);
+        let last = sim.store().log().last().map_or(0, |r| r.step);
+        entries.push(TraceEntry {
+            n: entries.len(),
+            choice: 0,
+            options: 1,
+            action: Action::Stop,
+            label: label.into(),
+            ops: Vec::new(),
+            steps: (first, last),
+            actions: Vec::new(),
+            ended: false,
+            clock: sim.store().now(),
+        });
+    };
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyDelete,
+            KeyMatch::Prefix("index.d/".into()),
+            FaultAction::Fail,
+        )
+        .client(b),
+    );
+    let (ga, sa) = hold_after_upload(&mut sim, a);
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    span(&sim, "upload");
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(JUMP);
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    let gh = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyWrite,
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    sim.resume(ga);
+    sim.expect_paused(gh, "a's head PUT");
+    let a_segments = sim.store().keys_written_by(a, "index.d/");
+    assert!(!a_segments.is_empty(), "a's segment");
+    span(&sim, "commit to the fence");
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.advance(JUMP);
+    assert!(sim.time().wait_for_waiters(1, WAIT));
+    sim.compact(b).expect_ok();
+    span(&sim, "compact");
+    for k in &a_packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept");
+    }
+    for k in &a_segments {
+        assert!(sim.store().object(k).is_some(), "{k} collected");
+    }
+    sim.resume(gh);
+    let _ = sim.join(sa);
+    span(&sim, "head PUT");
+    let report = sim.check_invariants(&[
+        Invariant::CommittedSnapshotsRestore,
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::AllowedErrors,
+        Invariant::LockExclusion,
+        Invariant::OrphanGrace,
+        Invariant::MarkerGapCommit,
+    ]);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::IndexNamesAbsentPack),
+        "{report:?}"
+    );
+    assert_eq!(
+        classify_case(&sim, &report, &entries),
+        BTreeSet::from([Signature::AgedLockReaped, Signature::AgedLockPacksCollected]),
         "{report:?}"
     );
 }

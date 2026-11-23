@@ -10,13 +10,30 @@
 //! [`PACK_AGE_LIMIT`] at its head's landing ([`HEAD_LANDING_ALLOWANCE`]
 //! before the head PUT, none after it); journal recovery adopts packs
 //! younger than [`RECOVERY_MAX_PACK_AGE`].
+//!
+//! Segment age (04 step 7): a backup segment's age is the store's "now"
+//! minus the mtime of its `index.d/` key in one LIST_META ([`SegmentAges`]).
+//! "Now" is the mtime of the lock key this client holds: the maintenance
+//! lock for compact, the commit lock for a backup's index write. While a
+//! backup segment is younger than [`T_PACK`], compact's sweep leaves the
+//! entries it adds and no fold writes it into a base. Unknown is young: an
+//! object the listing lacks, one listed without an mtime, or no "now".
+//! Caveat (plaintext repositories only): an identical re-PUT of an
+//! `index.d/` key keeps the first PUT's mtime on vykar-server (and in the
+//! simulator's store) and renews it on S3, local and SFTP; a backup segment
+//! whose bytes equal an older unnamed object then reads as old as that
+//! object. Encrypted segments get a fresh nonce, so a new segment always
+//! has a new name and a new mtime.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::debug;
 use vykar_storage::{ListedObject, StorageBackend, StoreNow};
 use vykar_types::error::Result;
+
+use crate::index::head::{ObjectName, SegmentKind, SegmentRef};
 
 use super::host_env::HostEnv;
 use super::lock::SESSION_STALE_SECS;
@@ -158,5 +175,157 @@ impl StoreClock {
                 (None, None)
             }
         }
+    }
+}
+
+/// Ages of `index.d/` objects on the store's clock: one listing and one
+/// reading of "now" (the mtime of the lock key this client holds). An
+/// object not listed, listed without an mtime, or judged without a "now"
+/// is young (04 step 7: fail closed means keep).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SegmentAges {
+    now: Option<StoreNow>,
+    mtimes: HashMap<ObjectName, Option<SystemTime>>,
+}
+
+impl SegmentAges {
+    /// LIST_META `index.d/` and keep every object's mtime, judged against
+    /// `now`.
+    ///
+    /// # Errors
+    ///
+    /// The listing failed.
+    pub(crate) fn list(storage: &dyn StorageBackend, now: Option<StoreNow>) -> Result<Self> {
+        let mtimes = super::index_store::list_index_object_mtimes(storage)?;
+        Ok(Self { now, mtimes })
+    }
+
+    /// Ages from parts (tests).
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        now: Option<StoreNow>,
+        mtimes: HashMap<ObjectName, Option<SystemTime>>,
+    ) -> Self {
+        Self { now, mtimes }
+    }
+
+    /// Whether the listing showed `name`.
+    pub(crate) fn listed(&self, name: &ObjectName) -> bool {
+        self.mtimes.contains_key(name)
+    }
+
+    /// Whether `name` is at least `grace` old: always at zero grace;
+    /// otherwise it needs a listed mtime and a "now" (a future mtime is age
+    /// 0).
+    pub(crate) fn is_old(&self, name: &ObjectName, grace: Duration) -> bool {
+        if grace.is_zero() {
+            return true;
+        }
+        match (self.now, self.mtimes.get(name).copied().flatten()) {
+            (Some(now), Some(mtime)) => now.age_of(mtime) >= grace,
+            _ => false,
+        }
+    }
+}
+
+/// Whether a fold may write `seg` into a base and a sweep may remove the
+/// entries it adds: a maintenance segment always; a backup segment once it
+/// is `grace` old by `ages` (never without ages, unless `grace` is zero).
+///
+/// Maintenance segments are foldable at any age because they add nothing a
+/// backup depends on: a sweep removes, a repack relocates by chunk ID, and
+/// the only maintenance segments with additions come from `check
+/// --repair`, which refuses to run beside live sessions. (Part 9 note: once
+/// the lock goes, repair's own sweep needs the young-segment rule too.)
+pub(crate) fn foldable(seg: &SegmentRef, ages: Option<&SegmentAges>, grace: Duration) -> bool {
+    match seg.kind {
+        SegmentKind::Maintenance => true,
+        SegmentKind::Backup => grace.is_zero() || ages.is_some_and(|a| a.is_old(&seg.name, grace)),
+    }
+}
+
+/// The length of the longest prefix of `segments` that is foldable
+/// (segments apply in order, so only a prefix can go into a base).
+pub(crate) fn foldable_prefix(
+    segments: &[SegmentRef],
+    ages: Option<&SegmentAges>,
+    grace: Duration,
+) -> usize {
+    segments
+        .iter()
+        .take_while(|s| foldable(s, ages, grace))
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(byte: u8, kind: SegmentKind) -> SegmentRef {
+        SegmentRef {
+            name: ObjectName([byte; 32]),
+            size: 10,
+            kind,
+            entries: 1,
+        }
+    }
+
+    #[test]
+    fn segment_ages_fail_closed() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100 * 3600);
+        let at = |hours_ago: u64| Some(now - Duration::from_secs(hours_ago * 3600));
+        let mtimes = HashMap::from([
+            (ObjectName([1; 32]), at(13)),
+            (ObjectName([2; 32]), at(1)),
+            (ObjectName([3; 32]), None),
+            (ObjectName([4; 32]), at(12)),
+            (ObjectName([5; 32]), Some(now + Duration::from_secs(3600))),
+        ]);
+        let ages = SegmentAges::from_parts(Some(StoreNow::at(now)), mtimes.clone());
+        assert!(ages.is_old(&ObjectName([1; 32]), T_PACK));
+        assert!(!ages.is_old(&ObjectName([2; 32]), T_PACK));
+        assert!(!ages.is_old(&ObjectName([3; 32]), T_PACK), "no mtime");
+        assert!(!ages.is_old(&ObjectName([9; 32]), T_PACK), "not listed");
+        assert!(ages.is_old(&ObjectName([4; 32]), T_PACK), "age = grace");
+        assert!(!ages.is_old(&ObjectName([5; 32]), T_PACK), "future mtime");
+        // Zero grace: everything is old, even unlisted.
+        assert!(ages.is_old(&ObjectName([9; 32]), Duration::ZERO));
+        // No "now": young.
+        let no_now = SegmentAges::from_parts(None, mtimes);
+        assert!(!no_now.is_old(&ObjectName([1; 32]), T_PACK));
+        // Without ages a backup segment is young, a maintenance one not.
+        assert!(!foldable(&seg(1, SegmentKind::Backup), None, T_PACK));
+        assert!(foldable(&seg(1, SegmentKind::Backup), None, Duration::ZERO));
+        assert!(foldable(&seg(2, SegmentKind::Maintenance), None, T_PACK));
+    }
+
+    #[test]
+    fn foldable_prefix_stops_at_the_first_young_backup_segment() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100 * 3600);
+        let mtimes = HashMap::from([
+            (
+                ObjectName([1; 32]),
+                Some(now - Duration::from_secs(13 * 3600)),
+            ),
+            (ObjectName([2; 32]), Some(now - Duration::from_secs(3600))),
+            (
+                ObjectName([4; 32]),
+                Some(now - Duration::from_secs(13 * 3600)),
+            ),
+        ]);
+        let ages = SegmentAges::from_parts(Some(StoreNow::at(now)), mtimes);
+        let segments = [
+            seg(0, SegmentKind::Maintenance),
+            seg(1, SegmentKind::Backup),
+            seg(2, SegmentKind::Backup),
+            seg(3, SegmentKind::Maintenance),
+            seg(4, SegmentKind::Backup),
+        ];
+        // The old backup segment after the young one is outside the prefix.
+        assert_eq!(foldable_prefix(&segments, Some(&ages), T_PACK), 2);
+        assert_eq!(foldable_prefix(&segments, None, T_PACK), 1);
+        assert_eq!(foldable_prefix(&segments, None, Duration::ZERO), 5);
+        assert_eq!(foldable_prefix(&segments[3..], Some(&ages), T_PACK), 2);
+        assert_eq!(foldable_prefix(&[], Some(&ages), T_PACK), 0);
     }
 }

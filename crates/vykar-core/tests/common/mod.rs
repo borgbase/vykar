@@ -262,6 +262,9 @@ pub fn exercise_pack_naming(
         commands::delete::run(config, passphrase, &["pn-a"], false, &CancelToken::new()).unwrap();
     assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
 
+    // pn-a's backup segment and packs are old, so the sweep takes its
+    // entries (compact keeps those of segments younger than T_pack).
+    age_repo_objects(repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let compact =
         commands::compact::run(config, passphrase, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(
@@ -284,4 +287,36 @@ pub fn exercise_pack_naming(
     .unwrap();
     assert_eq!(std::fs::read(dest.join("pn-keep.bin")).unwrap(), keep);
     assert!(!dest.join("pn-drop.bin").exists());
+}
+
+/// 13 h: past T_pack (12 h), the age below which compact keeps a backup
+/// segment's entries and orphan packs.
+pub const PAST_T_PACK: std::time::Duration = std::time::Duration::from_secs(13 * 3600);
+
+/// Move the mtime of every file under `<repo_dir>/<prefix>` back by `by`:
+/// on the storage's clock those objects are that much older, so a compact
+/// sweeps a deleted snapshot's entries and deletes the packs it emptied.
+pub fn age_repo_objects(repo_dir: &Path, prefixes: &[&str], by: std::time::Duration) {
+    fn walk(dir: &Path, by: std::time::Duration) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, by);
+            } else {
+                let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(mtime - by)
+                    .unwrap();
+            }
+        }
+    }
+    for prefix in prefixes {
+        walk(&repo_dir.join(prefix), by);
+    }
 }

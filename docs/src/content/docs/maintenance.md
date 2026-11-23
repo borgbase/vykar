@@ -20,6 +20,8 @@ vykar prune --compact
 
 `delete` and `prune` free no space: they only delete snapshot objects. `compact` reclaims it. On every run it first marks every live snapshot and removes the index entries none of them references (the sweep), then rewrites and deletes packs.
 
+A snapshot's space is reclaimed by a compact at least 12 hours after the backup that wrote its chunks: compact keeps the chunks that backups of the last 12 hours added, referenced or not, because a backup running meanwhile may reuse them. Deleting a fresh snapshot and compacting at once therefore frees its own chunks only at a compact 12 hours later; the compact output says how many it kept ("unreferenced chunks … kept: added by backups in the last 12 h"). Packs compact empties are deleted once they are 12 hours old too.
+
 Restores, listings, `find`, `diff` and `check` running elsewhere do not hold compact (or `prune`, `delete`) back: readers register nothing, and read what compact moved from its new place. A restore of a snapshot that is deleted and compacted meanwhile fails and says so. A snapshot that `prune` or `delete` removes while `check` or `find` runs is skipped with a warning; `diff` of such a snapshot fails with "snapshot not found".
 
 Compact, `prune` and `delete` also run while backups upload. Compact keeps what a running backup has uploaded (orphan packs younger than 12 hours, and those a live backup may still need; the summary counts the ones it kept for a running backup), and also keeps the uploads of a crashed backup until they are 12 hours old. A backup that finishes uploading while a compact runs waits for it, up to 2 hours, then commits; a backup that starts while maintenance holds the lock fails with "locked" after a few seconds, as before. A backup that reused data a concurrent compact removed fails and asks to be retried.
@@ -98,8 +100,8 @@ the snapshots that need it are removed.
 by writing a pack map for its pack, which removes nothing.
 
 If a backup crashes after its index was committed but before its snapshot was
-written, the index keeps orphan chunk entries that no snapshot references; the
-next `compact` sweeps them and reclaims the space.
+written, the index keeps orphan chunk entries that no snapshot references; a
+`compact` at least 12 hours later sweeps them and reclaims the space.
 
 ## Delete a snapshot
 

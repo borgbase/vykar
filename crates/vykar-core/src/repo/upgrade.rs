@@ -221,7 +221,7 @@ impl Repository {
         self.storage.create_dir(index_store::HEAD_PREFIX)?;
         self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         self.set_pending_sweep(PendingSweep::Initial);
-        let head = self.put_base(None, false)?;
+        let head = self.put_base(None, false, super::index_write::FoldRequest::Full)?;
 
         // 6. The version switch.
         self.switch_version(target)?;

@@ -515,3 +515,45 @@ vykar_storage::delegate_storage_backend! {
         self.inner.delete(key)
     }
 }
+
+/// Move the mtime of every file under `<repo_dir>/<prefix>` back by `by`,
+/// so ages on the store's clock see those objects as that much older: a
+/// backup segment T_pack old is foldable and its additions sweepable, a
+/// pack T_pack old a deletable orphan (04 steps 5 and 7). For a
+/// LocalBackend repository or a vykar-server's data dir.
+pub(crate) fn age_repo_objects(repo_dir: &Path, prefixes: &[&str], by: std::time::Duration) {
+    fn walk(dir: &Path, by: std::time::Duration) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, by);
+            } else {
+                let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(mtime - by)
+                    .unwrap();
+            }
+        }
+    }
+    for prefix in prefixes {
+        walk(&repo_dir.join(prefix), by);
+    }
+}
+
+/// 13 h: past T_pack (12 h) with room to spare.
+pub(crate) const PAST_T_PACK: std::time::Duration = std::time::Duration::from_secs(13 * 3600);
+
+/// "Now" on the store's clock for a handle that holds no lock (tests that
+/// call compact or a fold directly): the local clock, which is a
+/// LocalBackend's.
+pub(crate) fn set_store_now(repo: &mut Repository) {
+    repo.set_lock_store_time(Some(vykar_storage::StoreNow::at(
+        std::time::SystemTime::now(),
+    )));
+}

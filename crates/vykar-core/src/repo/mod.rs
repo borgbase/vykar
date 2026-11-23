@@ -571,15 +571,15 @@ pub struct Repository {
     index_head: Option<crate::index::head::IndexHead>,
     /// When chains are folded into a new base.
     fold_policy: index_write::FoldPolicy,
-    /// Make the next index write a fold.
-    fold_requested: bool,
+    /// What fold the next index write was asked for.
+    fold_requested: index_write::FoldRequest,
     /// What the next index write records in the head's `sweep`; consumed by it.
     pending_sweep: Option<index_write::PendingSweep>,
     /// Grace of `collect_index_garbage`: `INDEX_GC_GRACE`; tests lower it.
     index_gc_grace: std::time::Duration,
-    /// The maintenance lock's own key's mtime: "now" on the store's clock for
-    /// the ages this lock holder judges. `None` outside a lock, or when the
-    /// storage reports no mtime.
+    /// The held lock's key mtime (the maintenance lock, or a backup's commit
+    /// lock): "now" on the store's clock for the ages this lock holder
+    /// judges. `None` outside a lock, or when the storage reports no mtime.
     lock_store_time: Option<vykar_storage::StoreNow>,
     /// The sessions the maintenance lock found live, for compact's horizon;
     /// `None` outside `with_maintenance_lock`.
@@ -587,6 +587,13 @@ pub struct Repository {
     /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
     /// (zero turns the guard off, so a test double without mtimes deletes).
     pack_grace: std::time::Duration,
+    /// Backup segments younger than this keep their entries from a sweep and
+    /// stay out of a fold: `ages::T_PACK`; tests lower it (zero: every
+    /// segment is old, the write's own included).
+    segment_grace: std::time::Duration,
+    /// The ages of `index.d/` objects, listed at most once per lock hold;
+    /// cleared with the lock fence.
+    segment_ages: Option<ages::SegmentAges>,
     /// The latest index a relocation loaded, see [`relocate`].
     relocation: relocate::RelocationCache,
 }
@@ -745,6 +752,7 @@ impl Repository {
         self.lock_fence = None;
         self.lock_store_time = None;
         self.live_sessions = None;
+        self.segment_ages = None;
     }
 
     /// Record the sessions the maintenance lock found live.
@@ -793,6 +801,54 @@ impl Repository {
     /// The age below which orphan packs are kept.
     pub(crate) fn pack_grace(&self) -> std::time::Duration {
         self.pack_grace
+    }
+
+    /// Set the age below which backup segments are young (tests).
+    #[cfg(test)]
+    pub(crate) fn set_segment_grace(&mut self, grace: std::time::Duration) {
+        self.segment_grace = grace;
+    }
+
+    /// The age below which backup segments are young (04 step 7).
+    pub(crate) fn segment_grace(&self) -> std::time::Duration {
+        self.segment_grace
+    }
+
+    /// List the ages of `index.d/` objects unless this lock hold did
+    /// already; "now" is [`Self::lock_store_time`]. Without a "now" nothing
+    /// is listed (every backup segment is young then anyway).
+    ///
+    /// # Errors
+    ///
+    /// The listing failed; nothing is cached then.
+    pub(crate) fn load_segment_ages(&mut self) -> Result<()> {
+        if self.segment_ages.is_some() || self.lock_store_time.is_none() {
+            return Ok(());
+        }
+        let ages = ages::SegmentAges::list(self.storage.as_ref(), self.lock_store_time)?;
+        self.segment_ages = Some(ages);
+        Ok(())
+    }
+
+    /// The ages listed in this lock hold, if any.
+    pub(crate) fn segment_ages(&self) -> Option<&ages::SegmentAges> {
+        self.segment_ages.as_ref()
+    }
+
+    /// Whether judging `segments` needs a listing: a backup segment among
+    /// them, a non-zero grace, a "now", and no listing yet in this lock hold.
+    pub(crate) fn needs_segment_ages(&self, segments: &[crate::index::head::SegmentRef]) -> bool {
+        !self.segment_grace.is_zero()
+            && self.segment_ages.is_none()
+            && self.lock_store_time.is_some()
+            && segments
+                .iter()
+                .any(|s| s.kind == crate::index::head::SegmentKind::Backup)
+    }
+
+    /// [`ages::foldable_prefix`] with this handle's ages and grace.
+    pub(crate) fn foldable_prefix(&self, segments: &[crate::index::head::SegmentRef]) -> usize {
+        ages::foldable_prefix(segments, self.segment_ages.as_ref(), self.segment_grace)
     }
 
     /// Check the lock fence if one is installed. No-op if no fence is set.

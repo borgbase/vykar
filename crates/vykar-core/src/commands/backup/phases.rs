@@ -541,6 +541,9 @@ impl PendingCommit {
         let fence =
             lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
         repo.set_lock_fence(fence);
+        // "Now" for the backup fold's segment ages (04 step 7): the commit
+        // lock key's mtime; cleared with the fence at release.
+        repo.set_lock_store_time(guard.store_time());
         let machine = BackupCommit::new(&repo, snapshot_entry, snapshot_packed, session.marker());
         CommitInProgress {
             session,

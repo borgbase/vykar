@@ -1,9 +1,7 @@
 {
   "name": "aged-session-reaped-swept-packs",
-  "note": "AgedSessionReaped through swept packs (phase F part 7, from a 300 s make sim-campaign): a's fold publishes its head after a 3 h 1 min jump, then a 6 h 1 min jump ages its lock and marker; b's compact reaps both, sweeps a's entries (no snapshot names them yet) and deletes the packs its sweep left empty at once (04 step 5 guards only true orphans), and a's snapshot PUT then names chunks that are gone. Bounded by 04 step 7 (the marker horizon) and I8; fixed with 04 step 8.",
-  "expect": [
-    "AgedSessionReaped"
-  ],
+  "note": "AgedSessionReaped through swept packs (phase F part 7, from a 300 s make sim-campaign): a's fold publishes its head after a 3 h 1 min jump, then a 6 h 1 min jump ages its lock and marker; b's compact reaps both, sweeps a's entries (no snapshot names them yet) and deletes the packs its sweep left empty at once (04 step 5 guards only true orphans), and a's snapshot PUT then names chunks that are gone. Bounded by 04 step 7 (the marker horizon) and I8; fixed with 04 step 8. Re-derived for phase F part 8c (04 step 7, young segments): the fold now takes a fold-prefix step and writes a's own segment after the base (a's fold folds c0's old segment and keeps its own). Narrowed by 8c: at b's compact a's segment is about 6 h old, younger than T_pack, so the sweep leaves its additions, a's packs keep their entries (and are young anyway), and a's late snapshot PUT names chunks that exist: no signature. aged-session-reaped-swept-packs-old-segment shows the route with a's segment older than T_pack. Fixed by 04 step 8.",
+  "expect": [],
   "at": [
     [
       {
@@ -83,7 +81,16 @@
           "pick": 0
         }
       },
-      "verify-packs +local +local +local"
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
     ],
     [
       {
@@ -93,6 +100,15 @@
         }
       },
       "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
     ],
     [
       {
@@ -209,6 +225,8 @@
       0,
       0,
       5,
+      0,
+      0,
       0,
       0,
       0,

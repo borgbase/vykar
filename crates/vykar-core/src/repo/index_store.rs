@@ -466,7 +466,7 @@ pub(crate) fn decode_base_v2_to_temp(
 
 /// What [`fetch_all`] got.
 #[derive(Debug, PartialEq, Eq)]
-enum Fetched {
+pub(crate) enum Fetched {
     /// Every object, in key order.
     All(Vec<Vec<u8>>),
     /// The position in `keys` of the first absent object.
@@ -475,7 +475,11 @@ enum Fetched {
 
 /// GET `keys` with up to `width` requests in flight. Absence and errors
 /// are reported for the first failing key in key order.
-fn fetch_all(storage: &dyn StorageBackend, keys: &[String], width: usize) -> Result<Fetched> {
+pub(crate) fn fetch_all(
+    storage: &dyn StorageBackend,
+    keys: &[String],
+    width: usize,
+) -> Result<Fetched> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -831,6 +835,19 @@ fn object_name_of_key(key: &str) -> Option<ObjectName> {
     let hex = key.strip_prefix(INDEX_OBJECT_DIR)?;
     let bytes: [u8; 32] = hex::decode(hex).ok()?.try_into().ok()?;
     Some(ObjectName(bytes))
+}
+
+/// The mtime of every `index.d/` object one LIST_META returns, by name
+/// (keys that are not object names are skipped). `None` = listed without
+/// one.
+pub(crate) fn list_index_object_mtimes(
+    storage: &dyn StorageBackend,
+) -> Result<std::collections::HashMap<ObjectName, Option<std::time::SystemTime>>> {
+    Ok(storage
+        .list_meta(INDEX_OBJECT_DIR)?
+        .into_iter()
+        .filter_map(|o| Some((object_name_of_key(&o.key)?, o.mtime)))
+        .collect())
 }
 
 /// What [`collect_index_garbage`] did.

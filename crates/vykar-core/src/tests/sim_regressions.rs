@@ -53,10 +53,14 @@ fn fixed_by(s: Signature) -> &'static str {
     match s {
         Signature::TwoLockHolders | Signature::SessionReaped => "04 step 1",
         Signature::AgedLockReaped => "04 steps 8 and 9 (the lock leaves the commit path)",
-        Signature::AgedSessionReaped => "04 step 7 (marker horizon) and I8",
+        Signature::AgedSessionReaped => {
+            "04 step 8 (narrowed by step 7: horizon, I8, young segments)"
+        }
+        Signature::LateSnapshotWrite => {
+            "04 step 8 (narrowed by step 7: needs a segment older than T_pack)"
+        }
         Signature::OrphanLockKey
         | Signature::LateHeadWrite
-        | Signature::LateSnapshotWrite
         | Signature::LateIndexWrite
         | Signature::LateHeadSegmentCollected
         | Signature::AgedLockSegmentCollected => "04 step 8",

@@ -1,0 +1,261 @@
+{
+  "name": "aged-session-reaped-swept-packs-old-segment",
+  "note": "AgedSessionReaped through the swept-packs route with the victim's segment older than T_pack (phase F part 8c, built from aged-session-reaped-swept-packs for 04 step 7): one more 6 h 1 min jump between a's head PUT and b's compact (jumps of 3 h 1 min, 6 h 1 min and 6 h 1 min), so at the compact a's own backup segment is about 12 h 2 min old: b reaps a's stale marker, sweeps a's entries (its snapshot is not visible yet) and deletes the packs that sweep emptied (old too); a's snapshot PUT, whose last fence ran before the jumps, then lands and names absent chunks. Since 04 step 7's young segments this needs a stall of T_pack in all between the victim's head PUT and the compact. Fixed by 04 step 8 (the head as commit point).",
+  "expect": [
+    "AgedSessionReaped"
+  ],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 10860
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "collect-garbage +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-snapshot"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "finish"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "whole delete"
+    ],
+    [
+      "Stop",
+      "stop"
+    ]
+  ],
+  "case": {
+    "hosts": "SameHostname",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": true
+          }
+        },
+        "DeleteControl"
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [
+      {
+        "client": 1,
+        "class": "IndexObject",
+        "nth": 1,
+        "kind": "Duplicate"
+      }
+    ],
+    "crash": true,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      5,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      6,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    "policy": "First"
+  }
+}

@@ -109,9 +109,11 @@ pub const LATE_BOOT_SECS: i64 = 30;
 pub enum Command {
     /// One small tree: one file of 8 KiB seeded by the snapshot name, and
     /// with `shared` the file every shared tree (and the control snapshot
-    /// `c0`) has. `fold`: request a fold before the commit, so the commit
-    /// takes the fold path (it stands in for the hard limit, which takes the
-    /// same code path).
+    /// `c0`) has. `fold`: request a fold before the commit (the hard
+    /// limit's stand-in, which takes the same code path): the commit folds
+    /// the foldable prefix (c0's segment, maintenance segments, case
+    /// segments older than T_pack) and keeps its own segment and every
+    /// younger one.
     Backup {
         shared: bool,
         fold: bool,
@@ -349,9 +351,28 @@ impl Default for Template {
 
 impl Template {
     pub fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// The template without the jump after c0's backup: c0's segment is
+    /// young in every case, so a sweep keeps its entries and a commit's fold
+    /// keeps it as a segment (the young-entries rule of 04 step 7 under
+    /// search, `tests::sim_exhaustive`).
+    pub fn young() -> Self {
+        Self::build(false)
+    }
+
+    fn build(aged: bool) -> Self {
         let mut sim = Sim::new();
         let ctl = sim.client("ctl");
         sim.backup(ctl, "c0", &backup_tree("c0", true)).expect_ok();
+        if aged {
+            // c0 predates every case by more than T_pack, as a real
+            // repository's older snapshots do: its segment is foldable and
+            // its entries sweepable (04 step 7), so the fold path and the
+            // reuse of a swept chunk stay reachable without jumps.
+            sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
+        }
         Self { sim }
     }
 
@@ -414,7 +435,11 @@ pub enum Action {
 /// clean-design phase F (04 step 1) removed `TwoLockHolders`' source;
 /// part 7 (04 step 5: ages on the store's clock, young orphan packs kept)
 /// narrowed `AgedSessionReaped`, `AgedLockPacksCollected` and
-/// `LateHeadThenCompact`; part 9 (04 step 8) removes the late head writes.
+/// `LateHeadThenCompact`; part 8c (04 step 7: young backup segments keep
+/// their entries from a sweep and stay out of folds; packs a sweep empties
+/// are kept while young) narrowed `AgedSessionReaped` and
+/// `LateSnapshotWrite` and put `AgedLockPacksCollected` out of the
+/// driver's reach; part 9 (04 step 8) removes the late head writes.
 ///
 /// The driver's time jumps move the store and every client clock together,
 /// so a jump is a genuine stall of every client, and ages on the store's
@@ -460,8 +485,9 @@ pub enum Signature {
     /// and keeps their orphan uploads inside their marker's horizon as well
     /// as by age; a reaped marker leaves only the age guard, and a victim
     /// whose marker record is broken commits only while its packs are
-    /// younger than T_pack − M − 30 min (I8). Packs the compact's own sweep
-    /// emptied still go at once (until young index segments).
+    /// younger than T_pack − M − 30 min (I8). Since phase F part 8c packs
+    /// the compact's own sweep empties obey the age guard too, and the
+    /// sweep leaves the additions of backup segments younger than T_pack.
     SessionReaped,
     /// A live backup's session marker deleted as stale by another client
     /// after a jump of virtual time past the session staleness (a suspended
@@ -481,8 +507,12 @@ pub enum Signature {
     /// uploads inside their marker's horizon as well as by age; a reaped
     /// marker leaves only the age guard, and a victim whose marker record
     /// is broken commits only while its packs are younger than T_pack − M
-    /// − 30 min (I8). Packs the compact's own sweep emptied still go at
-    /// once (young index segments narrow that).
+    /// − 30 min (I8). Since 04 step 7's young segments (phase F part 8c) a
+    /// victim's own segment stays a segment until T_pack old and the sweep
+    /// leaves its additions, and packs a sweep empties are kept while
+    /// young: the swept-packs route needs a stall of T_pack in all between
+    /// the victim's head PUT and the compact (seed
+    /// `aged-session-reaped-swept-packs-old-segment`). Fixed by 04 step 8.
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
     /// age (not written for more than the 6 h stale age: the driver's time
@@ -573,7 +603,23 @@ pub enum Signature {
     /// part 8b) I8 narrows it: V's head must pass its fence before its
     /// packs are T_pack − M − 30 min old (11 h 20 min), so the last jump
     /// must come after the fence (a stall after it, the lost-lock hazard).
-    /// Fixed by 04 step 8.
+    /// Since phase F part 8c no driver case reaches it: V writes every
+    /// index object before its fence, so the jump that ages its lock ages
+    /// them past T_idx too, and the compact's index GC collects them (no
+    /// head names them yet). V's head then names an absent segment, and a
+    /// later eligible fold of V's keeps that segment named (a segment its listing
+    /// lacks reads young; before 8c the fold carried its entries into a
+    /// base from V's cache and hid the loss): `AgedLockSegmentCollected`
+    /// (seeds `aged-lock-packs-collected{,-old-packs}`). More jumps would
+    /// not change that, so it is not `MAX_ADVANCES` (3) that keeps it out
+    /// of reach. The scripted test
+    /// `an_aged_lock_head_names_packs_compact_deleted` (tests/sim.rs)
+    /// shows it with the compact's `index.d/` deletes failing. In production
+    /// it is reached whenever the compact's index GC does not take V's
+    /// segment after its packs went: a failed best-effort delete, a GC
+    /// stopped by an unreadable retained head, a compact that ends between
+    /// its pack deletes and its index maintenance, or a later full fold of
+    /// V's from its warm index. Fixed by 04 step 8.
     AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
     /// chunks: invariant 1 fails with no lock violation other than late
@@ -584,8 +630,14 @@ pub enum Signature {
     /// segment no head names leaves the late snapshot's index coverage
     /// alone, while the reaped run's `index.h/` or `snapshots/` writes, or a
     /// reap of the late snapshot's own run, do not qualify. Claims the
-    /// violations of the snapshot whose PUT was the released write. Fixed
-    /// by 04 step 8 (the commit point is the head).
+    /// violations of the snapshot whose PUT was the released write.
+    /// Narrowed by 04 step 7 (phase F part 8c): the late snapshot's own new
+    /// chunks survive while its backup segment is younger than T_pack;
+    /// what remains needs a stall of T_pack between its head and the
+    /// compact (seed `late-snapshot-write-old-segment`), or a chunk it
+    /// reused from a snapshot whose segment is old and that nothing else
+    /// visible references. Fixed by 04 step 8 (the commit point is the
+    /// head).
     LateSnapshotWrite,
     /// A released write of `index.h/` or `index.d/` that landed outside
     /// the lock and damaged nothing else (invariant 7 only): the late-write

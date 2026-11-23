@@ -30,7 +30,9 @@ use crate::repo::{OpenOptions, Repository, TreeChunkSource, WriteSessionOptions}
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{Item, ItemType};
 
-use super::helpers::{backup_single_source_with, make_test_config, source_entry};
+use super::helpers::{
+    PAST_T_PACK, age_repo_objects, backup_single_source_with, make_test_config, source_entry,
+};
 
 const PASS: &str = "mark-pass";
 
@@ -502,6 +504,9 @@ fn report_on_a_healthy_repository_is_clean() {
         )
         .unwrap();
         assert_eq!(stats.pruned, 2);
+        // Their backup segments are old, so the sweep takes their entries
+        // (04 step 7 keeps those of segments younger than T_pack).
+        age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
 
         // Prune leaves the pruned snapshots' entries for compact to sweep.
         let report = fx.report().unwrap();
@@ -1528,6 +1533,7 @@ fn compact_after_a_delete_sweeps_what_the_report_names() {
     for encrypted in [false, true] {
         let fx = two_disjoint_snapshots(encrypted);
         commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+        age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let report = fx.report().unwrap();
         assert!(!report.unreferenced.is_empty());
 
@@ -1859,6 +1865,7 @@ fn compact_refuses_a_newer_sweep_record() {
 fn compact_dry_run_reports_the_sweep_and_writes_nothing() {
     let fx = two_disjoint_snapshots(false);
     commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+    age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let before = repo_files(&fx);
     let cached = fx.cached();
     let dry = compact(&fx, true).unwrap();
@@ -1899,6 +1906,7 @@ fn compact_deletes_the_maps_of_deleted_packs() {
     std::fs::write(fx.repo_dir.join("packmaps").join(&damaged), b"not this").unwrap();
 
     commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+    age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let stats = compact(&fx, false).unwrap();
     assert!(stats.packs_deleted_empty > 0, "{stats:?}");
 
@@ -1953,9 +1961,9 @@ fn compact_collects_old_heads_and_unnamed_objects() {
     for _ in 0..20u32 {
         commands::util::with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
-            // No edit: a requested fold makes each round a head.
+            // No edit: a requested (full) fold makes each round a head.
             repo.mark_index_dirty();
-            repo.request_index_fold();
+            repo.request_full_index_fold();
             repo.save_state()
         })
         .unwrap();

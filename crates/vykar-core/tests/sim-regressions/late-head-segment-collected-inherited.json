@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-inherited",
-  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads).",
+  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's old segment). Unchanged signatures.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -100,7 +100,16 @@
           "pick": 0
         }
       },
-      "verify-packs +local +local +local"
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
     ],
     [
       {
@@ -110,6 +119,15 @@
         }
       },
       "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
     ],
     [
       {
@@ -194,6 +212,8 @@
       0,
       0,
       3,
+      0,
+      0,
       0,
       0,
       0,

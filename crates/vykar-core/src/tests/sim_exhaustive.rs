@@ -274,6 +274,56 @@ fn backup_against_compact_is_clean() {
     );
 }
 
+/// The same pair over the young template (c0's segment younger than
+/// T_pack, 04 step 7), whole and stepped: compact's sweep keeps c0's
+/// entries, so the backup's reuse of the shared file holds and it never
+/// ends `StaleChunksDuringCommit`; every schedule is clean and the search
+/// completes.
+#[test]
+fn backup_against_compact_over_a_young_control_never_goes_stale() {
+    let t = Template::young();
+    for (name, c) in [
+        (
+            "compact-young-distinct",
+            commit_vs_compact(HostPlan::Distinct),
+        ),
+        (
+            "compact-young-distinct-stepped",
+            stepped(commit_vs_compact(HostPlan::Distinct)),
+        ),
+    ] {
+        let mut stale = 0usize;
+        let e = explore(
+            &t,
+            &c,
+            Bound {
+                preemptions: PRECOMMIT_K,
+                max_runs: PRECOMMIT_MAX_RUNS,
+            },
+            |o| {
+                let went_stale = o.sim.history().runs.iter().any(|r| {
+                    r.error_class()
+                        == Some(&ErrorClass::Allowed(AllowedError::StaleChunksDuringCommit))
+                });
+                if went_stale {
+                    stale += 1;
+                }
+                Control::Continue
+            },
+        );
+        print_search(name, &e);
+        if let Some((sig, (_, case))) = e.signatures.iter().next() {
+            panic!(
+                "{name}: a schedule shows {sig:?}:\n{}",
+                kept_trace(&t, name, case)
+            );
+        }
+        assert!(e.search.complete, "{name}: the search did not complete");
+        assert_eq!(e.clean, e.search.runs, "{name}");
+        assert_eq!(stale, 0, "{name}: a backup went stale over a young c0");
+    }
+}
+
 /// Most `locks/` ops one client makes in one raw acquisition, release
 /// included (about five are expected); one more is a harness bug.
 const MAX_LOCK_OPS: usize = 12;

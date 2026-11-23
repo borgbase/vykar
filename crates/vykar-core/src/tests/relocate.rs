@@ -162,8 +162,15 @@ fn located(repo: &Repository, ids: &[ChunkId]) -> Vec<(ChunkId, PackId, u64, u32
         .collect()
 }
 
+/// Delete `name` and compact, the repository's objects aged past T_pack
+/// first so the sweep takes the deleted snapshot's entries (04 step 7).
 fn delete_and_compact(config: &crate::config::VykarConfig, pass: Option<&str>, name: &str) {
     commands::delete::run(config, pass, &[name], false, &CancelToken::new()).unwrap();
+    super::helpers::age_repo_objects(
+        Path::new(&config.repository.url),
+        &["index.d", "packs"],
+        super::helpers::PAST_T_PACK,
+    );
     commands::compact::run(config, pass, 0.0, None, false, &CancelToken::new()).unwrap();
 }
 
@@ -370,7 +377,7 @@ fn move_head(config: &crate::config::VykarConfig, pass: Option<&str>) {
     let before = repo.index_generation();
     commands::util::with_maintenance_lock(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
-        repo.request_index_fold();
+        repo.request_full_index_fold();
         repo.mark_index_dirty();
         repo.save_state()
     })

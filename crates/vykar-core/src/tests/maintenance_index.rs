@@ -23,7 +23,9 @@ use crate::repo::control::CancelToken;
 use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, RepoFormat, Repository};
 
-use super::helpers::{backup_single_source, make_test_config, source_entry};
+use super::helpers::{
+    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, source_entry,
+};
 
 /// GETs of heads (`index.h/`) and of `index.d/` objects.
 #[derive(Default)]
@@ -398,6 +400,8 @@ fn compact_leaves_the_table_at_the_new_state() {
         env.backup(&src, "a", "s2");
         // s1's data pack now holds a live chunk (one.bin) and a dead one.
         commands::delete::run(&env.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+        // s1's segment is old, so its entries are swept (04 step 7).
+        age_repo_objects(&env.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let before = env.open_fresh().index_generation();
 
         let stats =
@@ -440,6 +444,8 @@ fn maintenance_on_a_host_without_caches_segmented() {
     )
     .unwrap();
     assert_eq!(stats.pruned, 1);
+    // The pruned snapshot's segment is old, so its entries are swept.
+    age_repo_objects(&env.repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let head_before = env.open_fresh().index_head().unwrap().clone();
 
     let other_cache = env.dir.path().join("maintenance-only");
@@ -481,6 +487,8 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
+        // The pruned snapshot's segment is old, so its entries are swept.
+        age_repo_objects(&env.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let remote = env.open_fresh();
         let (id, generation) = (remote.config.id.clone(), remote.index_generation());
         let head = remote.index_head().unwrap().clone();
@@ -555,7 +563,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         let result = with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
             repo.mark_index_dirty();
-            repo.request_index_fold();
+            repo.request_full_index_fold();
             for key in repo.storage.list("locks/").unwrap() {
                 if key.ends_with(".json") {
                     repo.storage.delete(&key).unwrap();
@@ -578,12 +586,12 @@ fn lock_lost_before_save_leaves_caches_untouched() {
     }
 }
 
-/// Persists the index as a fold (a new base and head); call under the
+/// Persists the index as a full fold (a new base and head); call under the
 /// maintenance lock.
 fn fold_and_save(repo: &mut Repository) -> Result<()> {
     repo.load_chunk_index_under_lock()?;
     repo.mark_index_dirty();
-    repo.request_index_fold();
+    repo.request_full_index_fold();
     repo.save_state()
 }
 

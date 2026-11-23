@@ -3,8 +3,8 @@ use crate::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
-    backup_single_source, clear_tree_cache, init_repo, load_snapshot_cache_from_disk,
-    open_local_repo,
+    PAST_T_PACK, age_repo_objects, backup_single_source, clear_tree_cache, init_repo,
+    load_snapshot_cache_from_disk, open_local_repo,
 };
 
 fn compact(config: &crate::config::VykarConfig) -> commands::compact::CompactStats {
@@ -110,6 +110,9 @@ fn delete_removes_the_snapshot_and_compact_its_chunks() {
     assert!(after.manifest().find_snapshot("snap-delete-live").is_none());
     assert_eq!(after.chunk_index().len(), chunks_before);
     drop(after);
+    // The deleted snapshot's backup segment is old: its entries go (04
+    // step 7 keeps those of segments younger than T_pack).
+    age_repo_objects(&repo_dir, &["index.d", "packs"], PAST_T_PACK);
     let swept = compact(&config);
     assert_eq!(
         swept.chunks_unreferenced,

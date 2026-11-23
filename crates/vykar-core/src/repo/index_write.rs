@@ -13,8 +13,16 @@
 //! a *fold*, which also becomes the repository's local table file.
 //!
 //! Fold: PUT the new state as a base (none for the empty index), then the
-//! head with no segments and the previous live set as `retired`. Nothing is
-//! deleted before the head PUT. After it, old heads and unreferenced
+//! head naming it and the previous objects it folded as `retired`. A fold
+//! writes into the base only the longest prefix of the chain that is
+//! *foldable* (04 step 7): maintenance segments, and backup segments at
+//! least T_pack old on the store's clock ([`super::ages::foldable`]). The
+//! segments after that prefix stay listed after the new base, followed by
+//! the write's own segment when it is not foldable (a backup's own segment
+//! never is at the production grace); the fold limits count only the
+//! prefix, and a fold with nothing to fold writes a plain segment. A write
+//! without a head, `check --repair`'s fold and a plaintext repeat fold
+//! every segment (a *full* fold). Nothing is deleted before the head PUT. After it, old heads and unreferenced
 //! `index.d/` objects are deleted by age
 //! ([`index_store::collect_index_garbage`]), so a reader still on a recent
 //! head can finish and a concurrent writer's fresh object survives.
@@ -31,7 +39,7 @@ use super::index_store::{self, PackedObject, StoredHead};
 use super::machine::{StepCx, drive_blocking};
 use super::publish_machine::PublishMachine;
 use crate::index::LiveIndex;
-use crate::index::head::{HEAD_LAYOUT_VERSION, IndexHead};
+use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
 use crate::index::head::{SegmentKind, SweepState};
 use crate::index::segment_v2::SegmentBody;
 use crate::index::sweep_record::SweepRecord;
@@ -86,6 +94,21 @@ impl RepairIndexLoad {
     }
 }
 
+/// What fold the next index write was asked for (ordered: the stronger of
+/// two requests wins).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FoldRequest {
+    #[default]
+    None,
+    /// Fold the foldable prefix (04 step 7): compact's soft-limit fold, and
+    /// the hard limit's stand-in in the simulator and tests.
+    Eligible,
+    /// Fold every segment, young ones too: `check --repair`, which runs only
+    /// without live sessions and must name only objects it uploads, and the
+    /// upgrade (no previous head).
+    Full,
+}
+
 /// When a chain is folded into a new base: at `segments` segments, or when
 /// the segments add up to `percent` of the base's bytes and at least
 /// `min_bytes` (below that a small index would fold on every write).
@@ -97,15 +120,22 @@ pub(crate) struct FoldLimits {
 }
 
 impl FoldLimits {
-    /// Whether `head`'s chain plus `extra` more segments of `extra_bytes`
-    /// reaches these limits. An empty chain never does.
-    pub(crate) fn reached(&self, head: &IndexHead, extra: usize, extra_bytes: u64) -> bool {
-        let count = head.segments.len() + extra;
+    /// Whether a chain of `segments` over `base`, plus one more segment of
+    /// `extra` bytes when given, reaches these limits. An empty chain never
+    /// does. Callers pass the foldable prefix (04 step 7): young backup
+    /// segments do not count.
+    pub(crate) fn reached(
+        &self,
+        base: Option<&BaseRef>,
+        segments: &[SegmentRef],
+        extra: Option<u64>,
+    ) -> bool {
+        let count = segments.len() + usize::from(extra.is_some());
         if count == 0 {
             return false;
         }
-        let bytes = head.segments.iter().map(|s| s.size).sum::<u64>() + extra_bytes;
-        let base = head.base.as_ref().map_or(0, |b| b.size);
+        let bytes = segments.iter().map(|s| s.size).sum::<u64>() + extra.unwrap_or(0);
+        let base = base.map_or(0, |b| b.size);
         count >= self.segments
             || (bytes >= self.min_bytes
                 && bytes.saturating_mul(100) >= base.saturating_mul(self.percent))
@@ -245,13 +275,22 @@ impl Repository {
         self.index_head.as_ref()
     }
 
-    /// Make the next index write a fold (a new base, garbage collected).
+    /// Make the next index write fold the foldable prefix of the chain (a
+    /// new base, garbage collected; young backup segments stay segments).
+    /// With nothing foldable the write is a plain segment.
+    #[cfg(any(test, feature = "sim"))]
     pub(crate) fn request_index_fold(&mut self) {
-        self.fold_requested = true;
+        self.fold_requested = self.fold_requested.max(FoldRequest::Eligible);
+    }
+
+    /// Make the next index write a full fold: every segment, young backup
+    /// segments too, goes into the new base (`check --repair`).
+    pub(crate) fn request_full_index_fold(&mut self) {
+        self.fold_requested = FoldRequest::Full;
     }
 
     /// The per-repo cache dir the chunk tables live in, if there is one.
-    pub(super) fn cache_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn cache_dir(&self) -> Option<PathBuf> {
         crate::cache_paths::repo_cache_dir(&self.config.id, self.cache_dir_override.as_deref())
     }
 
@@ -324,10 +363,15 @@ impl Repository {
         self.publish_index_state(Some(head), Some(seg), false)
     }
 
-    /// Publish `seg` as the successor of `prev`: as a segment, or as a base
-    /// (a fold) when there is no `prev`, the hard limit is reached, a fold
-    /// was requested or the packed segment's name is already named by
-    /// `prev` (plaintext repeat).
+    /// Publish `seg` as the successor of `prev`: as a segment, or with a
+    /// fold. A full fold (every segment into the base) when there is no
+    /// `prev`, a full fold was requested (`check --repair`) or the packed
+    /// segment's name is already named by `prev` (plaintext repeat); a fold
+    /// of the foldable prefix (04 step 7) when a fold was requested or the
+    /// prefix reaches the hard limit and something is foldable, keeping the
+    /// young backup segments after the new base and `seg` after them when it
+    /// is not foldable (a backup's own segment never is at the production
+    /// grace).
     ///
     /// `backup`: `seg` is a backup commit's additions over an unedited
     /// index at `prev`; after the head PUT it is applied to the index (a
@@ -359,18 +403,23 @@ impl Repository {
     }
 
     /// Fold: write the index's current state as a base (no object for the
-    /// empty index) and the head naming it alone, with `prev`'s live objects
-    /// as retired. Nothing is deleted before the head PUT; after it, the
-    /// age-gated garbage collection runs, best-effort. The base's body
-    /// becomes the repository's table (`index_base.<name>`), with no
-    /// segments and no edits. `removes`: the new state lacks entries
-    /// `prev`'s has (for the sweep bookkeeping).
+    /// empty index) and the head naming it, with `prev`'s folded objects as
+    /// retired. `request` `Full` folds every segment; `Eligible` only the
+    /// foldable prefix of `prev`'s chain (04 step 7), keeping the young
+    /// backup segments after the new base, and writes nothing when no
+    /// segment is foldable (the output is then `prev`). Nothing is deleted
+    /// before the head PUT; after it, the age-gated garbage collection runs,
+    /// best-effort. The base's body becomes the repository's table
+    /// (`index_base.<name>`), with the kept segments applied over it and no
+    /// edits. `removes`: the new state lacks entries `prev`'s has (for the
+    /// sweep bookkeeping).
     pub(super) fn put_base(
         &mut self,
         prev: Option<&IndexHead>,
         removes: bool,
+        request: FoldRequest,
     ) -> Result<IndexHead> {
-        let mut m = PublishMachine::base(prev.cloned(), removes);
+        let mut m = PublishMachine::base(prev.cloned(), removes, request);
         let events = |_: CommitEvent| {};
         drive_blocking(
             &mut m,
@@ -384,7 +433,9 @@ impl Repository {
     /// Index upkeep at the end of `compact`, under the lock: fold when the
     /// chain reached the soft limit, then delete old heads and unreferenced
     /// `index.d/` objects. The deletion is age-gated, so it never deletes a
-    /// concurrent writer's fresh segment (H4-segment).
+    /// concurrent writer's fresh segment (H4-segment). The soft limit counts
+    /// only the foldable prefix; young backup segments stay in the head
+    /// (04 step 7).
     pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
         if self.index_dirty {
             self.save_state()?;
@@ -392,13 +443,18 @@ impl Repository {
         let Some(head) = self.current_head_for_write()? else {
             return Ok(());
         };
-        let latest = if self.fold_policy.soft.reached(&head, 0, 0) {
+        let k = self.foldable_prefix(&head.segments);
+        let latest = if self.fold_policy.soft.reached(
+            head.base.as_ref(),
+            head.segments.get(..k).unwrap_or_default(),
+            None,
+        ) {
             if !self.index_at(&head) || self.chunk_index.is_modified() {
                 let synced = self.sync_index(Some(head.clone()), true)?;
                 self.install_synced_index(synced);
             }
-            // A fold writes the same state as a base.
-            let new_head = self.put_base(Some(&head), false)?;
+            // A fold writes the same state as a base and the kept segments.
+            let new_head = self.put_base(Some(&head), false, FoldRequest::Eligible)?;
             self.index_generation = new_head.generation;
             self.index_head = Some(new_head.clone());
             new_head
@@ -481,7 +537,7 @@ impl Repository {
                             // and a head that name only objects it uploads.
                             self.install_synced_index(synced);
                             self.index_dirty = true;
-                            self.request_index_fold();
+                            self.request_full_index_fold();
                             return Ok(RepairIndexLoad::read(IndexRecovery::Complete));
                         } else if damaged {
                             warn!(
@@ -627,5 +683,52 @@ fn rebuild_refusal(e: VykarError) -> VykarError {
         e => VykarError::Other(format!(
             "rebuilding the index from the packs: {e}. Nothing was changed"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::head::{ObjectName, SegmentKind};
+
+    fn seg(byte: u8, size: u64) -> SegmentRef {
+        SegmentRef {
+            name: ObjectName([byte; 32]),
+            size,
+            kind: SegmentKind::Backup,
+            entries: 1,
+        }
+    }
+
+    #[test]
+    fn fold_limits_count_only_the_given_segments() {
+        let limits = FoldLimits {
+            segments: 3,
+            percent: 20,
+            min_bytes: 100,
+        };
+        let base = BaseRef {
+            name: ObjectName([9; 32]),
+            size: 1000,
+            entries: 10,
+        };
+        let chain = [seg(1, 10), seg(2, 10), seg(3, 10)];
+        assert!(!limits.reached(Some(&base), &[], None), "an empty chain");
+        assert!(limits.reached(Some(&base), &chain, None), "by count");
+        // A prefix of two does not reach the count; the extra segment does.
+        assert!(!limits.reached(Some(&base), &chain[..2], None));
+        assert!(limits.reached(Some(&base), &chain[..2], Some(10)));
+        assert!(!limits.reached(None, &[], Some(10)), "one small segment");
+        // By bytes: 20 % of the base and at least min_bytes.
+        let big = [seg(4, 150), seg(5, 60)];
+        assert!(
+            limits.reached(Some(&base), &big, None),
+            "210 >= 200 and 100"
+        );
+        assert!(!limits.reached(Some(&base), &big[..1], None), "150 < 200");
+        assert!(limits.reached(Some(&base), &big[..1], Some(50)));
+        // No base: min_bytes alone.
+        assert!(limits.reached(None, &big[..1], None));
+        assert!(!limits.reached(None, &[seg(6, 99)], None));
     }
 }

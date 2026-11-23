@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use super::mark;
 use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
 use crate::config::VykarConfig;
+use crate::index::head::{SegmentKind, SegmentRef};
 use crate::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use crate::repo::OpenOptions;
 use crate::repo::control::CancelToken;
@@ -41,8 +42,11 @@ pub struct CompactStats {
     pub blobs_live: u64,
     pub space_freed: u64,
     pub packs_corrupt: u64,
+    /// Packs no index entry names: never committed, or emptied by this
+    /// run's sweep.
     pub packs_orphan: u64,
-    /// Orphan packs kept because they are younger than
+    /// Orphan packs (no index entry: never committed, or emptied by this
+    /// run's sweep) kept because they are younger than
     /// [`ORPHAN_PACK_GRACE`] on the store's clock (counted in
     /// `packs_orphan` too).
     pub packs_orphan_young: u64,
@@ -64,6 +68,11 @@ pub struct CompactStats {
     /// (dry run: that would be removed), and their stored bytes.
     pub chunks_unreferenced: u64,
     pub bytes_unreferenced: u64,
+    /// Unmarked index entries the sweep kept because a backup segment
+    /// younger than T_pack added them (04 step 7), and their stored bytes;
+    /// a compact once those segments are T_pack old removes them.
+    pub chunks_unreferenced_young: u64,
+    pub bytes_unreferenced_young: u64,
 }
 
 /// Prefix of the error a compact returns when the mark fails; matched by
@@ -166,7 +175,9 @@ pub struct UnreferencedReport {
     pub references: u64,
     pub entries: usize,
     pub referenced: usize,
-    /// Index entries no live snapshot references, sorted by chunk ID.
+    /// Index entries no live snapshot references, sorted by chunk ID. The
+    /// next compact keeps those a backup segment younger than T_pack added
+    /// (04 step 7).
     pub unreferenced: Vec<ChunkId>,
     pub unreferenced_bytes: u64,
     /// Packs holding at least one unreferenced entry / only unreferenced ones.
@@ -339,11 +350,12 @@ pub fn compact_repo(
         dry_run,
         concurrency,
         shutdown,
-        &swept.packs,
     )?;
     stats.snapshots_marked = swept.snapshots;
     stats.chunks_unreferenced = swept.entries_removed;
     stats.bytes_unreferenced = swept.bytes_removed;
+    stats.chunks_unreferenced_young = swept.kept_young;
+    stats.bytes_unreferenced_young = swept.kept_young_bytes;
     Ok(stats)
 }
 
@@ -366,12 +378,10 @@ pub(crate) fn compact_repo_without_mark(
         dry_run,
         concurrency,
         shutdown,
-        &HashSet::new(),
     )
 }
 
 /// Everything [`compact_repo`] does after the mark-and-sweep.
-/// `swept_packs` are the packs whose entries the sweep removed.
 fn compact_after_mark(
     repo: &mut Repository,
     threshold: f64,
@@ -379,7 +389,6 @@ fn compact_after_mark(
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
-    swept_packs: &HashSet<PackId>,
 ) -> Result<CompactStats> {
     let run = compact_packs(
         repo,
@@ -388,7 +397,6 @@ fn compact_after_mark(
         dry_run,
         concurrency,
         shutdown,
-        swept_packs,
     );
     if dry_run {
         repo.discard_index_edits();
@@ -427,6 +435,10 @@ struct SweepPlan {
     bytes_live: u64,
     references: u64,
     referenced_bytes: u64,
+    /// Unmarked entries left in the index because a young backup segment
+    /// added them (04 step 7), and their stored bytes.
+    kept_young: u64,
+    kept_young_bytes: u64,
 }
 
 impl SweepPlan {
@@ -440,9 +452,8 @@ struct Swept {
     snapshots: u64,
     entries_removed: u64,
     bytes_removed: u64,
-    /// The packs of the removed entries: committed once, so a pack the
-    /// sweep left without entries goes at once, whatever its age.
-    packs: HashSet<PackId>,
+    kept_young: u64,
+    kept_young_bytes: u64,
 }
 
 /// Strict listing, the guards on it, the tree-chunk set, then `mark_live`
@@ -500,6 +511,8 @@ fn plan_sweep_inner(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPl
         bytes_live: 0,
         references: found.references,
         referenced_bytes: 0,
+        kept_young: 0,
+        kept_young_bytes: 0,
     };
     positions.for_each_live(|p, id, e| {
         if found.is_marked(p) {
@@ -515,9 +528,77 @@ fn plan_sweep_inner(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPl
     plan.tree_set = tree_set;
     plan.unreferenced
         .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    // 04 "Compact" 6: an entry a backup segment younger than the segment
+    // grace added stays, marked or not: its snapshot may not be visible yet,
+    // or a running backup may have reused it.
+    let (kept, kept_bytes) = keep_young_additions(repo, &mut plan.unreferenced)?;
+    plan.kept_young = kept;
+    plan.kept_young_bytes = kept_bytes;
     plan.snapshots
         .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     Ok(plan)
+}
+
+/// Drop from `unreferenced` (sorted by chunk ID) every chunk a young backup
+/// segment of the loaded head adds (04 step 7: a backup segment not yet
+/// [`ages::foldable`]); returns the count and stored bytes dropped. A
+/// segment is read from the local cache, else GET; one decoded segment is
+/// held at a time; its additions and `unreferenced` are both sorted, so
+/// each is one merge pass. Nothing is read when `unreferenced` is empty.
+///
+/// [`ages::foldable`]: crate::repo::ages::foldable
+fn keep_young_additions(
+    repo: &Repository,
+    unreferenced: &mut Vec<(ChunkId, u32)>,
+) -> Result<(u64, u64)> {
+    let Some(head) = repo.index_head() else {
+        return Ok((0, 0));
+    };
+    let young: Vec<&SegmentRef> = head
+        .segments
+        .iter()
+        .filter(|s| {
+            s.kind == SegmentKind::Backup
+                && !crate::repo::ages::foldable(s, repo.segment_ages(), repo.segment_grace())
+        })
+        .collect();
+    let (mut kept, mut kept_bytes) = (0u64, 0u64);
+    let dir = repo.cache_dir();
+    for r in young {
+        if unreferenced.is_empty() {
+            break;
+        }
+        let bytes = match dir
+            .as_deref()
+            .and_then(|d| crate::index::table::read_cached_segment(d, r))
+        {
+            Some(b) => b,
+            None => {
+                let key = index_store::object_key(&r.name);
+                repo.storage
+                    .get(&key)?
+                    .ok_or(VykarError::IndexObjectMissing {
+                        kind: "segment",
+                        key,
+                    })?
+            }
+        };
+        let body = index_store::decode_segment_v2(r, &bytes, repo.crypto.as_ref())?;
+        drop(bytes);
+        // Both sorted by chunk ID: one merge pass.
+        let mut adds = body.additions.iter().map(|(id, _)| id).peekable();
+        unreferenced.retain(|(id, size)| {
+            while adds.next_if(|a| a.as_bytes() < id.as_bytes()).is_some() {}
+            if adds.peek().is_some_and(|a| *a == id) {
+                kept += 1;
+                kept_bytes += u64::from(*size);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    Ok((kept, kept_bytes))
 }
 
 /// Refuse when a snapshot the previous sweep marked is missing from the
@@ -607,22 +688,26 @@ fn apply_sweep(repo: &mut Repository, plan: &SweepPlan) -> Result<()> {
 /// so that the analysis after it shows what a real run would free; the
 /// caller discards those edits.
 fn mark_and_sweep(repo: &mut Repository, dry_run: bool, shutdown: &CancelToken) -> Result<Swept> {
+    // The ages of the head's backup segments (04 step 7), one listing per
+    // lock hold; a failed listing returns before anything changed.
+    if let Some(head) = repo.index_head()
+        && repo.needs_segment_ages(&head.segments)
+    {
+        repo.load_segment_ages()?;
+    }
     let plan = plan_sweep(repo, shutdown)?;
-    let packs = plan
-        .unreferenced
-        .iter()
-        .filter_map(|(id, _)| repo.chunk_index().get(id).map(|e| e.pack_id))
-        .collect();
     let swept = Swept {
         snapshots: plan.snapshots.len() as u64,
         entries_removed: plan.unreferenced.len() as u64,
         bytes_removed: plan.bytes_removed(),
-        packs,
+        kept_young: plan.kept_young,
+        kept_young_bytes: plan.kept_young_bytes,
     };
     debug!(
         snapshots = swept.snapshots,
         removed = swept.entries_removed,
         bytes = swept.bytes_removed,
+        kept_young = swept.kept_young,
         dry_run,
         "mark-and-sweep"
     );
@@ -656,7 +741,6 @@ fn compact_packs(
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
-    swept_packs: &HashSet<PackId>,
 ) -> Result<PackRun> {
     let mut stats = CompactStats::default();
     let mut deleted: HashSet<PackId> = HashSet::new();
@@ -821,13 +905,13 @@ fn compact_packs(
             // Case B: orphan pack (no index entries).
             packs_orphan.fetch_add(1, Ordering::Relaxed);
 
-            // 04 step 5: a pack no entry of the loaded head named may belong
-            // to an upload not yet committed; it goes only once it is T_pack
-            // old on the store's clock. A pack whose entries this run's
-            // sweep removed was committed, and goes now, whatever its age and
-            // the live horizons (narrower than 04's I1 read literally; young
-            // index segments, 04 step 7's second half, close that).
-            if !swept_packs.contains(pack_id) && !old_enough(p.mtime, store_now, pack_grace) {
+            // A pack with no entry left (never committed, or emptied by this
+            // run's sweep) goes only once T_pack old and before every live
+            // horizon (04 I1). Its entries were old (the sweep keeps young
+            // backup segments' additions), but its own age is not bounded by
+            // theirs: a repack output, a base folded from maintenance
+            // segments, or a zero test grace.
+            if !old_enough(p.mtime, store_now, pack_grace) {
                 if p.mtime.is_none() || store_now.is_none() {
                     packs_orphan_unknown_age.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -837,7 +921,7 @@ fn compact_packs(
                 return;
             }
             // 04 "Compact" 3: not while a live backup may still name it.
-            if !swept_packs.contains(pack_id) && !before_horizons(p.mtime, &horizons) {
+            if !before_horizons(p.mtime, &horizons) {
                 packs_orphan_live.fetch_add(1, Ordering::Relaxed);
                 debug!(%pack_id, "keeping an orphan pack inside a live backup's horizon");
                 return;

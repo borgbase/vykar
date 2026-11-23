@@ -25,7 +25,9 @@ pub struct SweepRecord {
     /// Entries kept (marked) and their stored bytes.
     pub entries_live: u64,
     pub bytes_live: u64,
-    /// Entries this sweep removed and their stored bytes.
+    /// Entries this sweep removed and their stored bytes. Unmarked entries
+    /// it kept because a young backup segment added them (04 step 7) are
+    /// in neither count.
     pub entries_removed: u64,
     pub bytes_removed: u64,
     /// Chunk references decoded.

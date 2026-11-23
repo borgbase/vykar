@@ -283,6 +283,19 @@ pub fn with_open_repo_maintenance_lock<T>(
     with_maintenance_lock(&mut repo, action)
 }
 
+/// `Err(AppendOnlyServer { command })` when the repository's server
+/// advertises append-only mode ([`vykar_storage::ServerOps::append_only`]).
+/// Call before a command's first delete; it sends at most one `GET /health`.
+pub(crate) fn refuse_on_append_only_server(
+    storage: &dyn StorageBackend,
+    command: &'static str,
+) -> Result<()> {
+    if storage.server_ops().is_some_and(|s| s.append_only()) {
+        return Err(VykarError::AppendOnlyServer { command });
+    }
+    Ok(())
+}
+
 /// Execute a maintenance operation while holding an advisory lock.
 ///
 /// Acquires the lock, cleans up stale sessions (>45 min since last refresh),

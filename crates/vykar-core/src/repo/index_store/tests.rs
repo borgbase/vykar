@@ -1426,6 +1426,99 @@ fn collect_index_garbage_with_nothing_to_delete_sends_no_request() {
     assert!(storage.deletes.lock().unwrap().is_empty());
 }
 
+/// A vykar-server stand-in that advertises (or not) append-only mode, and
+/// counts `list_meta` and `delete` calls.
+struct AdvertisedServer {
+    inner: Arc<dyn StorageBackend>,
+    append_only: bool,
+    lists: Mutex<usize>,
+    deletes: Mutex<usize>,
+}
+
+impl AdvertisedServer {
+    fn new(inner: Arc<dyn StorageBackend>, append_only: bool) -> Self {
+        Self {
+            inner,
+            append_only,
+            lists: Mutex::new(0),
+            deletes: Mutex::new(0),
+        }
+    }
+}
+
+impl InnerBackend for AdvertisedServer {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for AdvertisedServer;
+    except [delete, list_meta, batch_delete, server_ops];
+
+    fn delete(&self, key: &str) -> Result<()> {
+        *self.deletes.lock().unwrap() += 1;
+        self.inner.delete(key)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        *self.lists.lock().unwrap() += 1;
+        self.inner.list_meta(prefix)
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        Some(self)
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+}
+
+impl vykar_storage::ServerOps for AdvertisedServer {
+    fn offers(&self, _op: vykar_storage::ServerOp) -> bool {
+        false
+    }
+
+    fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+        let mut caps = crate::testutil::fake_server_caps();
+        caps.append_only = self.append_only;
+        Ok(caps)
+    }
+
+    fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_only(&self) -> bool {
+        self.append_only
+    }
+}
+
+/// On a server that advertises append-only mode the GC lists and deletes
+/// nothing; the same wrapper without the flag collects as usual.
+#[test]
+fn collect_index_garbage_skips_an_append_only_server() {
+    let aged = Arc::new(Aged::new());
+    let latest = gc_fixture(&aged);
+    let before = remaining(aged.as_ref());
+    let storage = AdvertisedServer::new(aged.clone(), true);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, Some("append-only server"));
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
+    assert_eq!(*storage.lists.lock().unwrap(), 0);
+    assert_eq!(*storage.deletes.lock().unwrap(), 0);
+    assert_eq!(remaining(&storage), before);
+    assert_eq!(list_head_generations(&storage).unwrap().len(), 20);
+
+    let storage = AdvertisedServer::new(aged, false);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, None);
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (2, 3));
+    assert_eq!(*storage.lists.lock().unwrap(), 2);
+    assert_eq!(remaining(&storage), remaining_after_gc());
+}
+
 /// STORE-8: a backup segment that changes existing entries is refused; a
 /// segment whose kind differs from its head's is not the one it names.
 #[test]

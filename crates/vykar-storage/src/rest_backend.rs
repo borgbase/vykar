@@ -91,7 +91,8 @@ pub struct RestBackend {
     /// process probes an old server at most once.
     sizes_unsupported: AtomicBool,
     /// What `/health` advertised. Probed on first need (a pack large enough
-    /// to split, or a non-pack PUT on a backend not bound to BLAKE3), or
+    /// to split, a non-pack PUT on a backend not bound to BLAKE3, or
+    /// [`ServerOps::append_only`]), or
     /// recorded by an explicit [`ServerOps::capabilities`] call,
     /// so a backup that uploads nothing pays no extra round trip.
     probed: OnceLock<ProbedCaps>,
@@ -127,6 +128,7 @@ struct ProbedCaps {
     conditional_put: bool,
     repack: bool,
     repack_trailer: bool,
+    append_only: bool,
 }
 
 impl From<&ServerCapabilities> for ProbedCaps {
@@ -137,6 +139,7 @@ impl From<&ServerCapabilities> for ProbedCaps {
             conditional_put: caps.conditional_put,
             repack: caps.repack,
             repack_trailer: caps.repack_trailer,
+            append_only: caps.append_only,
         }
     }
 }
@@ -1092,6 +1095,11 @@ impl ServerOps for RestBackend {
         Ok(caps)
     }
 
+    /// Probed once; a failed probe reads as not append-only.
+    fn append_only(&self) -> bool {
+        self.probed_caps().append_only
+    }
+
     fn init(&self) -> Result<()> {
         let url = format!("{}?init", self.base_url);
         self.retry_call(
@@ -1690,6 +1698,34 @@ mod tests {
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         assert!(!backend.offers(ServerOp::Repack));
         server.join().unwrap();
+    }
+
+    /// `append_only` follows `/health`: true when advertised, false when the
+    /// field is absent or the probe failed. Probed once for any number of calls.
+    #[test]
+    fn append_only_is_read_from_the_probe() {
+        for (health, expected) in [
+            (
+                json_response(
+                    r#"{"status":"ok","version":"0.25.0","protocol_version":2,"append_only":true}"#,
+                ),
+                true,
+            ),
+            (
+                json_response(r#"{"status":"ok","version":"0.24.0","protocol_version":2}"#),
+                false,
+            ),
+            (empty("500 Internal Server Error"), false),
+        ] {
+            let (url, seen) = routing_server(move |_: &str| health.clone());
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            let server = backend.server_ops().expect("a server is behind REST");
+            assert_eq!(server.append_only(), expected);
+            assert_eq!(server.append_only(), expected);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(count(&seen, |s| s.line.starts_with("GET /health")), 1);
+            assert_eq!(seen.len(), 1);
+        }
     }
 
     fn trailer_op(trailer: Option<Vec<u8>>) -> vykar_protocol::RepackOperationRequest {

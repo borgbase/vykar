@@ -842,8 +842,9 @@ pub(crate) struct IndexGcStats {
     pub skipped: Option<&'static str>,
 }
 
-/// Log a failed best-effort delete: at debug for a write refusal
-/// (append-only), at warn otherwise.
+/// Log a failed best-effort delete: at debug for a write refusal (an
+/// append-only backend that does not advertise it, a read-only mount), at
+/// warn otherwise.
 fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
     if e.is_write_refusal() {
         debug!("{what} {key} not deleted (refused): {e}");
@@ -874,6 +875,11 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// it is never read, because readers take the latest. Deletes are
 /// best-effort and logged (at debug when refused, as on an append-only
 /// server). Storage errors on the two listings are returned.
+///
+/// On a server that advertises append-only mode
+/// ([`vykar_storage::ServerOps::append_only`]) nothing is listed or deleted
+/// (`skipped = "append-only server"`): old heads and objects accumulate until
+/// a compact in a maintenance window.
 pub(crate) fn collect_index_garbage(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
@@ -881,6 +887,11 @@ pub(crate) fn collect_index_garbage(
     grace: std::time::Duration,
 ) -> Result<IndexGcStats> {
     let mut stats = IndexGcStats::default();
+    // An append-only server refuses every delete below: skip the listings too.
+    if storage.server_ops().is_some_and(|s| s.append_only()) {
+        stats.skipped = Some("append-only server");
+        return Ok(stats);
+    }
     let heads: Vec<(u64, Option<std::time::SystemTime>)> = storage
         .list_meta(HEAD_PREFIX)?
         .into_iter()

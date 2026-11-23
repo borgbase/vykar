@@ -775,15 +775,20 @@ pub fn run_full_cycle_with_passphrase_source(
                 repo,
                 on_event,
                 &mut steps,
-                |_evt| {
-                    commands::compact::run(
-                        config,
-                        passphrase.get()?,
-                        config.compact.threshold,
-                        None,
-                        false,
-                        shutdown,
-                    )
+                |_evt| match commands::compact::run(
+                    config,
+                    passphrase.get()?,
+                    config.compact.threshold,
+                    None,
+                    false,
+                    shutdown,
+                ) {
+                    // Compact runs in every cycle; on an append-only server it
+                    // belongs to the maintenance window, so the cycle skips it.
+                    Err(VykarError::AppendOnlyServer { .. }) => Err(VykarError::Skipped(
+                        "the server is append-only; compact runs in a maintenance window".into(),
+                    )),
+                    other => other,
                 },
                 |_| StepOutcome::Ok,
             );

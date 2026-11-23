@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::mark;
-use super::util::{open_repo, with_maintenance_lock};
+use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
 use crate::config::VykarConfig;
 use crate::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use crate::repo::OpenOptions;
@@ -233,7 +233,8 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
 
 /// [`run`] on an already opened repository, with a sanitised `threshold`.
 /// The chunk index is loaded under the maintenance lock, so any index loaded
-/// at open is replaced.
+/// at open is replaced. On an append-only server a non-dry run is refused
+/// before the lock.
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
     threshold: f64,
@@ -241,6 +242,9 @@ pub(crate) fn run_on_repo(
     dry_run: bool,
     shutdown: &CancelToken,
 ) -> Result<CompactStats> {
+    if !dry_run {
+        refuse_on_append_only_server(repo.storage.as_ref(), "vykar compact")?;
+    }
     let concurrency = repo.storage.profile().request_width;
 
     with_maintenance_lock(repo, |repo| {

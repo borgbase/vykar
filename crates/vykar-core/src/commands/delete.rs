@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use vykar_types::error::Result;
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::{open_repo, with_maintenance_lock};
+use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 
@@ -57,6 +57,9 @@ pub(crate) fn run_on_repo(
         let names: Vec<String> = if dry_run {
             targets.into_iter().map(|t| t.snapshot_name).collect()
         } else {
+            if !targets.is_empty() {
+                refuse_on_append_only_server(repo.storage.as_ref(), "vykar snapshot delete")?;
+            }
             remove_snapshots(repo, targets, shutdown)?
         };
         Ok(DeleteResult {

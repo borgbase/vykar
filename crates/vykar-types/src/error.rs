@@ -271,6 +271,17 @@ pub enum VykarError {
     #[error("active sessions prevent maintenance: {0}")]
     ActiveSessions(ActiveSessionList),
 
+    /// `command` would delete repository objects, and the repository's
+    /// vykar-server advertised append-only mode. Returned before the command
+    /// changed anything. One line: it is printed into the cycle summary.
+    #[error(
+        "{command} deletes data, and the repository server is append-only (it refuses deletes); \
+         nothing was changed. Run it from a trusted machine in a maintenance window, with the \
+         server restarted without --append-only (see \"Maintenance on an append-only server\" \
+         in the server setup guide)"
+    )]
+    AppendOnlyServer { command: &'static str },
+
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
 
@@ -412,6 +423,20 @@ impl VykarError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One line (the cycle summary), naming the command and the way out; a
+    /// write refusal like the storage errors it stands in for.
+    #[test]
+    fn append_only_server_message() {
+        let e = VykarError::AppendOnlyServer {
+            command: "vykar compact",
+        };
+        let msg = e.to_string();
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.starts_with("vykar compact deletes data"), "{msg}");
+        assert!(msg.contains("maintenance window"), "{msg}");
+        assert!(e.is_write_refusal());
+    }
 
     #[test]
     fn soft_io_error_permission_denied() {

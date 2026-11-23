@@ -160,14 +160,15 @@ All standard repository commands work over REST without changing the CLI workflo
 
 ## Maintenance on an append-only server
 
-`--append-only` rejects every request that deletes or overwrites committed data, so these commands fail with `403 Forbidden`:
+`--append-only` rejects every request that deletes or overwrites committed data. The server reports the mode in `/health` (`append_only`), and vykar reads it, so these commands stop before changing anything, with a message that points here:
 
-- `vykar snapshot delete` and `vykar prune`
+- `vykar snapshot delete` and `vykar prune`, when they would remove a snapshot
 - `vykar compact`
-- `vykar check --repair`
-- `vykar delete`
+- `vykar check --repair`, when the repair would drop data
 
-`init`, `backup`, `list`, `info`, `restore`, `mount`, and `check` (without `--repair`) work as usual. In the full cycle (bare `vykar`, the daemon, the GUI), a configured `retention` makes the prune step fail on every run. Leave `retention` out of the backup clients' config — the cycle then skips pruning.
+`vykar delete` (the whole repository) is refused by the server with `403 Forbidden`. A server older than this release does not report the mode; against it the commands above get `403 Forbidden` as well, at their first delete (`check --repair` refuses with its own message after a delete probe).
+
+`init`, `backup`, `list`, `info`, `restore`, `mount`, and `check` (without `--repair`) work as usual, and so do dry runs and a `check --repair` that only adds data. In the full cycle (bare `vykar`, the daemon, the GUI), the compact step is skipped, and a configured `retention` makes the prune step fail on every run. Leave `retention` out of the backup clients' config — the cycle then skips pruning. With neither step running, nothing in the cycle takes the maintenance lock, so the session markers of crashed backups also stay in `sessions/` until the window's maintenance command removes the stale ones.
 
 Retention therefore has to be applied from a trusted machine during a maintenance window:
 
@@ -177,7 +178,7 @@ Retention therefore has to be applied from a trusted machine during a maintenanc
 
 Backups in progress are interrupted by each restart.
 
-Between windows, old index heads and index objects accumulate on the server, since it refuses to delete them. The window's `vykar prune --compact` (or `vykar compact`) removes them.
+Between windows, old index heads and index objects accumulate on the server: backups do not try to delete them, since the server would refuse. The window's `vykar prune --compact` (or `vykar compact`) removes them.
 
 ### Recovering from a damaged or crafted index
 

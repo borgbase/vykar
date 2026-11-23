@@ -6,7 +6,7 @@ use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::{open_repo, with_maintenance_lock};
+use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
 use crate::repo::{OpenOptions, Repository};
 
 /// Aggregate result of a prune operation.
@@ -140,6 +140,10 @@ pub(crate) fn run_on_repo(
                 },
                 list_entries,
             ));
+        }
+
+        if !to_prune.is_empty() {
+            refuse_on_append_only_server(repo.storage.as_ref(), "vykar prune")?;
         }
 
         // Process oldest first

@@ -662,6 +662,17 @@ pub trait ServerOps: Send + Sync {
     /// Transport or parse failure.
     fn capabilities(&self) -> Result<ServerCapabilities>;
 
+    /// Whether the server runs in append-only mode (`/health` `append_only`):
+    /// it refuses deletes and overwrites the key-class table forbids, including
+    /// deletes of `index.d/`, `index.h/` and `packmaps/` keys. Callers skip
+    /// work the server would refuse, or refuse a command before changing
+    /// anything. `false` when not advertised: a server that predates the
+    /// field, a failed probe (cached for this backend instance, as for `offers`), a fake.
+    /// Like `offers`, may `GET /health` (read-only) on its first call.
+    fn append_only(&self) -> bool {
+        false
+    }
+
     /// Server-side repository directory scaffolding (keys/, snapshots/,
     /// locks/, packs/*). Every vykar-server answers it.
     ///

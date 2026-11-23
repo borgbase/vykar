@@ -528,17 +528,25 @@ pub(crate) fn run_with_repair_on_repo(
             // Before the delete probe.
             refuse_repair_if_plan_changed(mode, &plan)?;
 
-            // If plan has data-loss actions, probe append-only before mutating.
-            if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
-                return Err(VykarError::Other(
-                    "repair requires deleting immutable snapshot objects; \
-                 not supported on append-only backends"
-                        .into(),
-                ));
+            // A plan with data loss deletes objects. Refuse before the mutation
+            // boundary: by capability on a server that advertises append-only
+            // mode (no probe is sent), else by the delete probe.
+            if plan.has_data_loss {
+                crate::commands::util::refuse_on_append_only_server(
+                    repo.storage.as_ref(),
+                    "vykar check --repair",
+                )?;
+                if !probe_deletes_allowed(repo.storage.as_ref()) {
+                    return Err(VykarError::Other(
+                        "repair requires deleting immutable snapshot objects; \
+                     not supported on append-only backends"
+                            .into(),
+                    ));
+                }
             }
 
             // Mutation boundary. Everything above — the scan, the plan, the
-            // append-only probe — is cancellable; from here on `execute_repair`
+            // append-only checks — is cancellable; from here on `execute_repair`
             // deletes immutable snapshot objects and rewrites the index, with
             // no resumable mid-state, so it and the read path beneath it
             // (`repair_apply`) deliberately do not poll the flag. This is the

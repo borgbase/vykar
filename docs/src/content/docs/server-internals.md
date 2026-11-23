@@ -162,7 +162,7 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 {"status":"ok","version":"0.20.0","protocol_version":3,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true,"repack_trailer":true,"append_only":false}
 ```
 
-`append_only` reports whether the server runs with `--append-only`, so a client can skip deletes the server would refuse. Older servers omit it, which a client reads as `false`: "not known to be append-only".
+`append_only` reports whether the server runs with `--append-only`, so a client can skip deletes the server would refuse: clients skip the index garbage collection there and refuse compact, prune, snapshot delete and a data-dropping `check --repair` before changing anything. Older servers omit it, which a client reads as `false`: "not known to be append-only".
 
 `conditional_put` says the server honours `If-None-Match: *` on `PUT` (see the `PUT` row above). Older servers omit it and would ignore the header and overwrite, so a client sends a conditional PUT only to a server that advertises it.
 

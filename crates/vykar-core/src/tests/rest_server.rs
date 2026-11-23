@@ -3,6 +3,7 @@
 //! all is the positive path of the `segmented_index` capability check.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use super::helpers::{backup_single_source, make_test_config};
 use crate::commands;
@@ -16,13 +17,18 @@ use vykar_server::config::ServerSection;
 
 const TOKEN: &str = "rest-server-test";
 
-/// vykar-server on 127.0.0.1, serving `data` as a single repository.
-/// Dropping it drops the runtime, which stops the server.
+/// A request the server answered: method, path and query, status.
+type Request = (axum::http::Method, String, u16);
+
+/// vykar-server on 127.0.0.1, serving `data` as a single repository, with a
+/// log of the requests it answered. Dropping it drops the runtime, which
+/// stops the server.
 struct Server {
     // Declared first so the server stops before `data` is removed.
     _rt: tokio::runtime::Runtime,
     url: String,
     data: tempfile::TempDir,
+    requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl Server {
@@ -46,10 +52,35 @@ impl Server {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
+        let log = requests.clone();
+        let app = vykar_server::handlers::router(state).layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let log = log.clone();
+                async move {
+                    let (method, uri) = (req.method().clone(), req.uri().to_string());
+                    let resp = next.run(req).await;
+                    log.lock()
+                        .unwrap()
+                        .push((method, uri, resp.status().as_u16()));
+                    resp
+                }
+            },
+        ));
         rt.spawn(async move {
-            let _ = axum::serve(listener, vykar_server::handlers::router(state)).await;
+            let _ = axum::serve(listener, app).await;
         });
-        Self { _rt: rt, url, data }
+        Self {
+            _rt: rt,
+            url,
+            data,
+            requests,
+        }
+    }
+
+    /// The requests answered since the last call.
+    fn take_requests(&self) -> Vec<Request> {
+        std::mem::take(&mut *self.requests.lock().unwrap())
     }
 
     /// Files under `index.d/` in the server's data directory.
@@ -280,49 +311,321 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     check_clean(&c.config);
 }
 
-/// The index GC after a fold deletes unnamed index objects on a normal
-/// server; an append-only server refuses those deletes (03 step 1a) and the
-/// write still succeeds. Heads are left out: the GC keeps the 17 newest, and
-/// their deletes were refused in append-only mode before.
+/// A backup whose commit folds the index, as the simulator's driver runs
+/// one: the fold's garbage collection runs inside the backup.
+fn backup_with_fold(c: &Client, name: &str) {
+    fn no_events(_: crate::repo::control::CommitEvent) {}
+    let source_paths = vec![c.source.to_string_lossy().into_owned()];
+    let req = commands::backup::BackupRequest {
+        snapshot_name: name,
+        passphrase: None,
+        source_paths: &source_paths,
+        source_label: "src",
+        exclude_patterns: &[],
+        exclude_if_present: &[],
+        one_file_system: true,
+        git_ignore: false,
+        xattrs_enabled: false,
+        compression: crate::compress::Compression::None,
+        command_dumps: &[],
+        verbose: false,
+    };
+    let mut pending = commands::backup::upload(
+        &c.config,
+        &req,
+        &mut None,
+        &CancelToken::new(),
+        None,
+        crate::repo::HostEnv::system(),
+    )
+    .map_err(|(_, e)| e)
+    .unwrap();
+    pending.repo_mut().request_index_fold();
+    let guard = pending
+        .wait_for_lock(&mut None, &CancelToken::new())
+        .unwrap();
+    let mut commit = pending.begin_commit(guard);
+    let result = commit.drive(&no_events);
+    commit.finish(result, &mut None).unwrap();
+}
+
+/// An unnamed `index.d/` object two hours old: older than the GC grace
+/// relative to anything just written, and named by no head.
+fn plant_old_debris(server: &Server) -> PathBuf {
+    let debris = server
+        .data
+        .path()
+        .join(INDEX_OBJECT_DIR)
+        .join("ab".repeat(32));
+    std::fs::write(&debris, b"debris").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&debris)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .unwrap();
+    debris
+}
+
+/// The object key a logged request names: its path without the leading
+/// `/` and the query.
+fn request_key(uri: &str) -> &str {
+    let path = uri.split('?').next().unwrap_or(uri);
+    path.trim_start_matches('/')
+}
+
+/// The deletes in `reqs` an append-only server refuses: every DELETE of a
+/// key the key-class table forbids deleting, and every batch delete.
+fn refused_deletes(reqs: &[Request]) -> Vec<String> {
+    reqs.iter()
+        .filter(|(method, uri, _)| {
+            (*method == axum::http::Method::DELETE
+                && !vykar_protocol::append_only_allows(
+                    request_key(uri),
+                    vykar_protocol::Verb::Delete,
+                ))
+                || (*method == axum::http::Method::POST && uri.contains("batch-delete"))
+        })
+        .map(|(method, uri, _)| format!("{method} {uri}"))
+        .collect()
+}
+
+/// The 03 step 7 done criterion: a backup whose commit folds, against an
+/// append-only server, sends no delete the server refuses and gets no 403;
+/// its garbage collection is skipped. The normal-mode run shows the same
+/// backup does collect the debris there.
 #[test]
-fn append_only_server_refuses_index_garbage_collection() {
+fn a_backup_against_an_append_only_server_issues_no_refused_delete() {
     for append_only in [false, true] {
         let server = Server::start(append_only);
         let c = Client::init(&server);
         c.write("a", "alpha");
-        c.write("b", "bravo");
         c.backup("s1");
-        c.write("c", "charlie");
-        c.backup("s2");
-
-        let debris = server
-            .data
-            .path()
-            .join(INDEX_OBJECT_DIR)
-            .join("ab".repeat(32));
-        std::fs::write(&debris, b"debris").unwrap();
-
-        let mut repo = open(&c.config);
-        let mut policy = FoldPolicy::default();
-        policy.hard.segments = 2;
-        policy.hard.percent = 100_000;
-        repo.set_fold_policy(policy);
-        repo.set_index_gc_grace(std::time::Duration::ZERO);
-        let mut toggled = None;
-        repo.load_chunk_index_under_lock().unwrap();
-        crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
-        repo.save_state().unwrap();
+        let debris = plant_old_debris(&server);
+        c.write("b", "bravo");
+        server.take_requests();
+        backup_with_fold(&c, "s2");
+        let reqs = server.take_requests();
         assert!(
-            repo.index_head().unwrap().segments.is_empty(),
-            "append_only={append_only}: the write folds"
+            head(&c.config).segments.is_empty(),
+            "append_only={append_only}: the commit folds"
         );
-        assert_eq!(debris.exists(), append_only, "append_only={append_only}");
-
-        repo.load_chunk_index_under_lock().unwrap();
-        crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
-        repo.save_state().unwrap();
-        drop(repo);
+        if append_only {
+            assert!(debris.exists(), "the GC is skipped");
+            assert_eq!(refused_deletes(&reqs), Vec::<String>::new());
+            let forbidden: Vec<_> = reqs.iter().filter(|r| r.2 == 403).collect();
+            assert!(forbidden.is_empty(), "{forbidden:?}");
+            assert!(
+                reqs.iter()
+                    .any(|(m, uri, _)| *m == axum::http::Method::DELETE
+                        && (request_key(uri).starts_with("sessions/")
+                            || request_key(uri).starts_with("locks/"))),
+                "the log records the backup's ephemeral deletes: {reqs:?}"
+            );
+        } else {
+            assert!(!debris.exists(), "the GC collects the debris");
+            assert!(
+                reqs.iter()
+                    .any(|(m, uri, _)| (*m == axum::http::Method::POST
+                        && uri.contains("batch-delete"))
+                        || (*m == axum::http::Method::DELETE
+                            && request_key(uri).starts_with(INDEX_OBJECT_DIR))),
+                "{reqs:?}"
+            );
+        }
         check_clean(&c.config);
+    }
+}
+
+/// The snapshot objects on the server, sorted.
+fn server_snapshots(server: &Server) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(server.data.path().join("snapshots"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A refused command sent no delete outside `locks/` and `sessions/`, got
+/// no 403, and left the index head and the snapshots as they were.
+fn assert_refused_cleanly(
+    server: &Server,
+    config: &VykarConfig,
+    before: &(IndexHead, Vec<String>),
+    what: &str,
+) -> Vec<Request> {
+    let reqs = server.take_requests();
+    let deletes: Vec<_> = reqs
+        .iter()
+        .filter(|(m, uri, _)| {
+            let key = request_key(uri);
+            (*m == axum::http::Method::DELETE
+                && !key.starts_with("locks/")
+                && !key.starts_with("sessions/"))
+                || (*m == axum::http::Method::POST && uri.contains("batch-delete"))
+        })
+        .collect();
+    assert!(deletes.is_empty(), "{what}: {deletes:?}");
+    let forbidden: Vec<_> = reqs.iter().filter(|r| r.2 == 403).collect();
+    assert!(forbidden.is_empty(), "{what}: {forbidden:?}");
+    assert_eq!(head(config), before.0, "{what}");
+    assert_eq!(server_snapshots(server), before.1, "{what}");
+    reqs
+}
+
+fn is_append_only_refusal(e: &vykar_types::error::VykarError, command: &str) -> bool {
+    matches!(e, vykar_types::error::VykarError::AppendOnlyServer { command: c } if *c == command)
+}
+
+/// compact, prune, snapshot delete and `check --repair` stop before their
+/// first change on an advertising server; dry runs and runs that remove
+/// nothing still succeed.
+#[test]
+fn deleting_commands_refuse_early_on_an_append_only_server() {
+    let server = Server::start(true);
+    let c = Client::init(&server);
+    c.write("a", "alpha");
+    c.backup("s1");
+    c.write("b", "bravo");
+    c.backup("s2");
+    let before = (head(&c.config), server_snapshots(&server));
+    assert_eq!(before.1.len(), 2);
+    let cancel = CancelToken::new();
+
+    // compact: refused before the lock, so nothing is written at all.
+    server.take_requests();
+    let err = commands::compact::run(&c.config, None, 0.0, None, false, &cancel).unwrap_err();
+    assert!(is_append_only_refusal(&err, "vykar compact"), "{err:?}");
+    let reqs = assert_refused_cleanly(&server, &c.config, &before, "compact");
+    let puts: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.0 == axum::http::Method::PUT)
+        .collect();
+    assert!(puts.is_empty(), "{puts:?}");
+    commands::compact::run(&c.config, None, 0.0, None, true, &cancel).unwrap();
+    server.take_requests();
+
+    // prune: refused only when it would remove a snapshot.
+    let mut pruning = c.config.clone();
+    pruning.retention.keep_last = Some(1);
+    let err = commands::prune::run(&pruning, None, false, false, &[], &[], &cancel)
+        .err()
+        .unwrap();
+    assert!(is_append_only_refusal(&err, "vykar prune"), "{err:?}");
+    assert_refused_cleanly(&server, &c.config, &before, "prune");
+    let (stats, _) = commands::prune::run(&pruning, None, true, false, &[], &[], &cancel).unwrap();
+    assert_eq!(stats.pruned, 1);
+    pruning.retention.keep_last = Some(5);
+    let (stats, _) = commands::prune::run(&pruning, None, false, false, &[], &[], &cancel).unwrap();
+    assert_eq!(stats.pruned, 0);
+    server.take_requests();
+
+    // snapshot delete: unknown names still fail first.
+    let err = commands::delete::run(&c.config, None, &["s1"], false, &cancel)
+        .err()
+        .unwrap();
+    assert!(
+        is_append_only_refusal(&err, "vykar snapshot delete"),
+        "{err:?}"
+    );
+    assert_refused_cleanly(&server, &c.config, &before, "delete");
+    let err = commands::delete::run(&c.config, None, &["nope"], false, &cancel)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::SnapshotNotFound(_)),
+        "{err:?}"
+    );
+    commands::delete::run(&c.config, None, &["s1"], true, &cancel).unwrap();
+    server.take_requests();
+
+    // check --repair with data loss: refused by capability, no delete probe.
+    let (pack, _) = server_packs(&server).into_iter().next().unwrap();
+    std::fs::remove_file(server.data.path().join(&pack)).unwrap();
+    let plan = commands::check::run_with_repair(
+        &c.config,
+        None,
+        false,
+        commands::check::RepairMode::PlanOnly,
+        None,
+        &cancel,
+    )
+    .unwrap()
+    .plan;
+    assert!(plan.has_data_loss, "{:?}", plan.actions);
+    server.take_requests();
+    let err = commands::check::run_with_repair(
+        &c.config,
+        None,
+        false,
+        commands::check::RepairMode::Apply,
+        None,
+        &cancel,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        is_append_only_refusal(&err, "vykar check --repair"),
+        "{err:?}"
+    );
+    let reqs = assert_refused_cleanly(&server, &c.config, &before, "check --repair");
+    assert!(
+        !reqs.iter().any(|(_, uri, _)| uri.contains(".repair-probe")),
+        "{reqs:?}"
+    );
+}
+
+/// The full cycle skips compact on an append-only server (it belongs to the
+/// maintenance window) and runs it on a normal one.
+#[test]
+fn the_cycle_skips_compact_on_an_append_only_server() {
+    use crate::app::operations::{CycleStep, StepOutcome, run_full_cycle_for_repo};
+    for append_only in [false, true] {
+        let server = Server::start(append_only);
+        let c = Client::init(&server);
+        c.write("a", "alpha");
+        let repo = super::helpers::resolved_repo(
+            c.config.clone(),
+            vec![super::helpers::source_entry(&c.source, "src")],
+        );
+        let result = run_full_cycle_for_repo(
+            &repo,
+            None,
+            &CancelToken::new(),
+            false,
+            &[],
+            crate::app::preflight::UnavailableRepo::Skip,
+            &mut |_| {},
+        );
+        let outcome = |step: CycleStep| {
+            result
+                .steps
+                .iter()
+                .find(|(s, _)| *s == step)
+                .map(|(_, o)| o.clone())
+                .unwrap_or_else(|| panic!("no outcome for {}", step.command_name()))
+        };
+        assert!(
+            matches!(outcome(CycleStep::Backup), StepOutcome::Ok),
+            "{:?}",
+            result.steps
+        );
+        assert!(
+            matches!(outcome(CycleStep::Prune), StepOutcome::Skipped(r) if r.contains("no retention")),
+            "{:?}",
+            result.steps
+        );
+        match outcome(CycleStep::Compact) {
+            StepOutcome::Skipped(r) if append_only => assert!(r.contains("append-only"), "{r}"),
+            StepOutcome::Ok if !append_only => {}
+            other => panic!("append_only={append_only}: {other:?}"),
+        }
+        assert!(
+            !matches!(outcome(CycleStep::Check), StepOutcome::Failed(_)),
+            "{:?}",
+            result.steps
+        );
     }
 }
 

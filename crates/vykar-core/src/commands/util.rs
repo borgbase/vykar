@@ -156,7 +156,7 @@ pub(crate) fn open_repo_with_read_session_on(
     let env = opts.host_env.clone();
     let opts = with_identity_context(opts, req);
     let session_id = format!("{:032x}", rand::random::<u128>());
-    lock::register_session(backend.as_ref(), &session_id, &env)?;
+    let registration = lock::register_session(backend.as_ref(), &session_id, &env)?;
 
     let open_result = Repository::open_shared(
         Arc::clone(&backend),
@@ -172,11 +172,7 @@ pub(crate) fn open_repo_with_read_session_on(
                 lock::deregister_session(backend.as_ref(), &session_id, &env);
                 return Err(e);
             }
-            match lock::SessionGuard::adopt(
-                Arc::clone(&repo.storage),
-                session_id.clone(),
-                env.clone(),
-            ) {
+            match lock::SessionGuard::adopt(Arc::clone(&repo.storage), registration, env.clone()) {
                 Ok(guard) => Ok((repo, guard)),
                 Err(e) => {
                     lock::deregister_session(repo.storage.as_ref(), &session_id, &env);

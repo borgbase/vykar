@@ -8,7 +8,8 @@
 //! scenario reports `NotReproduced` and the entry moves from `KNOWN_HAZARDS`
 //! to `REGRESSIONS`, where the same scenario must then hold. 05 step 8 moved
 //! H5 (the mark refuses) and H4-segment (index garbage is collected by age)
-//! there; 04 step 1 moved H1 and H1-session (installation ID).
+//! there; 04 step 1 moved H1 and H1-session (installation ID); 04 step 2
+//! moved H2-marker (non-resurrecting marker refresh).
 //!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
 //! protocol, under random schedules; the shapes of damage it recognises are
@@ -92,12 +93,6 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: interleavings::h2_lock_refresh_resurrects,
     },
     KnownHazard {
-        id: "H2-marker",
-        summary: "session refresh recreates a reaped marker and the backup is never told",
-        fixed_by: "04-commit-protocol.md step 2 (non-resurrecting marker refresh)",
-        run: interleavings::h2_marker_refresh_resurrects,
-    },
-    KnownHazard {
         id: "H4",
         summary: "compact loses its lock, deletes sources with no fence after its head \
                   PUT, and a stale head names the deleted packs",
@@ -126,6 +121,12 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "same hostname: a live backup's marker is kept, compact refuses with \
                   ActiveSessions",
         run: interleavings::h1_session_regression,
+    },
+    Regression {
+        id: "H2-marker",
+        summary: "a reaped session marker is never written again; the refresh finds it \
+                  missing and the backup refuses as stale",
+        run: interleavings::h2_marker_regression,
     },
     Regression {
         id: "H4-segment",

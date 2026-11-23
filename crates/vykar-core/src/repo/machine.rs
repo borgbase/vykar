@@ -21,14 +21,17 @@ pub(crate) enum StepKind {
     Flush,
     /// Compound: LIST `snapshots/`, GET the blobs not cached.
     RefreshSnapshots,
-    /// EXISTS `sessions/<id>.json`.
+    /// EXISTS the session's current marker key `sessions/<id>[.<n>].json`
+    /// (again with the new key if a refresh moved it), after an EXISTS of
+    /// each superseded key whose refresh check failed.
     ProbeMarker,
     /// Compound: LIST `index.h/`, GET the latest (re-list on a 404).
     FetchHead,
     /// Compound: GET the `index.d/` objects not held locally; on a missing
     /// one, LIST/GET `index.h/`.
     SyncIndex,
-    /// Pack existence (`packs/`; not a protocol key) and the reuse check.
+    /// Pack existence (`packs/`; not a protocol key) and the reuse check;
+    /// on a failed pack check, EXISTS the session marker.
     VerifyPacks,
     /// LIST `index.h/` (a fold without a previous head).
     ListHeads,
@@ -126,7 +129,7 @@ impl StepKind {
             StepKind::ProbeMarker => &[(Read, "sessions/")],
             StepKind::FetchHead => FETCH_HEAD,
             StepKind::SyncIndex => &[(Read, "index.d/"), (List, "index.h/"), (Read, "index.h/")],
-            StepKind::VerifyPacks => &[(Read, "packs/"), (List, "packs/")],
+            StepKind::VerifyPacks => &[(Read, "packs/"), (List, "packs/"), (Read, "sessions/")],
             StepKind::ListHeads => &[(List, "index.h/")],
             StepKind::PutSweepRecord | StepKind::PutSegment | StepKind::PutBase => {
                 &[(Write, "index.d/")]

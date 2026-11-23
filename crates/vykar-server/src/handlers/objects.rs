@@ -1569,6 +1569,7 @@ mod tests {
             ("index.gen".into(), LegacyMutable),
             ("locks/l.json".into(), Ephemeral),
             ("sessions/s.json".into(), Ephemeral),
+            ("sessions/s.7.json".into(), Ephemeral),
             ("snapshots/.tmp.x.1".into(), Temp),
         ]
     }

@@ -10,18 +10,24 @@
 //!    list, then probe the session marker (the probe follows the refresh);
 //!    fetch the index head when there is a delta to merge. Production runs
 //!    them concurrently, as one batch; the simulator one at a time.
-//! 3. Judge them in the old order: marker, snapshot list and name check,
-//!    head.
+//! 3. Judge them in the old order: marker (the probe together with what the
+//!    heartbeat recorded, [`lock::commit_marker_check`]), snapshot list and
+//!    name check, head.
 //! 4. Sync the index to the head, check reuse and verify the session's
 //!    packs, then publish the additions as a backup segment (a
-//!    [`PublishMachine`], stepped from here).
+//!    [`PublishMachine`], stepped from here). A pack found missing while
+//!    the session's marker is gone is `StaleChunksDuringCommit`: compact
+//!    deleted the packs of a reaped session.
 //! 5. Check the fence and PUT the snapshot.
+
+use std::sync::Arc;
 
 use tracing::{debug, warn};
 
 use super::Repository;
 use super::commit::{check_reused_chunks, commit_additions, needs_recheck};
 use super::index_store::{self, SyncedIndex};
+use super::lock::{self, SessionMarker};
 use super::machine::{
     Machine, StepCx, StepKind, bad_pick, emit_stage, join_scoped, log_stage_elapsed,
 };
@@ -46,7 +52,9 @@ pub(crate) struct BackupCommit {
     entry: Option<SnapshotEntry>,
     packed: Vec<u8>,
     session_id: String,
-    marker_key: Option<String>,
+    /// The session's marker record; `None` for a session without a marker
+    /// (repository-level tests).
+    marker: Option<Arc<SessionMarker>>,
     /// The open `CommitEvent::Stage`, closed with `log_stage_elapsed`.
     stage: Option<(std::time::Instant, &'static str)>,
     state: CommitState,
@@ -89,7 +97,7 @@ struct StartReads {
     delta: Option<IndexDelta>,
     view: Option<SessionView>,
     refresh: Slot<Result<SnapshotRefresh>>,
-    /// `NotNeeded` for the "default" session, which has no marker.
+    /// `NotNeeded` for a session without a marker.
     marker: Slot<Result<bool>>,
     /// `NotNeeded` unless the delta is non-empty.
     head: Slot<Result<IndexHead>>,
@@ -164,17 +172,19 @@ fn refresh_snapshots(repo: &Repository) -> Result<SnapshotRefresh> {
 
 impl BackupCommit {
     /// The commit of the active write session as `entry` (`packed`: its
-    /// snapshot blob). No storage access. Panics when no write session is
-    /// active.
-    pub(crate) fn new(repo: &Repository, entry: SnapshotEntry, packed: Vec<u8>) -> Self {
-        let session_id = repo.ws().session_id.clone();
-        let marker_key =
-            (session_id != "default").then(|| super::lock::session_marker_key(&session_id));
+    /// snapshot blob), whose marker record is `marker`. No storage access.
+    /// Panics when no write session is active.
+    pub(crate) fn new(
+        repo: &Repository,
+        entry: SnapshotEntry,
+        packed: Vec<u8>,
+        marker: Option<Arc<SessionMarker>>,
+    ) -> Self {
         Self {
             entry: Some(entry),
             packed,
-            session_id,
-            marker_key,
+            session_id: repo.ws().session_id.clone(),
+            marker,
             stage: None,
             state: CommitState::Flush,
         }
@@ -288,7 +298,7 @@ impl BackupCommit {
             delta,
             view,
             refresh: Slot::Pending,
-            marker: Slot::needed(self.marker_key.is_some()),
+            marker: Slot::needed(self.marker.is_some()),
             head: Slot::needed(fetch_index),
         })))
     }
@@ -297,8 +307,8 @@ impl BackupCommit {
         match read {
             Read::Refresh => reads.refresh = Slot::Done(refresh_snapshots(repo)),
             Read::Marker => {
-                if let Some(key) = &self.marker_key {
-                    reads.marker = Slot::Done(repo.storage.exists(key));
+                if let Some(marker) = &self.marker {
+                    reads.marker = Slot::Done(marker.probe(repo.storage.as_ref()));
                 }
             }
             Read::Head => {
@@ -316,10 +326,10 @@ impl BackupCommit {
     /// write follows them.
     fn read_all(&self, repo: &Repository, reads: &mut StartReads) {
         let do_refresh = reads.refresh.pending();
-        let marker_key = reads
+        let marker = reads
             .marker
             .pending()
-            .then(|| self.marker_key.clone())
+            .then(|| self.marker.clone())
             .flatten();
         let do_head = reads.head.pending();
         let storage = repo.storage.as_ref();
@@ -327,14 +337,14 @@ impl BackupCommit {
         let repo_id = repo.config.id.as_slice();
         let cache_dir = repo.cache_dir_override.as_deref();
         let (side, head) = std::thread::scope(|scope| {
-            let side = (do_refresh || marker_key.is_some()).then(|| {
+            let side = (do_refresh || marker.is_some()).then(|| {
                 scope.spawn(move || {
                     let refresh = do_refresh.then(|| {
                         snapshot_cache::refresh_snapshot_cache(
                             storage, crypto, repo_id, cache_dir, true,
                         )
                     });
-                    let marker = marker_key.map(|key| storage.exists(&key));
+                    let marker = marker.map(|m| m.probe(storage));
                     (refresh, marker)
                 })
             });
@@ -363,24 +373,17 @@ impl BackupCommit {
             marker,
             head,
         } = reads;
-        // Session-existence probe. If the marker was reaped by maintenance
+        // Session-existence check. If the marker was reaped by maintenance
         // (e.g. because we missed too many heartbeats under extreme clock
-        // skew), surface the same typed error the later reuse check
-        // would produce, so callers matching on `StaleChunksDuringCommit`
-        // catch this path too. Inconclusive storage errors fall through —
-        // the reuse check is still a safety net.
-        match marker {
-            Slot::Done(Ok(false)) => {
-                warn!(
-                    session_id = self.session_id,
-                    "session marker reaped before commit; retry the backup"
-                );
-                return Err(VykarError::StaleChunksDuringCommit);
-            }
-            Slot::Done(Err(e)) => {
-                debug!(error = %e, "session-existence probe failed, proceeding");
-            }
-            Slot::Done(Ok(true)) | Slot::NotNeeded | Slot::Pending => {}
+        // skew), surface the same typed error the later reuse check would
+        // produce, so callers matching on `StaleChunksDuringCommit` catch
+        // this path too. The heartbeat's record is read after the probe, so
+        // a reap a refresh found during the probe is seen. An inconclusive
+        // probe falls through only when the record is continuous; the reuse
+        // check is still a safety net.
+        if let (Slot::Done(probe), Some(m)) = (marker, &self.marker) {
+            let report = m.report(repo.host_env().clock.as_ref());
+            lock::commit_marker_check(&self.session_id, probe, &report)?;
         }
         match refresh {
             Slot::Done(refresh) => repo.apply_snapshot_refresh(refresh?),
@@ -475,7 +478,25 @@ impl BackupCommit {
         });
         // A stale chunk is the typed error callers retry on; report it first.
         reused?;
-        verified?;
+        if let Err(e) = verified {
+            // A missing pack while the session's marker is gone: compact
+            // deleted the packs of a reaped session, which is what
+            // `StaleChunksDuringCommit` means. With the marker present it is
+            // storage loss and keeps its own error.
+            if let Some(m) = &self.marker {
+                let gone = m.report(repo.host_env().clock.as_ref()).missing
+                    || matches!(m.probe(storage), Ok(false));
+                if gone {
+                    warn!(
+                        session_id = self.session_id,
+                        error = %e,
+                        "session pack check failed and the session marker is gone; retry the backup"
+                    );
+                    return Err(VykarError::StaleChunksDuringCommit);
+                }
+            }
+            return Err(e);
+        }
         let mut pack_trailers: Vec<(PackId, u32)> = Vec::with_capacity(pack_ids.len());
         for pack in &pack_ids {
             let trailer_len = delta.pack_trailers.get(pack).copied().ok_or_else(|| {

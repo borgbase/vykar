@@ -481,6 +481,8 @@ mod tests {
     #[test]
     fn valid_directory_keys() {
         assert!(is_valid_storage_key("sessions/abc123.json"));
+        // A rotated session marker (04 step 2).
+        assert!(is_valid_storage_key("sessions/abc123.7.json"));
         // Per-session pending index journal (co-located with session marker)
         assert!(is_valid_storage_key("sessions/abc123.index"));
         // Legacy pending_index directory (backward compat)

@@ -10,7 +10,9 @@
 //! H4-segment is a regression since 05 step 8 (index garbage is collected
 //! by age): [`h4_segment_regression`]. H1 and H1-session are regressions
 //! since 04 step 1 (installation ID): [`h1_regression`],
-//! [`h1_session_regression`]. H4 reaches its two lock holders through a
+//! [`h1_session_regression`]. H2-marker is a regression since 04 step 2
+//! (non-resurrecting marker refresh): [`h2_marker_regression`]. H4 reaches
+//! its two lock holders through a
 //! skewed clock since then ([`Hosts::Skewed`]).
 
 use std::time::Duration;
@@ -577,30 +579,47 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     )
 }
 
-/// When maintenance reaps the marker in H2-marker.
+/// When maintenance reaps a's registration marker in H2-marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerReap {
-    /// Maintenance reaps between the heartbeat's GET and PUT: the hazard.
-    BetweenGetAndPut,
-    /// Maintenance reaps before the heartbeat's GET, which then finds the
-    /// marker missing and does not recreate it.
-    BeforeGet,
+    /// Compact reaps the 46-min-old marker while the heartbeat is held
+    /// before its refresh PUT; compact runs (no live marker); the refresh
+    /// then writes the next key and finds the old one gone.
+    BeforeRefresh,
+    /// The refresh PUT of the next key has landed, its presence check of the
+    /// old key has not: compact judges a's session by its newest key, which
+    /// is fresh, reaps nothing and refuses with ActiveSessions; the check
+    /// then finds the old key present and a commits.
+    AfterPut,
 }
 
-/// H2-marker: a session-marker refresh recreates a reaped marker, and the
-/// backup is never told.
-pub fn h2_marker_refresh_resurrects() -> HazardOutcome {
-    h2_marker_with(MarkerReap::BetweenGetAndPut)
-}
-
-/// H2-marker with the reap placed by `reap`; `BeforeGet` neutralises it.
+/// H2-marker with the reap placed by `reap`. Before 04 step 2 a refresh
+/// read the marker and wrote it back, so a reap between the two was undone
+/// and the backup was never told.
 ///
 /// A backs up a1 and is held at journal recovery's LIST of `sessions/`, its
 /// first main-thread operation after the heartbeat started. The heartbeat
 /// is stepped to its first refresh (30 polls of 30 s); 31 min later its
-/// marker is 46 min old and B's compact reaps it.
+/// registration marker is 46 min old and B compacts.
 pub fn h2_marker_with(reap: MarkerReap) -> HazardOutcome {
     settle(h2_marker_scenario(reap))
+}
+
+/// H2-marker as a regression: both placements `NotReproduced`; any other
+/// outcome is a `DisallowedError` with subject `"H2-marker at <reap>"`.
+pub fn h2_marker_regression() -> Report {
+    let mut out = Report::default();
+    for reap in [MarkerReap::BeforeRefresh, MarkerReap::AfterPut] {
+        let outcome = h2_marker_with(reap);
+        if !matches!(outcome, HazardOutcome::NotReproduced { .. }) {
+            out.add(
+                ViolationKind::DisallowedError,
+                format!("H2-marker at {reap:?}"),
+                format!("{outcome:?}"),
+            );
+        }
+    }
+    out
 }
 
 fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
@@ -624,8 +643,8 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
     );
     reach(&sim, g_main, "a's journal-recovery LIST")?;
     // A's main thread is held: only the heartbeat touches sessions/ now.
-    let g_get = sim.gate(GateRule::new(a, OpMatch::Kind(OpKind::Get), sessions()));
     let g_put = sim.gate(GateRule::new(a, OpMatch::AnyWrite, sessions()));
+    let g_exists = sim.gate(GateRule::new(a, OpMatch::Kind(OpKind::Exists), sessions()));
     let heartbeat = || broken("heartbeat did not reach its refresh");
     if !sim.time().wait_for_waiters(1, WAIT) {
         return Err(heartbeat());
@@ -636,36 +655,35 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
             return Err(heartbeat());
         }
     }
-    reach(&sim, g_get, "heartbeat did not reach its refresh")?;
+    reach(&sim, g_put, "the heartbeat's refresh PUT")?;
     let stale = Duration::from_secs(31 * 60);
     let rb = match reap {
-        MarkerReap::BetweenGetAndPut => {
-            sim.resume(g_get);
-            reach(&sim, g_put, "the heartbeat's marker PUT")?;
+        MarkerReap::BeforeRefresh => {
             sim.advance(stale);
             let rb = sim.compact(b);
             sim.resume(g_put);
-            // The marker write must land before a's main thread goes on to
-            // probe it: wait until the heartbeat is back in its timed wait.
-            if !sim.time().wait_for_waiters(1, WAIT) {
-                return Err(heartbeat());
-            }
+            // Released or disarmed: the check runs ungated.
+            sim.resume(g_exists);
             rb
         }
-        MarkerReap::BeforeGet => {
+        MarkerReap::AfterPut => {
+            sim.resume(g_put);
+            reach(&sim, g_exists, "the refresh's presence check")?;
             sim.advance(stale);
             let rb = sim.compact(b);
-            sim.resume(g_get);
-            // Disarm, so the journal PUT under sessions/ is not caught.
-            sim.resume(g_put);
+            sim.resume(g_exists);
             rb
         }
     };
+    // The refresh must end before a's main thread goes on to commit: wait
+    // until the heartbeat is back in its timed wait.
+    if !sim.time().wait_for_waiters(1, WAIT) {
+        return Err(heartbeat());
+    }
     sim.resume(g_main);
     let ra = sim.join(sa);
     let report = sim.check_invariants(CHECKED);
     controls(&report)?;
-    ok(&rb, "compact b")?;
     let Some(marker) = marker_key_of(&sim, &ra) else {
         return Err(broken(format!("a wrote no marker\n{}", outcomes(&ra, &rb))));
     };
@@ -681,20 +699,35 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
             .collect()
         })
         .unwrap_or_default();
+    let left: Vec<String> = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".json") && sim.store().object(k).is_some())
+        .collect();
     let evidence = format!(
         "{}\na's marker {marker} deleted by b at {reaped:?}, written by a after: \
-         {rewrites:?}\n{report}",
+         {rewrites:?}; a's markers left: {left:?}\n{report}",
         outcomes(&ra, &rb)
     );
+    let held = match reap {
+        MarkerReap::BeforeRefresh => {
+            !reaped.is_empty() && rb.is_ok() && allowed(&ra, AllowedError::StaleChunksDuringCommit)
+        }
+        MarkerReap::AfterPut => {
+            reaped.is_empty() && allowed(&rb, AllowedError::ActiveSessions) && ra.is_ok()
+        }
+    };
     Ok(
-        if !reaped.is_empty() && rewrites.iter().any(|(_, t)| t == "session-refresh") && ra.is_ok()
-        {
+        if !reaped.is_empty() && (!rewrites.is_empty() || ra.is_ok()) {
             HazardOutcome::Reproduced { evidence }
-        } else if !reaped.is_empty()
-            && rewrites.is_empty()
-            && allowed(&ra, AllowedError::StaleChunksDuringCommit)
-        {
+        } else if held && rewrites.is_empty() && left.is_empty() {
             HazardOutcome::NotReproduced { evidence }
+        } else if reap == MarkerReap::BeforeRefresh && reaped.is_empty() {
+            broken(format!(
+                "B did not reap A's marker; check the advance against the staleness \
+             constants\n{evidence}"
+            ))
         } else {
             different_damage(evidence)
         },

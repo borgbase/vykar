@@ -468,6 +468,11 @@ pub fn verify_lock_validity(
 
 // ── Session markers ──────────────────────────────────────────────────────
 
+/// Prefix of every session object: the markers `sessions/<id>.json`
+/// (generation 0, written at registration, the shape every released binary
+/// writes) and `sessions/<id>.<n>.json` (the `n`-th refresh attempt), and the
+/// journal `sessions/<id>.index`. Of a session's markers the newest
+/// generation is the live one.
 pub(crate) const SESSIONS_PREFIX: &str = "sessions/";
 /// Sessions whose `last_refresh` is strictly older than this threshold are
 /// treated as stale. Shared between maintenance cleanup
@@ -477,9 +482,21 @@ pub(crate) const SESSIONS_PREFIX: &str = "sessions/";
 /// still keep a session live, a third marks it dead.
 pub(crate) const SESSION_STALE_SECS: i64 = 45 * 60;
 
-/// Storage key for a session's JSON marker: `sessions/<id>.json`.
+/// Storage key of generation `generation` of a session's marker:
+/// `sessions/<id>.json` for 0 (written at registration, the shape every
+/// released binary writes), `sessions/<id>.<n>.json` for the `n`-th refresh
+/// attempt. Session IDs contain no '.' (callers generate 32 hex digits).
+pub(crate) fn session_marker_key_at(session_id: &str, generation: u64) -> String {
+    if generation == 0 {
+        format!("{SESSIONS_PREFIX}{session_id}.json")
+    } else {
+        format!("{SESSIONS_PREFIX}{session_id}.{generation}.json")
+    }
+}
+
+/// [`session_marker_key_at`] for generation 0: `sessions/<id>.json`.
 pub(crate) fn session_marker_key(session_id: &str) -> String {
-    format!("{SESSIONS_PREFIX}{session_id}.json")
+    session_marker_key_at(session_id, 0)
 }
 
 /// Storage key for a session's pending index journal: `sessions/<id>.index`.
@@ -487,14 +504,50 @@ pub(crate) fn session_index_key(session_id: &str) -> String {
     format!("{SESSIONS_PREFIX}{session_id}.index")
 }
 
-/// Extract the session ID from a `.json` marker key, if it matches.
-fn parse_session_id(key: &str) -> Option<&str> {
-    key.strip_prefix(SESSIONS_PREFIX)
-        .and_then(|s| s.strip_suffix(".json"))
+/// The session and generation a `.json` key under `sessions/` names.
+///
+/// Total over such keys, so every marker counts (fail closed): a stem
+/// `<x>.<n>` with `n` canonical decimal ≥ 1 (no leading zero) and `x`
+/// non-empty is (`x`, n); any other stem is (stem, 0). `None` for keys
+/// outside `sessions/`, without the `.json` suffix, or with an empty stem.
+pub(crate) fn parse_session_marker_key(key: &str) -> Option<(&str, u64)> {
+    let stem = key.strip_prefix(SESSIONS_PREFIX)?.strip_suffix(".json")?;
+    if stem.is_empty() {
+        return None;
+    }
+    if let Some((id, n)) = stem.rsplit_once('.')
+        && !id.is_empty()
+        && !n.is_empty()
+        && !n.starts_with('0')
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(generation) = n.parse::<u64>()
+    {
+        return Some((id, generation));
+    }
+    Some((stem, 0))
 }
 
-/// A session marker stored at `sessions/<session_id>.json`.
-#[derive(Debug, Serialize, Deserialize)]
+/// The `.json` markers among `keys`, grouped by session ID (ascending), each
+/// session's keys in ascending generation: the last is the live marker.
+fn group_session_markers(keys: &[String]) -> std::collections::BTreeMap<&str, Vec<(u64, &str)>> {
+    let mut sessions: std::collections::BTreeMap<&str, Vec<(u64, &str)>> =
+        std::collections::BTreeMap::new();
+    for key in keys {
+        if let Some((id, generation)) = parse_session_marker_key(key) {
+            sessions
+                .entry(id)
+                .or_default()
+                .push((generation, key.as_str()));
+        }
+    }
+    for markers in sessions.values_mut() {
+        markers.sort_unstable();
+    }
+    sessions
+}
+
+/// A session marker stored at `sessions/<session_id>[.<n>].json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub hostname: String,
     pub pid: u32,
@@ -506,6 +559,76 @@ pub struct SessionEntry {
     pub installation_id: Option<String>,
     #[serde(default)]
     pub pid_ns: Option<u64>,
+}
+
+impl SessionEntry {
+    /// The marker of `env`'s process, registered at `registered_at`, last
+    /// written at `last_refresh`. The one place that fills the identity
+    /// fields.
+    pub(crate) fn new(
+        env: &HostEnv,
+        registered_at: DateTime<Utc>,
+        last_refresh: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            hostname: env.host.hostname.clone(),
+            pid: env.host.pid,
+            registered_at: registered_at.to_rfc3339(),
+            last_refresh: last_refresh.to_rfc3339(),
+            boot_id: env.host.boot_id.clone(),
+            installation_id: env.host.installation_id.clone(),
+            pid_ns: env.host.pid_ns,
+        }
+    }
+}
+
+/// When a marker write completed, on every clock a gap is measured with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarkerStamp {
+    mono: std::time::Instant,
+    uptime: Option<std::time::Duration>,
+    wall: DateTime<Utc>,
+}
+
+impl MarkerStamp {
+    pub(crate) fn now(clock: &dyn Clock) -> Self {
+        Self {
+            mono: clock.monotonic(),
+            uptime: clock.uptime(),
+            wall: clock.now_utc(),
+        }
+    }
+
+    /// Time from `self` to `later`, suspend included: the uptime difference
+    /// (`CLOCK_BOOTTIME`) when both have one, else the larger of the
+    /// monotonic difference and the wall-clock difference (clamped at
+    /// zero). Never less than the monotonic difference.
+    pub(crate) fn until(&self, later: &MarkerStamp) -> std::time::Duration {
+        let mono = later.mono.saturating_duration_since(self.mono);
+        match (self.uptime, later.uptime) {
+            (Some(a), Some(b)) => b.saturating_sub(a).max(mono),
+            _ => {
+                let wall = (later.wall - self.wall)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                wall.max(mono)
+            }
+        }
+    }
+}
+
+/// A registered session: what [`SessionGuard::adopt`] needs.
+#[derive(Debug)]
+pub struct Registration {
+    session_id: String,
+    entry: SessionEntry,
+    written: MarkerStamp,
+}
+
+impl Registration {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 /// Register a backup session. Writes a session marker, then checks (without
@@ -522,7 +645,7 @@ pub fn register_session(
     storage: &dyn StorageBackend,
     session_id: &str,
     env: &HostEnv,
-) -> Result<()> {
+) -> Result<Registration> {
     register_session_inner(storage, session_id, 3, 2000, env)
 }
 
@@ -532,18 +655,10 @@ pub(crate) fn register_session_inner(
     max_attempts: usize,
     base_delay_ms: u64,
     env: &HostEnv,
-) -> Result<()> {
+) -> Result<Registration> {
     let key = session_marker_key(session_id);
     let now = env.now_utc();
-    let entry = SessionEntry {
-        hostname: env.host.hostname.clone(),
-        pid: env.host.pid,
-        registered_at: now.to_rfc3339(),
-        last_refresh: now.to_rfc3339(),
-        boot_id: env.host.boot_id.clone(),
-        installation_id: env.host.installation_id.clone(),
-        pid_ns: env.host.pid_ns,
-    };
+    let entry = SessionEntry::new(env, now, now);
     let data = serde_json::to_vec(&entry)
         .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
     if let Err(e) = storage.put(&key, &data) {
@@ -552,13 +667,18 @@ pub(crate) fn register_session_inner(
         let _ = storage.delete(&key);
         return Err(e);
     }
+    let written = MarkerStamp::now(env.clock.as_ref());
 
     match retry_while_locked(max_attempts, base_delay_ms, env.clock.as_ref(), || {
         probe_unlocked(storage, env)
     }) {
         Ok(()) => {
             debug!(session_id, "session registered, no active lock");
-            Ok(())
+            Ok(Registration {
+                session_id: session_id.to_string(),
+                entry,
+                written,
+            })
         }
         Err(e) => {
             // Lock held or unexpected error — clean up and propagate.
@@ -568,28 +688,518 @@ pub(crate) fn register_session_inner(
     }
 }
 
-/// Deregister a backup session. Best-effort: retries twice on failure.
+/// Deregister a session before a [`SessionGuard`] exists: delete its
+/// registration marker. Best-effort: retries twice on failure.
 ///
 /// Blocks the calling thread on `env.clock` between retries. Callers running
 /// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
 /// (see `commands/mount.rs` for the established pattern).
 pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str, env: &HostEnv) {
-    let key = session_marker_key(session_id);
-    for attempt in 0..3 {
-        match storage.delete(&key) {
-            Ok(()) => {
-                debug!(session_id, "session deregistered");
-                return;
-            }
-            Err(e) => {
-                if attempt < 2 {
-                    debug!(session_id, error = %e, "retrying session deregister");
-                    env.clock.sleep(std::time::Duration::from_millis(500));
-                } else {
-                    warn!(session_id, error = %e, "failed to deregister session after retries");
+    deregister_keys(storage, session_id, &[session_marker_key(session_id)], env);
+}
+
+/// Delete `keys` of session `session_id`, each with 3 attempts 500 ms apart
+/// on `env.clock`, warning after the last.
+fn deregister_keys(storage: &dyn StorageBackend, session_id: &str, keys: &[String], env: &HostEnv) {
+    for key in keys {
+        for attempt in 0..3 {
+            match storage.delete(key) {
+                Ok(()) => {
+                    debug!(session_id, key = %key, "session marker deleted");
+                    break;
+                }
+                Err(e) => {
+                    if attempt < 2 {
+                        debug!(session_id, key = %key, error = %e, "retrying session deregister");
+                        env.clock.sleep(std::time::Duration::from_millis(500));
+                    } else {
+                        warn!(session_id, key = %key, error = %e, "failed to deregister session after retries");
+                    }
                 }
             }
         }
+    }
+}
+
+/// Longest stretch without a successful marker write that 04's commit rule
+/// tolerates ("not refreshed for more than 30 minutes"): two refresh
+/// intervals, below the 45-minute staleness.
+pub(crate) const MARKER_GAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// What a session knows about its marker; shared by the heartbeat (the only
+/// writer) and the commit.
+///
+/// The `n`-th refresh attempt PUTs a new key, generation `n`, checks with an
+/// EXISTS that the key it replaces is still there, and deletes the key
+/// before that one. No key is ever written twice, so a key a reaper deleted
+/// cannot come back through this client's requests (a late copy of an
+/// earlier PUT, delayed or duplicated by the transport, still can), and a
+/// refresh that finds its previous key gone knows the marker was missing. A
+/// live session keeps two keys for a whole refresh interval: a LIST that is
+/// not atomic can pass the new key's position before its PUT, but then
+/// reaches the old key, which still exists. The one assumption left is that a LIST does not miss a key that
+/// existed for its whole duration.
+pub(crate) struct SessionMarker {
+    session_id: String,
+    /// Identity and `registered_at` of every key this session writes.
+    entry: SessionEntry,
+    state: std::sync::Mutex<MarkerState>,
+}
+
+struct MarkerState {
+    /// Generation of the key that is the marker now: the newest one whose
+    /// PUT succeeded.
+    current: u64,
+    /// When the current key's PUT completed.
+    current_written: MarkerStamp,
+    /// Highest generation attempted; a key is never attempted twice.
+    attempted: u64,
+    /// Generations whose key may exist: the current one, earlier ones not
+    /// yet deleted, keys whose PUT failed (it may have landed) and keys
+    /// whose DELETE failed. Deregistration deletes all of them.
+    owned: std::collections::BTreeSet<u64>,
+    /// Superseded keys whose presence check failed: checked again at
+    /// every heartbeat poll, at the next refresh and by the commit's probe, never deleted before an
+    /// EXISTS found them.
+    unchecked: std::collections::BTreeSet<u64>,
+    /// Superseded keys found present, deleted by the next refresh.
+    retired: std::collections::BTreeSet<u64>,
+    /// When the last successful marker write completed: registration, or a
+    /// write whose predecessors were all found present.
+    last_ok: MarkerStamp,
+    longest_gap: std::time::Duration,
+    missing: bool,
+    refreshes: u32,
+    failed_refreshes: u32,
+}
+
+impl MarkerState {
+    /// Apply one presence check of the superseded key `generation`: `true`
+    /// if it settled the key (found or found gone). A result for a key that
+    /// is no longer waiting for a check (the other checker settled it) is
+    /// ignored, so a session's own delete of a settled key never reads as a
+    /// reap.
+    fn settle(&mut self, generation: u64, present: bool) {
+        if !self.unchecked.remove(&generation) {
+            return;
+        }
+        if present {
+            self.retired.insert(generation);
+        } else {
+            self.owned.remove(&generation);
+            self.missing = true;
+        }
+    }
+
+    /// The writes up to the current key are all proven: close the stretch.
+    fn close_gap(&mut self) -> std::time::Duration {
+        let gap = self.last_ok.until(&self.current_written);
+        self.longest_gap = self.longest_gap.max(gap);
+        self.last_ok = self.current_written;
+        gap
+    }
+}
+
+/// A snapshot of the record, with the open stretch since the last
+/// successful write included in `longest_gap`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkerReport {
+    pub missing: bool,
+    pub longest_gap: std::time::Duration,
+    /// Superseded keys whose presence check has not succeeded yet.
+    pub unchecked: usize,
+    pub refreshes: u32,
+    pub failed_refreshes: u32,
+}
+
+impl MarkerReport {
+    /// Never missing, every superseded key checked, and never unrefreshed
+    /// longer than [`MARKER_GAP_LIMIT`].
+    pub(crate) fn continuous(&self) -> bool {
+        !self.missing && self.unchecked == 0 && self.longest_gap <= MARKER_GAP_LIMIT
+    }
+}
+
+/// What one refresh attempt found.
+#[derive(Debug)]
+pub(crate) enum RefreshOutcome {
+    /// New key written, every superseded key confirmed present. `gap`: time
+    /// since the last successful write.
+    Refreshed { gap: std::time::Duration },
+    /// New key written; a superseded key was gone: a reaper deleted it.
+    Missing,
+    /// The new key was written; a presence check failed, so a superseded key
+    /// stays unchecked. The gap stays open; the heartbeat checks it again at
+    /// its next poll.
+    Unchecked(VykarError),
+    /// The new key's PUT failed (it may exist). Nothing about the past is
+    /// learned; the gap stays open.
+    Failed(VykarError),
+}
+
+impl SessionMarker {
+    pub(crate) fn new(registration: &Registration) -> Self {
+        Self {
+            session_id: registration.session_id.clone(),
+            entry: registration.entry.clone(),
+            state: std::sync::Mutex::new(MarkerState {
+                current: 0,
+                current_written: registration.written,
+                attempted: 0,
+                owned: std::collections::BTreeSet::from([0]),
+                unchecked: std::collections::BTreeSet::new(),
+                retired: std::collections::BTreeSet::new(),
+                last_ok: registration.written,
+                longest_gap: std::time::Duration::ZERO,
+                missing: false,
+                refreshes: 0,
+                failed_refreshes: 0,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MarkerState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn key(&self, generation: u64) -> String {
+        session_marker_key_at(&self.session_id, generation)
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The key that is the marker now, with its generation.
+    pub(crate) fn current(&self) -> (u64, String) {
+        let generation = self.lock().current;
+        (generation, self.key(generation))
+    }
+
+    /// One refresh attempt (the heartbeat; never concurrently with itself).
+    ///
+    /// PUTs the next generation's key; then checks the key it replaces and
+    /// every superseded key whose earlier check failed; then deletes the
+    /// keys an earlier refresh found present. Nothing is written over an
+    /// existing key and nothing is written when a write fails, so a reaped
+    /// key stays deleted and a failed read cannot overwrite a live marker.
+    pub(crate) fn refresh(
+        &self,
+        storage: &dyn StorageBackend,
+        clock: &dyn Clock,
+    ) -> RefreshOutcome {
+        let (generation, to_check) = {
+            let mut st = self.lock();
+            st.attempted += 1;
+            let generation = st.attempted;
+            st.owned.insert(generation);
+            let mut to_check: Vec<u64> = st.unchecked.iter().copied().collect();
+            to_check.push(st.current);
+            (generation, to_check)
+        };
+        let entry = SessionEntry {
+            last_refresh: clock.now_utc().to_rfc3339(),
+            ..self.entry.clone()
+        };
+        let put = serde_json::to_vec(&entry)
+            .map_err(|e| VykarError::Other(format!("session serialize: {e}")))
+            .and_then(|data| storage.put(&self.key(generation), &data));
+        if let Err(e) = put {
+            self.lock().failed_refreshes += 1;
+            return RefreshOutcome::Failed(e);
+        }
+        let written = MarkerStamp::now(clock);
+        let checks: Vec<(u64, Result<bool>)> = to_check
+            .into_iter()
+            .map(|g| (g, storage.exists(&self.key(g))))
+            .collect();
+
+        let (outcome, to_delete) = {
+            let mut st = self.lock();
+            // Before any delete: the probe follows the marker to the new key.
+            let previous = st.current;
+            st.current = generation;
+            st.current_written = written;
+            st.unchecked.insert(previous);
+            // Found present by an earlier refresh: two generations back now.
+            let to_delete: Vec<u64> = std::mem::take(&mut st.retired).into_iter().collect();
+            let missing_before = st.missing;
+            let mut error: Option<VykarError> = None;
+            for (g, result) in checks {
+                match result {
+                    Ok(present) => st.settle(g, present),
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
+                }
+            }
+            let outcome = if st.missing && !missing_before {
+                st.last_ok = written;
+                RefreshOutcome::Missing
+            } else if let Some(e) = error {
+                st.failed_refreshes += 1;
+                RefreshOutcome::Unchecked(e)
+            } else {
+                // Every check answered, so every superseded key is settled.
+                st.refreshes += 1;
+                RefreshOutcome::Refreshed {
+                    gap: st.close_gap(),
+                }
+            };
+            (outcome, to_delete)
+        };
+
+        for g in to_delete {
+            match storage.delete(&self.key(g)) {
+                Ok(()) => {
+                    self.lock().owned.remove(&g);
+                }
+                Err(e) => {
+                    debug!(session_id = self.session_id, generation = g, error = %e, "failed to delete a superseded session marker; deregistration retries");
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Check every superseded key whose earlier check failed again (one
+    /// found gone records the marker as missing). `Ok(Some(gap))` when that
+    /// settled them all with none gone, which closes the open stretch at the
+    /// current key; `Ok(None)` when there was nothing to settle or a key was
+    /// gone; the first error when a check failed and a key is still
+    /// unchecked.
+    fn check_unchecked(&self, storage: &dyn StorageBackend) -> Result<Option<std::time::Duration>> {
+        let unchecked: Vec<u64> = self.lock().unchecked.iter().copied().collect();
+        if unchecked.is_empty() {
+            return Ok(None);
+        }
+        let mut error: Option<VykarError> = None;
+        for g in unchecked {
+            match storage.exists(&self.key(g)) {
+                Ok(present) => self.lock().settle(g, present),
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        let mut st = self.lock();
+        if st.unchecked.is_empty() {
+            return Ok((!st.missing).then(|| st.close_gap()));
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// The heartbeat's poll between refreshes while a superseded key is
+    /// unchecked: check those keys again and write nothing. `Refreshed`
+    /// when all are settled present (`gap`: the stretch this closed),
+    /// `Missing` when one was gone, `Unchecked` when a check failed again.
+    pub(crate) fn recheck(&self, storage: &dyn StorageBackend) -> RefreshOutcome {
+        let missing_before = self.lock().missing;
+        let result = self.check_unchecked(storage);
+        if self.lock().missing && !missing_before {
+            return RefreshOutcome::Missing;
+        }
+        match result {
+            Ok(gap) => RefreshOutcome::Refreshed {
+                gap: gap.unwrap_or_default(),
+            },
+            Err(e) => RefreshOutcome::Unchecked(e),
+        }
+    }
+
+    /// Whether the marker exists now: first every superseded key whose
+    /// check failed is checked again (one found gone records the marker as
+    /// missing; one whose check fails again fails the probe with that
+    /// error, since a reap of it cannot be ruled out), then EXISTS of the
+    /// current key; when that finds nothing and a refresh moved the marker
+    /// meanwhile, again with the new key (at most 3 rounds, then `Err`).
+    pub(crate) fn probe(&self, storage: &dyn StorageBackend) -> Result<bool> {
+        self.check_unchecked(storage)?;
+        for _ in 0..3 {
+            let (generation, key) = self.current();
+            if storage.exists(&key)? {
+                return Ok(true);
+            }
+            if self.lock().current == generation {
+                return Ok(false);
+            }
+        }
+        Err(VykarError::Other(format!(
+            "session {} marker moved during each of three probes",
+            self.session_id
+        )))
+    }
+
+    pub(crate) fn report(&self, clock: &dyn Clock) -> MarkerReport {
+        let now = MarkerStamp::now(clock);
+        let st = self.lock();
+        MarkerReport {
+            missing: st.missing,
+            longest_gap: st.longest_gap.max(st.last_ok.until(&now)),
+            unchecked: st.unchecked.len(),
+            refreshes: st.refreshes,
+            failed_refreshes: st.failed_refreshes,
+        }
+    }
+
+    /// Every key that may exist, for deregistration.
+    pub(crate) fn owned_keys(&self) -> Vec<String> {
+        let owned: Vec<u64> = self.lock().owned.iter().copied().collect();
+        owned.into_iter().map(|g| self.key(g)).collect()
+    }
+}
+
+/// 04 "Why markers carry weight", as far as today's protocol needs it. In
+/// order: a marker recorded missing refuses whatever the probe says; a
+/// current key found gone refuses (no key is written twice, so that is
+/// conclusive); a current key found present commits once every superseded
+/// key is checked (a gap over [`MARKER_GAP_LIMIT`] is logged; refusing on
+/// it needs the pack ages of 04's `T_pack` rule), and refuses while one is
+/// unchecked, since its reap cannot be ruled out; a failed probe commits
+/// only if the record is [continuous](MarkerReport::continuous).
+pub(crate) fn commit_marker_check(
+    session_id: &str,
+    probe: Result<bool>,
+    report: &MarkerReport,
+) -> Result<()> {
+    if report.missing {
+        warn!(
+            session_id,
+            "session marker was missing at a refresh; retry the backup"
+        );
+        return Err(VykarError::StaleChunksDuringCommit);
+    }
+    match probe {
+        Ok(false) => {
+            warn!(
+                session_id,
+                "session marker reaped before commit; retry the backup"
+            );
+            Err(VykarError::StaleChunksDuringCommit)
+        }
+        Ok(true) if report.unchecked > 0 => {
+            warn!(
+                session_id,
+                unchecked = report.unchecked,
+                "a superseded session marker key could not be checked; refusing to commit"
+            );
+            Err(VykarError::Other(format!(
+                "session {session_id}: {} superseded marker key(s) could not be checked for a reap",
+                report.unchecked
+            )))
+        }
+        Ok(true) => {
+            if report.longest_gap > MARKER_GAP_LIMIT {
+                info!(
+                    session_id,
+                    gap_secs = report.longest_gap.as_secs(),
+                    "session marker went unrefreshed for a while (machine suspended?); it is still present"
+                );
+            }
+            Ok(())
+        }
+        Err(e) if report.continuous() => {
+            warn!(
+                session_id,
+                error = %e,
+                "could not probe the session marker; refreshed without a gap, proceeding"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                session_id,
+                error = %e,
+                gap_secs = report.longest_gap.as_secs(),
+                unchecked = report.unchecked,
+                "could not probe the session marker and its refreshes are not continuous; refusing to commit"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// How often the heartbeat refreshes the session marker.
+pub(crate) const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// The heartbeat's poll on `env.clock`.
+pub(crate) const HEARTBEAT_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest wait before a failed marker PUT is tried again.
+pub(crate) const PUT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+
+/// What the heartbeat does at one poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeartbeatAction {
+    Wait,
+    /// [`SessionMarker::recheck`]: check the unchecked superseded keys,
+    /// write nothing.
+    Recheck,
+    /// [`SessionMarker::refresh`]: write the next generation's key.
+    Refresh,
+}
+
+/// When the heartbeat acts, counted in polls of [`HEARTBEAT_POLL`], not
+/// elapsed time, so a single long jump of the clock (a suspend) counts as
+/// one poll.
+///
+/// A refresh is due [`REFRESH_INTERVAL`] after the last attempt; after
+/// `k` failed PUTs in a row, `30 s · 2^(k−1)` after it (the next poll,
+/// then 1 min), capped at [`PUT_RETRY_MAX`]: the cap is small against the
+/// slack between the refresh interval and the marker staleness (30 min),
+/// so a session whose store comes back writes its marker again before a
+/// reaper can take it for stale. While a
+/// superseded key is unchecked (a presence check failed, the PUT
+/// succeeded), every poll before the next refresh rechecks it and writes
+/// nothing, so an outage of presence checks adds one key per refresh
+/// interval and its checks grow linearly. The gap bookkeeping is the
+/// marker's: a stretch stays open until a write is proven.
+#[derive(Debug)]
+pub(crate) struct HeartbeatSchedule {
+    since_attempt: std::time::Duration,
+    due: std::time::Duration,
+    failed_puts: u32,
+    recheck: bool,
+}
+
+impl HeartbeatSchedule {
+    pub(crate) fn new() -> Self {
+        Self {
+            since_attempt: std::time::Duration::ZERO,
+            due: REFRESH_INTERVAL,
+            failed_puts: 0,
+            recheck: false,
+        }
+    }
+
+    /// One poll has passed: what to do now.
+    pub(crate) fn poll(&mut self) -> HeartbeatAction {
+        self.since_attempt += HEARTBEAT_POLL;
+        if self.since_attempt >= self.due {
+            HeartbeatAction::Refresh
+        } else if self.recheck {
+            HeartbeatAction::Recheck
+        } else {
+            HeartbeatAction::Wait
+        }
+    }
+
+    /// What `action` (a [`Recheck`](HeartbeatAction::Recheck) or a
+    /// [`Refresh`](HeartbeatAction::Refresh)) found.
+    pub(crate) fn record(&mut self, action: HeartbeatAction, outcome: &RefreshOutcome) {
+        if action == HeartbeatAction::Refresh {
+            self.since_attempt = std::time::Duration::ZERO;
+            if matches!(outcome, RefreshOutcome::Failed(_)) {
+                self.failed_puts = self.failed_puts.saturating_add(1);
+                let doublings = (self.failed_puts - 1).min(16);
+                self.due = (HEARTBEAT_POLL * (1u32 << doublings)).min(PUT_RETRY_MAX);
+                return;
+            }
+            self.failed_puts = 0;
+            self.due = REFRESH_INTERVAL;
+        }
+        self.recheck = matches!(outcome, RefreshOutcome::Unchecked(_));
     }
 }
 
@@ -597,7 +1207,7 @@ pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str, env: &
 /// the session marker so maintenance doesn't treat it as stale.
 pub struct SessionGuard {
     storage: Arc<dyn StorageBackend>,
-    session_id: String,
+    marker: Arc<SessionMarker>,
     refresh_handle: Option<JoinHandle<()>>,
     stop: Arc<StopSignal>,
     env: HostEnv,
@@ -609,50 +1219,90 @@ impl SessionGuard {
     /// before opening the repo (mirrors backup's ordering).
     pub fn adopt(
         storage: Arc<dyn StorageBackend>,
-        session_id: String,
+        registration: Registration,
         env: HostEnv,
     ) -> Result<Self> {
+        let marker = Arc::new(SessionMarker::new(&registration));
         let stop = Arc::new(StopSignal::new());
         let handle = Self::spawn_refresher(
             Arc::clone(&storage),
-            session_id.clone(),
+            Arc::clone(&marker),
             Arc::clone(&stop),
             env.clone(),
         )?;
         Ok(Self {
             storage,
-            session_id,
+            marker,
             refresh_handle: Some(handle),
             stop,
             env,
         })
     }
 
-    /// The heartbeat counts polls, not elapsed time: it refreshes after 30
-    /// polls of 30 s on `env.clock`, so a single long jump of the clock (a
-    /// suspend) counts as one poll.
+    pub fn session_id(&self) -> &str {
+        self.marker.session_id()
+    }
+
+    /// The session's marker record, for the commit.
+    pub(crate) fn marker(&self) -> Arc<SessionMarker> {
+        Arc::clone(&self.marker)
+    }
+
+    /// The heartbeat polls every 30 s on `env.clock` and acts as
+    /// [`HeartbeatSchedule`] says.
     fn spawn_refresher(
         storage: Arc<dyn StorageBackend>,
-        session_id: String,
+        marker: Arc<SessionMarker>,
         stop: Arc<StopSignal>,
         env: HostEnv,
     ) -> Result<JoinHandle<()>> {
         std::thread::Builder::new()
             .name("session-refresh".into())
             .spawn(move || {
-                const REFRESH_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(15 * 60);
-                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-                let mut elapsed = std::time::Duration::ZERO;
+                let session_id = marker.session_id();
+                let mut schedule = HeartbeatSchedule::new();
                 loop {
-                    if env.clock.wait_timeout(&stop, POLL_INTERVAL) {
+                    if env.clock.wait_timeout(&stop, HEARTBEAT_POLL) {
                         break;
                     }
-                    elapsed += POLL_INTERVAL;
-                    if elapsed >= REFRESH_INTERVAL {
-                        refresh_session(storage.as_ref(), &session_id, env.clock.as_ref());
-                        elapsed = std::time::Duration::ZERO;
+                    let action = schedule.poll();
+                    let outcome = match action {
+                        HeartbeatAction::Wait => continue,
+                        HeartbeatAction::Recheck => marker.recheck(storage.as_ref()),
+                        HeartbeatAction::Refresh => {
+                            marker.refresh(storage.as_ref(), env.clock.as_ref())
+                        }
+                    };
+                    match &outcome {
+                        RefreshOutcome::Refreshed { gap } => {
+                            if *gap > MARKER_GAP_LIMIT {
+                                warn!(
+                                    session_id,
+                                    gap_secs = gap.as_secs(),
+                                    "session marker went unrefreshed for a while (machine suspended?)"
+                                );
+                            } else {
+                                debug!(session_id, ?action, "session marker refreshed");
+                            }
+                        }
+                        RefreshOutcome::Missing => warn!(
+                            session_id,
+                            "session marker was removed by another client while this session ran; \
+                             a backup in this session will not commit"
+                        ),
+                        RefreshOutcome::Unchecked(e) if action == HeartbeatAction::Recheck => {
+                            debug!(session_id, error = %e, "superseded session marker key still unchecked");
+                        }
+                        RefreshOutcome::Unchecked(e) => warn!(
+                            session_id,
+                            error = %e,
+                            "could not check a superseded session marker key; checking again at the next poll"
+                        ),
+                        RefreshOutcome::Failed(e) => {
+                            warn!(session_id, error = %e, "failed to refresh session marker");
+                        }
                     }
+                    schedule.record(action, &outcome);
                 }
             })
             .map_err(|e| VykarError::Other(format!("failed to spawn session refresh thread: {e}")))
@@ -665,70 +1315,30 @@ impl Drop for SessionGuard {
         if let Some(handle) = self.refresh_handle.take() {
             let _ = handle.join();
         }
-        deregister_session(self.storage.as_ref(), &self.session_id, &self.env);
+        deregister_keys(
+            self.storage.as_ref(),
+            self.marker.session_id(),
+            &self.marker.owned_keys(),
+            &self.env,
+        );
     }
 }
 
-/// Refresh a session marker's `last_refresh` timestamp. Best-effort.
-///
-/// Deliberately non-resurrecting: if the marker is missing (successfully
-/// read as `None`) we do **not** recreate it. Missing markers indicate the
-/// session has already been deregistered — either cleanly by
-/// [`deregister_session`] or by maintenance that reaped us as stale — and
-/// resurrecting the key would race with that deletion and could confuse
-/// maintenance into seeing a "live" session that no one owns.
-///
-/// On storage read errors we also bail out without writing, so an
-/// inconclusive `Err` read can't overwrite a live marker's fields with
-/// defaults.
-pub fn refresh_session(storage: &dyn StorageBackend, session_id: &str, clock: &dyn Clock) {
-    let key = session_marker_key(session_id);
-    let now = clock.now_utc();
-
-    let mut entry: SessionEntry = match storage.get(&key) {
-        Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(session_id, error = %e, "session marker parse failed; skipping refresh");
-                return;
-            }
-        },
-        Ok(None) => {
-            debug!(session_id, "session marker missing; not resurrecting");
-            return;
-        }
-        Err(e) => {
-            warn!(session_id, error = %e, "storage read failed during refresh; skipping");
-            return;
-        }
-    };
-    entry.last_refresh = now.to_rfc3339();
-
-    let data = match serde_json::to_vec(&entry) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(session_id, error = %e, "failed to serialize session refresh");
-            return;
-        }
-    };
-    if let Err(e) = storage.put(&key, &data) {
-        warn!(session_id, error = %e, "failed to refresh session marker");
-    } else {
-        debug!(session_id, "session marker refreshed");
-    }
-}
-
-/// List all active session IDs (without the `sessions/` prefix and `.json` suffix).
+/// List the IDs of all sessions with a marker, sorted, one per session.
 pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
     let keys = storage.list(SESSIONS_PREFIX)?;
-    Ok(keys
-        .iter()
-        .filter_map(|k| parse_session_id(k).map(String::from))
+    Ok(group_session_markers(&keys)
+        .into_keys()
+        .map(String::from)
         .collect())
 }
 
-/// Remove session markers older than `max_age`, or left on this machine.
-/// Returns the IDs of cleaned sessions.
+/// Remove sessions whose marker is older than `max_age`, or left on this
+/// machine. Returns the IDs of cleaned sessions.
+///
+/// A session is judged by its newest listed marker key; when that one is
+/// stale, every listed key of the session is deleted, and an older key of a
+/// session whose newest key is fresh is kept.
 ///
 /// `.index` journals for cleaned sessions are **preserved** so the next backup
 /// can recover uploaded-but-uncommitted chunks via `recover_pending_index()`.
@@ -755,12 +1365,15 @@ pub fn cleanup_stale_sessions(
     // a one-run grace period so the next backup can recover the journal.
     let mut cleaned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // First pass: process only .json session markers.
-    for key in &keys {
-        let Some(session_id) = parse_session_id(key) else {
-            continue; // skip .index files — handled below
+    // First pass: the .json session markers, per session.
+    for (session_id, markers) in group_session_markers(&keys) {
+        let Some(&(_, newest)) = markers.last() else {
+            continue;
         };
-        let Some(data) = storage.get(key)? else {
+        let Some(data) = storage.get(newest)? else {
+            // Gone since the LIST (a rotation or a deregistration): the
+            // session may still be live, so its journal is kept.
+            surviving_markers.insert(session_id.to_string());
             continue;
         };
         let Ok(entry) = serde_json::from_slice::<SessionEntry>(&data) else {
@@ -797,19 +1410,20 @@ pub fn cleanup_stale_sessions(
         );
         let is_left_local = matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot);
 
-        if is_stale_by_age {
-            debug!(session_id, age_hours = %((now - ts).num_hours()), "cleaning stale session");
-            storage.delete(key)?;
-            cleaned_ids.insert(session_id.to_string());
-            cleaned.push(session_id.to_string());
-        } else if is_left_local {
-            debug!(
-                session_id,
-                pid = entry.pid,
-                ?verdict,
-                "cleaning session left on this machine"
-            );
-            storage.delete(key)?;
+        if is_stale_by_age || is_left_local {
+            if is_stale_by_age {
+                debug!(session_id, age_hours = %((now - ts).num_hours()), "cleaning stale session");
+            } else {
+                debug!(
+                    session_id,
+                    pid = entry.pid,
+                    ?verdict,
+                    "cleaning session left on this machine"
+                );
+            }
+            for &(_, key) in &markers {
+                storage.delete(key)?;
+            }
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else {
@@ -835,21 +1449,24 @@ pub fn cleanup_stale_sessions(
     Ok(cleaned)
 }
 
-/// List all session entries with their parsed content.
+/// List all sessions with their parsed marker, one per session, in
+/// ascending session ID order.
 ///
-/// Returns `(session_id, Option<SessionEntry>)` pairs. The entry is `None`
-/// if the marker file could not be parsed (malformed JSON).
+/// Returns `(session_id, Option<SessionEntry>)` pairs for the newest listed
+/// marker key of each session. The entry is `None` if that marker could not
+/// be parsed (malformed JSON) or vanished since the LIST; a session with any
+/// listed key is reported.
 pub fn list_session_entries(
     storage: &dyn StorageBackend,
 ) -> Result<Vec<(String, Option<SessionEntry>)>> {
     let keys = storage.list(SESSIONS_PREFIX)?;
     let mut entries = Vec::new();
-    for key in &keys {
-        let Some(session_id) = parse_session_id(key) else {
+    for (session_id, markers) in group_session_markers(&keys) {
+        let Some(&(_, newest)) = markers.last() else {
             continue;
         };
         let entry = storage
-            .get(key)?
+            .get(newest)?
             .and_then(|data| serde_json::from_slice::<SessionEntry>(&data).ok());
         entries.push((session_id.to_string(), entry));
     }

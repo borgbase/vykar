@@ -1377,6 +1377,19 @@ mod tests {
         assert!(is_known_repo_key(&format!("index.d/{}", "ab".repeat(32))));
     }
 
+    /// A rotated session marker (`sessions/<id>.<n>.json`, 04 step 2) is an
+    /// ephemeral key that an append-only server lets a client create,
+    /// overwrite and delete.
+    #[test]
+    fn rotated_session_marker_is_ephemeral() {
+        let key = format!("sessions/{}.7.json", "0123456789abcdef".repeat(2));
+        assert!(is_valid_storage_key(&key));
+        assert_eq!(key_class(&key), Some(KeyClass::Ephemeral));
+        for verb in [Verb::Create, Verb::Overwrite, Verb::Delete] {
+            assert!(append_only_allows(&key, verb), "{verb:?}");
+        }
+    }
+
     #[test]
     fn index_object_keys() {
         let name = "0123456789abcdef".repeat(4);

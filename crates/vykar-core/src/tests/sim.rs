@@ -1105,11 +1105,6 @@ fn known_hazard_h2_lock_refresh_resurrects() {
 }
 
 #[test]
-fn known_hazard_h2_marker_refresh_resurrects() {
-    hazards::assert_reproduces("H2-marker");
-}
-
-#[test]
 fn known_hazard_h4_compact_deletes_after_lost_lock() {
     hazards::assert_reproduces("H4");
 }
@@ -1132,12 +1127,13 @@ fn neutralised_h2_not_reproduced() {
     expect_not_reproduced("H2", interleavings::h2_with(H2Reap::BeforeFence));
 }
 
+/// Both placements of the H2-marker regression, one by one (a clearer
+/// failure than the regression report).
 #[test]
-fn neutralised_h2_marker_not_reproduced() {
-    expect_not_reproduced(
-        "H2-marker",
-        interleavings::h2_marker_with(MarkerReap::BeforeGet),
-    );
+fn h2_marker_placements_not_reproduced() {
+    for reap in [MarkerReap::BeforeRefresh, MarkerReap::AfterPut] {
+        expect_not_reproduced("H2-marker", interleavings::h2_marker_with(reap));
+    }
 }
 
 #[test]
@@ -1420,6 +1416,216 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
         .collect();
     assert!(!names.contains(&"a1".to_string()), "{names:?}");
     sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// D9's other half: a pack of a backup goes missing while its marker is
+/// present. That is storage loss, not a reaped session: the commit keeps the
+/// untyped "pack ... missing" error.
+#[test]
+fn missing_pack_with_a_live_marker_stays_untyped() {
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let ga = sim.gate(
+        GateRule::new(
+            a,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Exact("locks/".into()),
+        )
+        .nth(2),
+    );
+    let sa = sim.spawn(
+        a,
+        Call::Backup {
+            snapshot: "a1".into(),
+            tree: SourceTree::seeded("own", 3, 64 * KIB),
+        },
+    );
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    let pack = sim
+        .store()
+        .keys_written_by(a, "packs/")
+        .into_iter()
+        .next()
+        .expect("a uploaded a pack");
+    assert!(sim.tamper_delete(&pack));
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
+    assert!(sim.store().object(&marker).is_some(), "the marker is live");
+
+    sim.resume(ga);
+    let ra = sim.join(sa);
+    assert!(
+        !allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    assert!(
+        ra.detail().contains("missing from storage"),
+        "{}",
+        ra.detail()
+    );
+}
+
+/// A reaped session whose packs compact deleted, with nothing reused that
+/// the sweep removed (a tree of its own), so the reuse re-check passes and
+/// the pack check fails: typed as stale (D9). The commit's first marker
+/// probe is made inconclusive (an injected EXISTS error, with a continuous
+/// record it falls through), else it would refuse first; the re-probe after
+/// the failed pack check finds the marker gone.
+#[test]
+fn reaped_marker_and_deleted_packs_fail_typed() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let x = SourceTree::seeded("x", 3, 64 * KIB);
+    sim.backup(c, "t0", &x).expect_ok();
+    sim.delete(c, &["t0"]).expect_ok();
+
+    let ga = sim.gate(
+        GateRule::new(
+            a,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Exact("locks/".into()),
+        )
+        .nth(2),
+    );
+    let sa = sim.spawn(
+        a,
+        Call::Backup {
+            snapshot: "a1".into(),
+            tree: SourceTree::seeded("own", 3, 64 * KIB),
+        },
+    );
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
+    assert!(sim.tamper_delete(&marker));
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    assert!(!a_packs.is_empty());
+    assert!(
+        a_packs.iter().all(|k| sim.store().object(k).is_none()),
+        "orphans deleted"
+    );
+    sim.fault(
+        FaultRule::new(
+            OpMatch::Kind(OpKind::Exists),
+            KeyMatch::Prefix("sessions/".into()),
+            FaultAction::Fail,
+        )
+        .client(a),
+    );
+
+    sim.resume(ga);
+    let ra = sim.join(sa);
+    assert!(
+        allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    let probes: Vec<OpOutcome> = sim
+        .store()
+        .log()
+        .into_iter()
+        .filter(|r| r.client == a && r.op == OpKind::Exists && r.key.starts_with("sessions/"))
+        .map(|r| r.outcome)
+        .collect();
+    assert_eq!(probes.len(), 2, "the probe and the re-probe: {probes:?}");
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// 04 step 2, A1: the registration key's presence check fails at the
+/// heartbeat's refresh and again at the commit's probe. Whether a reaper
+/// deleted the key after the refresh's PUT or not, the commit refuses with
+/// the probe's error (not as stale: the reap is not proven) and the backup
+/// writes no index or snapshot.
+#[test]
+fn a_marker_key_that_stays_unchecked_stops_the_commit() {
+    const WAIT: Duration = Duration::from_secs(5);
+    for reaped in [true, false] {
+        let mut sim = Sim::new();
+        let c = sim.client("c");
+        sim.backup(c, "t0", &tree("t0")).expect_ok();
+        let a = sim.client("a");
+        // A's first main-thread operation after the heartbeat started.
+        let g_main = sim.gate(GateRule::new(
+            a,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Exact("sessions/".into()),
+        ));
+        let sa = sim.spawn(
+            a,
+            Call::Backup {
+                snapshot: "a1".into(),
+                tree: tree("a1"),
+            },
+        );
+        sim.expect_paused(g_main, "a's journal-recovery LIST");
+        let gen0 = sim
+            .store()
+            .keys_written_by(a, "sessions/")
+            .into_iter()
+            .find(|k| k.ends_with(".json"))
+            .expect("a's marker");
+        // The refresh's check, then the commit probe's.
+        for nth in [1, 2] {
+            sim.fault(
+                FaultRule::new(
+                    OpMatch::Kind(OpKind::Exists),
+                    KeyMatch::Exact(gen0.clone()),
+                    FaultAction::Fail,
+                )
+                .client(a)
+                .nth(nth),
+            );
+        }
+        // The heartbeat's first refresh: 30 polls of 30 s.
+        assert!(sim.time().wait_for_waiters(1, WAIT));
+        for _ in 0..30 {
+            sim.advance(Duration::from_secs(30));
+            assert!(sim.time().wait_for_waiters(1, WAIT));
+        }
+        assert!(
+            sim.store()
+                .keys_written_by(a, "sessions/")
+                .iter()
+                .any(|k| k.ends_with(".1.json")),
+            "the refresh wrote generation 1"
+        );
+        if reaped {
+            assert!(sim.tamper_delete(&gen0));
+        }
+
+        sim.resume(g_main);
+        let ra = sim.join(sa);
+        assert!(!ra.is_ok(), "reaped {reaped}: {:?}", ra.outcome);
+        assert!(
+            !allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+            "reaped {reaped}: {:?}",
+            ra.outcome
+        );
+        assert!(
+            ra.detail().contains(&format!("Exists {gen0}")),
+            "reaped {reaped}: {}",
+            ra.detail()
+        );
+        for prefix in ["index.d/", "index.h/", "snapshots/"] {
+            assert!(
+                sim.store().keys_written_by(a, prefix).is_empty(),
+                "reaped {reaped}: a wrote {prefix}"
+            );
+        }
+    }
 }
 
 /// SIM-5 (the H5 regression is in `regressions_hold`): a head that drops a

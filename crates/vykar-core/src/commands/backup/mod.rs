@@ -602,7 +602,7 @@ fn upload_prepared(
     // pending_index journal), so Phase 2 has no uploads left to wait for.
 
     // Register session marker and probe for maintenance lock.
-    lock::register_session(backend.as_ref(), &session_id, &host_env)?;
+    let registration = lock::register_session(backend.as_ref(), &session_id, &host_env)?;
     debug!(session_id, "backup session registered");
 
     // Open repo after session registration (minimizes T0→commit window).
@@ -651,7 +651,8 @@ fn upload_prepared(
     // `session` is declared after `repo` so it drops before `Repository::drop`;
     // those error returns depend on that order, and so does `PendingCommit`'s
     // field order.
-    let session = phases::BackupSession::adopt(&repo.storage, session_id, repo.host_env().clone())?;
+    let session =
+        phases::BackupSession::adopt(&repo.storage, registration, repo.host_env().clone())?;
 
     // Run-local tally of unreachable cloud-only content. Declared here because
     // Phase 1 below borrows it while `BackupOutcome` is built after the

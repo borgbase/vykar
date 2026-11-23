@@ -255,7 +255,7 @@ The single exception is the plaintext-mode `chunk_id_key` derivation, which *is*
 |- packmaps/<64 hex>         # Write-once pack maps (blob lists of packs without a trailer, e.g. every pre-upgrade pack), named by the BLAKE3 of their bytes
 |- index.gen                 # v2/v3 only (written by 0.24 and earlier): unencrypted advisory u64 generation hint
 |- snapshots/<id>            # Encrypted snapshot metadata; source of truth for snapshot listing
-|- sessions/<id>.json        # Session presence markers (concurrent backups)
+|- sessions/<id>[.<n>].json  # Session presence markers (concurrent backups; the newest generation is the live one)
 |- sessions/<id>.index       # Per-session crash-recovery journals (absent after clean backup)
 |- packs/<xx>/<pack-id>      # Pack files containing compressed+encrypted chunks (256 shard dirs)
 `- locks/                    # Advisory lock files
@@ -305,7 +305,7 @@ flowchart LR
         indexgen["index.gen (v2/v3)"]
         snapshots["snapshots/‹id›"]
         packs["packs/‹xx›/‹id›"]
-        sessions["sessions/‹id›.json"]
+        sessions["sessions/‹id›[.‹n›].json"]
         journal["sessions/‹id›.index"]
         locks["locks/*.json"]
     end
@@ -619,13 +619,17 @@ acquire_lock_with_deadline(COMMIT_LOCK_MAX_WAIT = 10 min, 500ms base, exponentia
 the commit machine (repo::commit_machine::BackupCommit):
   → flush packs (no-op safety net: Phase 1 already drained uploads)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
+  → probe the session marker (EXISTS of its current key); with the heartbeat's record:
+    marker ever missing, or current key gone → Err(StaleChunksDuringCommit);
+    probe failed and refreshes not continuous → that error
   → check snapshot name uniqueness against fresh list
   → if delta is non-empty (additions or reuse):
       → GET head, bring the index to it (normally the loaded one; another session's backup segments are applied)
       → when the head moved by a sweep, a fold or a maintenance segment (needs_recheck), check every reused chunk:
         one in neither the index nor the session's new entries → Err(StaleChunksDuringCommit), nothing written
       → the additions: the first location of each new chunk the index does not hold yet
-      → verify their packs
+      → verify their packs; a missing pack while the session marker is gone
+        → Err(StaleChunksDuringCommit), else the "pack … missing" error
       → no additions: nothing is written
       → else PUT one backup segment of the additions (a base at the fold limit), fence check,
         PUT index.h/<gen+1>; apply it to the index in memory
@@ -633,7 +637,7 @@ the commit machine (repo::commit_machine::BackupCommit):
 finish_backup_commit():
   → update in-memory manifest
   → persist local file cache
-deregister_session() → delete sessions/<session_id>.json (while holding lock)
+deregister the session → delete every marker key of the session (while holding lock)
 release_lock()
 clear sessions/<session_id>.index
 ```
@@ -741,7 +745,13 @@ During the upload phase of a backup, a lightweight JSON marker is written to `se
 
 Each marker contains: hostname, PID, `registered_at`, `last_refresh`, and the writer's boot ID, installation ID and PID namespace (see [Same-host reaping](#same-host-reaping)). On registration, the client writes its marker, then checks for an active advisory lock by listing `locks/` (3 retries, 2 s base delay, exponential backoff + 25 % jitter). The probe is read-only and writes no lock key. If the lock is held (maintenance in progress), the session marker is deleted and the backup aborts with `Locked`. This is safe against maintenance without taking the lock: the session writes its marker before listing locks, maintenance writes its lock before listing sessions, so at least one sees the other.
 
-Each client owns a dedicated heartbeat thread (`SessionGuard` with a 15-minute timer) that refreshes the marker independently of the upload pipeline — so a host that happens to have very long-running uploads still keeps its marker fresh. Markers whose `last_refresh` is strictly older than 45 minutes (three missed heartbeats) are treated as stale.
+Each client owns a dedicated heartbeat thread (`SessionGuard` with a 15-minute timer) that refreshes the marker independently of the upload pipeline — so a host that happens to have very long-running uploads still keeps its marker fresh. Markers whose `last_refresh` is strictly older than 45 minutes (three missed heartbeats) are treated as stale; a session is judged by its newest marker key.
+
+A refresh never writes a key twice. The `n`-th refresh writes a new key `sessions/<session_id>.<n>.json` (registration wrote generation 0, `sessions/<session_id>.json`), then checks with an EXISTS that the key it replaces is still there, then deletes the key before that one: a live session keeps two keys for a whole refresh interval, so a LIST that is not atomic still sees one of them. A key a reaper deleted therefore never comes back through the client's own requests, and a refresh that finds its previous key gone records the marker as missing. A late copy of an earlier PUT (one the transport delayed or duplicated, landing after the reap) can still recreate it, and put-if-absent would not stop that, since the key is absent by then: the commit then finds the marker present, a missing pack keeps its own error and no snapshot is written. A failed check keeps the old key, which is checked again at every 30 s poll (writing nothing) until it settles or the next refresh is due, and by the commit; a refresh whose PUT failed is retried at the next poll, then after 1 minute, then every 2 minutes, so that a store that comes back gets a fresh marker long before the 45-minute staleness. The record also keeps the longest stretch between successful marker writes, measured on time that includes suspend (`CLOCK_BOOTTIME` where available).
+
+The commit judges the marker with that record: a marker ever recorded missing, or a current key the commit's probe finds gone, fails the commit with `StaleChunksDuringCommit` (retry the backup); an old key whose check fails again at the probe fails the probe, and a probe that fails commits only when the refreshes were continuous (never missing, every old key checked, no stretch over 30 minutes), else its error is returned; a probe that finds the current key commits only when every old key is checked. When the session's pack check finds a pack missing and the marker is gone (recorded or re-probed), the commit also fails with `StaleChunksDuringCommit`: compact deleted the packs of a reaped session. With the marker present a missing pack is storage loss and keeps its own error.
+
+Binaries built between the v6 format and this change (never released) read `<id>.<n>.json` as a session named `<id>.<n>`: their maintenance still refuses on any key, but once generation 0 is deleted their cleanup deletes the live session's journal; 0.24 refuses v6 repositories before that, except `break-lock --sessions`, which lists the keys as they are.
 
 #### Advisory Lock (exclusive)
 
@@ -821,12 +831,12 @@ flowchart TD
 If a backup is interrupted after packs have been flushed but before commit, those packs would be orphaned. The **pending index journal** prevents re-uploading their data on the next run:
 
 1. During backup, every 8 data-pack flushes, vykar writes a `sessions/<session_id>.index` blob to storage containing pack→chunk mappings for all flushed packs in this session
-2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its `.json` marker is missing (orphaned) or stale; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends). A pack is adopted when its length is exactly the end of its last journaled chunk (a pack without a trailer) or that plus exactly the trailer frame for its chunk count; no pack content is read
+2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its session has no `.json` marker (orphaned) or only stale ones; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends). A pack is adopted when its length is exactly the end of its last journaled chunk (a pack without a trailer) or that plus exactly the trailer frame for its chunk count; no pack content is read
 3. Verified chunks are promoted into the dedup structures so subsequent dedup checks find them
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
 5. `flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
 
-If a backup process crashes or is killed without clean shutdown, its session marker (`sessions/<id>.json`) remains on storage. Maintenance commands (`compact`, `delete`, `prune`) will see it via `list_session_entries()` and refuse to run until the marker ages out. `cleanup_stale_sessions()` removes markers whose `last_refresh` is strictly older than 45 minutes (three missed 15-minute heartbeats), and at once a marker that [same-host reaping](#same-host-reaping) proves was left on this machine by a dead process or an earlier boot. Companion `.index` journals are **preserved** across this cleanup so the next backup can recover any uploaded-but-uncommitted chunks; only `.index` files whose `.json` marker was already absent (orphaned from a prior run) are deleted. Malformed `.json` markers (unparseable JSON or bad timestamps) are left in place and reported as blocking sessions — they require operator intervention (`break-lock --sessions`).
+If a backup process crashes or is killed without clean shutdown, its session markers (`sessions/<id>[.<n>].json`) remain on storage. Maintenance commands (`compact`, `delete`, `prune`) will see it via `list_session_entries()` and refuse to run until the marker ages out. `cleanup_stale_sessions()` removes every marker key of a session whose newest key's `last_refresh` is strictly older than 45 minutes (three missed 15-minute heartbeats), and at once a marker that [same-host reaping](#same-host-reaping) proves was left on this machine by a dead process or an earlier boot. Companion `.index` journals are **preserved** across this cleanup so the next backup can recover any uploaded-but-uncommitted chunks; only `.index` files whose `.json` marker was already absent (orphaned from a prior run) are deleted. Malformed `.json` markers (unparseable JSON or bad timestamps) are left in place and reported as blocking sessions — they require operator intervention (`break-lock --sessions`).
 
 ### Concurrent Multi-Client Backups
 
@@ -834,7 +844,7 @@ Multiple machines or scheduled jobs can back up to the same repository concurren
 
 #### Session Lifecycle
 
-Each backup client registers a session marker at `sessions/<session_id>.json` before opening the repository. After the repository is open, a dedicated `SessionGuard` heartbeat thread refreshes the marker every 15 minutes, independent of the upload pipeline. At commit time, the client acquires the exclusive advisory lock, commits its changes, deregisters the session (while still holding the lock — the guard's `Drop` stops and joins the heartbeat thread before deleting the marker, so no refresh can race with the delete), then releases the lock.
+Each backup client registers a session marker at `sessions/<session_id>.json` before opening the repository. After the repository is open, a dedicated `SessionGuard` heartbeat thread refreshes the marker every 15 minutes, independent of the upload pipeline. At commit time, the client acquires the exclusive advisory lock, commits its changes, deregisters the session (while still holding the lock — the guard's `Drop` stops and joins the heartbeat thread before deleting the session's marker keys, so no refresh can race with the delete), then releases the lock.
 
 Each session's crash-recovery journal is co-located at `sessions/<session_id>.index`, keeping all per-session state in a single directory.
 

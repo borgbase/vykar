@@ -36,20 +36,26 @@ pub(super) struct BackupSession {
 }
 
 impl BackupSession {
-    /// Adopt the already-registered session `id` into a heartbeat guard.
-    /// On failure the marker is deregistered before the error is returned.
+    /// Adopt the already-registered session into a heartbeat guard. On
+    /// failure the marker is deregistered before the error is returned.
     pub(super) fn adopt(
         storage: &Arc<dyn StorageBackend>,
-        id: String,
+        registration: lock::Registration,
         env: HostEnv,
     ) -> Result<Self> {
-        match lock::SessionGuard::adopt(Arc::clone(storage), id.clone(), env.clone()) {
+        let id = registration.session_id().to_string();
+        match lock::SessionGuard::adopt(Arc::clone(storage), registration, env.clone()) {
             Ok(g) => Ok(Self { id, guard: Some(g) }),
             Err(e) => {
                 lock::deregister_session(storage.as_ref(), &id, &env);
                 Err(e)
             }
         }
+    }
+
+    /// The session's marker record; `None` once the guard was handed off.
+    fn marker(&self) -> Option<Arc<lock::SessionMarker>> {
+        self.guard.as_ref().map(lock::SessionGuard::marker)
     }
 
     /// Deregister now. A no-op once the guard was handed off or ended.
@@ -513,7 +519,7 @@ impl PendingCommit {
         let fence =
             lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
         repo.set_lock_fence(fence);
-        let machine = BackupCommit::new(&repo, snapshot_entry, snapshot_packed);
+        let machine = BackupCommit::new(&repo, snapshot_entry, snapshot_packed, session.marker());
         CommitInProgress {
             session,
             repo,
@@ -591,7 +597,7 @@ impl CommitInProgress {
         // lock is still held throughout and released only after that thread
         // is joined, below: deregistration happens under the lock as before.
         // The guard's Drop stops the heartbeat thread and joins it
-        // before the marker is deleted, so no concurrent refresh_session
+        // before the markers are deleted, so no concurrent refresh
         // call can race with this delete. This sequencing is why the commit
         // path releases the lock itself instead of running under
         // `with_repo_lock`.

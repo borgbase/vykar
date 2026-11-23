@@ -13,7 +13,9 @@ use vykar_types::error::Result;
 
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::host_env::Clock;
-use super::lock::{SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, session_index_key};
+use super::lock::{
+    SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, parse_session_marker_key, session_index_key,
+};
 use super::pack_recovery::verify_journal_packs_trailers;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
 
@@ -41,16 +43,19 @@ enum RecoverResult {
     Legacy,
 }
 
-/// Marker state for a session's `.json` file during recovery scanning.
-#[derive(Debug)]
+/// Marker state for a session's `.json` files during recovery scanning.
+/// A session with several marker keys (a refresh writes the next
+/// generation's key before it deletes an older one) takes the strongest:
+/// `Active` over `Unknown` over `Stale`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum MarkerState {
-    /// Marker exists, parseable, `last_refresh` within `SESSION_STALE_SECS`.
-    Active,
     /// Marker exists, parseable, `last_refresh` strictly older than
     /// `SESSION_STALE_SECS`.
     Stale,
     /// Marker exists but unreadable or unparseable.
     Unknown,
+    /// Marker exists, parseable, `last_refresh` within `SESSION_STALE_SECS`.
+    Active,
 }
 
 /// The parts of the write session that recovery fills in, and the clock it
@@ -69,10 +74,10 @@ pub(crate) struct RecoveryTarget<'a> {
 
 /// Recover chunk→pack mappings from previous interrupted sessions'
 /// `pending_index` files. Scans all `.index` files under `sessions/`,
-/// classifying each by its companion `.json` marker state.
+/// classifying each by the state of its session's `.json` markers.
 ///
 /// A journal is recoverable if it is **orphaned** (no companion `.json`)
-/// or **stale** (companion `.json` has `last_refresh` older than 45 min).
+/// or **stale** (every companion `.json` has `last_refresh` older than 45 min).
 /// Active sessions and sessions with unreadable markers are skipped.
 ///
 /// Must be called inside the repo lock, before any chunk is stored.
@@ -111,10 +116,7 @@ pub(crate) fn recover_pending_index(
         index_keys.iter().map(|(_, id)| id.as_str()).collect();
     let mut marker_states: StdHashMap<String, MarkerState> = StdHashMap::new();
     for key in &all_keys {
-        let Some(session_id) = key
-            .strip_prefix(SESSIONS_PREFIX)
-            .and_then(|s| s.strip_suffix(".json"))
-        else {
+        let Some((session_id, _)) = parse_session_marker_key(key) else {
             continue;
         };
         if !journal_sessions.contains(session_id) {
@@ -141,7 +143,10 @@ pub(crate) fn recover_pending_index(
             },
             _ => MarkerState::Unknown,
         };
-        marker_states.insert(session_id.to_string(), state);
+        marker_states
+            .entry(session_id.to_string())
+            .and_modify(|s| *s = (*s).max(state))
+            .or_insert(state);
     }
 
     let mut total_recovered = 0usize;
@@ -329,7 +334,7 @@ mod tests {
     use crate::index::{PendingPackEntry, encode_pending_journal};
     use crate::repo::format::pack_object_with_context;
     use crate::repo::host_env::SystemClock;
-    use crate::repo::lock::session_marker_key;
+    use crate::repo::lock::{session_marker_key, session_marker_key_at};
     use crate::repo::write_session::WriteSessionState;
     use crate::repo::write_session::tests::{fake_pack, test_crypto};
     use crate::testutil::{MemoryBackend, init_test_environment};
@@ -410,7 +415,17 @@ mod tests {
 
     /// Write a session marker JSON with a specific last_refresh time.
     fn write_session_marker(storage: &dyn StorageBackend, session_id: &str, last_refresh: &str) {
-        let key = session_marker_key(session_id);
+        write_session_marker_at(storage, session_id, 0, last_refresh);
+    }
+
+    /// [`write_session_marker`] for marker generation `generation`.
+    fn write_session_marker_at(
+        storage: &dyn StorageBackend,
+        session_id: &str,
+        generation: u64,
+        last_refresh: &str,
+    ) {
+        let key = session_marker_key_at(session_id, generation);
         let entry = SessionEntry {
             hostname: "test".to_string(),
             pid: 1234,
@@ -545,6 +560,58 @@ mod tests {
         );
         assert!(recovery.recovered_sessions.is_empty());
         assert!(ws.recovered_index_keys.is_empty());
+    }
+
+    /// Recovery of the journal of `id` with these marker generations and
+    /// timestamps written: whether it was recovered.
+    fn recovered_with_markers(markers: &[(u64, String)]) -> bool {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        for (generation, ts) in markers {
+            write_session_marker_at(&storage, "rot", *generation, ts);
+        }
+        write_valid_journal(&storage, &crypto, &session_index_key("rot"));
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(
+            recovery.recovered_sessions.is_empty(),
+            ws.recovered_index_keys.is_empty()
+        );
+        !recovery.recovered_sessions.is_empty()
+    }
+
+    #[test]
+    fn journal_of_a_session_with_a_rotated_active_marker_is_skipped() {
+        assert!(!recovered_with_markers(&[(2, fresh_timestamp())]));
+    }
+
+    #[test]
+    fn journal_with_only_a_stale_rotated_marker_is_recovered() {
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(50)).to_rfc3339();
+        assert!(recovered_with_markers(&[(2, old)]));
+    }
+
+    /// Generations 9 and 10 are one session (10 parsed as a number): a
+    /// fresh 10 keeps the journal although 9, last in lexical order, is
+    /// stale.
+    #[test]
+    fn generations_past_nine_belong_to_their_session() {
+        assert!(!recovered_with_markers(&[
+            (9, stale_timestamp()),
+            (10, fresh_timestamp())
+        ]));
+    }
+
+    #[test]
+    fn any_active_key_wins() {
+        assert!(!recovered_with_markers(&[
+            (0, stale_timestamp()),
+            (1, fresh_timestamp())
+        ]));
+        assert!(!recovered_with_markers(&[
+            (0, fresh_timestamp()),
+            (1, stale_timestamp())
+        ]));
     }
 
     /// Records every `get` key, to show which markers recovery fetches.

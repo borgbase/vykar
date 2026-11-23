@@ -3049,10 +3049,11 @@ fn session_guard_blocks_maintenance() {
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
         std::sync::Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let session_id = format!("{:032x}", rand::random::<u128>());
-    lock::register_session(storage.as_ref(), &session_id, &HostEnv::system()).unwrap();
+    let registration =
+        lock::register_session(storage.as_ref(), &session_id, &HostEnv::system()).unwrap();
     let guard = lock::SessionGuard::adopt(
         std::sync::Arc::clone(&storage),
-        session_id.clone(),
+        registration,
         HostEnv::system(),
     )
     .unwrap();

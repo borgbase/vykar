@@ -1,8 +1,10 @@
 use crate::repo::host_env::{Clock, StopSignal};
 use crate::repo::lock::{
-    SESSION_STALE_SECS, SessionEntry, SessionGuard, acquire_lock, break_lock, cleanup_stale_locks,
-    cleanup_stale_sessions, clear_all_sessions, default_stale_session_duration, format_age,
-    format_age_since, refresh_session, register_session, release_lock, session_marker_key,
+    HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, RefreshOutcome,
+    SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, acquire_lock, break_lock,
+    cleanup_stale_locks, cleanup_stale_sessions, clear_all_sessions, commit_marker_check,
+    default_stale_session_duration, format_age, format_age_since, parse_session_marker_key,
+    register_session, release_lock, session_marker_key, session_marker_key_at,
 };
 use crate::repo::{HostEnv, HostIdentity, SystemClock};
 use crate::sim::env::{SimTime, TimeMode};
@@ -759,54 +761,737 @@ fn cleanup_preserves_marker_with_bad_timestamp() {
     );
 }
 
-// --- Non-resurrecting refresh_session tests ---
+// --- Session marker rotation (04 step 2) ---
+
+/// A [`MemoryBackend`] with per-key faults, and a hook run once before the
+/// first EXISTS answers.
+struct FaultyBackend {
+    inner: Arc<MemoryBackend>,
+    faults: std::sync::Mutex<Faults>,
+    exists_calls: std::sync::Mutex<Vec<String>>,
+    before_exists: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for FaultyBackend {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(MemoryBackend::new()),
+            faults: Default::default(),
+            exists_calls: Default::default(),
+            before_exists: Default::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Faults {
+    /// PUT stores the object, then fails.
+    put_lands_then_fails: std::collections::HashSet<String>,
+    exists_fails: std::collections::HashSet<String>,
+    /// DELETE fails once, then works.
+    delete_fails_once: std::collections::HashSet<String>,
+    /// GET answers `None` although the object exists.
+    get_none: std::collections::HashSet<String>,
+}
+
+impl FaultyBackend {
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.faults.lock().unwrap()
+    }
+
+    fn exists_calls(&self) -> Vec<String> {
+        self.exists_calls.lock().unwrap().clone()
+    }
+}
+
+fn injected(key: &str) -> vykar_types::error::VykarError {
+    vykar_types::error::VykarError::Other(format!("injected fault on {key}"))
+}
+
+impl StorageBackend for FaultyBackend {
+    fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        if self.faults().get_none.contains(key) {
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+    fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+        self.inner.put(key, data)?;
+        if self.faults().put_lands_then_fails.contains(key) {
+            return Err(injected(key));
+        }
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> vykar_types::error::Result<()> {
+        if self.faults().delete_fails_once.remove(key) {
+            return Err(injected(key));
+        }
+        self.inner.delete(key)
+    }
+    fn exists(&self, key: &str) -> vykar_types::error::Result<bool> {
+        if let Some(hook) = self.before_exists.lock().unwrap().take() {
+            hook();
+        }
+        self.exists_calls.lock().unwrap().push(key.to_string());
+        if self.faults().exists_fails.contains(key) {
+            return Err(injected(key));
+        }
+        self.inner.exists(key)
+    }
+    fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        self.inner.get_range(key, offset, length)
+    }
+    fn create_dir(&self, key: &str) -> vykar_types::error::Result<()> {
+        self.inner.create_dir(key)
+    }
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        self.inner.profile()
+    }
+
+    vykar_storage::unsupported_server_ops!();
+}
+
+const MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `me()` on a virtual clock that starts now.
+fn sim_env() -> (Arc<SimTime>, HostEnv) {
+    let time = SimTime::new(Utc::now(), TimeMode::Auto);
+    let env = HostEnv::system()
+        .with_clock(Arc::new(time.clock(Duration::zero())))
+        .with_host(me());
+    (time, env)
+}
+
+/// Register `id` on `storage` and build its marker record.
+fn registered(storage: &dyn StorageBackend, id: &str, env: &HostEnv) -> SessionMarker {
+    SessionMarker::new(&register_session(storage, id, env).unwrap())
+}
+
+fn entry_at(storage: &dyn StorageBackend, key: &str) -> SessionEntry {
+    serde_json::from_slice(&storage.get(key).unwrap().unwrap()).unwrap()
+}
+
+fn session_keys(storage: &dyn StorageBackend) -> Vec<String> {
+    let mut keys = storage.list("sessions/").unwrap();
+    keys.sort();
+    keys
+}
 
 #[test]
-fn refresh_session_does_not_resurrect_missing_marker() {
+fn marker_keys_round_trip() {
+    let id = "0123abcd";
+    assert_eq!(session_marker_key_at(id, 0), session_marker_key(id));
+    assert_eq!(session_marker_key(id), "sessions/0123abcd.json");
+    assert_eq!(session_marker_key_at(id, 7), "sessions/0123abcd.7.json");
+    assert_eq!(
+        parse_session_marker_key(&session_marker_key(id)),
+        Some((id, 0))
+    );
+    assert_eq!(
+        parse_session_marker_key(&session_marker_key_at(id, 7)),
+        Some((id, 7))
+    );
+    // Not canonical generations: the whole stem is the session, generation 0.
+    assert_eq!(
+        parse_session_marker_key("sessions/0123abcd.07.json"),
+        Some(("0123abcd.07", 0))
+    );
+    assert_eq!(
+        parse_session_marker_key("sessions/0123abcd.0.json"),
+        Some(("0123abcd.0", 0))
+    );
+    assert_eq!(
+        parse_session_marker_key("sessions/.7.json"),
+        Some((".7", 0))
+    );
+    for key in ["sessions/0123abcd.index", "locks/x.json", "sessions/.json"] {
+        assert_eq!(parse_session_marker_key(key), None, "{key}");
+    }
+}
+
+#[test]
+fn refresh_never_rewrites_a_reaped_key() {
     let storage = MemoryBackend::new();
-    let key = session_marker_key("ghost");
-    assert!(!storage.exists(&key).unwrap());
+    let (_time, env) = sim_env();
+    let marker = registered(&storage, "ghost", &env);
+    let gen0 = session_marker_key("ghost");
+    // The reaper.
+    storage.delete(&gen0).unwrap();
 
-    // Refresh a session whose marker was already deleted (e.g. by maintenance).
-    // Must NOT recreate the key — otherwise the marker would come back from
-    // the dead and block the next maintenance run.
-    refresh_session(&storage, "ghost", &SystemClock);
-
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(matches!(outcome, RefreshOutcome::Missing), "{outcome:?}");
     assert!(
-        !storage.exists(&key).unwrap(),
-        "refresh_session must not recreate a deleted marker"
+        !storage.exists(&gen0).unwrap(),
+        "a reaped key is never written again"
+    );
+    assert!(storage.exists(&session_marker_key_at("ghost", 1)).unwrap());
+    assert!(marker.report(env.clock.as_ref()).missing);
+
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        session_keys(&storage),
+        [
+            session_marker_key_at("ghost", 1),
+            session_marker_key_at("ghost", 2)
+        ]
+    );
+    assert!(
+        marker.report(env.clock.as_ref()).missing,
+        "missing is sticky"
     );
 }
 
 #[test]
-fn refresh_session_updates_existing_marker() {
+fn refresh_rotates_to_the_next_key() {
     let storage = MemoryBackend::new();
-    let original = (Utc::now() - Duration::minutes(10)).to_rfc3339();
-    write_session_marker(&storage, "live", &original);
+    let (time, env) = sim_env();
+    let marker = registered(&storage, "live", &env);
+    let gen0 = session_marker_key("live");
+    let registered_at = entry_at(&storage, &gen0).registered_at;
+    time.advance(15 * MIN);
 
-    refresh_session(&storage, "live", &SystemClock);
-
-    let key = session_marker_key("live");
-    let data = storage.get(&key).unwrap().unwrap();
-    let entry: SessionEntry = serde_json::from_slice(&data).unwrap();
-    assert_ne!(
-        entry.last_refresh, original,
-        "refresh_session must advance last_refresh on existing marker"
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
     );
-    // registered_at should be preserved from the existing entry.
-    assert_eq!(entry.registered_at, original);
-
-    // The writer's identity survives the rewrite.
-    let full = session_entry(&me(), &original);
-    storage
-        .put(&key, &serde_json::to_vec(&full).unwrap())
-        .unwrap();
-    refresh_session(&storage, "live", &SystemClock);
-    let entry: SessionEntry = serde_json::from_slice(&storage.get(&key).unwrap().unwrap()).unwrap();
-    assert_ne!(entry.last_refresh, original);
+    let gen1 = session_marker_key_at("live", 1);
+    let entry = entry_at(&storage, &gen1);
+    assert_eq!(entry.last_refresh, env.now_utc().to_rfc3339());
+    assert_ne!(entry.last_refresh, registered_at);
+    assert_eq!(entry.registered_at, registered_at);
+    assert_eq!(entry.hostname, "myhost");
+    assert_eq!(entry.pid, 1);
     assert_eq!(entry.boot_id.as_deref(), Some("boot-a"));
     assert_eq!(entry.installation_id.as_deref(), Some("inst-a"));
     assert_eq!(entry.pid_ns, Some(1));
+    // The two keys overlap for a whole refresh interval.
+    assert_eq!(session_keys(&storage), [gen1.clone(), gen0.clone()]);
+    assert_eq!(marker.current(), (1, gen1.clone()));
+
+    time.advance(15 * MIN);
+    marker.refresh(&storage, env.clock.as_ref());
+    assert_eq!(
+        session_keys(&storage),
+        [gen1, session_marker_key_at("live", 2)]
+    );
+    let report = marker.report(env.clock.as_ref());
+    assert_eq!(report.refreshes, 2);
+    assert_eq!(report.failed_refreshes, 0);
+    assert!(!report.missing);
+    assert!(report.continuous(), "{report:?}");
+}
+
+#[test]
+fn refresh_put_failure_keeps_the_key_owned() {
+    let storage = Arc::new(FaultyBackend::default());
+    let gen1 = session_marker_key_at("put", 1);
+    storage.faults().put_lands_then_fails.insert(gen1.clone());
+    let (_time, env) = sim_env();
+    let registration = register_session(storage.as_ref(), "put", &env).unwrap();
+    let guard = SessionGuard::adopt(storage.clone(), registration, env.clone()).unwrap();
+    let marker = guard.marker();
+
+    let outcome = marker.refresh(storage.as_ref(), env.clock.as_ref());
+    assert!(matches!(outcome, RefreshOutcome::Failed(_)), "{outcome:?}");
+    assert_eq!(marker.current().0, 0);
+    assert_eq!(marker.report(env.clock.as_ref()).failed_refreshes, 1);
+    assert!(storage.exists(&gen1).unwrap(), "the failed PUT landed");
+
+    let outcome = marker.refresh(storage.as_ref(), env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(marker.current().0, 2);
+    assert_eq!(session_keys(storage.as_ref()).len(), 3);
+
+    drop(guard);
+    assert_eq!(session_keys(storage.as_ref()), Vec::<String>::new());
+}
+
+#[test]
+fn refresh_check_error_leaves_the_gap_open() {
+    let storage = FaultyBackend::default();
+    let gen0 = session_marker_key("chk");
+    storage.faults().exists_fails.insert(gen0.clone());
+    let (time, env) = sim_env();
+    let marker = registered(&storage, "chk", &env);
+    time.advance(15 * MIN);
+
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Unchecked(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(marker.current().0, 1);
+    assert!(
+        storage.inner.exists(&gen0).unwrap(),
+        "an unchecked key is not deleted"
+    );
+    let report = marker.report(env.clock.as_ref());
+    assert_eq!(report.failed_refreshes, 1);
+    assert_eq!(report.refreshes, 0);
+    assert_eq!(report.unchecked, 1);
+    assert!(!report.continuous());
+    assert_eq!(report.longest_gap, 15 * MIN);
+    time.advance(20 * MIN);
+    assert_eq!(
+        marker.report(env.clock.as_ref()).longest_gap,
+        35 * MIN,
+        "the gap keeps growing from registration"
+    );
+
+    // The check works again: the stretch closes at the newest write.
+    storage.faults().exists_fails.clear();
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    let report = marker.report(env.clock.as_ref());
+    assert_eq!((report.unchecked, report.missing), (0, false));
+    assert_eq!(report.longest_gap, 35 * MIN);
+}
+
+/// A1: a reap hidden behind a failed presence check is found by the next
+/// check, at a refresh or at the commit's probe.
+#[test]
+fn a_reap_behind_a_failed_check_is_found_later() {
+    for at_probe in [false, true] {
+        let storage = FaultyBackend::default();
+        let gen0 = session_marker_key("hid");
+        storage.faults().exists_fails.insert(gen0.clone());
+        let (_time, env) = sim_env();
+        let marker = registered(&storage, "hid", &env);
+        storage.inner.delete(&gen0).unwrap();
+        let outcome = marker.refresh(&storage, env.clock.as_ref());
+        assert!(
+            matches!(outcome, RefreshOutcome::Unchecked(_)),
+            "{outcome:?}"
+        );
+        assert!(!marker.report(env.clock.as_ref()).missing);
+
+        storage.faults().exists_fails.clear();
+        if at_probe {
+            assert!(marker.probe(&storage).unwrap(), "the current key is there");
+        } else {
+            let outcome = marker.refresh(&storage, env.clock.as_ref());
+            assert!(matches!(outcome, RefreshOutcome::Missing), "{outcome:?}");
+        }
+        let report = marker.report(env.clock.as_ref());
+        assert!(report.missing, "at_probe {at_probe}: {report:?}");
+        assert_eq!(
+            commit_marker_check("hid", Ok(true), &report)
+                .unwrap_err()
+                .to_string(),
+            vykar_types::error::VykarError::StaleChunksDuringCommit.to_string()
+        );
+    }
+}
+
+#[test]
+fn probe_follows_a_rotation() {
+    let inner = Arc::new(MemoryBackend::new());
+    let storage = FaultyBackend {
+        inner: Arc::clone(&inner),
+        ..Default::default()
+    };
+    let (_time, env) = sim_env();
+    let marker = Arc::new(registered(&storage, "rot", &env));
+    // Two refreshes before the probe's first answer: the second deletes the
+    // key the probe asks about.
+    let (m, clock) = (Arc::clone(&marker), Arc::clone(&env.clock));
+    *storage.before_exists.lock().unwrap() = Some(Box::new(move || {
+        m.refresh(inner.as_ref(), clock.as_ref());
+        m.refresh(inner.as_ref(), clock.as_ref());
+    }));
+
+    assert!(marker.probe(&storage).unwrap());
+    assert_eq!(
+        storage.exists_calls(),
+        [session_marker_key("rot"), session_marker_key_at("rot", 2)]
+    );
+    assert!(!marker.report(env.clock.as_ref()).missing);
+}
+
+#[test]
+fn probe_reports_a_reaped_current_key() {
+    let storage = FaultyBackend::default();
+    let (_time, env) = sim_env();
+    let marker = registered(&storage, "gone", &env);
+    storage.delete(&session_marker_key("gone")).unwrap();
+    assert!(!marker.probe(&storage).unwrap());
+    assert_eq!(storage.exists_calls().len(), 1);
+}
+
+#[test]
+fn gap_is_measured_on_suspend_aware_time() {
+    let storage = MemoryBackend::new();
+    let (time, env) = sim_env();
+    let clock = env.clock.as_ref();
+    let marker = registered(&storage, "nap", &env);
+    time.advance(40 * MIN);
+    match marker.refresh(&storage, clock) {
+        RefreshOutcome::Refreshed { gap } => assert_eq!(gap, 40 * MIN),
+        other => panic!("{other:?}"),
+    }
+    time.advance(5 * MIN);
+    let report = marker.report(clock);
+    assert_eq!(report.longest_gap, 40 * MIN);
+    assert!(!report.continuous());
+
+    let marker = registered(&storage, "awake", &env);
+    for _ in 0..2 {
+        time.advance(15 * MIN);
+        marker.refresh(&storage, clock);
+    }
+    assert!(marker.report(clock).continuous());
+
+    // An NTP step of the wall clock is not a gap: uptime wins over wall.
+    time.advance(15 * MIN);
+    time.jump_wall(Duration::hours(2));
+    match marker.refresh(&storage, clock) {
+        RefreshOutcome::Refreshed { gap } => assert_eq!(gap, 15 * MIN),
+        other => panic!("{other:?}"),
+    }
+    assert!(marker.report(clock).continuous());
+}
+
+#[test]
+fn commit_marker_check_rules() {
+    let report = |missing: bool, gap_min: u32| MarkerReport {
+        missing,
+        longest_gap: gap_min * MIN,
+        unchecked: 0,
+        refreshes: 0,
+        failed_refreshes: 0,
+    };
+    let stale = |r: vykar_types::error::Result<()>| {
+        matches!(
+            r,
+            Err(vykar_types::error::VykarError::StaleChunksDuringCommit)
+        )
+    };
+    let probe_err = || Err(injected("sessions/x.json"));
+    assert!(stale(commit_marker_check("s", Ok(true), &report(true, 0))));
+    assert!(stale(commit_marker_check(
+        "s",
+        Ok(false),
+        &report(false, 0)
+    )));
+    assert!(commit_marker_check("s", Ok(true), &report(false, 120)).is_ok());
+    assert!(commit_marker_check("s", probe_err(), &report(false, 15)).is_ok());
+    let err = commit_marker_check("s", probe_err(), &report(false, 31)).unwrap_err();
+    assert!(err.to_string().contains("injected fault"), "{err}");
+    assert!(stale(commit_marker_check(
+        "s",
+        probe_err(),
+        &report(true, 0)
+    )));
+    let unchecked = MarkerReport {
+        unchecked: 1,
+        ..report(false, 1)
+    };
+    assert!(commit_marker_check("s", probe_err(), &unchecked).is_err());
+    // A1: a key still unchecked after the probe refuses even when the
+    // current key was found, and not as stale: the reap is not proven.
+    let err = commit_marker_check("s", Ok(true), &unchecked).unwrap_err();
+    assert!(
+        !matches!(err, vykar_types::error::VykarError::StaleChunksDuringCommit),
+        "{err}"
+    );
+}
+
+/// F1 (A1): a superseded key whose check fails at the refresh and again at
+/// the commit's probe fails the probe with that check's error, and the
+/// commit refuses with it, whether a reaper deleted the key (a reaper that
+/// listed before PUT n deletes n−1) or not (cannot tell).
+#[test]
+fn a_key_that_stays_unchecked_refuses_the_commit() {
+    for reaped in [true, false] {
+        let storage = FaultyBackend::default();
+        let gen0 = session_marker_key("unk");
+        storage.faults().exists_fails.insert(gen0.clone());
+        let (_time, env) = sim_env();
+        let marker = registered(&storage, "unk", &env);
+        let outcome = marker.refresh(&storage, env.clock.as_ref());
+        assert!(
+            matches!(outcome, RefreshOutcome::Unchecked(_)),
+            "{outcome:?}"
+        );
+        if reaped {
+            storage.inner.delete(&gen0).unwrap();
+        }
+
+        let probe = marker.probe(&storage);
+        let probe_text = probe.as_ref().unwrap_err().to_string();
+        assert_eq!(probe_text, injected(&gen0).to_string(), "reaped {reaped}");
+        assert_eq!(
+            storage.exists_calls().last(),
+            Some(&gen0),
+            "the probe stops at the unchecked key"
+        );
+        let report = marker.report(env.clock.as_ref());
+        assert_eq!((report.missing, report.unchecked), (false, 1));
+        let err = commit_marker_check("unk", probe, &report).unwrap_err();
+        assert_eq!(err.to_string(), probe_text, "reaped {reaped}");
+    }
+}
+
+/// F4: a reaper that listed only key n−1 before refresh n's PUT deletes it
+/// after that refresh found it present. Its second LIST sees key n, so
+/// maintenance refuses; the session never checks a key it found present
+/// again, so it records nothing and commits: no false "missing".
+#[test]
+fn a_reap_after_the_check_is_refused_by_maintenance_and_not_recorded() {
+    let storage = MemoryBackend::new();
+    let (time, env) = sim_env();
+    let marker = registered(&storage, "after", &env);
+    time.advance(15 * MIN);
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    // The reaper, which listed generation 0 only.
+    storage.delete(&session_marker_key("after")).unwrap();
+    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    assert_eq!(listed.len(), 1, "the second LIST sees key 1: {listed:?}");
+    assert!(listed[0].1.is_some());
+
+    assert!(marker.probe(&storage).unwrap());
+    time.advance(15 * MIN);
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    let report = marker.report(env.clock.as_ref());
+    assert!(report.continuous(), "{report:?}");
+    assert!(commit_marker_check("after", marker.probe(&storage), &report).is_ok());
+}
+
+/// Polls until the heartbeat's next refresh, counting the poll that
+/// refreshes.
+fn polls_to_refresh(schedule: &mut HeartbeatSchedule) -> usize {
+    (1..=60)
+        .find(|_| schedule.poll() == HeartbeatAction::Refresh)
+        .expect("a refresh within the regular interval")
+}
+
+/// F2 (A4): a failed PUT is retried at the next poll, then after 1 min,
+/// 2 min, … up to the regular interval; a success restores the interval.
+#[test]
+fn a_failed_put_is_retried_with_back_off() {
+    let mut schedule = HeartbeatSchedule::new();
+    assert_eq!(polls_to_refresh(&mut schedule), 30);
+    let mut waits = Vec::new();
+    for _ in 0..7 {
+        schedule.record(
+            HeartbeatAction::Refresh,
+            &RefreshOutcome::Failed(injected("sessions/x.1.json")),
+        );
+        waits.push(polls_to_refresh(&mut schedule));
+    }
+    // Capped at two minutes, far below the 30 minutes between the refresh
+    // interval and the marker staleness.
+    assert_eq!(waits, [1, 2, 4, 4, 4, 4, 4]);
+    schedule.record(
+        HeartbeatAction::Refresh,
+        &RefreshOutcome::Refreshed {
+            gap: std::time::Duration::ZERO,
+        },
+    );
+    assert_eq!(polls_to_refresh(&mut schedule), 30);
+}
+
+/// Run `polls` heartbeat polls of `marker` on `storage`, the clock one
+/// poll further each.
+fn run_heartbeat(
+    storage: &dyn StorageBackend,
+    marker: &SessionMarker,
+    schedule: &mut HeartbeatSchedule,
+    time: &SimTime,
+    env: &HostEnv,
+    polls: usize,
+) {
+    for _ in 0..polls {
+        time.advance(HEARTBEAT_POLL);
+        let action = schedule.poll();
+        let outcome = match action {
+            HeartbeatAction::Wait => continue,
+            HeartbeatAction::Recheck => marker.recheck(storage),
+            HeartbeatAction::Refresh => marker.refresh(storage, env.clock.as_ref()),
+        };
+        schedule.record(action, &outcome);
+    }
+}
+
+/// F2: while presence checks fail and PUTs work, the polls between
+/// refreshes recheck the unchecked keys and write nothing: an outage
+/// spanning two refreshes leaves one key more than a healthy run, and once
+/// the checks work the next poll settles the keys.
+#[test]
+fn an_outage_of_presence_checks_does_not_multiply_keys() {
+    // Refreshes at polls 30 and 60.
+    const POLLS: usize = 88;
+    let healthy = MemoryBackend::new();
+    let (time, env) = sim_env();
+    let marker = registered(&healthy, "ok", &env);
+    let mut schedule = HeartbeatSchedule::new();
+    run_heartbeat(&healthy, &marker, &mut schedule, &time, &env, POLLS);
+    let healthy_keys = session_keys(&healthy).len();
+    assert_eq!(healthy_keys, 2);
+
+    let storage = FaultyBackend::default();
+    storage
+        .faults()
+        .exists_fails
+        .extend((0..10).map(|g| session_marker_key_at("out", g)));
+    let (time, env) = sim_env();
+    let marker = registered(&storage, "out", &env);
+    let mut schedule = HeartbeatSchedule::new();
+    run_heartbeat(&storage, &marker, &mut schedule, &time, &env, POLLS);
+    assert_eq!(session_keys(&storage).len(), healthy_keys + 1);
+    assert_eq!(marker.current().0, 2, "rechecks write no generation");
+    let checks = storage.exists_calls().len();
+    assert!(checks <= 2 * POLLS, "{checks} presence checks");
+    let report = marker.report(env.clock.as_ref());
+    assert_eq!(report.unchecked, 2);
+    assert!(!report.continuous());
+
+    storage.faults().exists_fails.clear();
+    run_heartbeat(&storage, &marker, &mut schedule, &time, &env, 1);
+    let report = marker.report(env.clock.as_ref());
+    assert_eq!((report.unchecked, report.missing), (0, false));
+    assert!(report.continuous(), "{report:?}");
+    // The refresh at poll 90 deletes the keys the recheck found present.
+    run_heartbeat(&storage, &marker, &mut schedule, &time, &env, 1);
+    assert_eq!(
+        session_keys(&storage),
+        [
+            session_marker_key_at("out", 2),
+            session_marker_key_at("out", 3)
+        ]
+    );
+}
+
+/// F4: of generations 9 and 10, 10 is the newest (numeric, not the
+/// listing's lexical order) in cleanup and in the listing.
+#[test]
+fn the_newest_generation_is_numeric() {
+    let storage = MemoryBackend::new();
+    let env = env_on("other-host", None, pid_always_alive);
+    let ago = |m: i64| (Utc::now() - Duration::minutes(m)).to_rfc3339();
+    let fresh = ago(1);
+    write_session_marker(&storage, "live.9", &ago(50));
+    write_session_marker(&storage, "live.10", &fresh);
+    write_session_marker(&storage, "dead.9", &ago(1));
+    write_session_marker(&storage, "dead.10", &ago(50));
+
+    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    assert_eq!(cleaned, ["dead"]);
+    assert_eq!(
+        session_keys(&storage),
+        ["sessions/live.10.json", "sessions/live.9.json"]
+    );
+    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, "live");
+    assert_eq!(listed[0].1.as_ref().unwrap().last_refresh, fresh);
+}
+
+#[test]
+fn one_session_with_two_keys_is_listed_once() {
+    let storage = MemoryBackend::new();
+    let old = (Utc::now() - Duration::minutes(20)).to_rfc3339();
+    let new = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    write_session_marker(&storage, "two", &old);
+    write_session_marker(&storage, "two.3", &new);
+
+    let entries = crate::repo::lock::list_session_entries(&storage).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].0, "two");
+    assert_eq!(entries[0].1.as_ref().unwrap().last_refresh, new);
+    assert_eq!(crate::repo::lock::list_sessions(&storage).unwrap(), ["two"]);
+}
+
+/// A3: a session is judged by its newest key.
+#[test]
+fn cleanup_judges_a_session_by_its_newest_key() {
+    let storage = MemoryBackend::new();
+    let env = env_on("other-host", None, pid_always_alive);
+    let ago = |m: i64| (Utc::now() - Duration::minutes(m)).to_rfc3339();
+    write_session_marker(&storage, "live", &ago(50));
+    write_session_marker(&storage, "live.1", &ago(5));
+    storage.put("sessions/live.index", b"journal").unwrap();
+    write_session_marker(&storage, "dead", &ago(60));
+    write_session_marker(&storage, "dead.1", &ago(50));
+    storage.put("sessions/dead.index", b"journal").unwrap();
+
+    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    assert_eq!(cleaned, ["dead"]);
+    assert_eq!(
+        session_keys(&storage),
+        [
+            "sessions/dead.index",
+            "sessions/live.1.json",
+            "sessions/live.index",
+            "sessions/live.json",
+        ]
+    );
+    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, "live");
+}
+
+#[test]
+fn cleanup_keeps_the_journal_of_a_vanished_marker() {
+    let storage = FaultyBackend::default();
+    write_session_marker(&storage.inner, "vanish", &Utc::now().to_rfc3339());
+    storage.put("sessions/vanish.index", b"journal").unwrap();
+    storage
+        .faults()
+        .get_none
+        .insert(session_marker_key("vanish"));
+
+    let env = env_on("other-host", None, pid_always_alive);
+    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    assert!(cleaned.is_empty());
+    assert!(storage.exists("sessions/vanish.index").unwrap());
+}
+
+#[test]
+fn deregistration_deletes_every_owned_key() {
+    let storage = Arc::new(FaultyBackend::default());
+    let (_time, env) = sim_env();
+    let registration = register_session(storage.as_ref(), "dereg", &env).unwrap();
+    let guard = SessionGuard::adopt(storage.clone(), registration, env.clone()).unwrap();
+    let marker = guard.marker();
+    marker.refresh(storage.as_ref(), env.clock.as_ref());
+    // The second refresh deletes gen 0, and that delete fails.
+    storage
+        .faults()
+        .delete_fails_once
+        .insert(session_marker_key("dereg"));
+    marker.refresh(storage.as_ref(), env.clock.as_ref());
+    assert_eq!(session_keys(storage.as_ref()).len(), 3);
+
+    drop(guard);
+    assert_eq!(session_keys(storage.as_ref()), Vec::<String>::new());
 }
 
 // --- Same-host rule (04 step 1) ---
@@ -1188,11 +1873,12 @@ fn session_heartbeat_refreshes_on_virtual_time() {
     let session_id = format!("guard-{:016x}", rand::random::<u64>());
     let wait = std::time::Duration::from_secs(5);
 
-    register_session(storage.as_ref(), &session_id, &env).unwrap();
-    let key = session_marker_key(&session_id);
-    assert!(storage.exists(&key).unwrap());
+    let registration = register_session(storage.as_ref(), &session_id, &env).unwrap();
+    let gen0 = session_marker_key(&session_id);
+    let gen1 = session_marker_key_at(&session_id, 1);
+    assert!(storage.exists(&gen0).unwrap());
 
-    let guard = SessionGuard::adopt(Arc::clone(&storage), session_id.clone(), env.clone()).unwrap();
+    let guard = SessionGuard::adopt(Arc::clone(&storage), registration, env.clone()).unwrap();
     assert!(time.wait_for_waiters(1, wait));
     // The heartbeat counts 30 polls of 30 s, then refreshes.
     for _ in 0..30 {
@@ -1202,25 +1888,65 @@ fn session_heartbeat_refreshes_on_virtual_time() {
     let expected = (start + Duration::minutes(15)).timestamp();
     let real = std::time::Instant::now();
     loop {
-        let data = storage.get(&key).unwrap().unwrap();
-        let entry: SessionEntry = serde_json::from_slice(&data).unwrap();
-        let refreshed = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
-            .unwrap()
-            .timestamp();
-        if refreshed == expected {
+        if let Some(data) = storage.get(&gen1).unwrap() {
+            let entry: SessionEntry = serde_json::from_slice(&data).unwrap();
+            let refreshed = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
+                .unwrap()
+                .timestamp();
+            assert_eq!(refreshed, expected, "{entry:?}");
             assert_eq!(env.now_utc().timestamp(), expected);
             break;
         }
-        assert!(real.elapsed() < wait, "marker not refreshed: {entry:?}");
+        assert!(real.elapsed() < wait, "marker not refreshed");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    // Generation 0 stays until the next refresh: two keys overlap.
+    assert!(storage.exists(&gen0).unwrap());
 
     drop(guard);
     assert!(
-        !storage.exists(&key).unwrap(),
-        "SessionGuard::drop must deregister after joining the heartbeat thread"
+        storage.list("sessions/").unwrap().is_empty(),
+        "SessionGuard::drop must deregister every key after joining the heartbeat thread"
     );
     assert!(time.waiters().is_empty(), "heartbeat thread still waits");
+}
+
+/// A4: a refresh whose PUT failed is retried at the next poll, not after
+/// another interval.
+#[test]
+fn heartbeat_retries_a_failed_put_at_the_next_poll() {
+    let storage = Arc::new(FaultyBackend::default());
+    let (time, env) = sim_env();
+    let wait = std::time::Duration::from_secs(5);
+    let registration = register_session(storage.as_ref(), "retry", &env).unwrap();
+    let gen1 = session_marker_key_at("retry", 1);
+    let gen2 = session_marker_key_at("retry", 2);
+    storage.faults().put_lands_then_fails.insert(gen1.clone());
+    let guard = SessionGuard::adopt(storage.clone(), registration, env.clone()).unwrap();
+    let appears = |key: &str| {
+        let real = std::time::Instant::now();
+        while !storage.inner.exists(key).unwrap() {
+            assert!(real.elapsed() < wait, "{key} not written");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert!(time.wait_for_waiters(1, wait));
+    for _ in 0..30 {
+        time.advance(HEARTBEAT_POLL);
+        assert!(time.wait_for_waiters(1, wait));
+    }
+    appears(&gen1);
+    assert!(time.wait_for_waiters(1, wait));
+    assert_eq!(
+        guard.marker().report(env.clock.as_ref()).failed_refreshes,
+        1
+    );
+    time.advance(HEARTBEAT_POLL);
+    appears(&gen2);
+    assert!(time.wait_for_waiters(1, wait));
+    assert_eq!(guard.marker().current().0, 2);
+    drop(guard);
+    assert_eq!(session_keys(storage.as_ref()), Vec::<String>::new());
 }
 
 // ── acquire_lock_with_deadline ───────────────────────────────────────────

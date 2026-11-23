@@ -2,8 +2,8 @@
 //! its storage operations stay inside the machine steps they declare, its
 //! default schedule is production's, it reproduces the scripted hazard H3,
 //! H1's schedules stay clean since 04 step 1, a late-booted clone still
-//! shows `TwoLockHolders` and `SessionReaped` (H1-late-clone), and its
-//! traces replay.
+//! shows `TwoLockHolders` (H1-late-clone) and reaps a live marker, whose
+//! victim fails typed since 04 step 2, and its traces replay.
 
 // Printing is the point of the env-driven helpers here (projections,
 // replays, the measurement); every other path asserts.
@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::commit_op_order::{project, run_records};
 use crate::repo::machine::{Access, StepKind};
-use crate::sim::checker::{Invariant, NotEvaluated, Violation, ViolationKind};
+use crate::sim::checker::{Invariant, NotEvaluated, Report, Violation, ViolationKind, run_subject};
 use crate::sim::driver::*;
+use crate::sim::history::{AllowedError, ErrorClass};
 use crate::sim::{ClientOp, OpKind, OpOutcome, OpRecord, RunRecord};
 
 fn backup() -> Command {
@@ -386,13 +387,50 @@ fn driver_session_reap_schedule_is_clean() {
     assert_locked(&o, &rb);
 }
 
-/// A marker reaped by age (`AgedSessionReaped`) claims its victim's error
-/// and nothing else: compact runs after a jump past both stale ages at A's
-/// "fetch-head", reaps A's aged lock and marker, and A's commit fails with
-/// the untyped "pack … missing" error. An unrelated violation, or a
-/// skipped evaluation, added to the report is left to `Unknown`.
+/// The victim of a marker reap whose packs compact deleted fails typed:
+/// a's run is `Allowed(StaleChunksDuringCommit)` (04 step 2: the pack check
+/// fails, the re-probe finds the marker gone), the report is clean and no
+/// signature is left. On that report, a `DisallowedError` of a's run is
+/// claimed by exactly `sig`.
+fn assert_victim_fails_typed(o: &Outcome, sig: Signature) -> Report {
+    let render = || o.trace.render();
+    let ra = driven_backups(o)
+        .into_iter()
+        .find(|r| o.sim.store().client_name(r.client) == "a")
+        .expect("a ran");
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::StaleChunksDuringCommit)),
+        "{}",
+        render()
+    );
+    assert!(o.signatures.is_empty(), "{}", render());
+    assert!(o.report.is_clean(), "{}", render());
+    let mut claimed = o.report.clone();
+    claimed.violations.push(Violation {
+        invariant: Invariant::AllowedErrors,
+        kind: ViolationKind::DisallowedError,
+        subject: run_subject(&ra),
+        detail: "injected by the test".into(),
+        step: None,
+    });
+    assert_eq!(
+        classify(&o.sim, &claimed, &o.trace.entries),
+        BTreeSet::from([sig]),
+        "{}",
+        render()
+    );
+    claimed
+}
+
+/// A marker reaped by age (`AgedSessionReaped`): compact runs after a jump
+/// past both stale ages at A's "fetch-head", reaps A's aged lock and marker
+/// and deletes its packs, and A's commit fails typed (D9 of 04 step 2). The
+/// signature claims an injected disallowed error of A's run and nothing
+/// else: an unrelated violation, or a skipped evaluation, added to the
+/// report is left to `Unknown`.
 #[test]
-fn session_reap_claims_only_its_victim() {
+fn aged_reap_fails_typed_and_claims_only_its_victim() {
     let t = Template::new();
     let mut c = case(
         HostPlan::Distinct,
@@ -428,25 +466,10 @@ fn session_reap_claims_only_its_victim() {
         .unwrap_or_else(|| panic!("no step of b after the jump:\n{}", after.trace.render()));
     c.choices.push(u16::try_from(b_step).unwrap());
     let o = run_case(&t, &c);
-    let render = || o.trace.render();
-    assert_eq!(
-        o.signatures,
-        BTreeSet::from([Signature::AgedSessionReaped]),
-        "{}",
-        render()
-    );
+    let claimed = assert_victim_fails_typed(&o, Signature::AgedSessionReaped);
     assert!(!Signature::AgedSessionReaped.cascades());
-    assert!(
-        matches!(
-            o.report.violations.as_slice(),
-            [v] if v.kind == ViolationKind::DisallowedError && v.subject.contains("\"a1\"")
-        ),
-        "{}",
-        render()
-    );
-    let with_unknown = || BTreeSet::from([Signature::AgedSessionReaped, Signature::Unknown]);
 
-    let mut unrelated = o.report.clone();
+    let mut unrelated = claimed;
     unrelated.violations.push(Violation {
         invariant: Invariant::CommittedSnapshotsRestore,
         kind: ViolationKind::RestoreDiffers,
@@ -456,7 +479,7 @@ fn session_reap_claims_only_its_victim() {
     });
     assert_eq!(
         classify(&o.sim, &unrelated, &o.trace.entries),
-        with_unknown()
+        BTreeSet::from([Signature::AgedSessionReaped, Signature::Unknown])
     );
 
     let mut skipped = o.report.clone();
@@ -465,7 +488,10 @@ fn session_reap_claims_only_its_victim() {
         subject: "index".into(),
         reason: "injected by the test".into(),
     });
-    assert_eq!(classify(&o.sim, &skipped, &o.trace.entries), with_unknown());
+    assert_eq!(
+        classify(&o.sim, &skipped, &o.trace.entries),
+        BTreeSet::from([Signature::Unknown])
+    );
 }
 
 /// `c` with a jump of 61 s at client a's first step labelled `label`,
@@ -537,8 +563,10 @@ fn late_clone_reaps_live_lock() {
 
 /// H1-late-clone for markers: a late-booted clone compacts at a's
 /// "fetch-head" a minute after its boot, reaps a's young marker and lock
-/// as its own earlier boot's and deletes a's packs; a's commit fails with
-/// the untyped "pack … missing" error: exactly `SessionReaped`.
+/// as its own earlier boot's and deletes a's packs. Since 04 step 2 a's
+/// commit fails typed (the re-probe after the failed pack check finds the
+/// marker gone), so the case is clean; a disallowed error of a's run would
+/// be exactly `SessionReaped`.
 #[test]
 fn late_clone_reaps_live_marker() {
     let t = Template::new();
@@ -555,12 +583,7 @@ fn late_clone_reaps_live_marker() {
     );
     let c = jump_then_b(&t, &c, "fetch-head");
     let o = run_case(&t, &c);
-    assert_eq!(
-        o.signatures,
-        BTreeSet::from([Signature::SessionReaped]),
-        "{}",
-        o.trace.render()
-    );
+    assert_victim_fails_typed(&o, Signature::SessionReaped);
 }
 
 #[test]

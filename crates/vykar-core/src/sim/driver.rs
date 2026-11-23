@@ -337,21 +337,29 @@ pub enum Signature {
     /// only [`HostPlan::LateClone`] produces it (H1-late-clone), so a case
     /// on another host plan that shows it is a regression.
     ///
-    /// Known behaviour: when the victim's marker probe ran before compact
-    /// reaped the marker, its commit does not fail with
-    /// `StaleChunksDuringCommit` but with the untyped
-    /// `VykarError::Other("commit failed: pack … missing from storage …")`
-    /// of `repo/pack_verify.rs`, a disallowed error. 04 step 5 (compact
-    /// keeps young orphan packs) and 04's I8 / step 2 (a backup knows its
-    /// marker was missing) address it.
+    /// Since 04 step 2 (phase F part 6) a victim whose pack check fails
+    /// while its marker is gone fails with `StaleChunksDuringCommit`
+    /// (allowed), so such a case is clean and carries no signature; the
+    /// signature claims a victim's disallowed error or its snapshot's
+    /// violations when one remains: a reap after the pack check, or a late
+    /// copy of the victim's marker PUT (delayed or duplicated by the
+    /// transport) that lands after the reap and recreates the key, so the
+    /// commit finds the marker present and keeps the untyped pack-missing
+    /// error (seed `aged-session-reaped-late-marker-write`). Every marker
+    /// key is written once by the client, so "young" is judged by the write
+    /// time of the key that was deleted.
     SessionReaped,
     /// A live backup's session marker deleted as stale by another client
     /// after a jump of virtual time past the session staleness (a suspended
     /// machine: the heartbeat counts polls, so one long jump is one poll);
     /// compact then deletes the backup's uploads and its commit fails.
-    /// Claims like `SessionReaped`. The
-    /// documented limit of today's heartbeat; 04 step 5 (server-clock ages)
-    /// and I8 (a backup whose marker was missing does not commit) bound it.
+    /// Claims like `SessionReaped`; since 04 step 2 a victim whose pack
+    /// check fails with its marker gone fails typed and leaves no signature,
+    /// so what remains are the routes `SessionReaped` names (the late
+    /// marker copy is the one campaigns find).
+    /// The documented limit of today's heartbeat; 04 step 5 (server-clock
+    /// ages) and I8 (a backup whose marker was missing does not commit)
+    /// bound it.
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
     /// age (older than the 6 h stale age: the driver's time jumps). The

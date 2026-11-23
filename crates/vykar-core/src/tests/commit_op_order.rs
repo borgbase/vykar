@@ -71,6 +71,14 @@ pub(super) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
     if !backup {
         return mine;
     }
+    // Dropped before the start is looked for: a background journal PUT
+    // logged between the lock's LIST and its PUT would end the walk back.
+    let mine: Vec<OpRecord> = mine
+        .into_iter()
+        .filter(|r| {
+            !(r.op.is_write() && r.key.starts_with("sessions/") && r.key.ends_with(".index"))
+        })
+        .collect();
     let mut start = mine
         .iter()
         .position(|r| r.op.is_write() && r.key.starts_with("locks/"))
@@ -81,12 +89,7 @@ pub(super) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
     {
         start -= 1;
     }
-    mine.into_iter()
-        .skip(start)
-        .filter(|r| {
-            !(r.op.is_write() && r.key.starts_with("sessions/") && r.key.ends_with(".index"))
-        })
-        .collect()
+    mine.into_iter().skip(start).collect()
 }
 
 fn check(name: &str, got: Vec<String>, want: &[&str]) {

@@ -1043,6 +1043,28 @@ impl Sim {
         );
         let src = self.root.path().join("sources").join(snapshot);
         tree.write_to(&src).expect("write source tree");
+        // Items carry mtime and ctime, and a tree chunk is stored by its
+        // content: two snapshots of equal trees would share their tree
+        // chunk exactly when both sources were written within one
+        // timestamp tick of the filesystem (4 ms on tmpfs), and the later
+        // backup would then commit without a segment. Each snapshot's
+        // files get an mtime of their own, derived from its name, so no
+        // schedule depends on the wall clock.
+        let h = snapshot.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let stamp = std::time::UNIX_EPOCH
+            + std::time::Duration::new(
+                1_000_000_000 + h % 500_000_000,
+                ((h >> 32) % 1_000_000_000) as u32,
+            );
+        for rel in tree.files.keys() {
+            std::fs::File::options()
+                .write(true)
+                .open(src.join(rel))
+                .and_then(|f| f.set_modified(stamp))
+                .expect("stamp source file");
+        }
         self.history.trees.insert(snapshot.to_string(), tree);
         src
     }

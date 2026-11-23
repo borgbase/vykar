@@ -366,6 +366,9 @@ mod tests {
             pid,
             registered_at: last_refresh.to_string(),
             last_refresh: last_refresh.to_string(),
+            boot_id: None,
+            installation_id: None,
+            pid_ns: None,
         }
     }
 

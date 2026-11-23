@@ -1,8 +1,7 @@
 {
   "name": "h1-duplicated-lock",
-  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID).",
+  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): a's second backup no longer reaps b's young lock at its registration and ends Locked; kept as a regression: only the aged reap of a's first lock (AgedLockReaped) remains.",
   "expect": [
-    "TwoLockHolders",
     "AgedLockReaped"
   ],
   "at": [
@@ -159,15 +158,6 @@
     [
       {
         "Step": {
-          "client": 0,
-          "pick": 0
-        }
-      },
-      "lock"
-    ],
-    [
-      {
-        "Step": {
           "client": 1,
           "pick": 0
         }
@@ -185,11 +175,21 @@
     ],
     [
       {
-        "Release": {
-          "parked": 0
+        "Step": {
+          "client": 1,
+          "pick": 0
         }
       },
-      "release"
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-marker +local"
     ]
   ],
   "case": {

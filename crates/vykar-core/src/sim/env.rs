@@ -204,20 +204,33 @@ impl SimTime {
         !res.timed_out()
     }
 
-    /// A client's view, with a fixed wall-clock skew.
+    /// A client's view, with a fixed wall-clock skew, on a machine booted
+    /// [`DEFAULT_UPTIME_AT_START`] before the start.
     pub fn clock(self: &Arc<Self>, skew: chrono::Duration) -> SimClock {
         SimClock {
             time: Arc::clone(self),
             skew,
+            booted_at: -default_uptime_at_start(),
         }
     }
 }
 
-/// One client's clock: the shared [`SimTime`] plus a wall-clock skew.
+/// One client's clock: the shared [`SimTime`] plus a wall-clock skew and
+/// the virtual time at which the client's machine booted.
 #[derive(Clone)]
 pub struct SimClock {
     time: Arc<SimTime>,
     skew: chrono::Duration,
+    booted_at: chrono::Duration,
+}
+
+impl SimClock {
+    /// This clock on a machine that booted at `at`, virtual time since the
+    /// start (negative: before the start).
+    pub fn booted_at(mut self, at: chrono::Duration) -> Self {
+        self.booted_at = at;
+        self
+    }
 }
 
 impl Clock for SimClock {
@@ -271,10 +284,80 @@ impl Clock for SimClock {
         t.cv.notify_all();
         signalled
     }
+
+    /// Virtual monotonic time since boot: skew and wall jumps leave it
+    /// alone, as NTP steps leave `CLOCK_BOOTTIME` alone.
+    fn uptime(&self) -> Option<Duration> {
+        let elapsed =
+            chrono::Duration::from_std(self.time.elapsed()).expect("sim time out of range");
+        Some(
+            (elapsed - self.booted_at)
+                .to_std()
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+}
+
+/// Inode of Linux's initial PID namespace (`PROC_PID_INIT_INO`): every
+/// simulated process not in a container.
+pub const INIT_PID_NS: u64 = 0xEFFF_FFFC;
+
+/// Uptime of a simulated machine at the start of the simulation, unless
+/// it boots later.
+pub const DEFAULT_UPTIME_AT_START: Duration = Duration::from_secs(30 * 24 * 3600);
+
+fn default_uptime_at_start() -> chrono::Duration {
+    chrono::Duration::from_std(DEFAULT_UPTIME_AT_START).expect("constant in range")
+}
+
+/// Where a simulated client runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimMachine {
+    pub hostname: String,
+    pub boot_id: Option<String>,
+    pub installation_id: Option<String>,
+    pub pid_ns: Option<u64>,
+    /// Virtual time since the start at which this boot began; negative
+    /// for a machine already running at the start.
+    pub booted_at: chrono::Duration,
+}
+
+impl SimMachine {
+    /// `hostname` and `boot_id`, installation `install-<hostname>`, the
+    /// initial PID namespace, booted [`DEFAULT_UPTIME_AT_START`] before
+    /// the start.
+    pub fn new(hostname: &str, boot_id: Option<&str>) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            boot_id: boot_id.map(str::to_string),
+            installation_id: Some(format!("install-{hostname}")),
+            pid_ns: Some(INIT_PID_NS),
+            booted_at: -default_uptime_at_start(),
+        }
+    }
+
+    /// Replace the installation ID.
+    pub fn installation(mut self, id: Option<&str>) -> Self {
+        self.installation_id = id.map(str::to_string);
+        self
+    }
+
+    /// Replace the PID namespace.
+    pub fn pid_ns(mut self, ns: Option<u64>) -> Self {
+        self.pid_ns = ns;
+        self
+    }
+
+    /// Replace the boot time.
+    pub fn booted_at(mut self, at: chrono::Duration) -> Self {
+        self.booted_at = at;
+        self
+    }
 }
 
 struct HostSlot {
     host: HostIdentity,
+    booted_at: chrono::Duration,
     running: bool,
 }
 
@@ -285,9 +368,10 @@ struct HostsState {
 
 /// Per-client identity and the PID-liveness model.
 ///
-/// A machine is the pair (hostname, boot ID). Each run of a client is a new
-/// process with a fresh PID, alive only while the run lasts and the client
-/// has not crashed.
+/// A machine is the pair (hostname, boot ID), with an installation ID, a
+/// PID namespace and a boot time ([`SimMachine`]). Each run of a client is
+/// a new process with a fresh PID, alive only while the run lasts and the
+/// client has not crashed.
 #[derive(Clone)]
 pub struct SimHosts {
     inner: Arc<Mutex<HostsState>>,
@@ -309,8 +393,8 @@ impl SimHosts {
         self.inner.lock().expect("sim hosts poisoned")
     }
 
-    /// Register `c` on `hostname` and `boot_id`, with a fresh PID.
-    pub fn register(&self, c: ClientId, hostname: &str, boot_id: Option<&str>) {
+    /// Register `c` on `machine`, with a fresh PID.
+    pub fn register(&self, c: ClientId, machine: &SimMachine) {
         let mut st = self.lock();
         let pid = st.next_pid;
         st.next_pid += 1;
@@ -318,10 +402,13 @@ impl SimHosts {
             c,
             HostSlot {
                 host: HostIdentity {
-                    hostname: hostname.to_string(),
+                    hostname: machine.hostname.clone(),
                     pid,
-                    boot_id: boot_id.map(str::to_string),
+                    boot_id: machine.boot_id.clone(),
+                    installation_id: machine.installation_id.clone(),
+                    pid_ns: machine.pid_ns,
                 },
+                booted_at: machine.booted_at,
                 running: false,
             },
         );
@@ -335,6 +422,15 @@ impl SimHosts {
             .expect("unknown sim client")
             .host
             .clone()
+    }
+
+    /// When `c`'s machine booted, virtual time since the start.
+    pub fn booted_at(&self, c: ClientId) -> chrono::Duration {
+        self.lock()
+            .slots
+            .get(&c)
+            .expect("unknown sim client")
+            .booted_at
     }
 
     /// Start a new process for `c`: a fresh PID, running. Returns the PID.
@@ -357,14 +453,16 @@ impl SimHosts {
     }
 
     /// A PID is alive on `local`'s machine iff some client on the same
-    /// machine (same hostname and same boot ID) has that PID, is running,
-    /// and has not crashed. A PID on another machine is never alive from
-    /// here, as `kill(pid, 0)` cannot see it.
+    /// machine (same hostname and same boot ID) and in the same PID
+    /// namespace has that PID, is running, and has not crashed. A PID on
+    /// another machine or in another namespace is never alive from here, as
+    /// `kill(pid, 0)` cannot see it.
     pub fn pid_alive(&self, local: &HostIdentity, pid: u32) -> bool {
         let st = self.lock();
         st.slots.iter().any(|(c, slot)| {
             slot.host.hostname == local.hostname
                 && slot.host.boot_id == local.boot_id
+                && slot.host.pid_ns == local.pid_ns
                 && slot.host.pid == pid
                 && slot.running
                 && !self.store.is_crashed(*c)
@@ -506,18 +604,26 @@ mod tests {
             store.register_client("b"),
             store.register_client("c"),
         );
-        hosts.register(a, "hostx", Some("boot1"));
-        hosts.register(b, "hostx", Some("boot2"));
-        hosts.register(c, "hosty", Some("boot1"));
+        let d = store.register_client("d");
+        hosts.register(a, &SimMachine::new("hostx", Some("boot1")));
+        hosts.register(b, &SimMachine::new("hostx", Some("boot2")));
+        hosts.register(c, &SimMachine::new("hosty", Some("boot1")));
+        hosts.register(
+            d,
+            &SimMachine::new("hostx", Some("boot1")).pid_ns(Some(INIT_PID_NS + 1)),
+        );
         let pid = hosts.start_run(a);
         let same = HostIdentity {
             hostname: "hostx".into(),
             pid: 1,
             boot_id: Some("boot1".into()),
+            installation_id: Some("install-hostx".into()),
+            pid_ns: Some(INIT_PID_NS),
         };
         assert!(hosts.pid_alive(&same, pid));
         assert!(!hosts.pid_alive(&hosts.host(b), pid), "other boot ID");
         assert!(!hosts.pid_alive(&hosts.host(c), pid), "other hostname");
+        assert!(!hosts.pid_alive(&hosts.host(d), pid), "other PID namespace");
         hosts.set_running(a, false);
         assert!(!hosts.pid_alive(&same, pid), "finished run");
         let pid2 = hosts.start_run(a);
@@ -526,5 +632,34 @@ mod tests {
         assert!(hosts.pid_alive(&same, pid2));
         store.crash(a);
         assert!(!hosts.pid_alive(&same, pid2), "crashed client");
+    }
+
+    #[test]
+    fn sim_clock_uptime_follows_virtual_time() {
+        let time = SimTime::new(start(), TimeMode::Auto);
+        let clock = time.clock(chrono::Duration::zero());
+        assert_eq!(clock.uptime(), Some(DEFAULT_UPTIME_AT_START));
+        time.advance(Duration::from_secs(60));
+        assert_eq!(
+            clock.uptime(),
+            Some(DEFAULT_UPTIME_AT_START + Duration::from_secs(60))
+        );
+        let fresh = time
+            .clock(chrono::Duration::zero())
+            .booted_at(chrono::Duration::seconds(60));
+        assert_eq!(fresh.uptime(), Some(Duration::ZERO));
+        time.advance(Duration::from_secs(30));
+        assert_eq!(fresh.uptime(), Some(Duration::from_secs(30)));
+        let skewed = time
+            .clock(chrono::Duration::hours(3))
+            .booted_at(chrono::Duration::seconds(60));
+        assert_eq!(skewed.uptime(), fresh.uptime());
+        time.jump_wall(chrono::Duration::hours(-2));
+        assert_eq!(fresh.uptime(), Some(Duration::from_secs(30)));
+        // Not yet booted: clamped at zero.
+        let later = time
+            .clock(chrono::Duration::zero())
+            .booted_at(chrono::Duration::hours(1));
+        assert_eq!(later.uptime(), Some(Duration::ZERO));
     }
 }

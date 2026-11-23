@@ -19,6 +19,24 @@ struct LockEntry {
     time: String,
     #[serde(default)]
     boot_id: Option<String>,
+    #[serde(default)]
+    installation_id: Option<String>,
+    #[serde(default)]
+    pid_ns: Option<u64>,
+}
+
+impl LockEntry {
+    /// An entry for `env`'s process, stamped `time`.
+    fn new(env: &HostEnv, time: DateTime<Utc>) -> Self {
+        Self {
+            hostname: env.host.hostname.clone(),
+            pid: env.host.pid,
+            time: time.to_rfc3339(),
+            boot_id: env.host.boot_id.clone(),
+            installation_id: env.host.installation_id.clone(),
+            pid_ns: env.host.pid_ns,
+        }
+    }
 }
 
 const LOCKS_PREFIX: &str = "locks/";
@@ -67,12 +85,7 @@ pub fn acquire_lock(storage: &dyn StorageBackend, env: &HostEnv) -> Result<LockG
     }
 
     let now = env.now_utc();
-    let entry = LockEntry {
-        hostname: env.host.hostname.clone(),
-        pid: env.host.pid,
-        time: now.to_rfc3339(),
-        boot_id: env.host.boot_id.clone(),
-    };
+    let entry = LockEntry::new(env, now);
 
     let uuid = format!("{:032x}", rand::random::<u128>());
     // The timestamp prefix is not used for ordering. It is kept because older
@@ -205,8 +218,8 @@ fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv) -> Result<()> {
 
 /// Remove stale locks and return the keys that remain.
 ///
-/// A lock is stale when it is older than `max_age`, or when it comes from
-/// `env`'s hostname and either another boot ID or a dead PID.
+/// A lock is stale when it is older than `max_age`, or when [`same_host`]
+/// finds it was left by a dead process or an earlier boot of this machine.
 pub(crate) fn cleanup_stale_locks(
     storage: &dyn StorageBackend,
     max_age: Duration,
@@ -237,21 +250,112 @@ fn should_cleanup_lock(
     env: &HostEnv,
 ) -> bool {
     if let Some(entry) = entry {
-        let same_host = entry.hostname == env.host.hostname;
-        if same_host {
-            if let (Some(local), Some(remote)) =
-                (env.host.boot_id.as_deref(), entry.boot_id.as_deref())
-                && local != remote
-            {
-                return true;
-            }
-            if !env.is_pid_alive(entry.pid) {
-                return true;
-            }
+        let verdict = same_host(
+            &EntryHost {
+                hostname: &entry.hostname,
+                pid: entry.pid,
+                boot_id: entry.boot_id.as_deref(),
+                installation_id: entry.installation_id.as_deref(),
+                pid_ns: entry.pid_ns,
+                written_at: lock_timestamp(Some(entry), key),
+            },
+            now,
+            env,
+        );
+        if matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot) {
+            debug!(
+                lock_key = key,
+                ?verdict,
+                "cleaning lock left on this machine"
+            );
+            return true;
         }
     }
 
     lock_timestamp(entry, key).is_some_and(|acquired| now.signed_duration_since(acquired) > max_age)
+}
+
+/// Who wrote a lock or session entry, as the same-host rule reads it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EntryHost<'a> {
+    pub hostname: &'a str,
+    pub pid: u32,
+    pub boot_id: Option<&'a str>,
+    pub installation_id: Option<&'a str>,
+    pub pid_ns: Option<u64>,
+    /// When the entry was last written, on its writer's clock.
+    pub written_at: Option<DateTime<Utc>>,
+}
+
+/// What the same-host rule says about an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SameHost {
+    /// Not provably this machine: judged by age alone.
+    Unknown,
+    /// This machine and boot, and the process is alive.
+    Alive,
+    /// This machine and boot, and the process is gone: stale.
+    DeadProcess,
+    /// This installation, an earlier boot: older than our uptime, stale.
+    EarlierBoot,
+}
+
+/// The same-host verdict on `entry` for `env`, at `now` on `env`'s clock.
+///
+/// "This machine" needs the same hostname **and** the same installation ID
+/// (both known), so namesakes (other installations) and old clients (no
+/// installation ID) are judged by age alone. This narrows the old
+/// same-hostname rules with one widening, for session markers: the old
+/// marker rule needed a dead PID, while `EarlierBoot` reaps a marker of
+/// this installation's earlier boot even when a local process now has that
+/// PID number (04 step 1). With another boot ID the entry is stale only once
+/// it is older than our uptime: a reboot left it behind, while a cloned
+/// machine that shares the installation wrote it after both booted. With
+/// the same boot (or no boot ID on either side, as on macOS) and the same
+/// PID namespace, a dead PID makes it stale.
+///
+/// Residual: a clone that booted after its sibling's last write reaps the
+/// sibling's live entry (for markers about one refresh interval after the
+/// clone's boot, for locks up to the lock refresh interval).
+pub(crate) fn same_host(entry: &EntryHost<'_>, now: DateTime<Utc>, env: &HostEnv) -> SameHost {
+    let local = &env.host;
+    if entry.hostname != local.hostname {
+        return SameHost::Unknown;
+    }
+    let (Some(mine), Some(theirs)) = (local.installation_id.as_deref(), entry.installation_id)
+    else {
+        return SameHost::Unknown;
+    };
+    if mine != theirs {
+        return SameHost::Unknown;
+    }
+    match (local.boot_id.as_deref(), entry.boot_id) {
+        (Some(a), Some(b)) if a != b => {
+            // Our earlier boot, or a clone of this installation that wrote
+            // it after both machines booted.
+            let older = entry
+                .written_at
+                .and_then(|w| now.signed_duration_since(w).to_std().ok())
+                .zip(env.clock.uptime())
+                .is_some_and(|(age, up)| age > up);
+            return if older {
+                SameHost::EarlierBoot
+            } else {
+                SameHost::Unknown
+            };
+        }
+        (Some(_), Some(_)) | (None, None) => {}
+        // One side does not know its boot: no claim.
+        _ => return SameHost::Unknown,
+    }
+    if local.pid_ns != entry.pid_ns {
+        return SameHost::Unknown;
+    }
+    if env.is_pid_alive(entry.pid) {
+        SameHost::Alive
+    } else {
+        SameHost::DeadProcess
+    }
 }
 
 fn lock_timestamp(entry: Option<&LockEntry>, key: &str) -> Option<chrono::DateTime<Utc>> {
@@ -307,12 +411,7 @@ pub fn build_lock_fence(
         let now_secs = env.now_utc().timestamp();
         let elapsed = now_secs - last_refreshed.load(Ordering::SeqCst);
         if elapsed >= LOCK_REFRESH_INTERVAL_SECS as i64 {
-            let entry = LockEntry {
-                hostname: env.host.hostname.clone(),
-                pid: env.host.pid,
-                time: env.now_utc().to_rfc3339(),
-                boot_id: env.host.boot_id.clone(),
-            };
+            let entry = LockEntry::new(&env, env.now_utc());
             if let Ok(data) = serde_json::to_vec(&entry)
                 && storage.put(&lock_key, &data).is_ok()
             {
@@ -401,6 +500,12 @@ pub struct SessionEntry {
     pub pid: u32,
     pub registered_at: String,
     pub last_refresh: String,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
+    pub pid_ns: Option<u64>,
 }
 
 /// Register a backup session. Writes a session marker, then checks (without
@@ -435,6 +540,9 @@ pub(crate) fn register_session_inner(
         pid: env.host.pid,
         registered_at: now.to_rfc3339(),
         last_refresh: now.to_rfc3339(),
+        boot_id: env.host.boot_id.clone(),
+        installation_id: env.host.installation_id.clone(),
+        pid_ns: env.host.pid_ns,
     };
     let data = serde_json::to_vec(&entry)
         .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
@@ -619,7 +727,7 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Remove session markers older than `max_age`, or from dead local processes.
+/// Remove session markers older than `max_age`, or left on this machine.
 /// Returns the IDs of cleaned sessions.
 ///
 /// `.index` journals for cleaned sessions are **preserved** so the next backup
@@ -628,10 +736,11 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// and not cleaned this invocation) are deleted — they already had their
 /// grace period.
 ///
-/// `env` gives the time and enables same-host dead-process detection: if a
-/// session's hostname matches `env`'s and the PID is no longer alive there,
-/// the session is treated as stale regardless of age. Sessions from different
-/// hosts are only cleaned by the `max_age` timeout.
+/// `env` gives the time and enables same-host detection: if `same_host`
+/// finds the session was left by a dead process or an earlier boot of this
+/// machine, it is treated as stale regardless of age. Sessions from other
+/// hosts, other installations and old clients are only cleaned by the
+/// `max_age` timeout.
 pub fn cleanup_stale_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
@@ -672,19 +781,33 @@ pub fn cleanup_stale_sessions(
             continue;
         };
 
-        let is_stale_by_age = now.signed_duration_since(ts.with_timezone(&Utc)) > max_age;
-        let is_dead_local = entry.hostname == env.host.hostname && !env.is_pid_alive(entry.pid);
+        let ts = ts.with_timezone(&Utc);
+        let is_stale_by_age = now.signed_duration_since(ts) > max_age;
+        let verdict = same_host(
+            &EntryHost {
+                hostname: &entry.hostname,
+                pid: entry.pid,
+                boot_id: entry.boot_id.as_deref(),
+                installation_id: entry.installation_id.as_deref(),
+                pid_ns: entry.pid_ns,
+                written_at: Some(ts),
+            },
+            now,
+            env,
+        );
+        let is_left_local = matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot);
 
         if is_stale_by_age {
-            debug!(session_id, age_hours = %((now - ts.with_timezone(&Utc)).num_hours()), "cleaning stale session");
+            debug!(session_id, age_hours = %((now - ts).num_hours()), "cleaning stale session");
             storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
-        } else if is_dead_local {
+        } else if is_left_local {
             debug!(
                 session_id,
                 pid = entry.pid,
-                "cleaning session from dead local process"
+                ?verdict,
+                "cleaning session left on this machine"
             );
             storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());

@@ -1,3 +1,4 @@
+use crate::repo::host_env::{Clock, StopSignal};
 use crate::repo::lock::{
     SESSION_STALE_SECS, SessionEntry, SessionGuard, acquire_lock, break_lock, cleanup_stale_locks,
     cleanup_stale_sessions, clear_all_sessions, default_stale_session_duration, format_age,
@@ -15,8 +16,55 @@ fn pid_always_alive(_pid: u32) -> bool {
     true
 }
 
-/// The system clock on host `hostname` with boot ID `boot_id`, where
-/// `alive` decides PID liveness.
+/// The system clock with a fixed uptime.
+struct TestClock {
+    uptime: Option<std::time::Duration>,
+}
+
+impl Clock for TestClock {
+    fn now_utc(&self) -> chrono::DateTime<Utc> {
+        SystemClock.now_utc()
+    }
+    fn monotonic(&self) -> std::time::Instant {
+        SystemClock.monotonic()
+    }
+    fn sleep(&self, d: std::time::Duration) {
+        SystemClock.sleep(d);
+    }
+    fn wait_timeout(&self, signal: &StopSignal, timeout: std::time::Duration) -> bool {
+        SystemClock.wait_timeout(signal, timeout)
+    }
+    fn uptime(&self) -> Option<std::time::Duration> {
+        self.uptime
+    }
+}
+
+/// The identity the same-host tests run as.
+fn me() -> HostIdentity {
+    HostIdentity {
+        hostname: "myhost".into(),
+        pid: 1,
+        boot_id: Some("boot-a".into()),
+        installation_id: Some("inst-a".into()),
+        pid_ns: Some(1),
+    }
+}
+
+/// `host` on a clock with `uptime`, where `alive` decides PID liveness.
+fn env_as(
+    host: HostIdentity,
+    alive: impl Fn(u32) -> bool + Send + Sync + 'static,
+    uptime: Option<std::time::Duration>,
+) -> HostEnv {
+    HostEnv::system()
+        .with_clock(Arc::new(TestClock { uptime }))
+        .with_host(host)
+        .with_pid_alive(Arc::new(move |_, p| alive(p)))
+}
+
+/// The system clock on host `hostname` with boot ID `boot_id` and no
+/// installation ID (so only the age rule applies), where `alive` decides
+/// PID liveness.
 fn env_on(
     hostname: &str,
     boot_id: Option<&str>,
@@ -27,6 +75,8 @@ fn env_on(
             hostname: hostname.to_string(),
             pid: 1,
             boot_id: boot_id.map(str::to_string),
+            installation_id: None,
+            pid_ns: None,
         })
         .with_pid_alive(Arc::new(move |_, p| alive(p)))
 }
@@ -273,54 +323,6 @@ fn write_lock_marker(
 }
 
 #[test]
-fn stale_lock_cleanup_removes_same_host_older_boot() {
-    let storage = MemoryBackend::new();
-    let key = lock_key_at(Utc::now(), "old-boot");
-    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-b"), |_| true),
-    )
-    .unwrap();
-
-    assert!(!storage.exists(&key).unwrap());
-}
-
-#[test]
-fn stale_lock_cleanup_removes_dead_same_host_pid() {
-    let storage = MemoryBackend::new();
-    let key = lock_key_at(Utc::now(), "dead-pid");
-    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-a"), |_| false),
-    )
-    .unwrap();
-
-    assert!(!storage.exists(&key).unwrap());
-}
-
-#[test]
-fn stale_lock_cleanup_preserves_live_same_host_pid() {
-    let storage = MemoryBackend::new();
-    let key = lock_key_at(Utc::now(), "live-pid");
-    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-a"), |_| true),
-    )
-    .unwrap();
-
-    assert!(storage.exists(&key).unwrap());
-}
-
-#[test]
 fn stale_lock_cleanup_preserves_recent_foreign_host() {
     let storage = MemoryBackend::new();
     let key = lock_key_at(Utc::now(), "foreign");
@@ -430,6 +432,9 @@ fn write_session_marker_with_host(
         pid,
         registered_at: last_refresh.to_string(),
         last_refresh: last_refresh.to_string(),
+        boot_id: None,
+        installation_id: None,
+        pid_ns: None,
     };
     let data = serde_json::to_vec(&entry).unwrap();
     storage.put(&key, &data).unwrap();
@@ -540,8 +545,18 @@ fn cleanup_removes_dead_local_session() {
     let storage = MemoryBackend::new();
     let now = Utc::now().to_rfc3339();
 
-    // Session from "myhost" with PID 42 — we'll inject a pid_alive that says it's dead.
-    write_session_marker_with_host(&storage, "local-dead", &now, "myhost", 42);
+    // Session of this installation, boot and namespace with PID 42 — we'll
+    // inject a pid_alive that says it's dead.
+    let entry = SessionEntry {
+        pid: 42,
+        ..session_entry(&me(), &now)
+    };
+    storage
+        .put(
+            "sessions/local-dead.json",
+            &serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
     storage
         .put("sessions/local-dead.index", b"journal")
         .unwrap();
@@ -549,7 +564,7 @@ fn cleanup_removes_dead_local_session() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        &env_on("myhost", None, |_pid| false),
+        &env_as(me(), |_pid| false, None),
     )
     .unwrap();
     assert_eq!(cleaned, vec!["local-dead"]);
@@ -558,24 +573,6 @@ fn cleanup_removes_dead_local_session() {
         storage.exists("sessions/local-dead.index").unwrap(),
         ".index should be preserved for recovery by next backup"
     );
-}
-
-#[test]
-fn cleanup_preserves_alive_local_session() {
-    let storage = MemoryBackend::new();
-    let now = Utc::now().to_rfc3339();
-
-    // Session from "myhost" with PID 42 — pid_alive says it's alive.
-    write_session_marker_with_host(&storage, "local-alive", &now, "myhost", 42);
-
-    let cleaned = cleanup_stale_sessions(
-        &storage,
-        Duration::hours(72),
-        &env_on("myhost", None, |_pid| true),
-    )
-    .unwrap();
-    assert!(cleaned.is_empty());
-    assert!(storage.exists("sessions/local-alive.json").unwrap());
 }
 
 #[test]
@@ -798,6 +795,386 @@ fn refresh_session_updates_existing_marker() {
     );
     // registered_at should be preserved from the existing entry.
     assert_eq!(entry.registered_at, original);
+
+    // The writer's identity survives the rewrite.
+    let full = session_entry(&me(), &original);
+    storage
+        .put(&key, &serde_json::to_vec(&full).unwrap())
+        .unwrap();
+    refresh_session(&storage, "live", &SystemClock);
+    let entry: SessionEntry = serde_json::from_slice(&storage.get(&key).unwrap().unwrap()).unwrap();
+    assert_ne!(entry.last_refresh, original);
+    assert_eq!(entry.boot_id.as_deref(), Some("boot-a"));
+    assert_eq!(entry.installation_id.as_deref(), Some("inst-a"));
+    assert_eq!(entry.pid_ns, Some(1));
+}
+
+// --- Same-host rule (04 step 1) ---
+
+/// A full-identity session entry for `host`, written at `at`.
+fn session_entry(host: &HostIdentity, at: &str) -> SessionEntry {
+    SessionEntry {
+        hostname: host.hostname.clone(),
+        pid: host.pid,
+        registered_at: at.to_string(),
+        last_refresh: at.to_string(),
+        boot_id: host.boot_id.clone(),
+        installation_id: host.installation_id.clone(),
+        pid_ns: host.pid_ns,
+    }
+}
+
+/// Who wrote a planted entry, and how long ago.
+#[derive(Clone)]
+struct Writer {
+    host: HostIdentity,
+    /// Before now on the reaper's clock (negative: in the future).
+    age: Duration,
+    /// Write the identity keys; `false` is the format of 0.24 and older
+    /// (locks carry a boot ID there, sessions do not).
+    identity: bool,
+}
+
+/// An entry of PID 123 under `me()`'s identity, written now.
+fn writer() -> Writer {
+    Writer {
+        host: HostIdentity { pid: 123, ..me() },
+        age: Duration::zero(),
+        identity: true,
+    }
+}
+
+fn plant_lock(storage: &dyn StorageBackend, w: &Writer) -> String {
+    let time = Utc::now() - w.age;
+    let key = lock_key_at(time, "planted");
+    let mut value = serde_json::json!({
+        "hostname": w.host.hostname,
+        "pid": w.host.pid,
+        "time": time.to_rfc3339(),
+        "boot_id": w.host.boot_id,
+    });
+    if w.identity {
+        value["installation_id"] = serde_json::json!(w.host.installation_id);
+        value["pid_ns"] = serde_json::json!(w.host.pid_ns);
+    }
+    storage
+        .put(&key, &serde_json::to_vec(&value).unwrap())
+        .unwrap();
+    key
+}
+
+fn plant_session(storage: &dyn StorageBackend, w: &Writer) -> String {
+    let time = (Utc::now() - w.age).to_rfc3339();
+    let key = session_marker_key("planted");
+    let mut value = serde_json::json!({
+        "hostname": w.host.hostname,
+        "pid": w.host.pid,
+        "registered_at": time,
+        "last_refresh": time,
+    });
+    if w.identity {
+        value["boot_id"] = serde_json::json!(w.host.boot_id);
+        value["installation_id"] = serde_json::json!(w.host.installation_id);
+        value["pid_ns"] = serde_json::json!(w.host.pid_ns);
+    }
+    storage
+        .put(&key, &serde_json::to_vec(&value).unwrap())
+        .unwrap();
+    key
+}
+
+/// Plant `w`'s entry once as a lock (6 h limit) and once as a session
+/// marker (45 min limit), each in a fresh store, and run the reaper as
+/// `env`. Returns (lock reaped, session reaped).
+fn verdicts(w: &Writer, env: &HostEnv) -> (bool, bool) {
+    let locks = MemoryBackend::new();
+    let key = plant_lock(&locks, w);
+    cleanup_stale_locks(&locks, Duration::hours(6), env).unwrap();
+    let lock_reaped = !locks.exists(&key).unwrap();
+
+    let sessions = MemoryBackend::new();
+    let key = plant_session(&sessions, w);
+    cleanup_stale_sessions(&sessions, default_stale_session_duration(), env).unwrap();
+    let session_reaped = !sessions.exists(&key).unwrap();
+    (lock_reaped, session_reaped)
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+const TEN_MIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn dead(_: u32) -> bool {
+    false
+}
+
+fn alive(_: u32) -> bool {
+    true
+}
+
+#[test]
+fn same_installation_dead_pid_is_reaped() {
+    assert_eq!(
+        verdicts(&writer(), &env_as(me(), dead, Some(HOUR))),
+        (true, true)
+    );
+}
+
+#[test]
+fn same_installation_live_pid_is_kept() {
+    assert_eq!(
+        verdicts(&writer(), &env_as(me(), alive, Some(HOUR))),
+        (false, false)
+    );
+}
+
+/// A cloned machine (same installation and hostname, another boot) wrote
+/// the entry after we booted: not ours to reap.
+#[test]
+fn clone_with_other_boot_is_kept() {
+    let mut w = writer();
+    w.host.boot_id = Some("boot-b".into());
+    w.age = Duration::minutes(10);
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(72 * HOUR))),
+        (false, false)
+    );
+}
+
+/// This machine rebooted: an entry of another boot older than our uptime
+/// is from an earlier boot. Without an uptime, no claim.
+#[test]
+fn earlier_boot_entry_is_reaped() {
+    let mut w = writer();
+    w.host.boot_id = Some("boot-old".into());
+    w.age = Duration::minutes(30);
+    assert_eq!(
+        verdicts(&w, &env_as(me(), alive, Some(TEN_MIN))),
+        (true, true)
+    );
+    assert_eq!(verdicts(&w, &env_as(me(), dead, None)), (false, false));
+}
+
+/// Containers sharing a hostname, a config volume and a kernel: a PID of
+/// another namespace cannot be probed from here.
+#[test]
+fn other_pid_namespace_is_kept() {
+    let mut w = writer();
+    w.host.pid_ns = Some(2);
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(HOUR))),
+        (false, false)
+    );
+}
+
+/// Two installations that share a hostname (and here even a boot ID).
+#[test]
+fn namesake_installation_is_kept() {
+    let mut w = writer();
+    w.host.installation_id = Some("inst-b".into());
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(HOUR))),
+        (false, false)
+    );
+}
+
+/// One installation ID on two machines with different hostnames (a copied
+/// or shared home directory): the hostname still has to match.
+#[test]
+fn same_installation_other_hostname_is_kept() {
+    let unknown_boot = |h: HostIdentity| HostIdentity {
+        boot_id: None,
+        pid_ns: None,
+        ..h
+    };
+    let mut w = writer();
+    w.host = unknown_boot(w.host);
+    w.host.hostname = "otherhost".into();
+    assert_eq!(
+        verdicts(&w, &env_as(unknown_boot(me()), dead, None)),
+        (false, false)
+    );
+
+    let mut w = writer();
+    w.host.hostname = "otherhost".into();
+    w.host.boot_id = Some("boot-old".into());
+    w.age = Duration::minutes(30);
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(TEN_MIN))),
+        (false, false)
+    );
+}
+
+/// Entries of 0.24 and older carry no installation ID: age only.
+#[test]
+fn old_format_entry_is_reaped_by_age_only() {
+    let mut w = writer();
+    w.identity = false;
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(HOUR))),
+        (false, false)
+    );
+    w.age = Duration::minutes(46);
+    assert_eq!(verdicts(&w, &env_as(me(), dead, Some(HOUR))), (false, true));
+    w.age = Duration::hours(7);
+    assert_eq!(verdicts(&w, &env_as(me(), dead, Some(HOUR))), (true, true));
+}
+
+#[test]
+fn no_local_installation_id_reaps_by_age_only() {
+    let local = HostIdentity {
+        installation_id: None,
+        ..me()
+    };
+    assert_eq!(
+        verdicts(&writer(), &env_as(local, dead, Some(HOUR))),
+        (false, false)
+    );
+}
+
+#[test]
+fn boot_unknown_on_one_side_is_kept() {
+    let mut w = writer();
+    let local = HostIdentity {
+        boot_id: None,
+        ..me()
+    };
+    assert_eq!(
+        verdicts(&w, &env_as(local, dead, Some(HOUR))),
+        (false, false)
+    );
+    w.host.boot_id = None;
+    assert_eq!(
+        verdicts(&w, &env_as(me(), dead, Some(HOUR))),
+        (false, false)
+    );
+}
+
+/// Platforms without a boot ID or PID namespaces (macOS, BSD): within one
+/// installation and hostname the PID decides.
+#[test]
+fn boot_unknown_on_both_sides_uses_pid() {
+    let bare = |h: HostIdentity| HostIdentity {
+        boot_id: None,
+        pid_ns: None,
+        ..h
+    };
+    let mut w = writer();
+    w.host = bare(w.host);
+    assert_eq!(verdicts(&w, &env_as(bare(me()), dead, None)), (true, true));
+    assert_eq!(
+        verdicts(&w, &env_as(bare(me()), alive, None)),
+        (false, false)
+    );
+}
+
+#[test]
+fn future_entry_with_other_boot_is_kept() {
+    let mut w = writer();
+    w.host.boot_id = Some("boot-b".into());
+    w.age = Duration::hours(-1);
+    assert_eq!(
+        verdicts(
+            &w,
+            &env_as(me(), dead, Some(std::time::Duration::from_secs(60)))
+        ),
+        (false, false)
+    );
+}
+
+// --- Entry formats (D1) ---
+
+/// The fields of a 0.24 lock entry, as 0.24 declared them.
+#[derive(serde::Deserialize)]
+struct LockEntryV024 {
+    hostname: String,
+    pid: u32,
+    time: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    boot_id: Option<String>,
+}
+
+/// The fields of a 0.24 session entry, as 0.24 declared them.
+#[derive(serde::Deserialize)]
+struct SessionEntryV024 {
+    hostname: String,
+    pid: u32,
+    registered_at: String,
+    last_refresh: String,
+}
+
+/// A lock and a marker written by `me()`: (lock bytes, marker bytes).
+fn written_entries() -> (Vec<u8>, Vec<u8>) {
+    let storage = MemoryBackend::new();
+    let env = env_as(me(), alive, Some(HOUR));
+    let guard = acquire_lock(&storage, &env).unwrap();
+    let lock = storage.get(guard.key()).unwrap().unwrap();
+    release_lock(&storage, guard).unwrap();
+    register_session(&storage, "fmt", &env).unwrap();
+    let marker = storage.get(&session_marker_key("fmt")).unwrap().unwrap();
+    (lock, marker)
+}
+
+#[test]
+fn entries_round_trip_identity() {
+    let (lock, marker) = written_entries();
+    let lock: serde_json::Value = serde_json::from_slice(&lock).unwrap();
+    assert_eq!(lock["hostname"], "myhost");
+    assert_eq!(lock["boot_id"], "boot-a");
+    assert_eq!(lock["installation_id"], "inst-a");
+    assert_eq!(lock["pid_ns"], 1);
+
+    let entry: SessionEntry = serde_json::from_slice(&marker).unwrap();
+    let again: SessionEntry = serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+    for e in [&entry, &again] {
+        assert_eq!(e.hostname, "myhost");
+        assert_eq!(e.pid, 1);
+        assert_eq!(e.boot_id.as_deref(), Some("boot-a"));
+        assert_eq!(e.installation_id.as_deref(), Some("inst-a"));
+        assert_eq!(e.pid_ns, Some(1));
+    }
+
+    // Unknown values are written as null, never omitted.
+    let storage = MemoryBackend::new();
+    let bare = HostIdentity {
+        boot_id: None,
+        installation_id: None,
+        pid_ns: None,
+        ..me()
+    };
+    register_session(&storage, "bare", &env_as(bare, alive, None)).unwrap();
+    let marker: serde_json::Value =
+        serde_json::from_slice(&storage.get(&session_marker_key("bare")).unwrap().unwrap())
+            .unwrap();
+    for k in ["boot_id", "installation_id", "pid_ns"] {
+        assert_eq!(marker.get(k), Some(&serde_json::Value::Null), "{k}");
+    }
+}
+
+#[test]
+fn entries_without_identity_parse() {
+    let now = Utc::now().to_rfc3339();
+    let old =
+        format!(r#"{{"hostname":"h","pid":7,"registered_at":"{now}","last_refresh":"{now}"}}"#);
+    let entry: SessionEntry = serde_json::from_str(&old).unwrap();
+    assert_eq!(entry.hostname, "h");
+    assert_eq!(entry.boot_id, None);
+    assert_eq!(entry.installation_id, None);
+    assert_eq!(entry.pid_ns, None);
+}
+
+/// 0.24 parses what this binary writes (it ignores the unknown keys).
+#[test]
+fn new_entries_parse_as_0_24() {
+    let (lock, marker) = written_entries();
+    let lock: LockEntryV024 = serde_json::from_slice(&lock).unwrap();
+    assert_eq!(lock.hostname, "myhost");
+    assert_eq!(lock.pid, 1);
+    assert!(chrono::DateTime::parse_from_rfc3339(&lock.time).is_ok());
+    let marker: SessionEntryV024 = serde_json::from_slice(&marker).unwrap();
+    assert_eq!(marker.hostname, "myhost");
+    assert_eq!(marker.pid, 1);
+    assert!(chrono::DateTime::parse_from_rfc3339(&marker.registered_at).is_ok());
+    assert!(chrono::DateTime::parse_from_rfc3339(&marker.last_refresh).is_ok());
 }
 
 // --- SessionGuard lifecycle tests ---

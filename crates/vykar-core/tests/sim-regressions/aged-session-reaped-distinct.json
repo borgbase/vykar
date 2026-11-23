@@ -1,0 +1,100 @@
+{
+  "name": "aged-session-reaped-distinct",
+  "note": "AgedSessionReaped on distinct hosts (phase F part 5, promoted from tests::sim_driver::session_reap_claims_only_its_victim): a 6 h 1 min jump at the backup's fetch-head, then compact reaps its aged lock and marker and deletes its packs; the commit fails with the untyped pack-missing error. Bounded by 04 step 5 (server-clock ages) and I8.",
+  "expect": [
+    "AgedSessionReaped"
+  ],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ]
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      1
+    ],
+    "policy": "First"
+  }
+}

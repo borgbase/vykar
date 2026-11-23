@@ -8,7 +8,7 @@
 //! scenario reports `NotReproduced` and the entry moves from `KNOWN_HAZARDS`
 //! to `REGRESSIONS`, where the same scenario must then hold. 05 step 8 moved
 //! H5 (the mark refuses) and H4-segment (index garbage is collected by age)
-//! there.
+//! there; 04 step 1 moved H1 and H1-session (installation ID).
 //!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
 //! protocol, under random schedules; the shapes of damage it recognises are
@@ -78,18 +78,12 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: h3_compact_then_late_head,
     },
     KnownHazard {
-        id: "H1",
-        summary: "same hostname, other boot ID: a live lock is reaped and its holder \
-                  writes under the reaper's lock",
-        fixed_by: "04-commit-protocol.md step 1 (installation ID)",
-        run: interleavings::h1_live_lock_reaped,
-    },
-    KnownHazard {
-        id: "H1-session",
-        summary: "same hostname: a live backup's marker is reaped, compact deletes its \
-                  uploaded packs; its uploads are destroyed and the backup fails",
-        fixed_by: "04-commit-protocol.md step 1 (installation ID)",
-        run: interleavings::h1_session_reaped,
+        id: "H1-late-clone",
+        summary: "a clone of the installation that booted after the holder's last write \
+                  takes a live lock for one of its earlier boot and reaps it",
+        fixed_by: "not planned: a history of this installation's own boot IDs; \
+                   04 step 5 narrows it for markers",
+        run: interleavings::h1_late_clone,
     },
     KnownHazard {
         id: "H2",
@@ -119,6 +113,19 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "after a lost update, compact refuses (the mark fails) and deletes \
                   none of the unindexed packs",
         run: h5_regression,
+    },
+    Regression {
+        id: "H1",
+        summary: "same hostname: a live lock is kept by cloned machines, namesakes (also \
+                  one booted after the holder's write) and containers (installation ID, \
+                  boot ID and uptime, PID namespace)",
+        run: interleavings::h1_regression,
+    },
+    Regression {
+        id: "H1-session",
+        summary: "same hostname: a live backup's marker is kept, compact refuses with \
+                  ActiveSessions",
+        run: interleavings::h1_session_regression,
     },
     Regression {
         id: "H4-segment",

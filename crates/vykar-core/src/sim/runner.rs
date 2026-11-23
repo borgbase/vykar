@@ -14,7 +14,7 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 
 use super::checker::{Invariant, Report, ViolationKind, check_invariants};
-use super::env::{SimHosts, SimTime, TimeMode};
+use super::env::{SimHosts, SimMachine, SimTime, TimeMode};
 use super::fault::{ClientId, FaultRule, ParkedId, RuleId};
 use super::gate::{GateId, GateRule, Paused};
 use super::history::{
@@ -330,12 +330,20 @@ impl Sim {
         self.client_on(name, &format!("sim-{name}"), Some(&format!("boot-{name}")))
     }
 
-    /// A client on host `hostname` with boot ID `boot_id`. Two clients with
-    /// the same pair share a machine; the same hostname with another boot ID
-    /// is a second machine with a clashing name (cloned VMs, H1).
+    /// A client on host `hostname` with boot ID `boot_id`, installation
+    /// `install-<hostname>` ([`SimMachine::new`]). The same hostname means
+    /// the same installation, so two clients with the same pair share a
+    /// machine; the same hostname with another boot ID is a **clone** of that
+    /// installation (cloned VMs copy the config directory), H1's hardest case
+    /// before 04 step 1.
     pub fn client_on(&mut self, name: &str, hostname: &str, boot_id: Option<&str>) -> ClientId {
+        self.client_at(name, SimMachine::new(hostname, boot_id))
+    }
+
+    /// A client on `machine`.
+    pub fn client_at(&mut self, name: &str, machine: SimMachine) -> ClientId {
         let id = self.store.register_client(name);
-        self.hosts.register(id, hostname, boot_id);
+        self.hosts.register(id, &machine);
         let dir = self
             .root
             .path()
@@ -375,7 +383,7 @@ impl Sim {
             .unwrap_or_else(chrono::Duration::zero);
         let hosts = self.hosts.clone();
         HostEnv {
-            clock: Arc::new(self.time.clock(skew)),
+            clock: Arc::new(self.time.clock(skew).booted_at(self.hosts.booted_at(c))),
             host: self.hosts.host(c),
             pid_alive: Arc::new(move |local, pid| hosts.pid_alive(local, pid)),
         }

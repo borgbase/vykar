@@ -49,7 +49,7 @@ pub use driver::{
     Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, LABEL_LOCKED, Outcome, Policy,
     Signature, Template, Trace, TraceEntry, case_from_trace, free_actions, run_case,
 };
-pub use env::{SimClock, SimHosts, SimTime, TimeMode, Waiter};
+pub use env::{INIT_PID_NS, SimClock, SimHosts, SimMachine, SimTime, TimeMode, Waiter};
 pub use explore::{Bound, Control, Exploration, Point, Search, dfs, explore, explore_with};
 pub use fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedEffect,

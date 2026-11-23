@@ -26,6 +26,10 @@ pub trait Clock: Send + Sync {
     fn elapsed(&self, start: Instant) -> Duration {
         self.monotonic().saturating_duration_since(start)
     }
+    /// Time since this machine booted, suspend included, or None where the
+    /// platform does not say. Compared with an entry's age to tell an
+    /// entry left by an earlier boot from one written by a cloned machine.
+    fn uptime(&self) -> Option<Duration>;
 }
 
 /// The system clock.
@@ -48,6 +52,10 @@ impl Clock for SystemClock {
 
     fn wait_timeout(&self, signal: &StopSignal, timeout: Duration) -> bool {
         signal.wait_real(timeout)
+    }
+
+    fn uptime(&self) -> Option<Duration> {
+        crate::platform::uptime()
     }
 }
 
@@ -131,15 +139,24 @@ pub struct HostIdentity {
     pub pid: u32,
     /// Boot ID, where the OS exposes one.
     pub boot_id: Option<String>,
+    /// Random ID of this installation (`platform::installation_id`),
+    /// shared by every vykar process of one user on one machine.
+    pub installation_id: Option<String>,
+    /// Inode of the PID namespace the PID belongs to.
+    pub pid_ns: Option<u64>,
 }
 
 impl HostIdentity {
-    /// This process: the system hostname, the process ID and the boot ID.
+    /// This process: the system hostname, the process ID, the boot ID,
+    /// the installation ID and the PID namespace. The hostname is read each
+    /// call; the other platform values once per process.
     pub fn system() -> Self {
         Self {
             hostname: crate::platform::hostname(),
             pid: std::process::id(),
             boot_id: crate::platform::boot_id(),
+            installation_id: crate::platform::installation_id(),
+            pid_ns: crate::platform::pid_namespace(),
         }
     }
 
@@ -165,8 +182,9 @@ pub struct HostEnv {
 
 impl HostEnv {
     /// The system clock and this process's identity, read now. The hostname
-    /// is not cached across calls: a long-lived process sees a rename at its
-    /// next operation.
+    /// is read each call, so a long-lived process sees a rename at its next
+    /// operation; boot ID, installation ID and PID namespace once per
+    /// process.
     pub fn system() -> Self {
         Self {
             clock: Arc::new(SystemClock),
@@ -248,6 +266,14 @@ mod tests {
         assert_eq!(env.host.hostname, crate::platform::hostname());
         assert_eq!(env.host.pid, std::process::id());
         assert_eq!(env.host.boot_id, crate::platform::boot_id());
+        assert_eq!(env.host.installation_id, crate::platform::installation_id());
+        assert!(env.host.installation_id.is_some());
+        assert_eq!(env.host.pid_ns, crate::platform::pid_namespace());
+        #[cfg(target_os = "linux")]
+        {
+            assert!(env.host.pid_ns.is_some());
+            assert!(SystemClock.uptime().is_some_and(|u| u > Duration::ZERO));
+        }
     }
 
     #[test]
@@ -256,6 +282,8 @@ mod tests {
             hostname: "box.example.org".into(),
             pid: 1,
             boot_id: None,
+            installation_id: None,
+            pid_ns: None,
         };
         assert_eq!(host.short_hostname(), "box");
     }

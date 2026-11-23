@@ -8,11 +8,15 @@
 //! verdict needs (lock keys, markers) are read back from the op log.
 //!
 //! H4-segment is a regression since 05 step 8 (index garbage is collected
-//! by age): [`h4_segment_regression`].
+//! by age): [`h4_segment_regression`]. H1 and H1-session are regressions
+//! since 04 step 1 (installation ID): [`h1_regression`],
+//! [`h1_session_regression`]. H4 reaches its two lock holders through a
+//! skewed clock since then ([`Hosts::Skewed`]).
 
 use std::time::Duration;
 
 use super::checker::{Invariant, Report, ViolationKind};
+use super::env::{INIT_PID_NS, SimMachine};
 use super::fault::{ClientId, KeyMatch, OpKind, OpMatch};
 use super::gate::{GateId, GateRule, Paused};
 use super::hazards::{HazardOutcome, base_controls, broken, deleted_in_run, different_damage};
@@ -23,11 +27,32 @@ use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree, seeded_bytes};
 /// Where the two clients of a scenario live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hosts {
-    /// Hostname "ubuntu" on both, boot IDs "boot-a" and "boot-b": two
-    /// machines with one name (cloned VMs). The H1 condition.
+    /// Cloned VMs: hostname "ubuntu" and one installation on both, boot IDs
+    /// "boot-a" and "boot-b", both booted long before the scenario. H1's
+    /// condition before 04 step 1.
     SameHostname,
+    /// Two installations that share the hostname "ubuntu" (two machines
+    /// left at a distribution's default name).
+    Namesakes,
+    /// Containers on one kernel sharing a hostname and a config volume:
+    /// one installation, one boot ID, PID namespaces `INIT_PID_NS + 1` and
+    /// `+ 2`.
+    SharedUts,
     /// Hostnames "host-a" and "host-b".
     Distinct,
+    /// Distinct hosts, b's wall clock 6 h 1 min ahead: b reaps a's live
+    /// lock by age (04 issue 1, skew; 04 step 5 bounds it).
+    Skewed,
+    /// As `SameHostname`, but b's machine boots 30 s after the scenario's
+    /// clients are placed, and a scenario that uses it lets a minute pass
+    /// once a holds its lock: b's uptime is then shorter than the age of
+    /// a's live entry, so b takes it for its own earlier boot (04 step 1's
+    /// residual, H1-late-clone).
+    LateClone,
+    /// As `LateClone`, but the two machines are namesakes (installations
+    /// "install-a" and "install-b"): only the installation comparison keeps
+    /// b from taking a's live entry for its own earlier boot.
+    LateNamesake,
 }
 
 /// The checked set for these scenarios: STEP1 and invariant 7.
@@ -59,10 +84,56 @@ fn pair(sim: &mut Sim, hosts: Hosts) -> (ClientId, ClientId) {
             sim.client_on("a", "ubuntu", Some("boot-a")),
             sim.client_on("b", "ubuntu", Some("boot-b")),
         ),
+        Hosts::Namesakes => (
+            sim.client_at(
+                "a",
+                SimMachine::new("ubuntu", Some("boot-a")).installation(Some("install-a")),
+            ),
+            sim.client_at(
+                "b",
+                SimMachine::new("ubuntu", Some("boot-b")).installation(Some("install-b")),
+            ),
+        ),
+        Hosts::SharedUts => (
+            sim.client_at(
+                "a",
+                SimMachine::new("ubuntu", Some("boot-1")).pid_ns(Some(INIT_PID_NS + 1)),
+            ),
+            sim.client_at(
+                "b",
+                SimMachine::new("ubuntu", Some("boot-1")).pid_ns(Some(INIT_PID_NS + 2)),
+            ),
+        ),
         Hosts::Distinct => (
             sim.client_on("a", "host-a", Some("boot-a")),
             sim.client_on("b", "host-b", Some("boot-b")),
         ),
+        Hosts::LateClone | Hosts::LateNamesake => {
+            let boot = chrono::Duration::from_std(sim.time().elapsed()).expect("sim time in range")
+                + chrono::Duration::seconds(30);
+            let (ia, ib) = if hosts == Hosts::LateNamesake {
+                ("install-a", "install-b")
+            } else {
+                ("install-ubuntu", "install-ubuntu")
+            };
+            (
+                sim.client_at(
+                    "a",
+                    SimMachine::new("ubuntu", Some("boot-a")).installation(Some(ia)),
+                ),
+                sim.client_at(
+                    "b",
+                    SimMachine::new("ubuntu", Some("boot-b"))
+                        .installation(Some(ib))
+                        .booted_at(boot),
+                ),
+            )
+        }
+        Hosts::Skewed => {
+            let (a, b) = (sim.client("a"), sim.client("b"));
+            sim.set_skew(b, chrono::Duration::seconds(6 * 3600 + 60));
+            (a, b)
+        }
     }
 }
 
@@ -156,14 +227,64 @@ fn controls(report: &Report) -> Result<(), HazardOutcome> {
 
 // ── H1 ──────────────────────────────────────────────────────────────────
 
-/// H1: a live maintenance lock is reaped by a machine with the same
-/// hostname and another boot ID, and its holder writes under the reaper's
-/// lock.
-pub fn h1_live_lock_reaped() -> HazardOutcome {
-    h1_with(Hosts::SameHostname)
+/// The host placements that shared a hostname, and so met H1's rule
+/// before 04 step 1. `LateNamesake` is the one that only the installation
+/// comparison keeps clean.
+const ONE_HOSTNAME: &[Hosts] = &[
+    Hosts::SameHostname,
+    Hosts::Namesakes,
+    Hosts::SharedUts,
+    Hosts::LateNamesake,
+];
+
+/// Placements whose b boots after a's write: the scenario lets a minute
+/// pass once a holds its entry.
+fn boots_late(hosts: Hosts) -> bool {
+    matches!(hosts, Hosts::LateClone | Hosts::LateNamesake)
 }
 
-/// H1 with the clients placed by `hosts`; `Distinct` neutralises it.
+/// H1 as a regression: on cloned machines, namesakes (also one booted
+/// after a's write) and containers that share a hostname, b keeps a's live
+/// lock (Locked) and a finishes.
+pub fn h1_regression() -> Report {
+    not_reproduced_on("H1", ONE_HOSTNAME, h1_with)
+}
+
+/// H1-session as a regression: the same placements, compact refuses on
+/// a's live marker (ActiveSessions) and a commits.
+pub fn h1_session_regression() -> Report {
+    not_reproduced_on("H1-session", ONE_HOSTNAME, h1_session_with)
+}
+
+/// H1-late-clone: a clone of a's installation that booted after a wrote
+/// its lock takes the live lock for one of its own earlier boot and reaps
+/// it; a then writes under b's lock. The residual of 04 step 1's uptime
+/// rule.
+pub fn h1_late_clone() -> HazardOutcome {
+    h1_with(Hosts::LateClone)
+}
+
+/// A clean report if every placement gives `NotReproduced`; else one
+/// `DisallowedError` per other outcome, subject `"<id> on <hosts>"`.
+fn not_reproduced_on(id: &str, hosts: &[Hosts], run: fn(Hosts) -> HazardOutcome) -> Report {
+    let mut out = Report::default();
+    for &h in hosts {
+        let outcome = run(h);
+        if !matches!(outcome, HazardOutcome::NotReproduced { .. }) {
+            out.add(
+                ViolationKind::DisallowedError,
+                format!("{id} on {h:?}"),
+                format!("{outcome:?}"),
+            );
+        }
+    }
+    out
+}
+
+/// H1: a live maintenance lock reaped by another client that shares the
+/// holder's hostname, whose holder then writes under the reaper's lock.
+/// The clients are placed by `hosts`; since 04 step 1 no placement
+/// reproduces it.
 ///
 /// A deletes t0 and is held at its snapshot delete, after its fence check.
 /// B deletes t1: its stale-lock sweep reaps A's lock when it shares A's
@@ -195,6 +316,10 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         },
     );
     reach(&sim, ga, "a's snapshot delete")?;
+    if boots_late(hosts) {
+        // b boots after a's lock write.
+        sim.advance(Duration::from_secs(60));
+    }
     let sb = sim.spawn(
         b,
         Call::Delete {
@@ -248,14 +373,10 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
     )
 }
 
-/// H1-session: the same-hostname rule reaps a live backup's session marker;
-/// compact deletes the backup's uploaded packs, and the backup fails.
-pub fn h1_session_reaped() -> HazardOutcome {
-    h1_session_with(Hosts::SameHostname)
-}
-
-/// H1-session with the clients placed by `hosts`; `Distinct` neutralises
-/// it.
+/// H1-session: a live backup's session marker reaped by a compact that
+/// shares its hostname; compact deletes the backup's uploaded packs, and
+/// the backup fails. The clients are placed by `hosts`; since 04 step 1 no
+/// placement reproduces it.
 ///
 /// A backs up a1 and is held at its commit lock's stale-lock sweep, after
 /// phase 1 uploaded its packs. B compacts. Then A resumes.
@@ -289,6 +410,10 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     let a_packs = sim.store().keys_written_by(a, "packs/");
     if a_packs.is_empty() {
         return Err(broken("a paused before uploading; retarget the gate"));
+    }
+    if boots_late(hosts) {
+        // b boots after a's marker write.
+        sim.advance(Duration::from_secs(60));
     }
     let rb = sim.compact(b);
     sim.resume(ga);
@@ -596,15 +721,16 @@ enum BackupGate {
     Head,
 }
 
-/// H4: compact loses its lock (H1's rule) and deletes sources with no fence
-/// after its head PUT; a backup that read the head before then commits a
-/// head that names the deleted packs.
+/// H4: compact loses its lock (the age rule, read on a skewed clock) and
+/// deletes sources with no fence after its head PUT; a backup that read
+/// the head before then commits a head that names the deleted packs.
 pub fn h4_compact_deletes_after_lost_lock() -> HazardOutcome {
-    h4_with(Hosts::SameHostname, Order::Interleaved)
+    h4_with(Hosts::Skewed, Order::Interleaved)
 }
 
 /// H4 with the clients placed by `hosts` and ordered by `order`.
-/// `Sequential` neutralises it; `Distinct` removes its prerequisite (H1).
+/// `Sequential` neutralises it; a placement without the skew removes its
+/// prerequisite (a reaped live lock).
 ///
 /// Compact A is held at its second head PUT (the first is its sweep's),
 /// after the repack batch's segment PUT. Backup B, whose registration probe
@@ -627,7 +753,7 @@ pub fn h4_segment_with(hosts: Hosts, order: Order) -> HazardOutcome {
 /// regression's subject.
 pub fn h4_segment_regression() -> Report {
     let mut out = Report::default();
-    let (sim, b) = match h4_run(Hosts::SameHostname, Order::Interleaved, BackupGate::Head) {
+    let (sim, b) = match h4_run(Hosts::Skewed, Order::Interleaved, BackupGate::Head) {
         Ok(Ok(run)) => run,
         Ok(Err(outcome)) | Err(outcome) => {
             out.add(
@@ -704,7 +830,7 @@ fn h4_runs(
                     )));
                 }
                 return Ok(Err(HazardOutcome::PrerequisiteNotReproduced {
-                    prerequisite: "H1",
+                    prerequisite: "a reaped live lock",
                     evidence: format!("b could not reap a's lock\n{}", outcomes(&ra, &rb)),
                 }));
             }

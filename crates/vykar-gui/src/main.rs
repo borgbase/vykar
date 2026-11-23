@@ -33,6 +33,38 @@ use messages::{AppCommand, UiEvent, log_entry_now};
 
 const APP_TITLE: &str = "Vykar Backup";
 
+/// Point the per-user config and cache directories at a per-process temp
+/// directory, so tests that open repositories never write into the
+/// developer's real home (vykar-core's installation ID, identity pins).
+/// Idempotent; call before the test's first repository open.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) fn init_test_environment() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let base = std::env::temp_dir().join(format!("vykar-gui-tests-{}", std::process::id()));
+        let (home, config, cache) = (base.join("home"), base.join("config"), base.join("cache"));
+        for dir in [&home, &config, &cache] {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once behind `Once`, before the first repository
+        // open of whichever test calls it first (the same pattern as
+        // `vykar-core/src/testutil.rs`). Other tests may run concurrently
+        // and read the environment (`autostart.rs`, `state.rs`), but only
+        // through `std::env` and crates built on it, which take the same
+        // lock as `set_var`: they see the old value or the new one.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("APPDATA", &config);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+            std::env::set_var("LOCALAPPDATA", &cache);
+        }
+    });
+}
+
 // slint::include_modules!() — generated code, not subject to our lints.
 #[allow(
     warnings,

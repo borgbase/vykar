@@ -1,6 +1,7 @@
 //! Random exploration of the driver's cases (08 step 4). A general family
-//! must show no damage of an unknown shape; two narrow families must find
-//! H1 and H3 under random schedules and shrink them to a short case. The
+//! must show no damage of an unknown shape; a narrow family must find H3
+//! under random schedules and shrink it to a short case, and the
+//! one-hostname family (H1's before 04 step 1) must stay clean. The
 //! seed is `VYKAR_SIM_SEED` (else fixed), the case count of the general
 //! family `VYKAR_SIM_CASES`; `VYKAR_SIM_MEASURE=1` runs the measurement.
 
@@ -149,9 +150,10 @@ fn two_backups() -> Vec<Vec<Command>> {
     vec![vec![b.clone()], vec![b]]
 }
 
-/// H1's family: two backups on one hostname, no faults, no crash, no time
-/// jumps (an aged lock is reaped by design).
-fn h1_family() -> impl Strategy<Value = Case> {
+/// The one-hostname family (H1's before 04 step 1): two backups on cloned
+/// machines, no faults, no crash, no time jumps (an aged lock is reaped by
+/// design).
+fn one_hostname_family() -> impl Strategy<Value = Case> {
     choices().prop_map(|choices| Case {
         hosts: HostPlan::SameHostname,
         clients: two_backups(),
@@ -277,15 +279,20 @@ fn finds(
     }
 }
 
+/// Since 04 step 1 (installation ID) no schedule of the one-hostname
+/// family shows any signature.
 #[test]
-fn random_exploration_finds_h1() {
-    finds(
-        "finds-h1",
-        h1_family(),
-        256,
-        Signature::TwoLockHolders,
-        "04 step 1 (installation ID)",
-    );
+fn one_hostname_exploration_is_clean() {
+    let template = Template::new();
+    let result = runner(256).run(&one_hostname_family(), |case| {
+        let o = run_case(&template, &case);
+        prop_assert!(o.signatures.is_empty(), "signatures {:?}", o.signatures);
+        Ok(())
+    });
+    if let Err(TestError::Fail(_, case)) = &result {
+        panic!("{}", report_failure("one-hostname-clean", &template, case));
+    }
+    result.unwrap();
 }
 
 #[test]
@@ -384,7 +391,10 @@ fn measure() {
             "random_cases_have_no_unknown_violation",
             random_cases_have_no_unknown_violation as fn(),
         ),
-        ("random_exploration_finds_h1", random_exploration_finds_h1),
+        (
+            "one_hostname_exploration_is_clean",
+            one_hostname_exploration_is_clean,
+        ),
         ("random_exploration_finds_h3", random_exploration_finds_h3),
         (
             "random_cases_replay_identically",

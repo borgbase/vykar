@@ -460,6 +460,7 @@ mod tests {
     fn open_with(
         repo_dir: &std::path::Path,
     ) -> impl FnMut(Option<&str>) -> Result<(), VykarError> + use<> {
+        crate::init_test_environment();
         let repo_dir = repo_dir.to_path_buf();
         move |pass: Option<&str>| {
             let storage = Box::new(
@@ -480,6 +481,7 @@ mod tests {
 
     /// Build an encrypted repository whose passphrase is `pass`.
     fn encrypted_repo(tmp: &tempfile::TempDir, pass: &str) -> std::path::PathBuf {
+        crate::init_test_environment();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_dir).expect("create repo dir");
         let storage = Box::new(

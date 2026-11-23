@@ -1,9 +1,9 @@
 //! Bounded exhaustive search over the driver (08 step 5): every schedule of
 //! a small scenario with at most K preemptions, and a gate-stepped search
 //! over two raw lock acquisitions. The expectations are exact: a clean
-//! scenario must stay clean, the one-hostname pair must show H1 and nothing
-//! else. The scenario builders and the campaign's list are shared with
-//! `tests::sim_campaign`.
+//! scenario must stay clean, and so must the one-hostname pair since 04
+//! step 1 (installation ID) removed H1. The scenario builders and the
+//! campaign's list are shared with `tests::sim_campaign`.
 
 // The searches print their counts for the commit message and for anyone
 // re-measuring the bound; every other path asserts.
@@ -207,27 +207,12 @@ fn lock_pair_on_distinct_hosts_is_clean() {
     assert_clean("pair-distinct", &lock_pair(HostPlan::Distinct));
 }
 
-/// On one hostname (other boot IDs) the second backup's registration reaps
-/// the first one's live lock: H1, and nothing else.
+/// On one hostname (cloned machines: one installation, other boot IDs) the
+/// second backup's registration no longer reaps the first one's live lock
+/// (H1 before 04 step 1): every schedule is clean.
 #[test]
-fn lock_pair_on_one_hostname_shows_only_h1() {
-    let name = "pair-hostname";
-    let t = Template::new();
-    let e = search(&t, &lock_pair(HostPlan::SameHostname), false);
-    print_search(name, &e);
-    assert!(e.search.complete, "{name}: the search did not complete");
-    for (sig, (_, case)) in &e.signatures {
-        assert!(
-            *sig == Signature::TwoLockHolders,
-            "{name}: a schedule shows {sig:?}, not only TwoLockHolders:\n{}",
-            kept_trace(&t, name, case)
-        );
-    }
-    assert!(
-        e.signatures.contains_key(&Signature::TwoLockHolders),
-        "H1 no longer reproduces under the bounded search: 04 step 1 (installation ID) \
-         fixed it? make this scenario expect a clean search"
-    );
+fn lock_pair_on_one_hostname_is_clean() {
+    assert_clean("pair-hostname", &lock_pair(HostPlan::SameHostname));
 }
 
 /// A backup against delete + compact, compact one step at every boundary of
@@ -259,10 +244,6 @@ struct LockPairTally {
     one_held: usize,
     /// Both clients wrote a lock key and one backed off after its own.
     contended_puts: usize,
-    /// A run failed with "written lock key not returned by LIST": the other
-    /// client's pre-check reaped its key between its PUT and its confirming
-    /// LIST (one hostname only; H1's reap, see `lock_acquisitions_race`).
-    key_reaped: usize,
     first_double: Option<Vec<usize>>,
 }
 
@@ -303,6 +284,7 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
         let ids = ["a", "b"].map(|name| match hosts {
             HostPlan::Distinct => sim.client(name),
             HostPlan::SameHostname => sim.client_on(name, "ubuntu", Some(&format!("boot-{name}"))),
+            HostPlan::LateClone => unreachable!("the lock-pair search places no late clone"),
         });
         let inside: Arc<Mutex<Vec<(ClientId, u64)>>> = Arc::default();
         let mut cs: Vec<Contender> = ids
@@ -366,14 +348,9 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
         let runs: Vec<RunRecord> = spawned.into_iter().map(|s| sim.join(s)).collect();
         let locked =
             |r: &RunRecord| r.error_class() == Some(&ErrorClass::Allowed(AllowedError::Locked));
-        let reaped = |r: &RunRecord| {
-            hosts == HostPlan::SameHostname
-                && r.detail().contains("written lock key not returned by LIST")
-        };
-        tally.key_reaped += runs.iter().filter(|r| reaped(r)).count();
         for r in &runs {
             assert!(
-                r.is_ok() || locked(r) || reaped(r),
+                r.is_ok() || locked(r),
                 "a raw acquisition ended neither Ok nor Locked: {} / {}",
                 runs[0].detail(),
                 runs[1].detail()
@@ -430,54 +407,38 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
     (search, tally)
 }
 
-/// 08's "lock acquire vs lock acquire", operation by operation. On distinct
-/// hosts no schedule puts both inside the lock; on one hostname the
-/// pre-check of one reaps the other's live key (H1 at acquisition level).
+/// 08's "lock acquire vs lock acquire", operation by operation. On
+/// distinct hosts and, since 04 step 1 (installation ID), on one hostname
+/// (cloned machines) no schedule puts both inside the lock, and every run
+/// ends Ok or Locked: the pre-check of one no longer reaps the other's live
+/// key, before or after its confirming LIST (H1 at acquisition level).
 /// Both clients backing off (`sim_exclusion::simultaneous_acquires_both_back_off`)
 /// needs three preemptions; at K = 2 the check that the search reaches
 /// contention is a lock PUT by each client with one backing off.
-///
-/// On one hostname a run may also fail with "written lock key not returned
-/// by LIST": the other client's pre-check reaps (`should_cleanup_lock`: same
-/// hostname, other boot ID, any age) the key it has just written, before its
-/// confirming LIST. That is H1's reap again, and 04 step 1 (installation ID)
-/// removes it with the double hold.
 #[test]
 fn lock_acquisitions_race() {
     let bound = Bound {
         preemptions: GATE_K,
         max_runs: PRECOMMIT_MAX_RUNS,
     };
-    let start = Instant::now();
-    let (s, t) = lock_acquisitions(HostPlan::Distinct, bound);
-    eprintln!(
-        "gate search, distinct, K = {GATE_K}: {s:?} {t:?} in {:?}",
-        start.elapsed()
-    );
-    assert!(s.complete);
-    assert_eq!(t.double_holds, 0, "two holders on distinct hosts: {t:?}");
-    assert!(t.one_held > 0, "{t:?}");
-    assert!(
-        t.contended_puts > 0,
-        "the search never reached contention: {t:?}"
-    );
-    if GATE_K >= 3 {
-        assert!(t.both_backed_off > 0, "{t:?}");
+    for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
+        let start = Instant::now();
+        let (s, t) = lock_acquisitions(hosts, bound);
+        eprintln!(
+            "gate search, {hosts:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
+            start.elapsed()
+        );
+        assert!(s.complete);
+        assert_eq!(t.double_holds, 0, "two holders on {hosts:?}: {t:?}");
+        assert!(t.one_held > 0, "{t:?}");
+        assert!(
+            t.contended_puts > 0,
+            "the search never reached contention: {t:?}"
+        );
+        if GATE_K >= 3 {
+            assert!(t.both_backed_off > 0, "{t:?}");
+        }
     }
-
-    let start = Instant::now();
-    let (s, t) = lock_acquisitions(HostPlan::SameHostname, bound);
-    eprintln!(
-        "gate search, one hostname, K = {GATE_K}: {s:?} {t:?} in {:?}",
-        start.elapsed()
-    );
-    assert!(s.complete);
-    assert!(t.key_reaped > 0, "{t:?}");
-    assert!(
-        t.double_holds > 0,
-        "no double hold on one hostname: 04 step 1 (installation ID) fixed H1 at \
-         acquisition? make this expect none: {t:?}"
-    );
 }
 
 /// `VYKAR_SIM_MEASURE=1`: every pre-commit driver search at K = 1 and

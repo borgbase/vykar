@@ -1,7 +1,9 @@
 //! The deterministic driver over the steppable commit machines (08 step 4):
 //! its storage operations stay inside the machine steps they declare, its
-//! default schedule is production's, it reproduces the scripted hazards H1
-//! and H3, and its traces replay.
+//! default schedule is production's, it reproduces the scripted hazard H3,
+//! H1's schedules stay clean since 04 step 1, a late-booted clone still
+//! shows `TwoLockHolders` and `SessionReaped` (H1-late-clone), and its
+//! traces replay.
 
 // Printing is the point of the env-driven helpers here (projections,
 // replays, the measurement); every other path asserts.
@@ -299,12 +301,32 @@ fn driver_reproduces_h3_scripted() {
     );
 }
 
-/// H1 through the driver: B (same hostname, other boot ID) uploads while A
-/// is at its head PUT; B's registration reaps A's live lock and A writes
-/// its head with no lock (`interleavings::h1_with`). On distinct hosts the
-/// same choices leave B `Locked`.
+/// The b of `o`'s driven backups.
+fn backup_of_b(o: &Outcome) -> RunRecord {
+    driven_backups(o)
+        .into_iter()
+        .find(|r| o.sim.store().client_name(r.client) == "b")
+        .expect("b ran")
+}
+
+fn assert_locked(o: &Outcome, r: &RunRecord) {
+    assert_eq!(
+        r.error_class(),
+        Some(&crate::sim::ErrorClass::Allowed(
+            crate::sim::AllowedError::Locked
+        )),
+        "{}",
+        o.trace.render()
+    );
+}
+
+/// H1's schedule through the driver: B uploads while A is at its head PUT.
+/// Before 04 step 1 B's registration on the same hostname (another boot ID)
+/// reaped A's live lock and A wrote its head with no lock
+/// (`interleavings::h1_with`). Now, on cloned machines as on distinct
+/// hosts, the same choices leave B `Locked` and the case clean.
 #[test]
-fn driver_reproduces_h1_scripted() {
+fn driver_h1_schedule_is_clean() {
     let t = Template::new();
     let mut c = case(
         HostPlan::SameHostname,
@@ -314,39 +336,23 @@ fn driver_reproduces_h1_scripted() {
     c.advances = false;
     let at = decision_of(&t, &c, 0, "put-head");
     let c = with_choice(&c, at, 1);
-    let o = run_case(&t, &c);
-    assert!(
-        o.signatures.contains(&Signature::TwoLockHolders),
-        "{}",
-        o.trace.render()
-    );
-
-    let mut distinct = c.clone();
-    distinct.hosts = HostPlan::Distinct;
-    let o = run_case(&t, &distinct);
-    assert!(o.report.is_clean(), "{}", o.trace.render());
-    let runs = driven_backups(&o);
-    let b = runs
-        .iter()
-        .find(|r| o.sim.store().client_name(r.client) == "b")
-        .expect("b ran");
-    assert_eq!(
-        b.error_class(),
-        Some(&crate::sim::ErrorClass::Allowed(
-            crate::sim::AllowedError::Locked
-        )),
-        "{}",
-        o.trace.render()
-    );
+    for hosts in [HostPlan::SameHostname, HostPlan::Distinct] {
+        let mut c = c.clone();
+        c.hosts = hosts;
+        let o = run_case(&t, &c);
+        assert!(o.signatures.is_empty(), "{}", o.trace.render());
+        assert!(o.report.is_clean(), "{}", o.trace.render());
+        assert_locked(&o, &backup_of_b(&o));
+    }
 }
 
-/// H1-session through the driver: compact on the same hostname reaps A's
-/// live marker (and lock) after A's marker probe; A's commit then fails
-/// with the untyped "pack … missing" error. `SessionReaped` claims that
-/// error and nothing else: an unrelated violation, or a skipped
-/// evaluation, added to the report is left to `Unknown`.
+/// H1-session's schedule through the driver: compact runs at A's
+/// "fetch-head". Before 04 step 1 compact on the same hostname reaped A's
+/// live marker and lock there. Now compact finds A's commit lock held and
+/// ends `Locked` (it takes the lock before it looks at sessions), and A
+/// commits.
 #[test]
-fn session_reap_claims_only_its_victim() {
+fn driver_session_reap_schedule_is_clean() {
     let t = Template::new();
     let mut c = case(
         HostPlan::SameHostname,
@@ -362,13 +368,74 @@ fn session_reap_claims_only_its_victim() {
     let at = decision_of(&t, &c, 0, "fetch-head");
     c = with_choice(&c, at, 1);
     let o = run_case(&t, &c);
+    assert!(o.signatures.is_empty(), "{}", o.trace.render());
+    assert!(o.report.is_clean(), "{}", o.trace.render());
+    let ra = driven_backups(&o)
+        .into_iter()
+        .find(|r| o.sim.store().client_name(r.client) == "a")
+        .expect("a ran");
+    assert!(ra.is_ok(), "{}", o.trace.render());
+    let rb = o
+        .sim
+        .history()
+        .runs
+        .iter()
+        .find(|r| o.sim.store().client_name(r.client) == "b")
+        .expect("b ran")
+        .clone();
+    assert_locked(&o, &rb);
+}
+
+/// A marker reaped by age (`AgedSessionReaped`) claims its victim's error
+/// and nothing else: compact runs after a jump past both stale ages at A's
+/// "fetch-head", reaps A's aged lock and marker, and A's commit fails with
+/// the untyped "pack … missing" error. An unrelated violation, or a
+/// skipped evaluation, added to the report is left to `Unknown`.
+#[test]
+fn session_reap_claims_only_its_victim() {
+    let t = Template::new();
+    let mut c = case(
+        HostPlan::Distinct,
+        vec![
+            vec![Command::Backup {
+                shared: false,
+                fold: false,
+            }],
+            vec![Command::Compact],
+        ],
+        vec![],
+    );
+    let at = decision_of(&t, &c, 0, "fetch-head");
+    let probe = run_case(&t, &c);
+    let jump = Action::Advance { secs: 21660 };
+    let advance = probe.trace.entries[at]
+        .actions
+        .iter()
+        .position(|a| *a == jump)
+        .unwrap_or_else(|| {
+            panic!(
+                "{jump:?} not offered at fetch-head:\n{}",
+                probe.trace.render()
+            )
+        });
+    c = with_choice(&c, at, u16::try_from(advance).unwrap());
+    // Then b's step: the compact.
+    let after = run_case(&t, &c);
+    let b_step = after.trace.entries[at + 1]
+        .actions
+        .iter()
+        .position(|a| matches!(a, Action::Step { client: 1, .. }))
+        .unwrap_or_else(|| panic!("no step of b after the jump:\n{}", after.trace.render()));
+    c.choices.push(u16::try_from(b_step).unwrap());
+    let o = run_case(&t, &c);
     let render = || o.trace.render();
     assert_eq!(
         o.signatures,
-        BTreeSet::from([Signature::SessionReaped]),
+        BTreeSet::from([Signature::AgedSessionReaped]),
         "{}",
         render()
     );
+    assert!(!Signature::AgedSessionReaped.cascades());
     assert!(
         matches!(
             o.report.violations.as_slice(),
@@ -377,6 +444,7 @@ fn session_reap_claims_only_its_victim() {
         "{}",
         render()
     );
+    let with_unknown = || BTreeSet::from([Signature::AgedSessionReaped, Signature::Unknown]);
 
     let mut unrelated = o.report.clone();
     unrelated.violations.push(Violation {
@@ -388,7 +456,7 @@ fn session_reap_claims_only_its_victim() {
     });
     assert_eq!(
         classify(&o.sim, &unrelated, &o.trace.entries),
-        BTreeSet::from([Signature::SessionReaped, Signature::Unknown])
+        with_unknown()
     );
 
     let mut skipped = o.report.clone();
@@ -397,9 +465,101 @@ fn session_reap_claims_only_its_victim() {
         subject: "index".into(),
         reason: "injected by the test".into(),
     });
+    assert_eq!(classify(&o.sim, &skipped, &o.trace.entries), with_unknown());
+}
+
+/// `c` with a jump of 61 s at client a's first step labelled `label`,
+/// then client b's steps until b's command ends; past that the default.
+/// The jump puts b of [`HostPlan::LateClone`] past its boot, at an uptime
+/// shorter than the age of a's entries.
+fn jump_then_b(t: &Template, c: &Case, label: &str) -> Case {
+    let at = decision_of(t, c, 0, label);
+    let probe = run_case(t, c);
+    let jump = Action::Advance { secs: 61 };
+    let advance = probe.trace.entries[at]
+        .actions
+        .iter()
+        .position(|a| *a == jump)
+        .unwrap_or_else(|| panic!("{jump:?} not offered at {label}:\n{}", probe.trace.render()));
+    let mut c = with_choice(c, at, u16::try_from(advance).unwrap());
+    loop {
+        let out = run_case(t, &c);
+        let Some(entry) = out.trace.entries.get(c.choices.len()) else {
+            panic!(
+                "the case ended before b's command did:\n{}",
+                out.trace.render()
+            );
+        };
+        let step = entry
+            .actions
+            .iter()
+            .position(|a| *a == (Action::Step { client: 1, pick: 0 }))
+            .unwrap_or_else(|| panic!("b has no step:\n{}", out.trace.render()));
+        c.choices.push(u16::try_from(step).unwrap());
+        // The decision just added ran b's step; its entry says if it ended.
+        let out = run_case(t, &c);
+        if out.trace.entries[c.choices.len() - 1].ended {
+            return c;
+        }
+    }
+}
+
+/// H1-late-clone through the driver: a clone of a's installation that
+/// boots after a took its commit lock, then registers a minute later,
+/// reaps a's young lock as one of its own earlier boot, and a writes on:
+/// exactly `TwoLockHolders`. The same choices on clones booted long before
+/// are clean.
+#[test]
+fn late_clone_reaps_live_lock() {
+    let t = Template::new();
+    let own = Command::Backup {
+        shared: false,
+        fold: false,
+    };
+    let c = case(
+        HostPlan::LateClone,
+        vec![vec![own.clone()], vec![own]],
+        vec![],
+    );
+    let c = jump_then_b(&t, &c, "fetch-head");
+    let o = run_case(&t, &c);
     assert_eq!(
-        classify(&o.sim, &skipped, &o.trace.entries),
-        BTreeSet::from([Signature::SessionReaped, Signature::Unknown])
+        o.signatures,
+        BTreeSet::from([Signature::TwoLockHolders]),
+        "{}",
+        o.trace.render()
+    );
+    let mut early = c.clone();
+    early.hosts = HostPlan::SameHostname;
+    let o = run_case(&t, &early);
+    assert!(o.signatures.is_empty(), "{}", o.trace.render());
+}
+
+/// H1-late-clone for markers: a late-booted clone compacts at a's
+/// "fetch-head" a minute after its boot, reaps a's young marker and lock
+/// as its own earlier boot's and deletes a's packs; a's commit fails with
+/// the untyped "pack … missing" error: exactly `SessionReaped`.
+#[test]
+fn late_clone_reaps_live_marker() {
+    let t = Template::new();
+    let c = case(
+        HostPlan::LateClone,
+        vec![
+            vec![Command::Backup {
+                shared: false,
+                fold: false,
+            }],
+            vec![Command::Compact],
+        ],
+        vec![],
+    );
+    let c = jump_then_b(&t, &c, "fetch-head");
+    let o = run_case(&t, &c);
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::SessionReaped]),
+        "{}",
+        o.trace.render()
     );
 }
 

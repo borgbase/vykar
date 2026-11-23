@@ -1,9 +1,7 @@
 {
   "name": "h1-bounded",
-  "note": "First TwoLockHolders schedule of tests::sim_exhaustive::lock_pair_on_one_hostname_shows_only_h1 (K = 1). Fixed by 04 step 1 (installation ID).",
-  "expect": [
-    "TwoLockHolders"
-  ],
+  "note": "First TwoLockHolders schedule of tests::sim_exhaustive::lock_pair_on_one_hostname_shows_only_h1 (K = 1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): b no longer reaps a's live lock and ends Locked at its lock step, so the choices after it were trimmed; kept as a regression (now tests::sim_exhaustive::lock_pair_on_one_hostname_is_clean): this schedule must stay clean.",
+  "expect": [],
   "at": [
     [
       {
@@ -107,88 +105,7 @@
     [
       {
         "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "lock"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "flush"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "refresh-snapshots"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "probe-marker"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "fetch-head +local"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "sync-index"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "verify-packs +local"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "put-segment"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "fence"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
+          "client": 0,
           "pick": 0
         }
       },
@@ -197,7 +114,7 @@
     [
       {
         "Step": {
-          "client": 1,
+          "client": 0,
           "pick": 0
         }
       },
@@ -206,38 +123,11 @@
     [
       {
         "Step": {
-          "client": 1,
+          "client": 0,
           "pick": 0
         }
       },
       "put-snapshot"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "finish"
-    ],
-    [
-      {
-        "Step": {
-          "client": 0,
-          "pick": 0
-        }
-      },
-      "put-head +local"
-    ],
-    [
-      {
-        "Step": {
-          "client": 0,
-          "pick": 0
-        }
-      },
-      "fence"
     ],
     [
       {
@@ -292,19 +182,7 @@
       1,
       1,
       1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0
+      1
     ],
     "policy": "Continue"
   }

@@ -32,6 +32,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::checker::{Invariant, Report, Violation, ViolationKind, run_subject};
+use super::env::SimMachine;
 use super::fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpMatch, ParkedId,
 };
@@ -78,9 +79,20 @@ pub enum HostPlan {
     /// Every client on its own host (`sim-<name>`).
     Distinct,
     /// Every client on hostname "ubuntu" with its own boot ID
-    /// (`boot-<name>`): cloned machines, the H1 condition.
+    /// (`boot-<name>`) and one installation: cloned machines, H1's
+    /// condition before 04 step 1.
     SameHostname,
+    /// As `SameHostname`, but every client after the first boots
+    /// [`LATE_BOOT_SECS`] after it is placed. The driver's time moves only
+    /// by jumps of at least a minute, so after one such a client's uptime
+    /// is shorter than the age of the first client's entries and it takes
+    /// them for its own earlier boot's: the known hazard H1-late-clone.
+    LateClone,
 }
+
+/// How long after placement a later client of [`HostPlan::LateClone`]
+/// boots.
+pub const LATE_BOOT_SECS: i64 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -298,8 +310,9 @@ pub enum Action {
 /// known store step earlier than the hazard is not theirs. Only
 /// lock-exclusion violations carry a store step today, so a cascading
 /// signature excuses every other violation of its case: "no `Unknown`" is a
-/// weak guard for such cases until the hazards are gone. Parts 5 and 9 of
-/// clean-design phase F (04 steps 1 and 8) remove them.
+/// weak guard for such cases until the hazards are gone. Part 5 of
+/// clean-design phase F (04 step 1) removed `TwoLockHolders`' source;
+/// part 9 (04 step 8) removes the late head writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Signature {
     /// H1: a protected write by a client whose live lock another client on
@@ -308,15 +321,21 @@ pub enum Signature {
     /// victim's run makes an ordinary (not released) write to `index.d/`,
     /// `index.h/` or `snapshots/` after a young reap: a delayed or
     /// duplicated lock PUT of the victim's can recreate the reaped key, so
-    /// the checker sees a holder (seed `h1-duplicated-lock`). Fixed by 04
-    /// step 1 (installation ID).
+    /// the checker sees a holder (seed `h1-duplicated-lock`). A young reap
+    /// of a live lock by another client: H1 before 04 step 1 (installation
+    /// ID); since then only [`HostPlan::LateClone`] produces it (the known
+    /// hazard H1-late-clone), so a case on another host plan that shows it
+    /// is a regression.
     TwoLockHolders,
     /// H1-session: a live backup's session marker deleted by another client
     /// (same hostname, other boot ID) while younger than the session
     /// staleness; compact then deletes the backup's uploads and its commit
     /// fails. Claims the victim run's `DisallowedError` and the violations
     /// of its snapshot; a victim that fails with an allowed error leaves a
-    /// clean case and no signature. Fixed by 04 step 1 (installation ID).
+    /// clean case and no signature. A young reap of a live marker by
+    /// another client: H1 before 04 step 1 (installation ID); since then
+    /// only [`HostPlan::LateClone`] produces it (H1-late-clone), so a case
+    /// on another host plan that shows it is a regression.
     ///
     /// Known behaviour: when the victim's marker probe ran before compact
     /// reaped the marker, its commit does not fail with
@@ -651,6 +670,16 @@ impl<'c> Driver<'c> {
                     HostPlan::Distinct => sim.client(name),
                     HostPlan::SameHostname => {
                         sim.client_on(name, "ubuntu", Some(&format!("boot-{name}")))
+                    }
+                    HostPlan::LateClone => {
+                        let mut machine = SimMachine::new("ubuntu", Some(&format!("boot-{name}")));
+                        if name != NAMES[0] {
+                            let placed = chrono::Duration::from_std(sim.time().elapsed())
+                                .expect("sim time in range");
+                            machine = machine
+                                .booted_at(placed + chrono::Duration::seconds(LATE_BOOT_SECS));
+                        }
+                        sim.client_at(name, machine)
                     }
                 };
                 Actor {

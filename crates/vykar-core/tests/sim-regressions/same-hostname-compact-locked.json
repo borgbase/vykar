@@ -1,9 +1,7 @@
 {
-  "name": "aged-session-reaped",
-  "note": "First AgedSessionReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the session staleness, then compact reaps the live marker. Bounded by 04 step 5 (server-clock ages) and I8.",
-  "expect": [
-    "AgedSessionReaped"
-  ],
+  "name": "same-hostname-compact-locked",
+  "note": "Cloned machines (one installation, other boot IDs): a 46 min jump after the backup's upload, then a compact right after the backup's fetch-head (later commands of three clients follow). Saved as the first AgedSessionReaped case of a 10-minute make sim-campaign (phase F part 2), when the compact reached the aged marker only after the same-hostname rule had reaped the backup's young commit lock. Since 04 step 1 (installation ID, phase F part 5) the compact finds that lock held and ends Locked, and the case is clean; kept as a regression: this schedule must stay clean. AgedSessionReaped is shown by the seed aged-session-reaped-distinct.",
+  "expect": [],
   "at": [
     [
       {
@@ -92,7 +90,68 @@
           "pick": 0
         }
       },
-      "verify-packs"
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 960
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-snapshot"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 10860
+        }
+      },
+      "advance"
     ],
     [
       {
@@ -132,14 +191,6 @@
     ],
     [
       {
-        "Advance": {
-          "secs": 2760
-        }
-      },
-      "advance"
-    ],
-    [
-      {
         "Step": {
           "client": 1,
           "pick": 0
@@ -149,11 +200,12 @@
     ],
     [
       {
-        "Advance": {
-          "secs": 10860
+        "Step": {
+          "client": 1,
+          "pick": 1
         }
       },
-      "advance"
+      "fetch-head"
     ],
     [
       {
@@ -171,16 +223,7 @@
           "pick": 0
         }
       },
-      "probe-marker"
-    ],
-    [
-      {
-        "Step": {
-          "client": 1,
-          "pick": 0
-        }
-      },
-      "fetch-head +local"
+      "probe-marker +local"
     ],
     [
       {
@@ -239,6 +282,15 @@
     [
       {
         "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
           "client": 1,
           "pick": 0
         }
@@ -255,67 +307,8 @@
       "finish"
     ],
     [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "upload"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "lock"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "flush"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 1
-        }
-      },
-      "fetch-head"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "refresh-snapshots"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "probe-marker +local"
-    ],
-    [
-      {
-        "Step": {
-          "client": 2,
-          "pick": 0
-        }
-      },
-      "sync-index"
+      "Stop",
+      "stop"
     ]
   ],
   "case": {

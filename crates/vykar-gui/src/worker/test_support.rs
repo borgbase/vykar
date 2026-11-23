@@ -22,6 +22,7 @@ pub(super) struct Harness {
 /// `<tmp>/config.yaml`. `build_yaml` gets the temp dir, so the config can point
 /// the repo, sources and `cache_dir` inside it.
 pub(super) fn harness(build_yaml: impl FnOnce(&Path) -> String) -> Harness {
+    crate::init_test_environment();
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("config.yaml");
     std::fs::write(&path, build_yaml(tmp.path())).unwrap();

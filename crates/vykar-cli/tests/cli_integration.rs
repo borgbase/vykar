@@ -22,8 +22,37 @@ struct CliFixture {
     config_path: PathBuf,
 }
 
+/// Point this test process's own per-user directories at a per-process temp
+/// directory: some tests open repositories in-process (`Repository::open`,
+/// `Repository::init`), which read the installation ID from the config
+/// directory and write identity pins into the cache directory. The child
+/// processes get the fixture's own dirs through `CliFixture::test_env`.
+#[allow(unsafe_code)]
+fn isolate_process_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let base = std::env::temp_dir().join(format!("vykar-cli-tests-{}", std::process::id()));
+        let (home, config, cache) = (base.join("home"), base.join("config"), base.join("cache"));
+        for dir in [&home, &config, &cache] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once, from the first fixture, before any test of
+        // this process opens a repository in-process.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("APPDATA", &config);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+            std::env::set_var("LOCALAPPDATA", &cache);
+        }
+    });
+}
+
 impl CliFixture {
     fn new() -> Self {
+        isolate_process_env();
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("home");
         let cache_dir = tmp.path().join("cache");

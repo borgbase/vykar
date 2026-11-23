@@ -29,6 +29,9 @@ const FORBIDDEN: &[&str] = &[
     "platform::short_hostname",
     "platform::boot_id",
     "platform::is_pid_alive",
+    "platform::installation_id",
+    "platform::pid_namespace",
+    "platform::uptime",
     "process::id",
 ];
 

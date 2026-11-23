@@ -7,8 +7,8 @@ use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSI
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, classify};
 use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap, Order};
 use crate::sim::{
-    Call, ClientId, FaultAction, FaultRule, GateRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim,
-    SourceTree,
+    Call, ClientId, FaultAction, FaultRule, GateRule, INIT_PID_NS, KeyMatch, OpKind, OpMatch,
+    OpOutcome, Sim, SimMachine, SourceTree,
 };
 use vykar_types::error::{ActiveSessionList, LockHolder, VykarError};
 
@@ -405,17 +405,114 @@ fn same_machine_reaps_dead_holder_at_once() {
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
+/// A clone of hostx's installation (same hostname, other boot ID, booted
+/// long before) cannot tell a's lock from a live one: it waits for its age.
 #[test]
-fn same_hostname_other_boot_reaps_at_once() {
+fn clone_keeps_lock_until_stale() {
     let mut sim = Sim::new();
     let a = sim.client_on("a", "hostx", Some("boot1"));
     let d = sim.client_on("d", "hostx", Some("boot2"));
     sim.backup(d, "t0", &tree("t0")).expect_ok();
     hold_lock_and_crash(&mut sim, a);
 
-    sim.backup(d, "t1", &tree("t1")).expect_ok();
+    let r = sim.backup(d, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.backup(d, "t2", &tree("t2")).expect_ok();
     assert!(sim.store().keys("locks/").is_empty());
     sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// hostx rebooted: its new boot reaps the lock of the earlier boot once
+/// the lock is older than the uptime; a clone that booted long ago does
+/// not.
+#[test]
+fn rebooted_machine_reaps_lock_of_earlier_boot() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hostx", Some("boot1"));
+    let clone = sim.client_on("clone", "hostx", Some("boot3"));
+    let c = sim.client("c");
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    hold_lock_and_crash(&mut sim, a);
+    sim.advance(Duration::from_secs(10 * 60));
+    let booted = chrono::Duration::from_std(sim.time().elapsed()).unwrap();
+    let d = sim.client_at(
+        "d",
+        SimMachine::new("hostx", Some("boot2")).booted_at(booted),
+    );
+    sim.advance(Duration::from_secs(60));
+
+    let r = sim.backup(clone, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    sim.backup(d, "t2", &tree("t2")).expect_ok();
+    assert!(sim.store().keys("locks/").is_empty());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// Containers on one kernel with one hostname and one config volume: PIDs
+/// of another namespace are not visible, so the marker waits for its age.
+#[test]
+fn containers_sharing_a_hostname_reap_by_age_only() {
+    let mut sim = Sim::new();
+    let a = sim.client_at(
+        "a",
+        SimMachine::new("hostx", Some("boot1")).pid_ns(Some(INIT_PID_NS + 1)),
+    );
+    let c = sim.client_at(
+        "c",
+        SimMachine::new("hostx", Some("boot1")).pid_ns(Some(INIT_PID_NS + 2)),
+    );
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let marker = crash_backup_leaving_marker(&mut sim, a);
+
+    let r = sim.compact(c);
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
+        "{}",
+        r.detail()
+    );
+    sim.advance(Duration::from_secs(46 * 60));
+    sim.compact(c).expect_ok();
+    assert!(sim.store().object(&marker).is_none());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// A lock in the format of 0.24 and older (no installation ID) from c's
+/// own hostname and boot, with a dead PID, is judged by age only.
+#[test]
+fn old_format_lock_from_same_hostname_waits_for_age() {
+    let mut sim = Sim::new();
+    let c = sim.client_on("c", "hostx", Some("boot1"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let body = serde_json::json!({
+        "hostname": "hostx",
+        "pid": 999_999,
+        "time": sim.time().now_utc().to_rfc3339(),
+        "boot_id": "boot1",
+    });
+    sim.tamper_put("locks/old-client.json", &serde_json::to_vec(&body).unwrap());
+
+    let r = sim.backup(c, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.backup(c, "t2", &tree("t2")).expect_ok();
+    assert!(sim.store().keys("locks/").is_empty());
 }
 
 /// `a`'s backup crashes on its first pack upload, leaving its session
@@ -559,6 +656,8 @@ fn markers_carry_client_identity() {
     assert_eq!(entry["hostname"], "hosta");
     assert_eq!(entry["pid"], pid);
     assert_eq!(entry["boot_id"], "b1");
+    assert_eq!(entry["installation_id"], "install-hosta");
+    assert_eq!(entry["pid_ns"], INIT_PID_NS);
 
     let r = sim.backup(b, "t1", &tree("t1"));
     assert_eq!(
@@ -572,6 +671,33 @@ fn markers_carry_client_identity() {
         "{}",
         r.detail()
     );
+}
+
+#[test]
+fn session_markers_carry_client_identity() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hosta", Some("b1"));
+    let c = sim.client("c");
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let gate = sim.gate(sessions_list(a));
+    let sa = sim.spawn(a, backup_call("t1"));
+    sim.expect_paused(gate, "a's journal-recovery LIST");
+    let markers: Vec<String> = sim
+        .store()
+        .keys("sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .collect();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    let entry: serde_json::Value =
+        serde_json::from_slice(&sim.store().object(&markers[0]).unwrap().data).unwrap();
+    assert_eq!(entry["hostname"], "hosta");
+    assert_eq!(entry["pid"], sim.host(a).pid);
+    assert_eq!(entry["boot_id"], "b1");
+    assert_eq!(entry["installation_id"], "install-hosta");
+    assert_eq!(entry["pid_ns"], INIT_PID_NS);
+    sim.resume(gate);
+    sim.join(sa).expect_ok();
 }
 
 #[test]
@@ -649,6 +775,7 @@ const TESTED_IDS: &[&str] = &[
     "H3-compact",
     "H1",
     "H1-session",
+    "H1-late-clone",
     "H2",
     "H2-marker",
     "H4",
@@ -968,13 +1095,8 @@ fn wedge_check_skips_malformed_marker() {
 }
 
 #[test]
-fn known_hazard_h1_live_lock_reaped() {
-    hazards::assert_reproduces("H1");
-}
-
-#[test]
-fn known_hazard_h1_session_reaped() {
-    hazards::assert_reproduces("H1-session");
+fn known_hazard_h1_late_clone() {
+    hazards::assert_reproduces("H1-late-clone");
 }
 
 #[test]
@@ -1022,7 +1144,7 @@ fn neutralised_h2_marker_not_reproduced() {
 fn neutralised_h4_not_reproduced() {
     expect_not_reproduced(
         "H4",
-        interleavings::h4_with(Hosts::SameHostname, Order::Sequential),
+        interleavings::h4_with(Hosts::Skewed, Order::Sequential),
     );
 }
 
@@ -1030,26 +1152,31 @@ fn neutralised_h4_not_reproduced() {
 fn neutralised_h4_segment_not_reproduced() {
     expect_not_reproduced(
         "H4-segment",
-        interleavings::h4_segment_with(Hosts::SameHostname, Order::Sequential),
+        interleavings::h4_segment_with(Hosts::Skewed, Order::Sequential),
     );
 }
 
+/// Without the skew no client reaps compact's live lock: on distinct hosts,
+/// and since 04 step 1 on cloned machines either (the H1 fix seen through
+/// H4).
 #[test]
-fn h4_without_h1_has_no_prerequisite() {
-    for outcome in [
-        interleavings::h4_with(Hosts::Distinct, Order::Interleaved),
-        interleavings::h4_segment_with(Hosts::Distinct, Order::Interleaved),
-    ] {
-        assert!(
-            matches!(
-                outcome,
-                HazardOutcome::PrerequisiteNotReproduced {
-                    prerequisite: "H1",
-                    ..
-                }
-            ),
-            "H4 on distinct hostnames should report the missing prerequisite: {outcome:?}"
-        );
+fn h4_without_a_reaper_has_no_prerequisite() {
+    for hosts in [Hosts::Distinct, Hosts::SameHostname] {
+        for outcome in [
+            interleavings::h4_with(hosts, Order::Interleaved),
+            interleavings::h4_segment_with(hosts, Order::Interleaved),
+        ] {
+            assert!(
+                matches!(
+                    outcome,
+                    HazardOutcome::PrerequisiteNotReproduced {
+                        prerequisite: "a reaped live lock",
+                        ..
+                    }
+                ),
+                "H4 on {hosts:?} should report the missing prerequisite: {outcome:?}"
+            );
+        }
     }
 }
 

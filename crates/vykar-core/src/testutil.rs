@@ -86,8 +86,10 @@ pub fn init_test_environment() {
         let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));
         let home = base.join("home");
         let cache = base.join("cache");
+        let config = base.join("config");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        let _ = std::fs::create_dir_all(&config);
 
         // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
         // races. This runs once via `Once::call_once` at test-process startup
@@ -99,6 +101,10 @@ pub fn init_test_environment() {
             // real user profile.
             std::env::set_var("USERPROFILE", &home);
             std::env::set_var("LOCALAPPDATA", &cache);
+            // The config directory (installation ID) wins over HOME when
+            // set in the developer's shell.
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("APPDATA", &config);
         }
     });
 }

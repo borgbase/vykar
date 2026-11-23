@@ -162,7 +162,7 @@ RestartSec=60
 
 # Writable state, created by systemd before the service starts:
 # /var/cache/vykar (file cache, repository identity pins) and
-# /var/lib/vykar (scheduler lock).
+# /var/lib/vykar (scheduler lock, installation ID).
 CacheDirectory=vykar
 StateDirectory=vykar
 Environment=XDG_CACHE_HOME=/var/cache

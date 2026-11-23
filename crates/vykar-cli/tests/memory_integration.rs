@@ -20,6 +20,7 @@ struct CliFixture {
     _tmp: TempDir,
     home_dir: PathBuf,
     cache_dir: PathBuf,
+    config_home: PathBuf,
     repo_dir: PathBuf,
     source_dir: PathBuf,
     config_path: PathBuf,
@@ -36,12 +37,14 @@ impl CliFixture {
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("home");
         let cache_dir = tmp.path().join("cache");
+        let config_home = tmp.path().join("config-home");
         let repo_dir = tmp.path().join("repo");
         let source_dir = tmp.path().join("source");
         let config_path = tmp.path().join("vykar.yaml");
 
         std::fs::create_dir_all(&home_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::create_dir_all(&source_dir).unwrap();
 
@@ -49,6 +52,7 @@ impl CliFixture {
             _tmp: tmp,
             home_dir,
             cache_dir,
+            config_home,
             repo_dir,
             source_dir,
             config_path,
@@ -58,12 +62,15 @@ impl CliFixture {
     /// See `cli_integration`: Windows resolves home and cache through
     /// `USERPROFILE`/`LOCALAPPDATA`, not `HOME`/`XDG_CACHE_HOME`, so both sets
     /// are set to keep the run out of the developer's real profile.
-    fn test_env(&self) -> [(&str, &OsStr); 5] {
+    fn test_env(&self) -> [(&str, &OsStr); 7] {
         [
             ("HOME", self.home_dir.as_os_str()),
             ("USERPROFILE", self.home_dir.as_os_str()),
             ("XDG_CACHE_HOME", self.cache_dir.as_os_str()),
             ("LOCALAPPDATA", self.cache_dir.as_os_str()),
+            // The installation ID lives in the config directory.
+            ("XDG_CONFIG_HOME", self.config_home.as_os_str()),
+            ("APPDATA", self.config_home.as_os_str()),
             ("NO_COLOR", OsStr::new("1")),
         ]
     }

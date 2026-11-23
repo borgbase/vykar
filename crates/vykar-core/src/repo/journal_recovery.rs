@@ -416,6 +416,9 @@ mod tests {
             pid: 1234,
             registered_at: last_refresh.to_string(),
             last_refresh: last_refresh.to_string(),
+            boot_id: None,
+            installation_id: None,
+            pid_ns: None,
         };
         let data = serde_json::to_vec(&entry).unwrap();
         storage.put(&key, &data).unwrap();

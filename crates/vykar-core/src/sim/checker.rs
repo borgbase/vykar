@@ -4,6 +4,20 @@
 //! loader, snapshot and chunk reads, restore) on the read-only observer
 //! handle, but takes object presence and sizes from the store map and
 //! compares restore output with the harness's own record of each source.
+//!
+//! What it covers of the commit protocol's invariants (04 "Invariants")
+//! today, by this checker's numbers; later parts extend it:
+//!
+//! | 04 | Here |
+//! |---|---|
+//! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist); the age and horizon parts not yet |
+//! | I2 (every retained head names only objects that exist) | 4, for the latest head |
+//! | I3 (heads immutable, one per generation) | not yet; 7 (lock exclusion) stands in on today's protocol |
+//! | I4 (every listed snapshot covered by some retained head) | 1, against the latest head |
+//! | I5 (no removal without a completed mark) | not yet (the H5 regression is scripted) |
+//! | I6 (no snapshot references a chunk missing from its commit head) | 1 approximates it against the latest head |
+//! | I7 (a reader returns correct data or a typed error) | 1 (restore against the source), 8 |
+//! | I8 (a marker gap with an old pack does not commit) | not yet |
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -11,7 +25,7 @@ use std::fmt;
 use vykar_types::chunk_id::ChunkId;
 
 use super::fault::ClientId;
-use super::history::{ClientOp, ErrorClass, History, ObservationCause, RunOutcome};
+use super::history::{ClientOp, ErrorClass, History, ObservationCause, RunOutcome, RunRecord};
 use super::runner::SourceTree;
 use super::store::SimStore;
 use crate::commands::list;
@@ -131,6 +145,8 @@ pub struct Violation {
     pub kind: ViolationKind,
     pub subject: String,
     pub detail: String,
+    /// The store step of the operation it was found at, when there is one.
+    pub step: Option<u64>,
 }
 
 /// An invariant that could not be evaluated for `subject`.
@@ -197,11 +213,23 @@ impl Report {
         subject: impl Into<String>,
         detail: impl Into<String>,
     ) {
+        self.add_at(kind, subject, None, detail);
+    }
+
+    /// [`Self::add`] for a violation found at store step `step`.
+    pub(super) fn add_at(
+        &mut self,
+        kind: ViolationKind,
+        subject: impl Into<String>,
+        step: Option<u64>,
+        detail: impl Into<String>,
+    ) {
         self.violations.push(Violation {
             invariant: kind.invariant(),
             kind,
             subject: subject.into(),
             detail: detail.into(),
+            step,
         });
     }
 
@@ -599,13 +627,14 @@ fn check_errors(history: &History, report: &mut Report) {
         if let RunOutcome::Err(e) = &run.outcome
             && e.class == ErrorClass::Disallowed
         {
-            report.add(
-                ViolationKind::DisallowedError,
-                format!("run {} {:?}", run.index, run.op),
-                &e.display,
-            );
+            report.add(ViolationKind::DisallowedError, run_subject(run), &e.display);
         }
     }
+}
+
+/// The subject of a run's `DisallowedError`.
+pub(crate) fn run_subject(run: &RunRecord) -> String {
+    format!("run {} {:?}", run.index, run.op)
 }
 
 /// Prefixes of keys whose deletion only a lock holder may do.
@@ -630,9 +659,11 @@ fn is_lock_key(key: &str) -> bool {
 /// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
 /// tentative key that can coexist with the holder's until the loser deletes
 /// it, so a protected write by the rightful holder in that window reads as
-/// `WriteUnderSeveralLocks`. No scripted scenario holds a contender there;
-/// an ordering search (08 step 4) must count a key as held only once its
-/// writer's confirming LIST has returned.
+/// `WriteUnderSeveralLocks`. No scripted scenario holds a contender there,
+/// and in the driver (`sim::driver`) `acquire_lock` is one step, so a
+/// contender's tentative key never coexists with the holder's across a
+/// decision. A delayed or duplicated lock PUT that lands later is a key
+/// with no holder; the driver names that shape (`OrphanLockKey`).
 fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
     let init_runs: BTreeSet<usize> = history
         .runs
@@ -674,9 +705,10 @@ fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report
                     .iter()
                     .map(|(k, (c, r))| format!("{k} by {} run {r:?}", store.client_name(*c)))
                     .collect();
-                report.add(
+                report.add_at(
                     kind,
                     subject,
+                    Some(rec.step),
                     format!(
                         "step {} {:?} {} by {}; locks held: {holders:?}",
                         rec.step,

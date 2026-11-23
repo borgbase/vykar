@@ -616,7 +616,7 @@ flowchart LR
 ```text
 acquire_lock_with_deadline(COMMIT_LOCK_MAX_WAIT = 10 min, 500ms base, exponential backoff + jitter,
                            interruptible by Ctrl-C)
-commit_concurrent_session_with_progress():
+the commit machine (repo::commit_machine::BackupCommit):
   → flush packs (no-op safety net: Phase 1 already drained uploads)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list
@@ -630,12 +630,15 @@ commit_concurrent_session_with_progress():
       → else PUT one backup segment of the additions (a base at the fold limit), fence check,
         PUT index.h/<gen+1>; apply it to the index in memory
   → write snapshots/<id> (commit point)
+finish_backup_commit():
   → update in-memory manifest
   → persist local file cache
 deregister_session() → delete sessions/<session_id>.json (while holding lock)
 release_lock()
 clear sessions/<session_id>.index
 ```
+
+The commit and the index write it ends with (`repo::publish_machine::PublishMachine`, which every index write runs) are steppable state machines: each step does local work plus at most one storage operation on a protocol key, or one named compound (the snapshot refresh, the head fetch, the index sync, the fence, the garbage collection). Production drives them to the end in one call, with the start reads (snapshot refresh and marker probe, head fetch) concurrent as before; the protocol simulator steps them one at a time.
 
 #### Error Paths
 
@@ -755,7 +758,7 @@ Each client owns a dedicated heartbeat thread (`SessionGuard` with a 15-minute t
 
 The lock fence detects a lost lock at its next check; it cannot stop a write already in flight when the key is removed (`break-lock`, stale reaping). An older vykar binary still uses oldest-key-wins, so one with a slow clock can still jump a newer binary's lock; upgrading all clients closes this.
 
-Lock, session and maintenance code read time and host identity only through `repo::host_env::HostEnv`; the protocol simulator (`crates/vykar-core/src/sim`) runs several clients on virtual time and distinct identities in one process.
+Lock, session and maintenance code read time and host identity only through `repo::host_env::HostEnv`; the protocol simulator (`crates/vykar-core/src/sim`) runs several clients on virtual time and distinct identities in one process. Its driver (`sim::driver`) interleaves the backup commits' machine steps with whole maintenance commands, late landings of delayed writes, time jumps and crashes, one step at a time, in an order a choice sequence decides.
 
 The advisory lock is used for:
 - **Backup commit phase**: acquired with `acquire_lock_with_deadline`, which retries (500 ms base delay, exponential backoff + 25 % jitter) for up to `COMMIT_LOCK_MAX_WAIT` (10 minutes) and is interruptible by Ctrl-C. Waiters do not queue, so the bound is soft when several commits contend. The lock is held only for the brief commit — typically seconds, since all packs are uploaded before it is taken.

@@ -2,14 +2,20 @@ use chrono::Utc;
 use tracing::{debug, warn};
 
 use super::Repository;
+#[cfg(test)]
+use super::commit_machine::BackupCommit;
+use super::commit_machine::Committed;
 use super::control::{CommitEvent, EventSink};
 use super::file_cache;
 use super::index_store::{self, CacheLocation, SyncedIndex};
-use super::manifest::{self, Manifest};
+use super::machine::log_stage_elapsed;
+#[cfg(test)]
+use super::machine::{StepCx, drive_blocking};
+use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::write_session::SessionView;
 use crate::index::head::{IndexHead, SegmentKind};
-use crate::index::segment_v2::{Location, SegmentBody};
+use crate::index::segment_v2::Location;
 use crate::index::table::IndexState;
 use crate::index::{IndexDelta, LiveIndex};
 #[cfg(test)]
@@ -17,38 +23,13 @@ use std::sync::Arc;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
+#[cfg(test)]
 use vykar_types::pack_id::PackId;
-
-/// Emit a `CommitEvent::Stage` and return a context
-/// (start time, stage name) for later `log_stage_elapsed`.
-fn emit_stage(
-    events: &dyn EventSink<CommitEvent>,
-    stage: &'static str,
-) -> (std::time::Instant, &'static str) {
-    let start = std::time::Instant::now();
-    events.emit(CommitEvent::Stage { stage });
-    (start, stage)
-}
 
 /// `tracing::warn!` plus `CommitEvent::Warning`, always together.
 fn post_commit_warning(events: &dyn EventSink<CommitEvent>, message: String) {
     warn!("{message}");
     events.emit(CommitEvent::Warning { message });
-}
-
-/// Join a scoped helper thread, re-raising its panic on the caller.
-fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
-    handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
-fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
-    debug!(
-        stage = ctx.1,
-        elapsed_ms = ctx.0.elapsed().as_millis() as u64,
-        "commit stage complete"
-    );
 }
 
 impl Repository {
@@ -167,7 +148,7 @@ impl Repository {
     /// Must only be called when `write_session` is `Some`. The session itself
     /// stays active: on failure the caller can still run `flush_on_abort()`,
     /// which does not need the structures taken here.
-    fn flush_and_take_session_delta(
+    pub(super) fn flush_and_take_session_delta(
         &mut self,
     ) -> Result<(Option<IndexDelta>, Option<SessionView>)> {
         self.flush_packs()?;
@@ -225,104 +206,22 @@ impl Repository {
         Ok(())
     }
 
-    /// Commit a concurrent backup session with progress reporting.
+    /// After a [`BackupCommit`] wrote the snapshot (the commit point): join
+    /// the journal write, run `on_commit_point`, update the manifest and the
+    /// snapshot cache, then save the file cache and consume the write
+    /// session. Returns nothing: no error may escape after the commit point.
     ///
-    /// 1. Flush packs and join uploads.
-    /// 2. Take the delta from the write session.
-    /// 3. Refresh snapshot list from storage.
-    /// 4. Check snapshot name uniqueness against fresh list.
-    /// 5. GET the head, sync to it, write the session's additions as a
-    ///    backup segment (re-checking reused chunks when the head changed in
-    ///    a way that can have removed entries).
-    /// 6. Write `snapshots/<id>` to storage — **commit point**.
-    /// 7. Update local manifest + snapshot cache.
-    /// 8. Save file cache and consume write session.
-    ///
-    /// `on_commit_point` runs right after step 6 succeeded, before the
-    /// local post-commit work of steps 7-8, so the caller can start remote
-    /// cleanup that only a committed session may do (deregistering it,
-    /// deleting its journal) while that work runs. No journal write of this
-    /// session is in flight when it is called.
-    pub fn commit_concurrent_session_with_progress(
+    /// `on_commit_point` runs before that local post-commit work, so the
+    /// caller can start remote cleanup that only a committed session may do
+    /// (deregistering it, deleting its journal) while it runs. No journal
+    /// write of this session is in flight when it is called.
+    pub(crate) fn finish_backup_commit(
         &mut self,
-        snapshot_entry: manifest::SnapshotEntry,
-        snapshot_packed: Vec<u8>,
+        committed: Committed,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
         on_commit_point: impl FnOnce(),
-    ) -> Result<()> {
-        // The reads that start the commit are independent of each other. The
-        // index head (only fetched when there is a delta to merge) is fetched
-        // on this thread while a helper thread refreshes the snapshot list
-        // and then probes the session marker. All of these are reads under
-        // the commit lock; every write still follows them. Results are judged
-        // in the old order: probe, flush, snapshot list and name check, index.
-        let session_id = self.ws().session_id.clone();
-        let taken = self.flush_and_take_session_delta();
-        let fetch_index = matches!(&taken, Ok((Some(delta), _)) if !delta.is_empty());
-        let marker_key =
-            (session_id != "default").then(|| super::lock::session_marker_key(&session_id));
-        let storage = self.storage.as_ref();
-        let crypto = self.crypto.as_ref();
-        let repo_id = self.config.id.as_slice();
-        let cache_dir = self.cache_dir_override.as_deref();
-        let ctx = emit_stage(events, "refresh snapshots");
-        let (side, prefetched) = std::thread::scope(|scope| {
-            let side = taken.is_ok().then(|| {
-                scope.spawn(move || {
-                    // Strict I/O: fail on GET errors so a transient failure
-                    // can't hide an existing snapshot name and allow a
-                    // duplicate during commit.
-                    let refresh = snapshot_cache::refresh_snapshot_cache(
-                        storage, crypto, repo_id, cache_dir, true,
-                    );
-                    let marker = marker_key.map(|key| storage.exists(&key));
-                    (refresh, marker)
-                })
-            });
-            let prefetched = fetch_index.then(|| index_store::fetch_head(storage, crypto));
-            (side.map(join_scoped), prefetched)
-        });
-        log_stage_elapsed(ctx);
-        let (refreshed, marker) = match side {
-            Some((refresh, marker)) => (Some(refresh), marker),
-            None => (None, None),
-        };
-
-        // Session-existence probe. If the marker was reaped by maintenance
-        // (e.g. because we missed too many heartbeats under extreme clock
-        // skew), surface the same typed error the later reuse check
-        // would produce, so callers matching on `StaleChunksDuringCommit`
-        // catch this path too. Inconclusive storage errors fall through —
-        // the reuse check is still a safety net.
-        match marker {
-            Some(Ok(false)) => {
-                warn!(
-                    session_id,
-                    "session marker reaped before commit; retry the backup"
-                );
-                return Err(VykarError::StaleChunksDuringCommit);
-            }
-            Some(Err(e)) => {
-                debug!(error = %e, "session-existence probe failed, proceeding");
-            }
-            Some(Ok(true)) | None => {}
-        }
-        let (delta, view) = taken?;
-        if let Some(refresh) = refreshed {
-            self.apply_snapshot_refresh(refresh?);
-        }
-
-        self.commit_prepare(&snapshot_entry, delta, view, prefetched, events)?;
-
-        // ---- COMMIT POINT ----
-        let ctx = emit_stage(events, "write snapshot");
-        self.check_lock_fence()?;
-        self.storage
-            .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
-        log_stage_elapsed(ctx);
-        // ---- after this point, no `?` may escape ----
-
+    ) {
         // A journal PUT landing after the caller deleted the journal would
         // resurrect it, so none may still be running.
         if let Some(ws) = self.write_session.as_mut() {
@@ -333,138 +232,29 @@ impl Repository {
         // Manifest update is a post-commit in-memory op. Keeping it inline keeps
         // the ordering visible next to the PUT; commit_finalize handles the rest.
         self.manifest.timestamp = Utc::now();
-        self.manifest.snapshots.push(snapshot_entry);
+        self.manifest.snapshots.push(committed.entry);
         // Keep the local snapshot list cache in step with the commit, so the
         // next open does not re-download this snapshot's blob. Best-effort:
         // the cache is pruned against `snapshots/` on every open.
         self.persist_snapshot_cache_from_manifest();
 
         self.commit_finalize(new_file_cache, events);
-        Ok(())
     }
 
-    /// Pre-commit work up to (but not including) the snapshot PUT, once the
-    /// caller has flushed packs, taken the session `delta`, refreshed the
-    /// snapshot list (unreadable blobs are skipped — a garbage snapshot
-    /// that can't be decrypted cannot conflict with a valid name) and, for
-    /// a non-empty delta, fetched the index head (`prefetched`):
-    ///   4. Enforce snapshot name uniqueness against the fresh list.
-    ///   5. Write the delta's additions at that head.
-    fn commit_prepare(
+    /// Commit the active session as `entry` with no lock and no fence: the
+    /// backup commit driven to the end, then [`Self::finish_backup_commit`]
+    /// (tests that commit at repository level).
+    #[cfg(test)]
+    pub(crate) fn commit_session_blocking(
         &mut self,
-        snapshot_entry: &manifest::SnapshotEntry,
-        delta: Option<IndexDelta>,
-        view: Option<SessionView>,
-        prefetched: Option<Result<IndexHead>>,
+        entry: super::manifest::SnapshotEntry,
+        packed: Vec<u8>,
+        new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
-        // 4. Check snapshot name uniqueness against fresh list.
-        if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
-            return Err(VykarError::SnapshotAlreadyExists(
-                snapshot_entry.name.clone(),
-            ));
-        }
-
-        // 5. Write the delta's additions at the head. The repository's
-        // index becomes the head's, with the new segment applied.
-        if let Some(delta) = delta
-            && !delta.is_empty()
-        {
-            let head = match prefetched {
-                Some(head) => head?,
-                None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
-            };
-            self.segmented_commit(head, delta, view, events)?;
-        }
-
-        // Defensive: persist index if dirty but no delta (unreachable today
-        // because a backup session records every change in its delta, but
-        // guards future callers).
-        if self.index_dirty {
-            self.persist_segmented_index()?;
-        }
-
-        Ok(())
-    }
-
-    /// Bring the index to `head` (normally the repository's own, already
-    /// there), check the reused chunks when the head moved in a way that
-    /// can have removed entries, and write the session's new chunks as one
-    /// backup segment while the session's packs are verified. The snapshot
-    /// PUT that follows remains the commit point.
-    fn segmented_commit(
-        &mut self,
-        head: IndexHead,
-        delta: IndexDelta,
-        view: Option<SessionView>,
-        events: &dyn EventSink<CommitEvent>,
-    ) -> Result<()> {
-        let ctx = emit_stage(events, "fetch index");
-        let synced = self.sync_index(Some(head), true)?;
-        log_stage_elapsed(ctx);
-        let recheck = needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head);
-        // Nothing else may hold the view's applied layer when the segment
-        // is applied (`Arc::make_mut` would copy it).
-        drop(view);
-
-        let ctx = emit_stage(events, "check reuse");
-        // The additions: one per chunk (its first location), minus chunks
-        // the synced index already holds (another session committed them
-        // first; this session's copies are dead bytes).
-        let additions = commit_additions(&delta, &synced.index);
-        let pack_ids: std::collections::HashSet<PackId> =
-            additions.iter().map(|(_, l)| l.pack_id).collect();
-        let persisted_packs = self.persisted_pack_count();
-        let width = self.request_width();
-        let storage = self.storage.as_ref();
-        let (verified, reused) = std::thread::scope(|scope| {
-            let verify = scope.spawn(|| {
-                super::pack_verify::verify_packs_present(storage, &pack_ids, persisted_packs, width)
-            });
-            let reused = if recheck {
-                check_reused_chunks(&delta, &synced.index)
-            } else {
-                debug!(
-                    "index head unchanged since the session began, except for backup segments; reused chunks not re-checked"
-                );
-                Ok(())
-            };
-            (join_scoped(verify), reused)
-        });
-        // A stale chunk is the typed error callers retry on; report it first.
-        reused?;
-        verified?;
-        let mut pack_trailers: Vec<(PackId, u32)> = Vec::with_capacity(pack_ids.len());
-        for pack in &pack_ids {
-            let trailer_len = delta.pack_trailers.get(pack).copied().ok_or_else(|| {
-                VykarError::Other(format!(
-                    "BUG: the backup commit does not know the trailer length of pack {pack}"
-                ))
-            })?;
-            pack_trailers.push((*pack, trailer_len));
-        }
-        pack_trailers.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        drop(delta);
-        log_stage_elapsed(ctx);
-
-        let ctx = emit_stage(events, "write index");
-        let SyncedIndex { head, .. } = &synced;
-        let head = head.clone();
-        self.install_synced_index(synced);
-        if additions.is_empty() {
-            debug!("backup added no chunks; no index write");
-            log_stage_elapsed(ctx);
-            return Ok(());
-        }
-        let seg = SegmentBody {
-            kind: SegmentKind::Backup,
-            additions,
-            removals: Vec::new(),
-            relocations: Vec::new(),
-            pack_trailers,
-        };
-        self.publish_index_state(Some(head), Some(seg), true)?;
-        log_stage_elapsed(ctx);
+        let mut m = BackupCommit::new(self, entry, packed);
+        let committed = drive_blocking(&mut m, &mut StepCx { repo: self, events })?;
+        self.finish_backup_commit(committed, new_file_cache, events, || {});
         Ok(())
     }
 
@@ -514,7 +304,7 @@ impl Repository {
     }
 
     /// Packs already in the repository, a cost hint for `pack_lookup`.
-    fn persisted_pack_count(&self) -> usize {
+    pub(super) fn persisted_pack_count(&self) -> usize {
         self.write_session
             .as_ref()
             .map_or(0, |ws| ws.persisted_pack_count)
@@ -563,7 +353,7 @@ impl Repository {
     }
 
     /// Replace the in-memory manifest with a fresh snapshot listing.
-    fn apply_snapshot_refresh(&mut self, refresh: snapshot_cache::SnapshotRefresh) {
+    pub(super) fn apply_snapshot_refresh(&mut self, refresh: snapshot_cache::SnapshotRefresh) {
         self.skipped_snapshots = refresh.skipped;
         self.manifest = Manifest::from_snapshot_entries(refresh.entries);
     }
@@ -612,7 +402,7 @@ pub(crate) fn needs_recheck(from: Option<(&IndexState, u64)>, now: &IndexHead) -
 
 /// The delta's new entries in chunk-ID order, one per chunk (the first
 /// location recorded), without the chunks `index` already holds.
-fn commit_additions(delta: &IndexDelta, index: &LiveIndex) -> Vec<(ChunkId, Location)> {
+pub(super) fn commit_additions(delta: &IndexDelta, index: &LiveIndex) -> Vec<(ChunkId, Location)> {
     let mut seen = std::collections::HashSet::with_capacity(delta.new_entries.len());
     let mut out: Vec<(ChunkId, Location)> = delta
         .new_entries
@@ -636,7 +426,7 @@ fn commit_additions(delta: &IndexDelta, index: &LiveIndex) -> Vec<(ChunkId, Loca
 
 /// Every chunk the session reused must be in `index` or among the delta's
 /// new entries; else [`VykarError::StaleChunksDuringCommit`].
-fn check_reused_chunks(delta: &IndexDelta, index: &LiveIndex) -> Result<()> {
+pub(super) fn check_reused_chunks(delta: &IndexDelta, index: &LiveIndex) -> Result<()> {
     let new: std::collections::HashSet<ChunkId> =
         delta.new_entries.iter().map(|e| e.chunk_id).collect();
     if delta

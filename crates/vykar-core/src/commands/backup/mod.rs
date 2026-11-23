@@ -7,6 +7,9 @@ mod instrument;
 pub(crate) mod item_cut;
 mod listing;
 mod phases;
+#[cfg(any(test, feature = "sim"))]
+pub(crate) use phases::CommitInProgress;
+pub(crate) use phases::PendingCommit;
 pub(crate) mod pipeline;
 mod source;
 mod walk;
@@ -23,21 +26,21 @@ pub(crate) use chunk_process::WorkerChunk;
 
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::compress::Compression;
 use crate::config::{CommandDump, VykarConfig};
 
 use crate::limits;
 use crate::platform::fs;
-use crate::repo::control::{CancelToken, CommitEvent};
+use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
 use crate::repo::{HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
-use vykar_common::display::{format_bytes, format_count};
+use vykar_common::display::format_count;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
@@ -441,16 +444,55 @@ pub(crate) fn run_impl(
 pub(crate) fn run_scoped(
     config: &VykarConfig,
     req: BackupRequest<'_>,
-    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
-    let prepared = prepare(config, &req).map_err(|e| (FailureScope::Source, e))?;
-    run_against_repo(
+    let pending = upload(
         config,
         &req,
-        prepared,
+        &mut progress,
+        shutdown,
+        wrap_backend,
+        host_env,
+    )?;
+
+    // ── Phase 2: Commit (exclusive lock) ────────────────────────────────
+    let guard = match pending.wait_for_lock(&mut progress, shutdown) {
+        Ok(g) => g,
+        Err(e) => {
+            pending.abandon();
+            return Err((FailureScope::Repository, e));
+        }
+    };
+    let mut commit = pending.begin_commit(guard);
+    let result = {
+        let events = FnMutSink::new(|e: CommitEvent| emit_progress(&mut progress, e.into()));
+        commit.drive(&events)
+    };
+    commit
+        .finish(result, &mut progress)
+        .map_err(|e| (FailureScope::Repository, e))
+}
+
+/// A backup's first half: `prepare` (failures are `FailureScope::Source`),
+/// then session registration, open and Phase 1 (`Repository`). On a Phase 1
+/// failure the packs are flushed (`flush_on_abort`) and the session
+/// deregistered. The commit is [`PendingCommit`]'s.
+pub(crate) fn upload(
+    config: &VykarConfig,
+    req: &BackupRequest<'_>,
+    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    shutdown: &CancelToken,
+    wrap_backend: Option<BackendWrapper<'_>>,
+    host_env: HostEnv,
+) -> std::result::Result<PendingCommit, (FailureScope, VykarError)> {
+    let prepared = prepare(config, req).map_err(|e| (FailureScope::Source, e))?;
+    upload_prepared(
+        config,
+        req,
+        &prepared,
         progress,
         shutdown,
         wrap_backend,
@@ -518,15 +560,15 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
     })
 }
 
-fn run_against_repo(
+fn upload_prepared(
     config: &VykarConfig,
     req: &BackupRequest<'_>,
-    prepared: Prepared<'_>,
-    mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    prepared: &Prepared<'_>,
+    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
-) -> Result<BackupOutcome> {
+) -> Result<PendingCommit> {
     let snapshot_name = req.snapshot_name;
     let passphrase = req.passphrase;
     let source_paths = req.source_paths;
@@ -607,13 +649,13 @@ fn run_against_repo(
     // after `flush_on_abort`; Phase 2 ends it explicitly where it must precede
     // the lock release, or hands it to the cleanup thread at the commit point.
     // `session` is declared after `repo` so it drops before `Repository::drop`;
-    // those error returns depend on that order.
-    let mut session =
-        phases::BackupSession::adopt(&repo.storage, session_id, repo.host_env().clone())?;
+    // those error returns depend on that order, and so does `PendingCommit`'s
+    // field order.
+    let session = phases::BackupSession::adopt(&repo.storage, session_id, repo.host_env().clone())?;
 
     // Run-local tally of unreachable cloud-only content. Declared here because
-    // Phase 1 below borrows it while `BackupOutcome` is built after it
-    // returns. Never persisted into the snapshot (see `SnapshotStats`).
+    // Phase 1 below borrows it while `BackupOutcome` is built after the
+    // commit. Never persisted into the snapshot (see `SnapshotStats`).
     let mut dataless = DatalessTally::default();
 
     // Write session, command dumps, walk and uploads (no lock).
@@ -621,10 +663,10 @@ fn run_against_repo(
         &mut repo,
         config,
         req,
-        &prepared,
+        prepared,
         num_workers,
         &session_opts,
-        &mut progress,
+        progress,
         shutdown,
         &mut dataless,
     );
@@ -633,7 +675,7 @@ fn run_against_repo(
     let phases::Phase1Output {
         snapshot_entry,
         snapshot_packed,
-        mut new_file_cache,
+        new_file_cache,
         stats,
         instrumentation,
     } = match phase1_result {
@@ -647,62 +689,18 @@ fn run_against_repo(
         }
     };
 
-    // ── Phase 2: Commit (exclusive lock) ────────────────────────────────
-    //
-    // new_file_cache is passed by &mut so the caller retains ownership.
-    // On success, commit_concurrent_session_with_progress consumes the active
-    // section (merges it into the persistent cache).
-
-    let commit_result = phases::phase2_commit(
-        &mut repo,
-        &mut session,
+    Ok(PendingCommit {
+        session,
+        repo,
         snapshot_entry,
         snapshot_packed,
-        &mut new_file_cache,
-        &mut progress,
-        shutdown,
-    );
-
-    if commit_result.is_err() {
-        // flush_on_abort writes the remote sessions/<id>.index so the next
-        // run's recover_pending_index() can discover our packs. Must run on
-        // ALL Phase 2 failures (lock acquisition, commit, lock release).
-        // `session` drops at the return below, after this flush; a failed
-        // commit has already deregistered it before releasing the lock.
-        repo.flush_on_abort();
-    }
-    commit_result?;
-
-    if stats.errors > 0 {
-        info!(
-            "Snapshot '{}' created: {} files, {} errors, {} original, {} compressed, {} deduplicated",
-            snapshot_name,
-            format_count(stats.nfiles),
-            format_count(stats.errors),
-            format_bytes(stats.original_size),
-            format_bytes(stats.compressed_size),
-            format_bytes(stats.deduplicated_size)
-        );
-    } else {
-        info!(
-            "Snapshot '{}' created: {} files, {} original, {} compressed, {} deduplicated",
-            snapshot_name,
-            format_count(stats.nfiles),
-            format_bytes(stats.original_size),
-            format_bytes(stats.compressed_size),
-            format_bytes(stats.deduplicated_size)
-        );
-    }
-
-    // `is_partial` intentionally ignores the dataless tally: skipped cloud-only
-    // content is reported, not treated as a failure (see `BackupOutcome`).
-    let is_partial = stats.errors > 0;
-    Ok(BackupOutcome {
-        stats,
-        is_partial,
-        dataless_files_skipped: dataless.files,
-        dataless_dirs_skipped: dataless.dirs,
-        instrumentation,
+        report: phases::RunReport {
+            new_file_cache,
+            stats,
+            instrumentation,
+            dataless,
+            snapshot_name: snapshot_name.to_string(),
+        },
     })
 }
 

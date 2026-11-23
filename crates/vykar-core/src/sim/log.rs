@@ -19,6 +19,10 @@ pub struct OpRecord {
     /// Bytes written, returned, or requested (range).
     pub len: Option<u64>,
     pub outcome: OpOutcome,
+    /// What the issuing client was doing, as the driver labels its steps
+    /// (`SimStore::set_label`); a
+    /// released effect keeps the label of its issue.
+    pub label: Option<&'static str>,
 }
 
 impl OpRecord {
@@ -76,6 +80,45 @@ pub enum OpOutcome {
     Released(ParkedId),
     /// A released effect the store refused (append-only overwrite).
     ReleasedRefused(ParkedId),
+}
+
+impl OpOutcome {
+    /// A short name with no ids, for traces and projections.
+    pub fn name(&self) -> &'static str {
+        match self {
+            OpOutcome::Ok => "ok",
+            OpOutcome::NotFound => "not-found",
+            OpOutcome::Refused => "refused",
+            OpOutcome::Error => "error",
+            OpOutcome::Injected(_) => "injected",
+            OpOutcome::Parked(..) => "parked",
+            OpOutcome::Crashed => "crashed",
+            OpOutcome::Released(_) => "released",
+            OpOutcome::ReleasedRefused(_) => "released-refused",
+        }
+    }
+}
+
+const KEY_CLASSES: &[&str] = &[
+    "index.h/",
+    "index.d/",
+    "snapshots/",
+    "sessions/",
+    "locks/",
+    "packs/",
+    "packmaps/",
+    "keys/",
+    "config",
+];
+
+/// The first path segment of `key` with its slash (`index.h/`, `locks/`,
+/// ...), `config`, or "other": a key's class with no random name.
+pub fn key_class(key: &str) -> &'static str {
+    KEY_CLASSES
+        .iter()
+        .find(|c| key.starts_with(*c))
+        .copied()
+        .unwrap_or("other")
 }
 
 pub(crate) fn thread_label() -> String {

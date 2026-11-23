@@ -1,5 +1,6 @@
 //! Write side of the index (format v6); see `index_store` for the objects
-//! and the read side.
+//! and the read side. The write sequence itself (the PUTs, the fence, the
+//! head) is the steppable machine of `publish_machine.rs`.
 //!
 //! Every write runs under the repository lock: read the latest head, check
 //! it is the head the in-memory index was loaded from, express the edits as
@@ -24,15 +25,17 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::Repository;
-use super::control::CancelToken;
+use super::control::{CancelToken, CommitEvent};
 use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
 use super::index_store::{self, PackedObject, StoredHead};
+use super::machine::{StepCx, drive_blocking};
+use super::publish_machine::PublishMachine;
 use crate::index::LiveIndex;
-use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
+use crate::index::head::{HEAD_LAYOUT_VERSION, IndexHead};
 use crate::index::head::{SegmentKind, SweepState};
 use crate::index::segment_v2::SegmentBody;
 use crate::index::sweep_record::SweepRecord;
-use crate::index::table::{self, ChunkTable, IndexState, TableFileWriter};
+use crate::index::table::{self, ChunkTable, IndexState};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -162,7 +165,7 @@ impl Repository {
     /// The next head's generation: `prev.generation + 1`; with no readable head
     /// (repair, upgrade), the highest listed generation + 1, or 1, so a new
     /// head never reuses a key.
-    fn next_head_gen(&self, prev: Option<&IndexHead>) -> Result<u64> {
+    pub(super) fn next_head_gen(&self, prev: Option<&IndexHead>) -> Result<u64> {
         match prev {
             Some(p) => Ok(p.generation + 1),
             None => Ok(index_store::list_head_generations(self.storage.as_ref())?
@@ -184,7 +187,7 @@ impl Repository {
     /// `sweep.generation` of its own, the previous record kept), never as an
     /// unchanged sweep. Compact returns the error and does not write again;
     /// its next run marks and sweeps from scratch.
-    fn next_sweep(
+    pub(super) fn next_sweep(
         &mut self,
         prev: Option<&IndexHead>,
         generation: u64,
@@ -343,167 +346,16 @@ impl Repository {
         seg: Option<SegmentBody>,
         backup: bool,
     ) -> Result<()> {
-        let fold = std::mem::take(&mut self.fold_requested);
-        let published = self.publish_index_state_inner(prev, seg, backup, fold);
-        if published.is_err() {
-            self.fold_requested |= fold;
-        }
-        published
-    }
-
-    fn publish_index_state_inner(
-        &mut self,
-        prev: Option<IndexHead>,
-        seg: Option<SegmentBody>,
-        backup: bool,
-        fold: bool,
-    ) -> Result<()> {
-        if let (Some(prev), Some(seg)) = (prev.as_ref(), seg.as_ref())
-            && seg.is_empty()
-            && !fold
-        {
-            let head = if self.pending_sweep.is_some() {
-                self.put_head_only(prev)?
-            } else {
-                debug!("index unchanged, nothing to write");
-                prev.clone()
-            };
-            self.chunk_index.discard_edits();
-            self.index_generation = head.generation;
-            self.index_head = Some(head);
-            self.index_dirty = false;
-            return Ok(());
-        }
-
-        let start = std::time::Instant::now();
-        let removes = seg.as_ref().is_some_and(|s| !s.removals.is_empty());
-        let packed = seg
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .map(|s| index_store::pack_segment_v2(s, self.crypto.as_ref()))
-            .transpose()?;
-        // On a plaintext repository the same change from the same state
-        // packs to the same bytes, so its name may already be in the head
-        // (a state the chain returned to); an object is named only once.
-        let as_segment = match (prev.as_ref(), seg, packed) {
-            (Some(prev), Some(seg), Some(obj))
-                if !fold
-                    && !self.fold_policy.hard.reached(prev, 1, obj.size())
-                    && !prev.named_objects().any(|n| n == obj.name) =>
-            {
-                Ok((prev, seg, obj))
-            }
-            (_, seg, _) => Err(seg),
-        };
-
-        let head = match as_segment {
-            Ok((prev, seg, obj)) => {
-                let name = obj.name;
-                let head = self.put_segment(prev, &seg, obj, removes)?;
-                if backup {
-                    if let Err(e) = self.chunk_index.apply_segment(name, &seg) {
-                        // The head is published; the next load syncs to it.
-                        warn!("cannot apply the index segment just written: {e}");
-                        self.chunk_index = LiveIndex::empty();
-                    }
-                } else {
-                    self.chunk_index.mark_written(name);
-                }
-                head
-            }
-            Err(seg) => {
-                let added = backup && seg.is_some();
-                if backup && let Some(seg) = seg.as_ref() {
-                    for (id, loc) in &seg.additions {
-                        self.chunk_index
-                            .add(*id, loc.stored_size, loc.pack_id, loc.pack_offset);
-                    }
-                    for (pack, trailer_len) in &seg.pack_trailers {
-                        self.chunk_index.set_pack_trailer(*pack, *trailer_len);
-                    }
-                }
-                match self.put_base(prev.as_ref(), removes) {
-                    Ok(head) => head,
-                    Err(e) => {
-                        // `put_base` replaces the index only after the head
-                        // PUT; the backup's additions were its only edits.
-                        if added {
-                            self.chunk_index.discard_edits();
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        debug!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            generation = head.generation,
-            segments = head.segments.len(),
-            entries = self.chunk_index.len(),
-            "index written"
-        );
-        self.index_generation = head.generation;
-        self.index_head = Some(head);
-        self.index_dirty = false;
-        Ok(())
-    }
-
-    /// A head-only write: the same state, a new generation and the pending
-    /// sweep. PUT the record, check the fence, PUT the head.
-    fn put_head_only(&mut self, prev: &IndexHead) -> Result<IndexHead> {
-        let mut head = prev.successor();
-        let (sweep, record) = self.next_sweep(Some(prev), head.generation, false)?;
-        head.sweep = sweep;
-        head.validate()?;
-        if let Some(rec) = &record {
-            self.storage.put(&rec.key(), &rec.bytes)?;
-        }
-        self.check_lock_fence()?;
-        index_store::put_head(self.storage.as_ref(), &head, self.crypto.as_ref())?;
-        debug!(
-            generation = head.generation,
-            "index head written (no change to the entries)"
-        );
-        Ok(head)
-    }
-
-    /// PUT a segment (and the pending sweep record), then the head that
-    /// appends it. The segment's bytes go to the local segment cache.
-    fn put_segment(
-        &mut self,
-        prev: &IndexHead,
-        seg: &SegmentBody,
-        obj: PackedObject,
-        removes: bool,
-    ) -> Result<IndexHead> {
-        let mut head = prev.successor();
-        head.segments.push(SegmentRef {
-            name: obj.name,
-            size: obj.size(),
-            kind: seg.kind,
-            entries: seg.entries(),
-        });
-        let (sweep, record) = self.next_sweep(Some(prev), head.generation, removes)?;
-        head.sweep = sweep;
-        head.validate()?;
-        let packed_head = index_store::pack_head(&head, self.crypto.as_ref())?;
-
-        if let Some(rec) = &record {
-            self.storage.put(&rec.key(), &rec.bytes)?;
-        }
-        self.storage.put(&obj.key(), &obj.bytes)?;
-        if let Some(dir) = self.cache_dir() {
-            table::write_cached_segment(&dir, &obj.name, &obj.bytes);
-        }
-        self.check_lock_fence()?;
-        self.storage
-            .put(&index_store::head_key(head.generation), &packed_head)?;
-        debug!(
-            bytes = obj.size(),
-            generation = head.generation,
-            "index segment written"
-        );
-        Ok(head)
+        let mut m = PublishMachine::publish(self, prev, seg, backup);
+        let events = |_: CommitEvent| {};
+        drive_blocking(
+            &mut m,
+            &mut StepCx {
+                repo: self,
+                events: &events,
+            },
+        )
+        .map(|_| ())
     }
 
     /// Fold: write the index's current state as a base (no object for the
@@ -518,76 +370,15 @@ impl Repository {
         prev: Option<&IndexHead>,
         removes: bool,
     ) -> Result<IndexHead> {
-        let dir = self.cache_dir();
-        let anchor = index_store::cache_anchor(dir.as_deref());
-        let (w, entries) = self
-            .chunk_index
-            .write_base_body(TableFileWriter::new_beside(&anchor)?)?;
-        let table = ChunkTable::install(w.finish()?, None, None)?;
-        let obj = (entries > 0)
-            .then(|| index_store::pack_base_body(table.body(), self.crypto.as_ref()))
-            .transpose()?;
-        let generation = self.next_head_gen(prev)?;
-        let (sweep, record) = self.next_sweep(prev, generation, removes)?;
-        let head = IndexHead {
-            layout: HEAD_LAYOUT_VERSION,
-            generation,
-            features: Vec::new(),
-            base: obj.as_ref().map(|obj| BaseRef {
-                name: obj.name,
-                size: obj.size(),
-                entries,
-            }),
-            segments: Vec::new(),
-            // The same state written again (plaintext) has the same name.
-            retired: prev
-                .map(|p| {
-                    p.live_objects()
-                        .filter(|n| obj.as_ref().is_none_or(|o| *n != o.name))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            sweep,
-        };
-        head.validate()?;
-        let packed_head = index_store::pack_head(&head, self.crypto.as_ref())?;
-
-        if let Some(obj) = &obj {
-            self.storage.put(&obj.key(), &obj.bytes)?;
-        }
-        if let Some(rec) = &record {
-            self.storage.put(&rec.key(), &rec.bytes)?;
-        }
-        self.check_lock_fence()?;
-        self.storage
-            .put(&index_store::head_key(head.generation), &packed_head)?;
-        let gc = index_store::collect_index_garbage(
-            self.storage.as_ref(),
-            self.crypto.as_ref(),
-            &head,
-            self.index_gc_grace,
+        let mut m = PublishMachine::base(prev.cloned(), removes);
+        let events = |_: CommitEvent| {};
+        drive_blocking(
+            &mut m,
+            &mut StepCx {
+                repo: self,
+                events: &events,
+            },
         )
-        .unwrap_or_else(|e| {
-            warn!("failed to delete old index objects: {e}");
-            Default::default()
-        });
-        debug!(
-            bytes = obj.as_ref().map_or(0, PackedObject::size),
-            generation = head.generation,
-            heads_deleted = gc.heads_deleted,
-            objects_deleted = gc.objects_deleted,
-            "index folded into a new base"
-        );
-        // The head is published: the new state becomes the repository's
-        // table. Replace the index before pruning, so the table it mapped
-        // until now is unmapped and can be deleted once it is old enough.
-        let table = match obj.as_ref() {
-            Some(obj) => table.publish(obj.name, dir.as_deref()),
-            None => ChunkTable::empty(),
-        };
-        self.chunk_index = LiveIndex::from_table(Arc::new(table));
-        index_store::prune_local_files(dir.as_deref(), &head);
-        Ok(head)
     }
 
     /// Index upkeep at the end of `compact`, under the lock: fold when the

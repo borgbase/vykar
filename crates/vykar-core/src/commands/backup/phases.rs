@@ -1,4 +1,5 @@
-//! The two phases of a backup run, driven by `run_against_repo`, and the session owner they share.
+//! The two phases of a backup run, driven by `run_scoped`, and the session owner they share:
+//! Phase 1 (`phase1_upload`), and Phase 2 as [`PendingCommit`] and [`CommitInProgress`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -7,17 +8,21 @@ use tracing::{debug, info, warn};
 
 use super::instrument::{BackupInstrumentation, PipelineTimings};
 use super::{
-    BackupProgressEvent, BackupRequest, DatalessTally, ListingWriter, Prepared, command_dump,
-    emit_post_commit_warning, emit_progress, pipeline, source, source_paths_match,
+    BackupOutcome, BackupProgressEvent, BackupRequest, DatalessTally, ListingWriter, Prepared,
+    command_dump, emit_post_commit_warning, emit_progress, pipeline, source, source_paths_match,
 };
 use crate::config::VykarConfig;
-use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
+use crate::repo::control::{CancelToken, CommitEvent, EventSink, FnMutSink};
 use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::lock;
+#[cfg(any(test, feature = "sim"))]
+use crate::repo::machine::{Machine, StepKind};
+use crate::repo::machine::{StepCx, drive_blocking};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{HostEnv, Repository, WriteSessionOptions};
+use crate::repo::{BackupCommit, Committed, HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
+use vykar_common::display::{format_bytes, format_count};
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
@@ -313,7 +318,7 @@ pub(super) fn phase1_upload(
     // (see `absorb_read_sections`): `begin_sections` created a
     // write-cache section for every root, so `commit_finalize`
     // overwrites each moved key via `merge_section`, and a failed backup
-    // never saves the file cache (see the Phase 1 abort path in `run_against_repo`).
+    // never saves the file cache (see the Phase 1 abort path in `upload_prepared`).
     if !source_paths.is_empty() {
         let carried = new_file_cache.absorb_read_sections(repo.file_cache_mut());
         debug!(
@@ -416,57 +421,186 @@ pub(super) fn phase1_upload(
     })
 }
 
-/// Phase 2: take the commit lock, commit the snapshot, release the lock.
-/// Deregisters `session` on every path that reaches the commit (see the
-/// comments inline); a lock-acquisition failure leaves it to the caller.
-pub(super) fn phase2_commit(
-    repo: &mut Repository,
-    session: &mut BackupSession,
-    snapshot_entry: SnapshotEntry,
-    snapshot_packed: Vec<u8>,
-    new_file_cache: &mut FileCache,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
-) -> Result<()> {
-    let env = repo.host_env().clone();
-    let guard = lock::acquire_lock_with_deadline(
-        repo.storage.as_ref(),
-        &env,
-        lock::COMMIT_LOCK_MAX_WAIT,
-        500,
-        shutdown,
-        |_| {
-            emit_progress(
-                progress,
-                BackupProgressEvent::CommitStage {
-                    stage: "waiting for commit lock",
-                },
-            );
-        },
-    )?;
-    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage), env);
-    repo.set_lock_fence(fence);
+/// What the end of a run reports, carried from Phase 1 through the commit.
+pub(super) struct RunReport {
+    pub(super) new_file_cache: FileCache,
+    pub(super) stats: SnapshotStats,
+    pub(super) instrumentation: BackupInstrumentation,
+    pub(super) dataless: DatalessTally,
+    pub(super) snapshot_name: String,
+}
 
-    // Once the snapshot is committed, deregister the session and delete
-    // its journal on a helper thread while the commit finishes its local
-    // post-commit work (the file cache save), instead of after it. The
-    // lock is still held throughout and released only after that thread
-    // is joined, below: deregistration happens under the lock as before.
-    // The guard's Drop stops the heartbeat thread and joins it
-    // before the marker is deleted, so no concurrent refresh_session
-    // call can race with this delete. This sequencing is why the commit
-    // path releases the lock itself instead of running under
-    // `with_repo_lock`.
-    let repo_storage = Arc::clone(&repo.storage);
-    let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
-    let result = {
-        let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
-        repo.commit_concurrent_session_with_progress(
+/// A backup between its phases: session registered, packs uploaded,
+/// snapshot packed, no lock held. `session` is the first field so it drops
+/// (and deregisters) before `repo`, as the locals of the upload did.
+pub(crate) struct PendingCommit {
+    pub(super) session: BackupSession,
+    pub(super) repo: Repository,
+    pub(super) snapshot_entry: SnapshotEntry,
+    pub(super) snapshot_packed: Vec<u8>,
+    pub(super) report: RunReport,
+}
+
+/// Phase 2 in progress: the commit lock held, its fence installed, and the
+/// commit machine. Production drives it with [`Self::drive`], the
+/// simulator one step at a time with [`Self::step`]; either way
+/// [`Self::finish`] ends it. Dropped without `finish` (a crashed client in
+/// the simulator), the session deregisters and the lock stays.
+pub(crate) struct CommitInProgress {
+    session: BackupSession,
+    repo: Repository,
+    guard: lock::LockGuard,
+    machine: BackupCommit,
+    report: RunReport,
+}
+
+impl PendingCommit {
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn repo_mut(&mut self) -> &mut Repository {
+        &mut self.repo
+    }
+
+    /// Production: wait for the commit lock (`COMMIT_LOCK_MAX_WAIT`, with
+    /// backoff), reporting "waiting for commit lock" once contended.
+    pub(crate) fn wait_for_lock(
+        &self,
+        progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+        shutdown: &CancelToken,
+    ) -> Result<lock::LockGuard> {
+        let env = self.repo.host_env().clone();
+        lock::acquire_lock_with_deadline(
+            self.repo.storage.as_ref(),
+            &env,
+            lock::COMMIT_LOCK_MAX_WAIT,
+            500,
+            shutdown,
+            |_| {
+                emit_progress(
+                    progress,
+                    BackupProgressEvent::CommitStage {
+                        stage: "waiting for commit lock",
+                    },
+                );
+            },
+        )
+    }
+
+    /// One attempt at the commit lock (`lock::acquire_lock`): the
+    /// simulator's driver, which schedules the retries itself.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn try_lock(&self) -> Result<lock::LockGuard> {
+        lock::acquire_lock(self.repo.storage.as_ref(), self.repo.host_env())
+    }
+
+    /// Join the background journal write Phase 1 leaves running (the
+    /// simulator's driver, so that nothing runs between its steps;
+    /// production joins it in the commit's flush).
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn join_background_writes(&mut self) {
+        self.repo.join_journal_write();
+    }
+
+    /// Install the lock fence and build the commit machine. No storage
+    /// access.
+    pub(crate) fn begin_commit(self, guard: lock::LockGuard) -> CommitInProgress {
+        let Self {
+            session,
+            mut repo,
             snapshot_entry,
             snapshot_packed,
-            new_file_cache,
-            &events,
-            || {
+            report,
+        } = self;
+        let fence =
+            lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
+        repo.set_lock_fence(fence);
+        let machine = BackupCommit::new(&repo, snapshot_entry, snapshot_packed);
+        CommitInProgress {
+            session,
+            repo,
+            guard,
+            machine,
+            report,
+        }
+    }
+
+    /// The lock was not acquired: flush the packs (`flush_on_abort` writes
+    /// the journal, so the next run's recovery can find them), then drop,
+    /// which deregisters the session.
+    pub(crate) fn abandon(mut self) {
+        // flush_on_abort writes the remote sessions/<id>.index so the next
+        // run's recover_pending_index() can discover our packs.
+        self.repo.flush_on_abort();
+    }
+}
+
+impl CommitInProgress {
+    /// The steps the commit machine can run next; empty once it ended.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn enabled(&self) -> Vec<StepKind> {
+        self.machine.enabled()
+    }
+
+    /// Run enabled step `pick` of the commit machine (the simulator).
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn step(&mut self, pick: usize, events: &dyn EventSink<CommitEvent>) -> Result<()> {
+        self.machine.step(
+            &mut StepCx {
+                repo: &mut self.repo,
+                events,
+            },
+            pick,
+        )
+    }
+
+    /// The machine's output once it finished without error.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn take_output(&mut self) -> Option<Committed> {
+        self.machine.take_output()
+    }
+
+    /// Production: run the commit machine to the end.
+    pub(crate) fn drive(&mut self, events: &dyn EventSink<CommitEvent>) -> Result<Committed> {
+        drive_blocking(
+            &mut self.machine,
+            &mut StepCx {
+                repo: &mut self.repo,
+                events,
+            },
+        )
+    }
+
+    /// End Phase 2 once the machine ended with `result`: the post-commit
+    /// work, deregistration and lock release on success; on failure,
+    /// deregistration, the lock release, then `flush_on_abort`.
+    pub(crate) fn finish(
+        self,
+        result: Result<Committed>,
+        progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    ) -> Result<BackupOutcome> {
+        let Self {
+            mut session,
+            mut repo,
+            guard,
+            machine: _,
+            mut report,
+        } = self;
+
+        // Once the snapshot is committed, deregister the session and delete
+        // its journal on a helper thread while the commit finishes its local
+        // post-commit work (the file cache save), instead of after it. The
+        // lock is still held throughout and released only after that thread
+        // is joined, below: deregistration happens under the lock as before.
+        // The guard's Drop stops the heartbeat thread and joins it
+        // before the marker is deleted, so no concurrent refresh_session
+        // call can race with this delete. This sequencing is why the commit
+        // path releases the lock itself instead of running under
+        // `with_repo_lock`.
+        let repo_storage = Arc::clone(&repo.storage);
+        let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
+        let ok = result.is_ok();
+        let result = result.map(|committed| {
+            let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
+            repo.finish_backup_commit(committed, &mut report.new_file_cache, &events, || {
                 let guard = session.guard.take();
                 let storage = Arc::clone(&repo_storage);
                 let session_id = session.id.clone();
@@ -485,30 +619,74 @@ pub(super) fn phase2_commit(
                     Ok(handle) => cleanup = Some(handle),
                     Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
                 }
-            },
-        )
-    };
-    let journal_cleared = cleanup.is_some();
-    if let Some(handle) = cleanup.take() {
-        let _ = handle.join();
+            });
+        });
+        let journal_cleared = cleanup.is_some();
+        if let Some(handle) = cleanup.take() {
+            let _ = handle.join();
+        }
+        // Not reached by the helper (failed commit, or no thread): the same
+        // cleanup, inline.
+        session.end();
+
+        crate::commands::util::clear_fence_and_release(
+            &mut repo,
+            guard,
+            ok,
+            // Unlike `run_under_fence`, this path has a progress sink, so the
+            // release warning reaches GUI/CLI consumers and not just the log.
+            &mut |msg| emit_post_commit_warning(progress, msg),
+        );
+
+        if let Err(e) = result {
+            // flush_on_abort writes the remote sessions/<id>.index so the next
+            // run's recover_pending_index() can discover our packs. A failed
+            // commit has deregistered the session and released the lock
+            // first; `session` drops after this flush.
+            repo.flush_on_abort();
+            return Err(e);
+        }
+        if !journal_cleared {
+            repo.clear_pending_index(&session.id);
+        }
+
+        let RunReport {
+            stats,
+            instrumentation,
+            dataless,
+            snapshot_name,
+            ..
+        } = report;
+        if stats.errors > 0 {
+            info!(
+                "Snapshot '{}' created: {} files, {} errors, {} original, {} compressed, {} deduplicated",
+                snapshot_name,
+                format_count(stats.nfiles),
+                format_count(stats.errors),
+                format_bytes(stats.original_size),
+                format_bytes(stats.compressed_size),
+                format_bytes(stats.deduplicated_size)
+            );
+        } else {
+            info!(
+                "Snapshot '{}' created: {} files, {} original, {} compressed, {} deduplicated",
+                snapshot_name,
+                format_count(stats.nfiles),
+                format_bytes(stats.original_size),
+                format_bytes(stats.compressed_size),
+                format_bytes(stats.deduplicated_size)
+            );
+        }
+
+        // `is_partial` intentionally ignores the dataless tally: skipped cloud-only
+        // content is reported, not treated as a failure (see `BackupOutcome`).
+        let is_partial = stats.errors > 0;
+        Ok(BackupOutcome {
+            stats,
+            is_partial,
+            dataless_files_skipped: dataless.files,
+            dataless_dirs_skipped: dataless.dirs,
+            instrumentation,
+        })
     }
-    // Not reached by the helper (failed commit, or no thread): the same
-    // cleanup, inline.
-    session.end();
-
-    crate::commands::util::clear_fence_and_release(
-        repo,
-        guard,
-        result.is_ok(),
-        // Unlike `run_under_fence`, this path has a progress sink, so the
-        // release warning reaches GUI/CLI consumers and not just the log.
-        &mut |msg| emit_post_commit_warning(progress, msg),
-    );
-
-    result?;
-    if !journal_cleared {
-        repo.clear_pending_index(&session.id);
-    }
-
-    Ok(())
 }

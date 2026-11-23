@@ -33,7 +33,8 @@ impl<E, F: FnMut(E)> EventSink<E> for FnMutSink<F> {
     }
 }
 
-/// Progress of a commit (`Repository::commit_concurrent_session_with_progress`).
+/// Progress of a backup commit (`repo::commit_machine::BackupCommit` and
+/// `Repository::finish_backup_commit`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitEvent {
     /// A commit stage starts.

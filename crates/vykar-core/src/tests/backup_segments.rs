@@ -53,12 +53,11 @@ fn commit(repo: &mut Repository, name: &str) {
         hostname: String::new(),
     };
     let mut file_cache = crate::repo::file_cache::FileCache::new();
-    repo.commit_concurrent_session_with_progress(
+    repo.commit_session_blocking(
         entry,
         b"snapshot".to_vec(),
         &mut file_cache,
         &|_: crate::repo::control::CommitEvent| {},
-        || {},
     )
     .unwrap();
 }

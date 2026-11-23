@@ -117,7 +117,7 @@ pub fn seeded_bytes(seed: &str, size: usize) -> Vec<u8> {
 }
 
 /// Result of a client body: names removed, and a detail line.
-type RunResult = Result<(Vec<String>, String)>;
+pub(super) type RunResult = Result<(Vec<String>, String)>;
 
 /// A client body: store, config, client dir, run index, environment.
 type Body = Box<dyn FnOnce(&SimStore, VykarConfig, &Path, usize, HostEnv) -> RunResult + Send>;
@@ -201,11 +201,11 @@ pub(crate) struct Finished {
 }
 
 /// What `begin_run` hands the body.
-struct Started {
-    index: usize,
-    cfg: VykarConfig,
-    dir: PathBuf,
-    env: HostEnv,
+pub(super) struct Started {
+    pub(super) index: usize,
+    pub(super) cfg: VykarConfig,
+    pub(super) dir: PathBuf,
+    pub(super) env: HostEnv,
 }
 
 /// A spawned run not yet joined.
@@ -758,7 +758,7 @@ impl Sim {
         report
     }
 
-    fn client_config(&self, c: ClientId) -> VykarConfig {
+    pub(super) fn client_config(&self, c: ClientId) -> VykarConfig {
         let mut cfg = VykarConfig {
             repository: RepositoryConfig {
                 url: self.repo_url.clone(),
@@ -788,13 +788,7 @@ impl Sim {
     fn prepare(&mut self, c: ClientId, call: Call) -> (ClientOp, Body) {
         match call {
             Call::Backup { snapshot, tree } => {
-                assert!(
-                    !self.history.trees.contains_key(&snapshot),
-                    "snapshot name {snapshot} reused"
-                );
-                let src = self.root.path().join("sources").join(&snapshot);
-                tree.write_to(&src).expect("write source tree");
-                self.history.trees.insert(snapshot.clone(), tree);
+                let src = self.prepare_backup_source(&snapshot, tree);
                 let op = ClientOp::Backup {
                     snapshot: snapshot.clone(),
                 };
@@ -1033,8 +1027,56 @@ impl Sim {
         }
     }
 
+    /// Write the source tree of backup `snapshot` and record it for the
+    /// checker; returns the source directory.
+    pub(super) fn prepare_backup_source(&mut self, snapshot: &str, tree: SourceTree) -> PathBuf {
+        assert!(
+            !self.history.trees.contains_key(snapshot),
+            "snapshot name {snapshot} reused"
+        );
+        let src = self.root.path().join("sources").join(snapshot);
+        tree.write_to(&src).expect("write source tree");
+        self.history.trees.insert(snapshot.to_string(), tree);
+        src
+    }
+
+    /// A new `Sim` on a fork of this one's store, with its history (runs,
+    /// observations, source trees) and run counter, for one case of the
+    /// driver. Its clients are new: this one's are not carried over.
+    pub(super) fn fork_for_case(&self) -> Sim {
+        assert!(
+            self.in_flight.is_empty(),
+            "fork_for_case with runs in flight"
+        );
+        let mut sim = Sim::from_store(self.store.fork());
+        sim.history = self.history.clone();
+        sim.next_run = self.next_run;
+        sim
+    }
+
+    /// Record a run the driver started with `begin_run` and ran itself.
+    pub(super) fn finish_driven_run(
+        &mut self,
+        c: ClientId,
+        index: usize,
+        op: ClientOp,
+        first_step: u64,
+        result: RunResult,
+    ) -> RunRecord {
+        let finished = finish_run(
+            &self.store,
+            &self.hosts,
+            c,
+            index,
+            false,
+            first_step,
+            result,
+        );
+        self.record(index, c, op, finished)
+    }
+
     /// Reserve the run's index, tick the clock, and start `c`'s process.
-    fn begin_run(&mut self, c: ClientId) -> Started {
+    pub(super) fn begin_run(&mut self, c: ClientId) -> Started {
         let index = self.next_run;
         self.next_run += 1;
         let cfg = self.client_config(c);

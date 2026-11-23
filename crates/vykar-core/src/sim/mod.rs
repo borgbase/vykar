@@ -13,6 +13,8 @@
 //!   against the protocol invariants.
 //! - `hazards`: scenarios of known protocol hazards and their regressions;
 //!   `interleavings` holds the ones that need two clients in flight at once.
+//! - `driver`: the deterministic driver over the steppable commit machines
+//!   (08 step 4): cases, choice sequences, traces and damage signatures.
 //!
 //! Test support, not API: a panic is a test failure. Compiled for this
 //! crate's tests and with the `sim` feature; never enable it in a product
@@ -28,6 +30,7 @@
 )]
 
 pub mod checker;
+pub mod driver;
 pub mod env;
 pub mod fault;
 pub mod gate;
@@ -39,6 +42,10 @@ pub mod runner;
 pub mod store;
 
 pub use checker::{Invariant, Report, Violation, ViolationKind, check_invariants};
+pub use driver::{
+    Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, Outcome, Signature, Template,
+    Trace, TraceEntry, case_from_trace, run_case,
+};
 pub use env::{SimClock, SimHosts, SimTime, TimeMode, Waiter};
 pub use fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedEffect,

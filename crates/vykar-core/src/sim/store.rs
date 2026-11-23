@@ -75,6 +75,8 @@ struct State {
     names: Vec<String>,
     /// The run each client is in, if any.
     runs: BTreeMap<ClientId, usize>,
+    /// The label of each client's operations, if any (`set_label`).
+    labels: BTreeMap<ClientId, &'static str>,
     gates: Vec<GateState>,
     next_gate: u32,
 }
@@ -149,7 +151,8 @@ impl State {
         outcome: OpOutcome,
     ) {
         let run = self.runs.get(&client).copied();
-        self.record_for_run(client, run, op, key, keys, len, outcome);
+        let label = self.labels.get(&client).copied();
+        self.record_for_run(client, run, label, op, key, keys, len, outcome);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -157,6 +160,7 @@ impl State {
         &mut self,
         client: ClientId,
         run: Option<usize>,
+        label: Option<&'static str>,
         op: OpKind,
         key: &str,
         keys: &[String],
@@ -174,6 +178,7 @@ impl State {
             absent: Vec::new(),
             len,
             outcome,
+            label,
         });
     }
 
@@ -287,6 +292,7 @@ impl State {
                 key: key.to_string(),
                 keys: keys.to_vec(),
                 issued_at_step: self.step,
+                label: self.labels.get(&client).copied(),
                 action,
                 effect,
             },
@@ -329,6 +335,7 @@ impl SimStore {
                     crashed: BTreeSet::new(),
                     names,
                     runs: BTreeMap::new(),
+                    labels: BTreeMap::new(),
                     gates: Vec::new(),
                     next_gate: 0,
                 }),
@@ -469,6 +476,7 @@ impl SimStore {
         st.record_for_run(
             parked.client,
             parked.run,
+            parked.label,
             parked.op,
             &parked.key,
             &parked.keys,
@@ -583,6 +591,16 @@ impl SimStore {
         match run {
             Some(r) => st.runs.insert(client, r),
             None => st.runs.remove(&client),
+        };
+    }
+
+    /// Label `client`'s operations with `label` until set to None (the
+    /// driver's step names). `fork` drops labels.
+    pub(crate) fn set_label(&self, client: ClientId, label: Option<&'static str>) {
+        let mut st = self.state();
+        match label {
+            Some(l) => st.labels.insert(client, l),
+            None => st.labels.remove(&client),
         };
     }
 

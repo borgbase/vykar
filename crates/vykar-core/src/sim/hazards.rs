@@ -9,6 +9,10 @@
 //! to `REGRESSIONS`, where the same scenario must then hold. 05 step 8 moved
 //! H5 (the mark refuses) and H4-segment (index garbage is collected by age)
 //! there.
+//!
+//! The driver (`sim::driver`) finds these hazards, and more of today's
+//! protocol, under random schedules; the shapes of damage it recognises are
+//! documented on `driver::Signature`, each with the plan that removes it.
 
 use std::collections::BTreeSet;
 

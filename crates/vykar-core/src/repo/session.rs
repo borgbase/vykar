@@ -206,6 +206,15 @@ impl Repository {
         self.chunk_index.contains(id)
     }
 
+    /// Wait for the session's background journal write, if any (the
+    /// simulator's driver, after Phase 1). No-op without a write session.
+    #[cfg(any(test, feature = "sim"))]
+    pub(crate) fn join_journal_write(&mut self) {
+        if let Some(ws) = self.write_session.as_mut() {
+            ws.join_journal_write();
+        }
+    }
+
     /// Best-effort cleanup after a failed backup or other operation.
     ///
     /// Seals any partial pack writers, waits for in-flight uploads to land,

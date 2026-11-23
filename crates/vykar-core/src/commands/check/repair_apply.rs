@@ -70,7 +70,8 @@ fn apply_item_level_rewrites(
     repo.begin_write_session(&WriteSessionOptions::default())?;
 
     // 2. Prepare each rewrite (defer all PUT/DELETE until after Step 4 of
-    //    this routine, mirroring commit_prepare → PUT ordering).
+    //    this routine, mirroring the backup commit's index write → snapshot
+    //    PUT ordering).
     let mut prepared: Vec<PreparedRewrite> = Vec::new();
     for (action_idx, action) in plan.actions.iter().enumerate() {
         let RepairAction::DropItemsFromSnapshot {
@@ -395,7 +396,7 @@ pub(super) fn execute_repair(
     }
 
     // Step 4.5: Rewrite snapshots that survived item-level repair gates.
-    // Mirrors `Repository::commit_concurrent_session_with_progress`:
+    // Mirrors the backup commit (`repo::commit_machine::BackupCommit`):
     // begin_write_session → store_chunk per surviving item → flush_packs →
     // save_state (persists chunks BEFORE any snapshot blob references them).
     // Per-action errors are logged and skipped; the trailing sweep

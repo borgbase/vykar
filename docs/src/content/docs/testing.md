@@ -32,6 +32,14 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | Compression round-trip | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
 | IndexDelta state machine | Additions applied once; rollback restores the reused set and the additions exactly |
 
+## Protocol Simulation
+
+The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `sim` feature) runs many logical clients over one in-memory store, `SimStore`, which logs every operation and injects faults (fail, fail after applying, delay until released, duplicate, crash). Clients run the real commands on virtual time with their own host identities. A checker judges the store and the history against the protocol's invariants: committed snapshots restore, acknowledged commits stay, nothing disappears silently, the index holds together, only allowed errors, writes only under the lock.
+
+- **Scripted scenarios** hold one client at a pause point (a gate on its n-th matching operation) while another runs, and reproduce each known hazard (`sim::hazards`, `sim::interleavings`); once a hazard is fixed its scenario becomes a regression.
+- **The driver** (`sim::driver`) runs a *case*: hosts, a script of commands per client, a fault plan and a sequence of choices. The backup commit and the index write are steppable machines, so the driver interleaves the commits of several clients step by step with whole maintenance commands, releases of delayed writes, time jumps and crashes, one at a time, taking the next choice at every decision (0, the default, runs the first client's next step). Every case ends with the checker; what it found is classified by a damage signature (H1's two lock holders, H3's late head, ...), and damage of no known shape fails the test.
+- **Exploration** (`tests::sim_explore`) generates random cases with proptest: a general family must show no damage of an unknown shape, and two narrow families must find H1 and H3 and shrink them to a case with few non-default choices. A failing case is written as a trace (`$VYKAR_SIM_TRACE_DIR`, default `<temp>/vykar-sim`) whose first line is the case; `VYKAR_SIM_REPLAY=<trace>` with `tests::sim_driver::replay_from_env` runs it again. `VYKAR_SIM_SEED` sets the seed and `VYKAR_SIM_CASES` the number of general cases; `VYKAR_SIM_MEASURE=1` with `tests::sim_explore::measure` prints the cost per case.
+
 ## Matrix Tests
 
 9 corruption types tested against detection, repair, and resilience paths using `test-case` parametrization. Each corruption is applied to a known-good repository, then `check`, `repair`, and follow-up `backup` are run with assertions on the outcome.

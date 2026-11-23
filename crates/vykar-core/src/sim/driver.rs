@@ -1,0 +1,1259 @@
+//! The deterministic driver over the steppable commit machines (08 step 4).
+//!
+//! A [`Case`] is a scenario (hosts, one script of commands per client), a
+//! fault plan and a choice sequence. The driver runs it single-threaded in
+//! the sense that exactly one step runs at a time and nothing runs between
+//! steps: at every decision it lists the actions that can run next in a
+//! fixed order (a client's next step, the release of a parked effect, a jump
+//! of virtual time, a crash), takes the next choice modulo their number
+//! (past the end of the choices, 0), and runs that action to its end. Client
+//! code still uses its own threads inside a step (the upload pipeline, pack
+//! verification, the cleanup thread at the commit point), and each backup
+//! keeps its heartbeat thread; after every step the driver waits until each
+//! live heartbeat is blocked on virtual time again, so the store sees
+//! nothing between decisions.
+//!
+//! A backup is upload (registration, open and phase 1), then up to
+//! [`LOCK_ATTEMPTS`] single attempts at the commit lock, then one decision
+//! per step of its `BackupCommit` machine
+//! (`Local` steps run right after the step before them), then its finish.
+//! Compact and delete are one decision each: their index writes run the
+//! same publish machine, driven to the end inside the command.
+//!
+//! [`run_case`] judges the end state with the checker and classifies what
+//! it found by [`Signature`]. The [`Trace`] names no random key or time,
+//! so its canonical form is the same on every run of a case.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use super::checker::{Invariant, Report, Violation, ViolationKind, run_subject};
+use super::fault::{
+    ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpMatch, ParkedId,
+};
+use super::history::{ClientOp, RunOutcome};
+use super::log::{OpOutcome, OpRecord, key_class};
+use super::runner::{Call, RunResult, Sim, SourceTree, seeded_bytes};
+use crate::commands::backup::{self, BackupRequest, CommitInProgress, PendingCommit};
+use crate::compress::Compression;
+use crate::repo::Committed;
+use crate::repo::control::{CancelToken, CommitEvent};
+use crate::repo::machine::StepKind;
+use vykar_storage::StorageBackend;
+use vykar_types::error::VykarError;
+
+/// Single attempts at the commit lock before a backup gives up with
+/// `Locked` (production waits up to 10 minutes of real time instead).
+pub const LOCK_ATTEMPTS: u32 = 3;
+
+/// More decisions than this in one case is a harness bug.
+pub const MAX_DECISIONS: usize = 400;
+
+/// Jumps of virtual time a decision can offer (1 min, 16 min, 46 min,
+/// 3 h 1 min, 6 h 1 min): past the heartbeat poll, the session refresh,
+/// the session staleness, the lock refresh and the lock staleness.
+pub const ADVANCES: [u64; 5] = [61, 960, 2760, 10860, 21660];
+
+/// At most this many jumps of time per case.
+pub const MAX_ADVANCES: usize = 3;
+
+/// Real time to wait for the heartbeats to settle after a step.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Lock staleness of today's protocol (`DEFAULT_STALE_LOCK_SECS`).
+const STALE_LOCK_SECS: i64 = 6 * 3600;
+
+/// Session staleness of today's protocol (`SESSION_STALE_SECS`).
+const STALE_SESSION_SECS: i64 = 45 * 60;
+
+/// Size of each file of a backup's tree.
+const FILE_SIZE: usize = 8 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostPlan {
+    /// Every client on its own host (`sim-<name>`).
+    Distinct,
+    /// Every client on hostname "ubuntu" with its own boot ID
+    /// (`boot-<name>`): cloned machines, the H1 condition.
+    SameHostname,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Command {
+    /// One small tree: one file of 8 KiB seeded by the snapshot name, and
+    /// with `shared` the file every shared tree (and the control snapshot
+    /// `c0`) has. `fold`: request a fold before the commit, so the commit
+    /// takes the fold path (it stands in for the hard limit, which takes the
+    /// same code path).
+    Backup {
+        shared: bool,
+        fold: bool,
+    },
+    Compact,
+    /// Delete the template's control snapshot `c0`. At most one per case.
+    DeleteControl,
+}
+
+/// The keys a fault matches: `index.h/`, `index.d/`, `snapshots/`,
+/// `locks/`, `sessions/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyClass {
+    IndexHead,
+    IndexObject,
+    Snapshot,
+    Lock,
+    Session,
+}
+
+impl KeyClass {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            KeyClass::IndexHead => "index.h/",
+            KeyClass::IndexObject => "index.d/",
+            KeyClass::Snapshot => "snapshots/",
+            KeyClass::Lock => "locks/",
+            KeyClass::Session => "sessions/",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FaultKind {
+    Fail,
+    FailApplied,
+    Delay,
+    Duplicate,
+}
+
+impl FaultKind {
+    fn action(self) -> FaultAction {
+        match self {
+            FaultKind::Fail => FaultAction::Fail,
+            FaultKind::FailApplied => FaultAction::FailApplied,
+            FaultKind::Delay => FaultAction::Delay,
+            FaultKind::Duplicate => FaultAction::Duplicate,
+        }
+    }
+}
+
+/// A fault on the `nth` write (1-based) of `class` by client `client`
+/// (an index into [`Case::clients`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultSpec {
+    pub client: u8,
+    pub class: KeyClass,
+    pub nth: u8,
+    pub kind: FaultKind,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Case {
+    pub hosts: HostPlan,
+    /// One script per client (1..=3 clients, named a, b, c), run in order.
+    pub clients: Vec<Vec<Command>>,
+    pub faults: Vec<FaultSpec>,
+    /// Offer one `Crash` action.
+    pub crash: bool,
+    /// Offer `Advance` actions.
+    #[serde(default = "yes")]
+    pub advances: bool,
+    /// Consumed one per decision; past the end, 0.
+    pub choices: Vec<u16>,
+}
+
+impl Case {
+    /// Choices that are not the default.
+    pub fn non_default_choices(&self) -> usize {
+        self.choices.iter().filter(|c| **c != 0).count()
+    }
+}
+
+/// A store with init and the control backup `c0` (client "ctl", with the
+/// shared file), forked per case.
+pub struct Template {
+    sim: Sim,
+}
+
+impl Default for Template {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Template {
+    pub fn new() -> Self {
+        let mut sim = Sim::new();
+        let ctl = sim.client("ctl");
+        sim.backup(ctl, "c0", &backup_tree("c0", true)).expect_ok();
+        Self { sim }
+    }
+
+    /// A fork of the template, as each case starts from.
+    pub fn fork(&self) -> Sim {
+        self.sim.fork_for_case()
+    }
+}
+
+/// The tree the driver backs up as snapshot `name` (client `a`'s first
+/// backup is `a1`).
+pub fn backup_tree(name: &str, shared: bool) -> SourceTree {
+    let t = SourceTree::new().file("own.bin", seeded_bytes(name, FILE_SIZE));
+    if shared {
+        t.file("shared.bin", seeded_bytes("shared", FILE_SIZE))
+    } else {
+        t
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Action {
+    /// The next step of client `client`; `pick` chooses among a commit's
+    /// start reads.
+    Step {
+        client: u8,
+        pick: u8,
+    },
+    /// Apply parked effect `parked`.
+    Release {
+        parked: u64,
+    },
+    Advance {
+        secs: u64,
+    },
+    Crash {
+        client: u8,
+    },
+    /// End the case (every client done); unreleased effects never land.
+    Stop,
+}
+
+/// What a case's damage looks like. Every variant but `Unknown` is a known
+/// property of today's protocol, named here with the plan that removes it.
+///
+/// Each signature claims the violations it explains, and is inserted only
+/// when it claims one; a violation no signature claims, or a skipped
+/// evaluation without a cascading signature, adds `Unknown` next to the
+/// named ones. Most signatures claim narrowly: the lock-exclusion violation
+/// they are derived from, or the violations of one run and its snapshot.
+/// `TwoLockHolders`, `LateHeadWrite` and `LateHeadThenCompact` cascade:
+/// they leave real damage that later commands fail on, so each claims every
+/// violation not known to come before its hazard event (the reap, the
+/// released head write), and every skipped evaluation. A violation with a
+/// known store step earlier than the hazard is not theirs. Only
+/// lock-exclusion violations carry a store step today, so a cascading
+/// signature excuses every other violation of its case: "no `Unknown`" is a
+/// weak guard for such cases until the hazards are gone. Parts 5 and 9 of
+/// clean-design phase F (04 steps 1 and 8) remove them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Signature {
+    /// H1: a protected write by a client whose live lock another client on
+    /// the same hostname (another boot ID) reaped while it was younger than
+    /// the stale age. Fixed by 04 step 1 (installation ID).
+    TwoLockHolders,
+    /// H1-session: a live backup's session marker deleted by another client
+    /// (same hostname, other boot ID) while younger than the session
+    /// staleness; compact then deletes the backup's uploads and its commit
+    /// fails. Claims the victim run's `DisallowedError` and the violations
+    /// of its snapshot; a victim that fails with an allowed error leaves a
+    /// clean case and no signature. Fixed by 04 step 1 (installation ID).
+    ///
+    /// Known behaviour: when the victim's marker probe ran before compact
+    /// reaped the marker, its commit does not fail with
+    /// `StaleChunksDuringCommit` but with the untyped
+    /// `VykarError::Other("commit failed: pack … missing from storage …")`
+    /// of `repo/pack_verify.rs`, a disallowed error. 04 step 5 (compact
+    /// keeps young orphan packs) and 04's I8 / step 2 (a backup knows its
+    /// marker was missing) address it.
+    SessionReaped,
+    /// A live backup's session marker deleted as stale by another client
+    /// after a jump of virtual time past the session staleness (a suspended
+    /// machine: the heartbeat counts polls, so one long jump is one poll);
+    /// compact then deletes the backup's uploads and its commit fails.
+    /// Claims like `SessionReaped`. The
+    /// documented limit of today's heartbeat; 04 step 5 (server-clock ages)
+    /// and I8 (a backup whose marker was missing does not commit) bound it.
+    AgedSessionReaped,
+    /// A protected write by a client whose lock another client reaped by
+    /// age (older than the 6 h stale age: the driver's time jumps). The
+    /// fallback protocol's documented limit; 04 step 5 moves lock ages to
+    /// the server's clock, and step 8 takes the lock off the commit path.
+    /// Claims the lock-exclusion violation it is derived from.
+    AgedLockReaped,
+    /// A protected write while the store held a lock key that a delayed or
+    /// duplicated lock PUT left behind after its writer had deleted it (a
+    /// key with no holder). The fallback protocol's limit; 04 step 8 takes
+    /// the lock off the commit path. Claims the lock-exclusion violation it
+    /// is derived from.
+    OrphanLockKey,
+    /// H3: a released write of `index.h/` (a head PUT that timed out and
+    /// landed after the lock was released), and a snapshot of a backup that
+    /// returned Ok lost its index coverage. Fixed by 04 step 8.
+    LateHeadWrite,
+    /// H3-compact: a released write of `index.h/`, and the index names an
+    /// absent pack. Fixed by 04 steps 5 and 8.
+    LateHeadThenCompact,
+    /// A delayed `snapshots/` write released after a compact swept its
+    /// chunks: invariant 1 fails with no released `index.h/` write and no
+    /// lock violation. Claims the violations of the snapshot whose PUT was
+    /// the released write. Fixed by 04 step 8 (the commit point is the head).
+    LateSnapshotWrite,
+    /// A released write of `index.h/` or `index.d/` that landed outside
+    /// the lock and damaged nothing else (invariant 7 only): the late-write
+    /// mechanism of H3 without its damage. Claims the lock-exclusion
+    /// violations at released index writes that nothing else claims.
+    /// Fixed by 04 step 8.
+    LateIndexWrite,
+    /// A violation no signature above claims, or anything not evaluated
+    /// with no cascading signature.
+    Unknown,
+}
+
+impl Signature {
+    /// Signatures whose damage cascades (see [`Signature`]).
+    pub fn cascades(self) -> bool {
+        matches!(
+            self,
+            Signature::TwoLockHolders | Signature::LateHeadWrite | Signature::LateHeadThenCompact
+        )
+    }
+
+    /// Signatures that name a hazard (all but `Unknown`).
+    pub fn is_hazard(self) -> bool {
+        self != Signature::Unknown
+    }
+}
+
+/// One decision of a trace.
+#[derive(Clone, Debug)]
+pub struct TraceEntry {
+    pub n: usize,
+    pub choice: u16,
+    pub options: usize,
+    pub action: Action,
+    /// What ran: the step's name, "upload", "lock", "finish", "whole", or
+    /// the action's name; steps run at once after it follow with `+`.
+    pub label: String,
+    /// Each op as "client op key-class outcome", in issue order.
+    pub ops: Vec<String>,
+    /// Store steps of the decision: `(first, last]`.
+    pub steps: (u64, u64),
+    /// The store clock after the decision.
+    pub clock: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Trace {
+    pub case: Case,
+    pub entries: Vec<TraceEntry>,
+    pub signatures: Vec<Signature>,
+    pub report: String,
+}
+
+impl Trace {
+    /// Entries without random names or times: the action, the label, and
+    /// the ops sorted within the entry. A client's reads of `packs/` (not a
+    /// protocol key) count once per entry, without their outcome: whether a
+    /// presence check SIZEs each pack or LISTs their shards depends on how
+    /// the random pack IDs fall into shards.
+    pub fn canonical(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|e| {
+                let mut ops: Vec<String> = e
+                    .ops
+                    .iter()
+                    .map(|line| {
+                        let parts: Vec<&str> = line.split(' ').collect();
+                        match parts.as_slice() {
+                            [client, op, "packs/", _]
+                                if !matches!(*op, "PutPack" | "Put" | "Delete" | "BatchDelete") =>
+                            {
+                                format!("{client} reads packs/")
+                            }
+                            _ => line.clone(),
+                        }
+                    })
+                    .collect();
+                ops.sort();
+                ops.dedup_by(|a, b| a == b && a.ends_with(" reads packs/"));
+                format!("{:?} {} [{}]", e.action, e.label, ops.join(", "))
+            })
+            .collect()
+    }
+
+    /// Human-readable: a first line `case: <json>`, one line per entry
+    /// (non-default choices marked `*`), the signatures and the report.
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "case: {}\n",
+            serde_json::to_string(&self.case).expect("case serializes")
+        );
+        for e in &self.entries {
+            let mark = if e.choice == 0 { ' ' } else { '*' };
+            out.push_str(&format!(
+                "{mark}{:>3} {}/{} {:?} {}\n",
+                e.n, e.choice, e.options, e.action, e.label
+            ));
+            for op in &e.ops {
+                out.push_str(&format!("        {op}\n"));
+            }
+        }
+        out.push_str(&format!("signatures: {:?}\n", self.signatures));
+        out.push_str(&self.report);
+        out
+    }
+
+    /// Write [`Self::render`] to `$VYKAR_SIM_TRACE_DIR/<name>.trace`, or
+    /// under `<temp>/vykar-sim`.
+    pub fn write(&self, name: &str) -> std::io::Result<PathBuf> {
+        let dir = std::env::var_os("VYKAR_SIM_TRACE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("vykar-sim"));
+        self.write_in(&dir, name)
+    }
+
+    /// Write [`Self::render`] to `<dir>/<name>.trace`, creating `dir`.
+    pub fn write_in(&self, dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{name}.trace"));
+        std::fs::write(&path, self.render())?;
+        Ok(path)
+    }
+}
+
+/// Parse a written trace's first line back into its case.
+pub fn case_from_trace(text: &str) -> Result<Case, String> {
+    let line = text.lines().next().ok_or("empty trace")?;
+    let json = line
+        .strip_prefix("case: ")
+        .ok_or("the first line does not start with `case: `")?;
+    serde_json::from_str(json).map_err(|e| format!("bad case: {e}"))
+}
+
+pub struct Outcome {
+    pub report: Report,
+    pub signatures: BTreeSet<Signature>,
+    pub trace: Trace,
+    /// The simulation the case ran in, for tests that read its log.
+    pub sim: Sim,
+}
+
+/// Run `case` on a fork of `template`'s store and judge the end state.
+pub fn run_case(template: &Template, case: &Case) -> Outcome {
+    let mut d = Driver::new(template, case);
+    d.run();
+    d.verdict()
+}
+
+/// A run the driver started.
+struct RunCtx {
+    index: usize,
+    first_step: u64,
+    op: ClientOp,
+}
+
+enum Phase {
+    /// Between commands.
+    Idle,
+    /// Uploaded; waiting for the commit lock.
+    Lock(Box<LockWait>),
+    /// The commit machine runs.
+    Commit(Box<Running>),
+    /// The machine ended with this result; the finish is next.
+    Finish(Box<Running>, Box<vykar_types::error::Result<Committed>>),
+}
+
+struct LockWait {
+    run: RunCtx,
+    pending: PendingCommit,
+    attempts: u32,
+    fold: bool,
+}
+
+struct Running {
+    run: RunCtx,
+    commit: CommitInProgress,
+}
+
+struct Actor {
+    name: &'static str,
+    client: ClientId,
+    script: VecDeque<Command>,
+    backups: usize,
+    phase: Phase,
+}
+
+impl Actor {
+    fn has_work(&self) -> bool {
+        !matches!(self.phase, Phase::Idle) || !self.script.is_empty()
+    }
+
+    /// Its session is registered and its heartbeat runs.
+    fn heartbeat(&self) -> bool {
+        !matches!(self.phase, Phase::Idle)
+    }
+}
+
+const NAMES: [&str; 3] = ["a", "b", "c"];
+
+struct Driver<'c> {
+    sim: Sim,
+    case: &'c Case,
+    actors: Vec<Actor>,
+    advances: usize,
+    crashed: bool,
+    entries: Vec<TraceEntry>,
+}
+
+/// The commit's progress events; the driver has no use for them.
+fn no_events(_: CommitEvent) {}
+
+impl<'c> Driver<'c> {
+    fn new(template: &Template, case: &'c Case) -> Self {
+        assert!(
+            (1..=NAMES.len()).contains(&case.clients.len()),
+            "a case has 1 to 3 clients"
+        );
+        assert!(
+            case.clients
+                .iter()
+                .flatten()
+                .filter(|c| **c == Command::DeleteControl)
+                .count()
+                <= 1,
+            "at most one DeleteControl per case"
+        );
+        let mut sim = template.fork();
+        let actors: Vec<Actor> = case
+            .clients
+            .iter()
+            .zip(NAMES)
+            .map(|(script, name)| {
+                let client = match case.hosts {
+                    HostPlan::Distinct => sim.client(name),
+                    HostPlan::SameHostname => {
+                        sim.client_on(name, "ubuntu", Some(&format!("boot-{name}")))
+                    }
+                };
+                Actor {
+                    name,
+                    client,
+                    script: script.iter().cloned().collect(),
+                    backups: 0,
+                    phase: Phase::Idle,
+                }
+            })
+            .collect();
+        for f in &case.faults {
+            let Some(actor) = actors.get(usize::from(f.client)) else {
+                continue;
+            };
+            sim.fault(
+                FaultRule::new(
+                    OpMatch::AnyWrite,
+                    KeyMatch::Prefix(f.class.prefix().into()),
+                    f.kind.action(),
+                )
+                .client(actor.client)
+                .nth(u32::from(f.nth.max(1))),
+            );
+        }
+        Self {
+            sim,
+            case,
+            actors,
+            advances: 0,
+            crashed: false,
+            entries: Vec::new(),
+        }
+    }
+
+    /// The actions of the next decision, in the fixed order.
+    fn actions(&self) -> Vec<Action> {
+        let parked: Vec<Action> = self
+            .sim
+            .store()
+            .parked()
+            .iter()
+            .map(|p| Action::Release { parked: p.id.0 })
+            .collect();
+        if !self.actors.iter().any(Actor::has_work) {
+            let mut out = vec![Action::Stop];
+            out.extend(parked);
+            return out;
+        }
+        let mut out = Vec::new();
+        for (i, a) in self.actors.iter().enumerate() {
+            if !a.has_work() {
+                continue;
+            }
+            let client = i as u8;
+            let picks = match &a.phase {
+                Phase::Commit(r) => r.commit.enabled().len().max(1),
+                _ => 1,
+            };
+            for pick in 0..picks {
+                out.push(Action::Step {
+                    client,
+                    pick: pick as u8,
+                });
+            }
+        }
+        out.extend(parked);
+        if self.case.advances && self.advances < MAX_ADVANCES {
+            out.extend(ADVANCES.iter().map(|&secs| Action::Advance { secs }));
+        }
+        if self.case.crash && !self.crashed {
+            for (i, a) in self.actors.iter().enumerate() {
+                if a.has_work() {
+                    out.push(Action::Crash { client: i as u8 });
+                }
+            }
+        }
+        out
+    }
+
+    fn run(&mut self) {
+        for n in 0.. {
+            assert!(
+                n < MAX_DECISIONS,
+                "case not done after {MAX_DECISIONS} decisions:\n{}",
+                self.trace_text()
+            );
+            let actions = self.actions();
+            let choice = self.case.choices.get(n).copied().unwrap_or(0);
+            let action = actions[usize::from(choice) % actions.len()].clone();
+            let first = self.sim.store().step();
+            let label = match &action {
+                Action::Stop => {
+                    self.push_entry(n, choice, actions.len(), action, "stop".into(), first);
+                    return;
+                }
+                Action::Step { client, pick } => {
+                    self.step_actor(usize::from(*client), usize::from(*pick))
+                }
+                Action::Release { parked } => {
+                    self.sim.release(ParkedId(*parked));
+                    "release".into()
+                }
+                Action::Advance { secs } => {
+                    self.advances += 1;
+                    self.sim.advance(Duration::from_secs(*secs));
+                    "advance".into()
+                }
+                Action::Crash { client } => {
+                    self.crashed = true;
+                    self.crash(usize::from(*client));
+                    "crash".into()
+                }
+            };
+            self.settle();
+            self.push_entry(n, choice, actions.len(), action, label, first);
+        }
+    }
+
+    fn push_entry(
+        &mut self,
+        n: usize,
+        choice: u16,
+        options: usize,
+        action: Action,
+        label: String,
+        first: u64,
+    ) {
+        let store = self.sim.store();
+        self.entries.push(TraceEntry {
+            n,
+            choice,
+            options,
+            action,
+            label,
+            ops: Vec::new(),
+            steps: (first, store.step()),
+            clock: store.now(),
+        });
+    }
+
+    /// Wait until every live heartbeat is blocked on virtual time again.
+    fn settle(&self) {
+        let alive = self.actors.iter().filter(|a| a.heartbeat()).count();
+        assert!(
+            self.sim.time().wait_for_waiters(alive, SETTLE_TIMEOUT),
+            "heartbeats did not settle to {alive} waiters within {SETTLE_TIMEOUT:?} \
+                 (waiters: {:?}):\n{}",
+            self.sim.time().waiters(),
+            self.trace_text()
+        );
+    }
+
+    fn label(&self, i: usize, label: &'static str) {
+        self.sim
+            .store()
+            .set_label(self.actors[i].client, Some(label));
+    }
+
+    fn unlabel(&self, i: usize) {
+        self.sim.store().set_label(self.actors[i].client, None);
+    }
+
+    /// Run actor `i`'s next step; returns its label.
+    fn step_actor(&mut self, i: usize, pick: usize) -> String {
+        let phase = std::mem::replace(&mut self.actors[i].phase, Phase::Idle);
+        let label = match phase {
+            Phase::Idle => self.start_command(i),
+            Phase::Lock(w) => self.lock_attempt(i, w),
+            Phase::Commit(r) => self.commit_step(i, r, pick),
+            Phase::Finish(r, result) => self.finish(i, r, *result),
+        };
+        self.unlabel(i);
+        label
+    }
+
+    fn start_command(&mut self, i: usize) -> String {
+        let Some(cmd) = self.actors[i].script.pop_front() else {
+            return "idle".into();
+        };
+        let c = self.actors[i].client;
+        match cmd {
+            Command::Backup { shared, fold } => {
+                self.label(i, "upload");
+                self.actors[i].backups += 1;
+                let snapshot = format!("{}{}", self.actors[i].name, self.actors[i].backups);
+                let src = self
+                    .sim
+                    .prepare_backup_source(&snapshot, backup_tree(&snapshot, shared));
+                let started = self.sim.begin_run(c);
+                let first_step = self.sim.store().step();
+                let run = RunCtx {
+                    index: started.index,
+                    first_step,
+                    op: ClientOp::Backup {
+                        snapshot: snapshot.clone(),
+                    },
+                };
+                let mut cfg = started.cfg;
+                cfg.limits.threads = 1;
+                let handle = self.sim.store().handle(c);
+                let wrap = move |_: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+                    Box::new(handle.clone())
+                };
+                let source_paths = vec![src.to_string_lossy().into_owned()];
+                let req = BackupRequest {
+                    snapshot_name: &snapshot,
+                    passphrase: None,
+                    source_paths: &source_paths,
+                    source_label: "sim",
+                    exclude_patterns: &[],
+                    exclude_if_present: &[],
+                    one_file_system: true,
+                    git_ignore: false,
+                    xattrs_enabled: false,
+                    compression: Compression::None,
+                    command_dumps: &[],
+                    verbose: false,
+                };
+                match backup::upload(
+                    &cfg,
+                    &req,
+                    &mut None,
+                    &CancelToken::new(),
+                    Some(&wrap),
+                    started.env,
+                ) {
+                    Ok(mut pending) => {
+                        pending.join_background_writes();
+                        self.actors[i].phase = Phase::Lock(Box::new(LockWait {
+                            run,
+                            pending,
+                            attempts: 0,
+                            fold,
+                        }));
+                    }
+                    Err((_, e)) => self.end_run(i, run, Err(e)),
+                }
+                "upload".into()
+            }
+            Command::Compact => {
+                self.label(i, "whole");
+                self.sim.call(c, Call::Compact);
+                "whole compact".into()
+            }
+            Command::DeleteControl => {
+                self.label(i, "whole");
+                self.sim.call(
+                    c,
+                    Call::Delete {
+                        names: vec!["c0".into()],
+                    },
+                );
+                "whole delete".into()
+            }
+        }
+    }
+
+    fn lock_attempt(&mut self, i: usize, mut w: Box<LockWait>) -> String {
+        self.label(i, "lock");
+        match w.pending.try_lock() {
+            Ok(guard) => {
+                let LockWait {
+                    run,
+                    mut pending,
+                    fold,
+                    ..
+                } = *w;
+                if fold {
+                    pending.repo_mut().request_index_fold();
+                }
+                let commit = pending.begin_commit(guard);
+                let mut label = String::from("lock");
+                self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
+                label
+            }
+            Err(VykarError::Locked(_)) if w.attempts + 1 < LOCK_ATTEMPTS => {
+                w.attempts += 1;
+                self.actors[i].phase = Phase::Lock(w);
+                "lock (locked)".into()
+            }
+            Err(e) => {
+                let LockWait { run, pending, .. } = *w;
+                pending.abandon();
+                self.end_run(i, run, Err(e));
+                "lock (gave up)".into()
+            }
+        }
+    }
+
+    fn commit_step(&mut self, i: usize, mut r: Box<Running>, pick: usize) -> String {
+        let kind = r
+            .commit
+            .enabled()
+            .get(pick)
+            .copied()
+            .unwrap_or(StepKind::Local);
+        let mut label = kind.name().to_string();
+        self.label(i, kind.name());
+        let result = r.commit.step(pick, &no_events);
+        self.run_locals(i, r, result, &mut label);
+        label
+    }
+
+    /// After a step: run the `Local` steps that follow at once, then set
+    /// the phase from where the machine stands.
+    fn run_locals(
+        &mut self,
+        i: usize,
+        mut r: Box<Running>,
+        mut result: vykar_types::error::Result<()>,
+        label: &mut String,
+    ) {
+        while result.is_ok() && r.commit.enabled() == [StepKind::Local] {
+            self.label(i, StepKind::Local.name());
+            label.push_str(" +local");
+            result = r.commit.step(0, &no_events);
+        }
+        self.actors[i].phase = match result {
+            Err(e) => Phase::Finish(r, Box::new(Err(e))),
+            Ok(()) if r.commit.enabled().is_empty() => {
+                let out = r.commit.take_output().ok_or_else(|| {
+                    VykarError::Other("BUG: the commit machine ended without an output".into())
+                });
+                Phase::Finish(r, Box::new(out))
+            }
+            Ok(()) => Phase::Commit(r),
+        };
+    }
+
+    fn finish(
+        &mut self,
+        i: usize,
+        r: Box<Running>,
+        result: vykar_types::error::Result<Committed>,
+    ) -> String {
+        self.label(i, "finish");
+        let Running { run, commit } = *r;
+        let outcome = commit
+            .finish(result, &mut None)
+            .map(|o| (Vec::new(), format!("partial: {}", o.is_partial)));
+        self.end_run(i, run, outcome);
+        "finish".into()
+    }
+
+    fn end_run(&mut self, i: usize, run: RunCtx, result: RunResult) {
+        let c = self.actors[i].client;
+        self.sim
+            .finish_driven_run(c, run.index, run.op, run.first_step, result);
+    }
+
+    /// Crash actor `i`: every later op of it fails; its session and
+    /// repository are dropped without cleanup (the deregistration fails),
+    /// a run in progress ends with an injected error, and the rest of its
+    /// script is dropped.
+    fn crash(&mut self, i: usize) {
+        let c = self.actors[i].client;
+        self.label(i, "crash");
+        self.sim.crash(c);
+        self.actors[i].script.clear();
+        let phase = std::mem::replace(&mut self.actors[i].phase, Phase::Idle);
+        let run = match phase {
+            Phase::Idle => None,
+            Phase::Lock(w) => {
+                let LockWait { run, pending, .. } = *w;
+                drop(pending);
+                Some(run)
+            }
+            Phase::Commit(r) | Phase::Finish(r, _) => {
+                let Running { run, commit } = *r;
+                drop(commit);
+                Some(run)
+            }
+        };
+        if let Some(run) = run {
+            let err = VykarError::Other(format!("{INJECTED_MARKER}: client crashed"));
+            self.end_run(i, run, Err(err));
+        }
+        self.unlabel(i);
+    }
+
+    fn trace(&self, report: &Report, signatures: &BTreeSet<Signature>) -> Trace {
+        let log = self.sim.store().log();
+        let names: BTreeMap<ClientId, String> = log
+            .iter()
+            .map(|r| (r.client, self.sim.store().client_name(r.client)))
+            .collect();
+        let entries = self
+            .entries
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.ops = log
+                    .iter()
+                    .filter(|r| r.step > e.steps.0 && r.step <= e.steps.1)
+                    .map(|r| op_line(r, &names))
+                    .collect();
+                e
+            })
+            .collect();
+        Trace {
+            case: self.case.clone(),
+            entries,
+            signatures: signatures.iter().copied().collect(),
+            report: report.to_string(),
+        }
+    }
+
+    fn trace_text(&self) -> String {
+        self.trace(&Report::default(), &BTreeSet::new()).render()
+    }
+
+    fn verdict(self) -> Outcome {
+        let report = self.sim.check_invariants(&[
+            Invariant::CommittedSnapshotsRestore,
+            Invariant::AcknowledgedCommitsDurable,
+            Invariant::NoSilentRemoval,
+            Invariant::IndexIntegrity,
+            Invariant::AllowedErrors,
+            Invariant::LockExclusion,
+        ]);
+        let signatures = classify(&self.sim, &report, &self.entries);
+        let trace = self.trace(&report, &signatures);
+        Outcome {
+            report,
+            signatures,
+            trace,
+            sim: self.sim,
+        }
+    }
+}
+
+/// "client op key-class outcome".
+fn op_line(r: &OpRecord, names: &BTreeMap<ClientId, String>) -> String {
+    format!(
+        "{} {:?} {} {}",
+        names.get(&r.client).map_or("?", String::as_str),
+        r.op,
+        key_class(&r.key),
+        r.outcome.name()
+    )
+}
+
+fn is_lock_key(key: &str) -> bool {
+    key.starts_with("locks/") && key.ends_with(".json")
+}
+
+/// The acquisition time in a lock key's name (`locks/<micros>-<uuid>.json`).
+fn lock_key_time(key: &str) -> Option<DateTime<Utc>> {
+    let raw = key.strip_prefix("locks/")?.strip_suffix(".json")?;
+    let (micros, _) = raw.split_once('-')?;
+    DateTime::from_timestamp_micros(micros.parse().ok()?)
+}
+
+/// Which violations a case's signatures explain. A signature is inserted
+/// only with at least one violation it claims; a violation, or a skipped
+/// evaluation, that no signature claims inserts `Unknown`.
+struct Claims<'r> {
+    report: &'r Report,
+    claimed: Vec<bool>,
+    sigs: BTreeSet<Signature>,
+}
+
+impl<'r> Claims<'r> {
+    fn new(report: &'r Report) -> Self {
+        Self {
+            report,
+            claimed: vec![false; report.violations.len()],
+            sigs: BTreeSet::new(),
+        }
+    }
+
+    /// Claim for `sig` every violation `pred` accepts; insert `sig` when
+    /// there is one.
+    fn claim(&mut self, sig: Signature, pred: impl Fn(&Violation) -> bool) -> bool {
+        let mut any = false;
+        for (i, v) in self.report.violations.iter().enumerate() {
+            if pred(v) {
+                self.claimed[i] = true;
+                any = true;
+            }
+        }
+        if any {
+            self.sigs.insert(sig);
+        }
+        any
+    }
+
+    fn claim_index(&mut self, sig: Signature, i: usize) {
+        self.claimed[i] = true;
+        self.sigs.insert(sig);
+    }
+
+    /// A cascading signature (see [`Signature`]) found at store step
+    /// `hazard` claims every violation not known to come before it.
+    fn cascade(&mut self, sig: Signature, hazard: u64) {
+        self.claim(sig, |v| v.step.is_none_or(|s| s >= hazard));
+    }
+
+    fn finish(mut self) -> BTreeSet<Signature> {
+        let cascading = self.sigs.iter().any(|s| s.cascades());
+        if self.claimed.iter().any(|c| !c) || (!cascading && !self.report.not_evaluated.is_empty())
+        {
+            self.sigs.insert(Signature::Unknown);
+        }
+        self.sigs
+    }
+}
+
+/// What the case's damage looks like: the hazard signatures that claim its
+/// violations, and `Unknown` when any violation (or skipped evaluation) is
+/// left unclaimed.
+pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BTreeSet<Signature> {
+    let log = sim.store().log();
+    let runs = &sim.history().runs;
+    let released = |r: &OpRecord| matches!(r.outcome, OpOutcome::Released(_));
+    let first_released_write = |prefix: &str| {
+        log.iter()
+            .filter(|r| r.op.is_write() && released(r) && r.key.starts_with(prefix))
+            .map(|r| r.step)
+            .min()
+    };
+    let clock_at = |step: u64| {
+        entries
+            .iter()
+            .find(|e| step > e.steps.0 && step <= e.steps.1)
+            .map(|e| e.clock)
+    };
+    let mut claims = Claims::new(report);
+
+    // Lock keys deleted by a client other than their writer: (step, the
+    // writer, the lock's age in seconds then). The age is taken from the
+    // acquisition time in the key's name, not from the refreshed
+    // `LockEntry.time` production compares: a refreshed lock reads older
+    // here than to the reaper, so the error only goes towards "aged" (a
+    // refreshed lock a same-hostname client reaped young can read as
+    // `AgedLockReaped` instead of `TwoLockHolders`, never the reverse).
+    let mut writers: BTreeMap<&str, ClientId> = BTreeMap::new();
+    let mut reaps: Vec<(u64, ClientId, Option<i64>)> = Vec::new();
+    for r in &log {
+        if r.op.is_write() && r.applied() && is_lock_key(&r.key) {
+            writers.insert(&r.key, r.client);
+        }
+        for k in r.deleted_keys() {
+            if let Some(w) = writers.get(k).copied()
+                && w != r.client
+            {
+                let age = lock_key_time(k)
+                    .zip(clock_at(r.step))
+                    .map(|(t, now)| (now - t).num_seconds());
+                reaps.push((r.step, w, age));
+            }
+        }
+    }
+
+    // Lock-exclusion violations at a write that was not a release: each is
+    // claimed by the lock hazard it follows from. `TwoLockHolders` then
+    // cascades from its earliest reap.
+    let mut two_holders: Option<u64> = None;
+    for (i, v) in report.violations.iter().enumerate() {
+        if v.invariant != Invariant::LockExclusion {
+            continue;
+        }
+        let Some(rec) = v.step.and_then(|s| log.iter().find(|r| r.step == s)) else {
+            continue;
+        };
+        if released(rec) {
+            // A late index write: judged below.
+            continue;
+        }
+        let reaped: Vec<(u64, Option<i64>)> = reaps
+            .iter()
+            .filter(|(s, victim, _)| *s < rec.step && *victim == rec.client)
+            .map(|(s, _, age)| (*s, *age))
+            .collect();
+        let young = reaped
+            .iter()
+            .filter(|(_, a)| a.is_some_and(|a| a <= STALE_LOCK_SECS))
+            .map(|(s, _)| *s)
+            .min();
+        if let Some(s) = young {
+            claims.claim_index(Signature::TwoLockHolders, i);
+            two_holders = Some(two_holders.map_or(s, |h| h.min(s)));
+        } else if reaped
+            .iter()
+            .any(|(_, a)| a.is_some_and(|a| a > STALE_LOCK_SECS))
+        {
+            claims.claim_index(Signature::AgedLockReaped, i);
+        } else if log
+            .iter()
+            .any(|r| r.step < rec.step && r.op.is_write() && released(r) && is_lock_key(&r.key))
+        {
+            claims.claim_index(Signature::OrphanLockKey, i);
+        }
+    }
+
+    // Session markers deleted by another client while their writer's run
+    // was still in progress: the victim run's disallowed error and the
+    // violations of its snapshot.
+    let mut marker_writes: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
+    for r in &log {
+        if r.op.is_write()
+            && r.applied()
+            && r.key.starts_with("sessions/")
+            && r.key.ends_with(".json")
+        {
+            marker_writes.insert(&r.key, (r.client, r.run, r.step));
+        }
+        for k in r.deleted_keys() {
+            let Some((writer, run, written)) = marker_writes.get(k).copied() else {
+                continue;
+            };
+            let Some(victim) = run
+                .and_then(|i| runs.iter().find(|x| x.index == i))
+                .filter(|x| x.last_step > r.step)
+            else {
+                continue;
+            };
+            if writer == r.client {
+                continue;
+            }
+            let young = clock_at(written)
+                .zip(clock_at(r.step))
+                .is_some_and(|(w, now)| (now - w).num_seconds() <= STALE_SESSION_SECS);
+            let sig = if young {
+                Signature::SessionReaped
+            } else {
+                Signature::AgedSessionReaped
+            };
+            let run_subject = run_subject(victim);
+            let snapshot = match &victim.op {
+                ClientOp::Backup { snapshot } => Some(snapshot.as_str()),
+                _ => None,
+            };
+            claims.claim(sig, |v| {
+                (v.kind == ViolationKind::DisallowedError && v.subject == run_subject)
+                    || snapshot == Some(v.subject.as_str())
+            });
+        }
+    }
+
+    // A released head write cascades from its step when it left an
+    // acknowledged snapshot without index coverage, or the index naming
+    // an absent pack.
+    let late_head = first_released_write("index.h/");
+    if let Some(hazard) = late_head {
+        let acknowledged: BTreeSet<&str> = runs
+            .iter()
+            .filter_map(|r| match (&r.op, &r.outcome) {
+                (ClientOp::Backup { snapshot }, RunOutcome::Ok { .. }) => Some(snapshot.as_str()),
+                _ => None,
+            })
+            .collect();
+        let after = |v: &Violation| v.step.is_none_or(|s| s >= hazard);
+        if report.violations.iter().any(|v| {
+            after(v)
+                && matches!(
+                    v.kind,
+                    ViolationKind::TreeChunkNotInIndex | ViolationKind::FileChunkNotInIndex
+                )
+                && acknowledged.contains(v.subject.as_str())
+        }) {
+            claims.cascade(Signature::LateHeadWrite, hazard);
+        }
+        if report
+            .violations
+            .iter()
+            .any(|v| after(v) && v.kind == ViolationKind::IndexNamesAbsentPack)
+        {
+            claims.cascade(Signature::LateHeadThenCompact, hazard);
+        }
+    }
+    if let Some(hazard) = two_holders {
+        claims.cascade(Signature::TwoLockHolders, hazard);
+    }
+
+    // A released snapshot PUT: the violations of the snapshot it wrote.
+    if late_head.is_none() && !report.violated(Invariant::LockExclusion) {
+        for r in log
+            .iter()
+            .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("snapshots/"))
+        {
+            let Some(ClientOp::Backup { snapshot }) = r
+                .run
+                .and_then(|i| runs.iter().find(|x| x.index == i))
+                .map(|x| &x.op)
+            else {
+                continue;
+            };
+            if report.violated_for(Invariant::CommittedSnapshotsRestore, snapshot) {
+                claims.claim(Signature::LateSnapshotWrite, |v| v.subject == *snapshot);
+            }
+        }
+    }
+
+    // Lock-exclusion violations at a released index write that nothing
+    // above explains.
+    let unclaimed_late_index: Vec<usize> = report
+        .violations
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| {
+            !claims.claimed[*i]
+                && v.invariant == Invariant::LockExclusion
+                && v.step
+                    .and_then(|s| log.iter().find(|r| r.step == s))
+                    .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for i in unclaimed_late_index {
+        claims.claim_index(Signature::LateIndexWrite, i);
+    }
+
+    claims.finish()
+}

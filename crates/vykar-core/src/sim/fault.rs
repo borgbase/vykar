@@ -172,6 +172,8 @@ pub struct ParkedEffect {
     /// `BatchDelete` only.
     pub keys: Vec<String>,
     pub issued_at_step: u64,
+    /// The issuing client's label at the issue.
+    pub label: Option<&'static str>,
     /// `Delay` or `Duplicate`.
     pub action: FaultAction,
     pub(crate) effect: Effect,

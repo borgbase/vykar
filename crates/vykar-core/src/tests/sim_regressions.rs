@@ -52,15 +52,17 @@ fn taken(o: &Outcome, choices: usize) -> Vec<(Action, String)> {
 fn fixed_by(s: Signature) -> &'static str {
     match s {
         Signature::TwoLockHolders | Signature::SessionReaped => "04 step 1",
-        Signature::AgedSessionReaped | Signature::AgedLockReaped => "04 step 5",
+        Signature::AgedLockReaped => "04 steps 8 and 9 (the lock leaves the commit path)",
+        Signature::AgedSessionReaped => "04 step 7 (marker horizon) and I8",
         Signature::OrphanLockKey
         | Signature::LateHeadWrite
         | Signature::LateSnapshotWrite
         | Signature::LateIndexWrite
-        | Signature::LateHeadSegmentCollected => "04 step 8",
-        Signature::LateHeadThenCompact
-        | Signature::AgedLockSegmentCollected
-        | Signature::AgedLockPacksCollected => "04 steps 5 and 8",
+        | Signature::LateHeadSegmentCollected
+        | Signature::AgedLockSegmentCollected => "04 step 8",
+        Signature::LateHeadThenCompact | Signature::AgedLockPacksCollected => {
+            "04 step 8 (narrowed by step 5: needs packs older than T_pack)"
+        }
         Signature::Unknown => "nothing: Unknown is never expected",
     }
 }
@@ -135,6 +137,66 @@ fn regression_seeds_hold() {
         paths.len(),
         failures.join("\n\n")
     );
+}
+
+/// The outcome class of each run: Ok, the allowed error, or disallowed.
+fn run_classes(o: &Outcome) -> Vec<String> {
+    o.sim
+        .history()
+        .runs
+        .iter()
+        .map(|r| {
+            if r.is_ok() {
+                "Ok".to_string()
+            } else {
+                format!("{:?}", r.error_class())
+            }
+        })
+        .collect()
+}
+
+/// 04 step 5: no protocol decision reads a client's wall clock, so every
+/// seed gives the same decisions, signatures and run outcomes with its
+/// clients' clocks skewed by hours (cut to the seed's client count). A
+/// difference is a finding, not a reason to relax this.
+#[test]
+fn regression_seeds_are_skew_invariant() {
+    const SKEWS: [i64; 3] = [5 * 3600, -5 * 3600, 13 * 3600];
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(seed_dir())
+        .expect("read the seed directory")
+        .map(|e| e.expect("seed directory entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    let template = Template::new();
+    let mut failures = Vec::new();
+    for path in &paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let seed: Seed = serde_json::from_str(&std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(|e| panic!("seed {stem}: {e}"));
+        let plain = run_case(&template, &seed.case);
+        let mut skewed_case = seed.case.clone();
+        skewed_case.skews = SKEWS
+            .iter()
+            .copied()
+            .cycle()
+            .take(seed.case.clients.len())
+            .collect();
+        let skewed = run_case(&template, &skewed_case);
+        let n = seed.case.choices.len();
+        if taken(&plain, n) != taken(&skewed, n)
+            || plain.signatures != skewed.signatures
+            || run_classes(&plain) != run_classes(&skewed)
+        {
+            failures.push(format!(
+                "seed {stem} differs under skews {:?}:\nunskewed:\n{}\nskewed:\n{}",
+                skewed_case.skews,
+                plain.trace.render(),
+                skewed.trace.render()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 /// `VYKAR_SIM_PROMOTE=<trace file>`: run the trace's case and print it as a

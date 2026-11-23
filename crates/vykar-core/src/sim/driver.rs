@@ -65,10 +65,12 @@ pub const MAX_ADVANCES: usize = 3;
 /// Real time to wait for the heartbeats to settle after a step.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lock staleness of today's protocol (`DEFAULT_STALE_LOCK_SECS`).
+/// Lock staleness of today's protocol (`DEFAULT_STALE_LOCK_SECS`), on the
+/// store's clock since 04 step 5.
 const STALE_LOCK_SECS: i64 = 6 * 3600;
 
-/// Session staleness of today's protocol (`SESSION_STALE_SECS`).
+/// Session staleness of today's protocol (`SESSION_STALE_SECS`), on the
+/// store's clock since 04 step 5.
 const STALE_SESSION_SECS: i64 = 45 * 60;
 
 /// Size of each file of a backup's tree.
@@ -182,6 +184,11 @@ pub struct Case {
     /// What the driver does past the end of `choices`.
     #[serde(default)]
     pub policy: Policy,
+    /// Wall-clock skew in seconds of each client, by index into `clients`
+    /// (missing: 0). Since 04 step 5 no protocol decision reads a client's
+    /// wall clock, so a case must behave the same under any skews.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skews: Vec<i64>,
 }
 
 /// What the driver does past the end of a case's choices.
@@ -312,7 +319,14 @@ pub enum Action {
 /// signature excuses every other violation of its case: "no `Unknown`" is a
 /// weak guard for such cases until the hazards are gone. Part 5 of
 /// clean-design phase F (04 step 1) removed `TwoLockHolders`' source;
-/// part 9 (04 step 8) removes the late head writes.
+/// part 7 (04 step 5: ages on the store's clock, young orphan packs kept)
+/// narrowed `AgedSessionReaped`, `AgedLockPacksCollected` and
+/// `LateHeadThenCompact`; part 9 (04 step 8) removes the late head writes.
+///
+/// The driver's time jumps move the store and every client clock together,
+/// so a jump is a genuine stall of every client, and ages on the store's
+/// clock see it like the clients' clocks did; a case's `skews` move only
+/// client wall clocks, which no protocol decision reads since 04 step 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Signature {
     /// H1: a protected write by a client whose live lock another client on
@@ -356,16 +370,22 @@ pub enum Signature {
     /// Claims like `SessionReaped`; since 04 step 2 a victim whose pack
     /// check fails with its marker gone fails typed and leaves no signature,
     /// so what remains are the routes `SessionReaped` names (the late
-    /// marker copy is the one campaigns find).
-    /// The documented limit of today's heartbeat; 04 step 5 (server-clock
-    /// ages) and I8 (a backup whose marker was missing does not commit)
-    /// bound it.
+    /// marker copy is the one campaigns found).
+    /// The documented limit of today's heartbeat. Since 04 step 5 the reap
+    /// is left (46 min without a marker write is stale on any clock) but
+    /// its damage narrows: compact keeps the victim's orphan uploads younger
+    /// than T_pack. Packs the compact's own sweep emptied still go at once:
+    /// a victim that published its head but not yet its snapshot loses them
+    /// (seed `aged-session-reaped-swept-packs`). Bounded by 04 step 7 (the
+    /// marker horizon) and I8.
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
-    /// age (older than the 6 h stale age: the driver's time jumps). The
-    /// fallback protocol's documented limit; 04 step 5 moves lock ages to
-    /// the server's clock, and step 8 takes the lock off the commit path.
-    /// Claims the lock-exclusion violation it is derived from.
+    /// age (not written for more than the 6 h stale age: the driver's time
+    /// jumps, a genuine stall of the holder). The fallback protocol's
+    /// documented limit; since 04 step 5 the age is the lock key's mtime on
+    /// the store's clock, which only a stall (or a store clock step) moves
+    /// past the stale age. 04 steps 8 and 9 take the lock off the commit
+    /// path. Claims the lock-exclusion violation it is derived from.
     AgedLockReaped,
     /// A protected write while the store held a lock key that a delayed or
     /// duplicated lock PUT left behind after its writer had deleted it (a
@@ -381,7 +401,12 @@ pub enum Signature {
     /// Fixed by 04 step 8.
     LateHeadWrite,
     /// H3-compact: a released write of `index.h/`, and the index names an
-    /// absent pack. Fixed by 04 steps 5 and 8.
+    /// absent pack. Since 04 step 5 compact deletes only orphan packs older
+    /// than T_pack (12 h). A jump after the failed commit ages its segment
+    /// past T_idx too, so the compact's index GC takes it and the case shows
+    /// `LateHeadSegmentCollected` instead; the packs must age before the
+    /// segment is written (jumps between the uploads and the commit lock,
+    /// seed `late-head-then-compact-old-packs`). Fixed by 04 step 8.
     LateHeadThenCompact,
     /// H3 meeting index GC (04 "Current issues" 2 and 3): a head PUT that
     /// timed out names a segment of its failed commit; before the late
@@ -413,8 +438,9 @@ pub enum Signature {
     /// `HeadObjectAbsent`, the `ChainUnloadable` naming S, the
     /// `DisallowedError` naming S of runs that end after V's head PUT, and
     /// the skipped evaluations; the head PUT's own lock violation stays
-    /// `AgedLockReaped`'s. Fixed by 04 steps 5 (server-clock lock ages)
-    /// and 8 (create-if-absent commits take the lock off the commit path).
+    /// `AgedLockReaped`'s. Left by 04 step 5 (the lock is reaped by genuine
+    /// age, the segment collected at T_idx = 1 h); fixed by 04 step 8
+    /// (create-if-absent commits take the lock off the commit path).
     AgedLockSegmentCollected,
     /// The same aged reap with packs instead of a segment: victim V's lock
     /// and session marker age past their staleness in one jump of time;
@@ -424,8 +450,11 @@ pub enum Signature {
     /// them). Requires an aged reap of V's lock at step r, an applied
     /// delete after r by another client of a pack V PUT, and a later
     /// non-released `index.h/` PUT by V that violates lock exclusion;
-    /// claims the `IndexNamesAbsentPack` of those packs. Fixed by 04 steps
-    /// 5 (server-clock ages for locks, markers and orphan packs) and 8.
+    /// claims the `IndexNamesAbsentPack` of those packs. Since 04 step 5
+    /// V's packs must be at least T_pack (12 h) old on the store's clock at
+    /// the compact: a jump between V's uploads and its commit lock, one
+    /// before its fence (which refreshes the lock) and one after (seed
+    /// `aged-lock-packs-collected-old-packs`). Fixed by 04 step 8.
     AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
     /// chunks: invariant 1 fails with no lock violation other than late
@@ -613,6 +642,9 @@ struct LockWait {
     pending: PendingCommit,
     attempts: u32,
     fold: bool,
+    /// The wait's reading of the store's clock, shared by its attempts as
+    /// `acquire_lock_with_deadline` shares it.
+    store_clock: crate::repo::ages::StoreClock,
 }
 
 struct Running {
@@ -699,18 +731,26 @@ impl<'c> Driver<'c> {
                 }
             })
             .collect();
+        for (actor, &skew) in actors.iter().zip(&case.skews) {
+            if skew != 0 {
+                sim.set_skew(actor.client, chrono::Duration::seconds(skew));
+            }
+        }
         for f in &case.faults {
             let Some(actor) = actors.get(usize::from(f.client)) else {
                 continue;
             };
+            // Lock faults land on lock keys only, never on a clock probe
+            // (`locks/vykar-clock-*`), so the count of a class's writes
+            // is the same with and without contention.
+            let key = match f.class {
+                KeyClass::Lock => KeyMatch::LockKey,
+                class => KeyMatch::Prefix(class.prefix().into()),
+            };
             sim.fault(
-                FaultRule::new(
-                    OpMatch::AnyWrite,
-                    KeyMatch::Prefix(f.class.prefix().into()),
-                    f.kind.action(),
-                )
-                .client(actor.client)
-                .nth(u32::from(f.nth.max(1))),
+                FaultRule::new(OpMatch::AnyWrite, key, f.kind.action())
+                    .client(actor.client)
+                    .nth(u32::from(f.nth.max(1))),
             );
         }
         Self {
@@ -945,6 +985,7 @@ impl<'c> Driver<'c> {
                             pending,
                             attempts: 0,
                             fold,
+                            store_clock: Default::default(),
                         }));
                     }
                     Err((_, e)) => self.end_run(i, run, Err(e)),
@@ -971,7 +1012,7 @@ impl<'c> Driver<'c> {
 
     fn lock_attempt(&mut self, i: usize, mut w: Box<LockWait>) -> String {
         self.label(i, "lock");
-        match w.pending.try_lock() {
+        match w.pending.try_lock(&mut w.store_clock) {
             Ok(guard) => {
                 let LockWait {
                     run,
@@ -1158,13 +1199,6 @@ fn is_lock_key(key: &str) -> bool {
     key.starts_with("locks/") && key.ends_with(".json")
 }
 
-/// The acquisition time in a lock key's name (`locks/<micros>-<uuid>.json`).
-fn lock_key_time(key: &str) -> Option<DateTime<Utc>> {
-    let raw = key.strip_prefix("locks/")?.strip_suffix(".json")?;
-    let (micros, _) = raw.split_once('-')?;
-    DateTime::from_timestamp_micros(micros.parse().ok()?)
-}
-
 /// A lock key deleted by a client other than its writer.
 struct Reap {
     /// The store step of the delete.
@@ -1173,7 +1207,8 @@ struct Reap {
     victim: ClientId,
     /// The writer's run.
     run: Option<usize>,
-    /// The lock's age in seconds at the delete, from the key's name.
+    /// The lock's age in seconds at the delete: since the key's last
+    /// applied write, on the trace clock.
     age: Option<i64>,
 }
 
@@ -1268,23 +1303,22 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
     let mut claims = Claims::new(report);
 
     // Lock keys deleted by a client other than their writer, with the
-    // lock's age then. The age is taken from the acquisition time in the
-    // key's name, not from the refreshed
-    // `LockEntry.time` production compares: a refreshed lock reads older
-    // here than to the reaper, so the error only goes towards "aged" (a
-    // refreshed lock a same-hostname client reaped young can read as
-    // `AgedLockReaped` instead of `TwoLockHolders`, never the reverse).
-    let mut writers: BTreeMap<&str, (ClientId, Option<usize>)> = BTreeMap::new();
+    // lock's age then. Since 04 step 5 production ages a lock by its mtime
+    // on the store's clock, which every applied write renews (the fence
+    // refresh rewrites the key), so the age is taken from the key's last
+    // applied write, on the trace clock. Driver jumps move the store and
+    // every client together, so the two agree.
+    let mut writers: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
     let mut reaps: Vec<Reap> = Vec::new();
     for r in &log {
         if r.op.is_write() && r.applied() && is_lock_key(&r.key) {
-            writers.insert(&r.key, (r.client, r.run));
+            writers.insert(&r.key, (r.client, r.run, r.step));
         }
         for k in r.deleted_keys() {
-            if let Some((w, run)) = writers.get(k).copied()
+            if let Some((w, run, written)) = writers.get(k).copied()
                 && w != r.client
             {
-                let age = lock_key_time(k)
+                let age = clock_at(written)
                     .zip(clock_at(r.step))
                     .map(|(t, now)| (now - t).num_seconds());
                 reaps.push(Reap {

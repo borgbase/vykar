@@ -265,7 +265,7 @@ pub fn chunk_hasher_for(key: [u8; 32]) -> ChunkHasher {
 }
 
 /// Shared handle to inspect backend traffic: keys written via `put()`, and
-/// counts of `get_range()`, `list()`, `list_sized()`, `list_tree_sized()` and
+/// counts of `get_range()`, `list()`, `list_sized()`, `list_tree_meta()` and
 /// `size()` calls.
 #[derive(Clone)]
 pub struct PutLog {
@@ -297,7 +297,7 @@ impl PutLog {
         self.sized_lists.load(Ordering::Relaxed)
     }
 
-    /// Counted `list_tree_sized()` calls (only in a tree-listing mode).
+    /// Counted `list_tree_meta()` calls (only in a tree-listing mode).
     pub fn tree_list_count(&self) -> u64 {
         self.tree_lists.load(Ordering::Relaxed)
     }
@@ -306,7 +306,7 @@ impl PutLog {
         self.sizes.load(Ordering::Relaxed)
     }
 
-    /// Reset the `list()`, `list_sized()`, `list_tree_sized()` and `size()`
+    /// Reset the `list()`, `list_sized()`, `list_tree_meta()` and `size()`
     /// counters.
     pub fn reset_metadata_counts(&self) {
         for c in [
@@ -358,7 +358,7 @@ pub struct RecordingBackend {
     tree_listing: TreeListing,
 }
 
-/// How [`RecordingBackend`] answers `list_tree_sized`.
+/// How [`RecordingBackend`] answers `list_tree_meta`.
 enum TreeListing {
     /// No server: `server_ops()` is None, so nothing asks for a tree listing.
     Unsupported,
@@ -397,18 +397,18 @@ impl RecordingBackend {
     }
 
     /// Like [`Self::with_sized_listing`], plus a one-request
-    /// `list_tree_sized` with sizes (a vykar-server).
+    /// `list_tree_meta` with sizes (a vykar-server).
     pub fn with_tree_listing() -> (Self, PutLog) {
         Self::with_tree_mode(true, TreeListing::Answer)
     }
 
-    /// Like [`Self::new`], plus a one-request `list_tree_sized` that reports
+    /// Like [`Self::new`], plus a one-request `list_tree_meta` that reports
     /// no sizes (a vykar-server before `?list&sized`).
     pub fn with_unsized_tree_listing() -> (Self, PutLog) {
         Self::with_tree_mode(false, TreeListing::AnswerUnsized)
     }
 
-    /// Like [`Self::with_sized_listing`], but `list_tree_sized` fails.
+    /// Like [`Self::with_sized_listing`], but `list_tree_meta` fails.
     pub fn with_failing_tree_listing() -> (Self, PutLog) {
         Self::with_tree_mode(true, TreeListing::Fail)
     }
@@ -456,7 +456,7 @@ impl vykar_storage::ServerOps for RecordingBackend {
         Ok(())
     }
 
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+    fn list_tree_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
         let answer = match self.tree_listing {
             TreeListing::Unsupported => {
                 return Err(VykarError::Other("no tree listing without a server".into()));

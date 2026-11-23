@@ -1128,6 +1128,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
 
         type AtLockState = (Option<(String, Vec<u8>)>, Vec<String>);
         let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+        let repo_dir = dir.path().join("repo");
         let hook = {
             let (seen, config) = (Arc::clone(&seen), config.clone());
             move || {
@@ -1149,6 +1150,13 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 entry["last_refresh"] = old.into();
                 storage
                     .put(key, &serde_json::to_vec(&entry).unwrap())
+                    .unwrap();
+                // Its age is its mtime on the storage's clock (04 step 5).
+                fs::File::options()
+                    .write(true)
+                    .open(repo_dir.join(key))
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 3600))
                     .unwrap();
 
                 crate::commands::delete::run(&other, None, &["s1"], false, &CancelToken::new())

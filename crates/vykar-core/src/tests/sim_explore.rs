@@ -139,6 +139,7 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
             advances: true,
             choices,
             policy: Policy::First,
+            skews: vec![],
         })
 }
 
@@ -162,6 +163,7 @@ fn one_hostname_family() -> impl Strategy<Value = Case> {
         advances: false,
         choices,
         policy: Policy::First,
+        skews: vec![],
     })
 }
 
@@ -186,6 +188,7 @@ fn h3_family() -> impl Strategy<Value = Case> {
         advances: true,
         choices,
         policy: Policy::First,
+        skews: vec![],
     })
 }
 

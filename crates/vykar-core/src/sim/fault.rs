@@ -50,6 +50,8 @@ pub enum OpMatch {
     AnyMutation,
     /// Every operation that is not a mutation (`CreateDir` included).
     AnyRead,
+    /// Every listing: `List`, `ListSized` and `ListMeta`.
+    AnyList,
     Any,
 }
 
@@ -61,6 +63,7 @@ impl OpMatch {
             OpMatch::AnyDelete => op.is_delete(),
             OpMatch::AnyMutation => op.is_mutation(),
             OpMatch::AnyRead => !op.is_mutation(),
+            OpMatch::AnyList => matches!(op, OpKind::List | OpKind::ListSized | OpKind::ListMeta),
             OpMatch::Any => true,
         }
     }
@@ -70,7 +73,7 @@ impl OpMatch {
         match self {
             OpMatch::Kind(k) => !k.is_mutation(),
             OpMatch::AnyWrite | OpMatch::AnyDelete | OpMatch::AnyMutation => false,
-            OpMatch::AnyRead | OpMatch::Any => true,
+            OpMatch::AnyRead | OpMatch::AnyList | OpMatch::Any => true,
         }
     }
 }
@@ -80,6 +83,10 @@ pub enum KeyMatch {
     Any,
     Exact(String),
     Prefix(String),
+    /// A lock key (`locks/*.json`), or the `locks/` directory itself (the
+    /// key its listings are logged under); never a clock probe
+    /// (`locks/vykar-clock-*`).
+    LockKey,
 }
 
 impl KeyMatch {
@@ -88,6 +95,9 @@ impl KeyMatch {
             KeyMatch::Any => true,
             KeyMatch::Exact(k) => k == key,
             KeyMatch::Prefix(p) => key.starts_with(p.as_str()),
+            KeyMatch::LockKey => {
+                key == "locks/" || (key.starts_with("locks/") && key.ends_with(".json"))
+            }
         }
     }
 }

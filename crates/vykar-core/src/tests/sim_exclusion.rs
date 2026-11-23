@@ -3,10 +3,12 @@
 //! They assert what `tests/lock.rs` asserted with hooked backends.
 
 use crate::sim::history::{AllowedError, ErrorClass};
-use crate::sim::{Call, ClientId, GateRule, KeyMatch, OpKind, OpMatch, RunRecord, Sim, SourceTree};
+use crate::sim::{Call, ClientId, GateRule, KeyMatch, OpMatch, RunRecord, Sim, SourceTree};
 
+/// Lock keys only: a contended acquire's clock probe
+/// (`locks/vykar-clock-*`) is neither gated nor counted.
 fn locks() -> KeyMatch {
-    KeyMatch::Prefix("locks/".into())
+    KeyMatch::LockKey
 }
 
 /// A run that takes the repo lock and does nothing under it.
@@ -30,7 +32,7 @@ fn lock_writes(sim: &Sim) -> usize {
     sim.store()
         .log()
         .iter()
-        .filter(|r| r.op.is_write() && r.key.starts_with("locks/"))
+        .filter(|r| r.op.is_write() && KeyMatch::LockKey.matches(&r.key))
         .count()
 }
 
@@ -39,11 +41,7 @@ fn tree(seed: &str) -> SourceTree {
 }
 
 fn list_of(c: ClientId, prefix: &str) -> GateRule {
-    GateRule::new(
-        c,
-        OpMatch::Kind(OpKind::List),
-        KeyMatch::Exact(prefix.into()),
-    )
+    GateRule::new(c, OpMatch::AnyList, KeyMatch::Exact(prefix.into()))
 }
 
 /// Both contenders pass the pre-check and PUT before either LISTs: each

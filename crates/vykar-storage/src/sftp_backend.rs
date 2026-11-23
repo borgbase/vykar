@@ -2595,4 +2595,39 @@ mod tests {
             Duration::from_secs(7200)
         );
     }
+
+    /// Ages measured against an object just written use the server's clock
+    /// alone: a skewed server clock moves both mtimes, not the age.
+    #[test]
+    fn store_now_from_a_written_object_ignores_mtime_skew() {
+        let server = FaultServer::start();
+        let backend = server.backend(0);
+        for skew in [-7200_i64, 0, 7200] {
+            server.faults.mtime_skew_secs.store(skew, Ordering::SeqCst);
+            backend.put("locks/a.json", b"abc").unwrap();
+            backend.put("locks/vykar-clock-x", b"probe").unwrap();
+            let listing = backend.list_meta("locks").unwrap();
+            let now = crate::StoreNow::of_written(&listing, "locks/vykar-clock-x").unwrap();
+            let mtime = listing
+                .iter()
+                .find(|o| o.key == "locks/a.json")
+                .and_then(|o| o.mtime)
+                .unwrap();
+            assert!(
+                now.age_of(mtime) < Duration::from_secs(5),
+                "skew {skew}: age {:?}",
+                now.age_of(mtime)
+            );
+            // Against the client's clock the same object is off by the skew.
+            let secs = |d: Duration| i64::try_from(d.as_secs()).unwrap();
+            let by_client = SystemTime::now()
+                .duration_since(mtime)
+                .map_or_else(|e| -secs(e.duration()), secs);
+            assert!(
+                (by_client + skew).abs() < 5,
+                "skew {skew}: client-clock age {by_client}"
+            );
+            backend.delete("locks/vykar-clock-x").unwrap();
+        }
+    }
 }

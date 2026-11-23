@@ -251,6 +251,7 @@ fn run_under_fence<T>(
 ) -> Result<T> {
     let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
     repo.set_lock_fence(fence);
+    repo.set_lock_store_time(guard.store_time());
 
     let result = action(repo);
 
@@ -294,22 +295,31 @@ pub(crate) fn refuse_on_append_only_server(
 
 /// Execute a maintenance operation while holding an advisory lock.
 ///
-/// Acquires the lock, cleans up stale sessions (>45 min since last refresh),
-/// then refuses to run if any non-stale sessions remain. This prevents
-/// maintenance from deleting packs that active backups depend on. Malformed
-/// markers (unparseable JSON or bad timestamps) are preserved and surfaced
-/// in the blocking list — maintenance will not proceed past them without
-/// operator intervention (`break-lock --sessions`).
+/// Acquires the lock, cleans up stale sessions (no marker written for 45 min
+/// by the store's clock), then refuses to run if any non-stale sessions
+/// remain. This prevents maintenance from deleting packs that active backups
+/// depend on. Malformed markers (unparseable JSON or bad timestamps) are
+/// judged by their mtime: while younger than 45 minutes they are preserved
+/// and surfaced in the blocking list, after that they are reaped like any
+/// stale marker (`break-lock --sessions` clears them at once).
 pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
     let env = repo.host_env().clone();
     let guard = lock::acquire_lock(repo.storage.as_ref(), &env)?;
+    // An uncontended acquirer never probes the store's clock, so it removes
+    // the old probes its acquisition listed (best effort).
+    guard.remove_probe_debris(repo.storage.as_ref());
 
     // Clean up stale sessions before checking for active ones.
     let stale_threshold = lock::default_stale_session_duration();
-    match lock::cleanup_stale_sessions(repo.storage.as_ref(), stale_threshold, &env) {
+    match lock::cleanup_stale_sessions(
+        repo.storage.as_ref(),
+        stale_threshold,
+        &env,
+        guard.store_time(),
+    ) {
         Ok(cleaned) => {
             if !cleaned.is_empty() {
                 info!(

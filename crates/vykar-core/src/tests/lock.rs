@@ -1,6 +1,7 @@
+use crate::repo::ages::StoreClock;
 use crate::repo::host_env::{Clock, StopSignal};
 use crate::repo::lock::{
-    HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, RefreshOutcome,
+    HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, NowSource, RefreshOutcome,
     SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, acquire_lock, break_lock,
     cleanup_stale_locks, cleanup_stale_sessions, clear_all_sessions, commit_marker_check,
     default_stale_session_duration, format_age, format_age_since, parse_session_marker_key,
@@ -334,6 +335,7 @@ fn stale_lock_cleanup_preserves_recent_foreign_host() {
         &storage,
         Duration::hours(6),
         &env_on("myhost", Some("boot-b"), |_| false),
+        NowSource::Probe(&mut StoreClock::default()),
     )
     .unwrap();
 
@@ -351,6 +353,7 @@ fn stale_lock_cleanup_reaps_malformed_lock_by_key_age() {
         &storage,
         Duration::hours(6),
         &env_on("myhost", Some("boot-a"), |_| true),
+        NowSource::Probe(&mut StoreClock::default()),
     )
     .unwrap();
 
@@ -367,6 +370,7 @@ fn stale_lock_cleanup_preserves_recent_old_format_lock() {
         &storage,
         Duration::hours(6),
         &env_on("myhost", Some("boot-a"), |_| false),
+        NowSource::Probe(&mut StoreClock::default()),
     )
     .unwrap();
 
@@ -384,6 +388,7 @@ fn stale_lock_cleanup_reaps_age_stale_old_format_lock() {
         &storage,
         Duration::hours(6),
         &env_on("myhost", Some("boot-a"), |_| false),
+        NowSource::Probe(&mut StoreClock::default()),
     )
     .unwrap();
 
@@ -457,6 +462,7 @@ fn cleanup_stale_sessions_preserves_active_index() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -482,6 +488,7 @@ fn cleanup_stale_sessions_removes_marker_preserves_index() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert_eq!(cleaned, vec!["sess2"]);
@@ -505,6 +512,7 @@ fn cleanup_stale_sessions_removes_orphaned_index() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert!(cleaned.is_empty(), "no .json marker to report as cleaned");
@@ -531,6 +539,7 @@ fn cleanup_stale_sessions_skips_non_json_files() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -567,6 +576,7 @@ fn cleanup_removes_dead_local_session() {
         &storage,
         Duration::hours(72),
         &env_as(me(), |_pid| false, None),
+        None,
     )
     .unwrap();
     assert_eq!(cleaned, vec!["local-dead"]);
@@ -590,6 +600,7 @@ fn cleanup_does_not_remove_remote_dead_pid() {
         &storage,
         Duration::hours(72),
         &env_on("myhost", None, |_pid| false),
+        None,
     )
     .unwrap();
     assert!(
@@ -614,6 +625,7 @@ fn cleanup_second_pass_removes_orphan_index_from_prior_run() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert_eq!(cleaned, vec!["prior"]);
@@ -629,6 +641,7 @@ fn cleanup_second_pass_removes_orphan_index_from_prior_run() {
         &storage,
         Duration::hours(72),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -690,6 +703,7 @@ fn cleanup_keeps_session_at_44_minutes() {
         &storage,
         default_stale_session_duration(),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert!(cleaned.is_empty(), "44-min session must not be reaped");
@@ -706,6 +720,7 @@ fn cleanup_reaps_session_at_46_minutes() {
         &storage,
         default_stale_session_duration(),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
     assert_eq!(cleaned, vec!["stale"], "46-min session must be reaped");
@@ -724,11 +739,14 @@ fn cleanup_preserves_malformed_marker() {
         &storage,
         default_stale_session_duration(),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
 
     // Malformed markers are not reported as "cleaned" and must NOT be
-    // deleted — they fail-close maintenance until an operator clears them.
+    // deleted while their age is unknown (no mtimes on MemoryBackend) —
+    // they fail-close maintenance. With an mtime they age out after 45 min
+    // (`store_clock::malformed_marker_is_reaped_once_old_by_mtime`).
     assert!(cleaned.is_empty());
     assert!(
         storage.exists("sessions/bad.json").unwrap(),
@@ -751,6 +769,7 @@ fn cleanup_preserves_marker_with_bad_timestamp() {
         &storage,
         default_stale_session_duration(),
         &env_on("other-host", None, pid_always_alive),
+        None,
     )
     .unwrap();
 
@@ -1402,7 +1421,8 @@ fn the_newest_generation_is_numeric() {
     write_session_marker(&storage, "dead.9", &ago(1));
     write_session_marker(&storage, "dead.10", &ago(50));
 
-    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    let cleaned =
+        cleanup_stale_sessions(&storage, default_stale_session_duration(), &env, None).unwrap();
     assert_eq!(cleaned, ["dead"]);
     assert_eq!(
         session_keys(&storage),
@@ -1442,7 +1462,8 @@ fn cleanup_judges_a_session_by_its_newest_key() {
     write_session_marker(&storage, "dead.1", &ago(50));
     storage.put("sessions/dead.index", b"journal").unwrap();
 
-    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    let cleaned =
+        cleanup_stale_sessions(&storage, default_stale_session_duration(), &env, None).unwrap();
     assert_eq!(cleaned, ["dead"]);
     assert_eq!(
         session_keys(&storage),
@@ -1469,7 +1490,8 @@ fn cleanup_keeps_the_journal_of_a_vanished_marker() {
         .insert(session_marker_key("vanish"));
 
     let env = env_on("other-host", None, pid_always_alive);
-    let cleaned = cleanup_stale_sessions(&storage, default_stale_session_duration(), &env).unwrap();
+    let cleaned =
+        cleanup_stale_sessions(&storage, default_stale_session_duration(), &env, None).unwrap();
     assert!(cleaned.is_empty());
     assert!(storage.exists("sessions/vanish.index").unwrap());
 }
@@ -1574,12 +1596,18 @@ fn plant_session(storage: &dyn StorageBackend, w: &Writer) -> String {
 fn verdicts(w: &Writer, env: &HostEnv) -> (bool, bool) {
     let locks = MemoryBackend::new();
     let key = plant_lock(&locks, w);
-    cleanup_stale_locks(&locks, Duration::hours(6), env).unwrap();
+    cleanup_stale_locks(
+        &locks,
+        Duration::hours(6),
+        env,
+        NowSource::Probe(&mut StoreClock::default()),
+    )
+    .unwrap();
     let lock_reaped = !locks.exists(&key).unwrap();
 
     let sessions = MemoryBackend::new();
     let key = plant_session(&sessions, w);
-    cleanup_stale_sessions(&sessions, default_stale_session_duration(), env).unwrap();
+    cleanup_stale_sessions(&sessions, default_stale_session_duration(), env, None).unwrap();
     let session_reaped = !sessions.exists(&key).unwrap();
     (lock_reaped, session_reaped)
 }
@@ -2123,6 +2151,9 @@ mod exclusion {
         assert_eq!(storage.list("locks/").unwrap(), vec![foreign]);
     }
 
+    /// No PUT at all on a backend without mtimes (no clock probe); on a
+    /// real backend the property is "no lock key is PUT"
+    /// (`contended_acquire_writes_only_a_clock_probe`).
     #[test]
     fn contended_acquire_issues_no_put() {
         let (storage, log) = RecordingBackend::new();
@@ -2136,6 +2167,9 @@ mod exclusion {
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
     }
 
+    /// No lock PUT by a registration; on a real backend the probe reads
+    /// "now" from the marker it just wrote, so it writes no clock probe
+    /// either.
     #[test]
     fn register_session_probe_issues_no_lock_put() {
         let (storage, log) = RecordingBackend::new();
@@ -2196,5 +2230,396 @@ mod exclusion {
         }
         assert_eq!(max_inside.load(Ordering::SeqCst), 1);
         assert!(storage.list("locks/").unwrap().is_empty());
+    }
+}
+
+/// Ages on the store's clock (04 step 5): mtimes decide, the timestamps
+/// inside the entries do not. On a real `LocalBackend`, mtimes set by hand.
+mod store_clock {
+    use super::{lock_key_at, write_lock_marker};
+    use crate::repo::HostEnv;
+    use crate::repo::lock::{
+        SessionEntry, acquire_lock, cleanup_stale_sessions, default_stale_session_duration,
+        release_lock,
+    };
+    use crate::sim::{FaultAction, FaultRule, KeyMatch, OpMatch, SimConfig, SimStore};
+    use chrono::Utc;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+    use vykar_storage::StorageBackend;
+    use vykar_storage::local_backend::LocalBackend;
+    use vykar_types::error::VykarError;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    fn local() -> (tempfile::TempDir, LocalBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        (dir, backend)
+    }
+
+    /// Set `key`'s mtime `age` before now.
+    fn age(dir: &Path, key: &str, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(key))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn probes(storage: &dyn StorageBackend) -> Vec<String> {
+        storage
+            .list("locks/")
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.starts_with("locks/vykar-clock-"))
+            .collect()
+    }
+
+    fn marker(storage: &dyn StorageBackend, id: &str, last_refresh: chrono::DateTime<Utc>) {
+        let entry = SessionEntry {
+            hostname: "otherhost".into(),
+            pid: 4242,
+            registered_at: last_refresh.to_rfc3339(),
+            last_refresh: last_refresh.to_rfc3339(),
+            boot_id: None,
+            installation_id: None,
+            pid_ns: None,
+        };
+        storage
+            .put(
+                &format!("sessions/{id}.json"),
+                &serde_json::to_vec(&entry).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn lock_age_is_the_objects_mtime() {
+        // Written just now by its JSON, 7 h old by its mtime: reaped.
+        let (dir, storage) = local();
+        let key = lock_key_at(Utc::now(), "foreign");
+        write_lock_marker(&storage, &key, "otherhost", 4242, Utc::now(), None);
+        age(dir.path(), &key, 7 * HOUR);
+        let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
+        assert!(!storage.exists(&key).unwrap());
+        assert!(guard.store_time().is_some());
+        release_lock(&storage, guard).unwrap();
+        assert_eq!(probes(&storage), Vec::<String>::new());
+
+        // 7 h old by its JSON and its key, fresh by its mtime: it blocks.
+        let (_dir, storage) = local();
+        let old = Utc::now() - chrono::Duration::hours(7);
+        let key = lock_key_at(old, "foreign");
+        write_lock_marker(&storage, &key, "otherhost", 4242, old, None);
+        match acquire_lock(&storage, &HostEnv::system()) {
+            Err(VykarError::Locked(holder)) => assert_eq!(holder.key, key),
+            other => panic!("expected Locked, got {other:?}"),
+        }
+        assert!(storage.exists(&key).unwrap());
+        assert_eq!(probes(&storage), Vec::<String>::new());
+    }
+
+    #[test]
+    fn marker_age_is_the_objects_mtime() {
+        let (dir, storage) = local();
+        // Fresh by its JSON, 46 min old by its mtime.
+        marker(&storage, "aged", Utc::now());
+        age(
+            dir.path(),
+            "sessions/aged.json",
+            Duration::from_secs(46 * 60),
+        );
+        // 2 h old by its JSON, fresh by its mtime.
+        marker(&storage, "live", Utc::now() - chrono::Duration::hours(2));
+        let env = HostEnv::system();
+        let guard = acquire_lock(&storage, &env).unwrap();
+        let cleaned = cleanup_stale_sessions(
+            &storage,
+            default_stale_session_duration(),
+            &env,
+            guard.store_time(),
+        )
+        .unwrap();
+        assert_eq!(cleaned, vec!["aged".to_string()]);
+        assert!(!storage.exists("sessions/aged.json").unwrap());
+        assert!(storage.exists("sessions/live.json").unwrap());
+        release_lock(&storage, guard).unwrap();
+    }
+
+    #[test]
+    fn malformed_marker_is_reaped_once_old_by_mtime() {
+        let (dir, storage) = local();
+        storage.put("sessions/x.json", b"{").unwrap();
+        storage.put("sessions/x.index", b"journal").unwrap();
+        let env = HostEnv::system();
+        let guard = acquire_lock(&storage, &env).unwrap();
+        let max_age = default_stale_session_duration();
+
+        // Young: kept, it blocks maintenance.
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        assert!(cleaned.is_empty(), "{cleaned:?}");
+        assert!(storage.exists("sessions/x.json").unwrap());
+
+        // 46 min old by its mtime: reaped; its journal keeps one run's grace.
+        age(dir.path(), "sessions/x.json", Duration::from_secs(46 * 60));
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        assert_eq!(cleaned, vec!["x".to_string()]);
+        assert!(!storage.exists("sessions/x.json").unwrap());
+        assert!(storage.exists("sessions/x.index").unwrap());
+
+        // Without a reading of "now" nothing is stale by age.
+        storage.put("sessions/y.json", b"{").unwrap();
+        age(dir.path(), "sessions/y.json", 2 * HOUR);
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, None).unwrap();
+        assert!(cleaned.is_empty(), "{cleaned:?}");
+        assert!(storage.exists("sessions/y.json").unwrap());
+        release_lock(&storage, guard).unwrap();
+    }
+
+    #[test]
+    fn clock_probe_debris_is_removed_after_an_hour() {
+        let (dir, storage) = local();
+        let live = lock_key_at(Utc::now(), "foreign");
+        write_lock_marker(&storage, &live, "otherhost", 4242, Utc::now(), None);
+        let old = "locks/vykar-clock-0123456789abcdef0123456789abcdef";
+        let young = "locks/vykar-clock-fedcba9876543210fedcba9876543210";
+        storage.put(old, b"vykar clock probe").unwrap();
+        storage.put(young, b"vykar clock probe").unwrap();
+        age(dir.path(), old, 2 * HOUR);
+        age(dir.path(), young, Duration::from_secs(10 * 60));
+
+        assert!(matches!(
+            acquire_lock(&storage, &HostEnv::system()),
+            Err(VykarError::Locked(_))
+        ));
+        assert!(storage.exists(&live).unwrap());
+        assert_eq!(probes(&storage), vec![young.to_string()]);
+    }
+
+    /// `break-lock` also removes clock probes, which are not locks and are
+    /// not counted.
+    #[test]
+    fn break_lock_removes_clock_probes_uncounted() {
+        let storage = crate::testutil::MemoryBackend::new();
+        let key = lock_key_at(Utc::now(), "foreign");
+        write_lock_marker(&storage, &key, "otherhost", 4242, Utc::now(), None);
+        storage
+            .put(
+                "locks/vykar-clock-0123456789abcdef0123456789abcdef",
+                b"vykar clock probe",
+            )
+            .unwrap();
+        assert_eq!(crate::repo::lock::break_lock(&storage).unwrap(), 1);
+        assert!(storage.list("locks/").unwrap().is_empty());
+    }
+
+    /// Two clients of one SimStore on distinct hosts.
+    fn sim_pair() -> (
+        SimStore,
+        crate::sim::SimClient,
+        crate::sim::SimClient,
+        HostEnv,
+        HostEnv,
+    ) {
+        let store = SimStore::new(SimConfig::default());
+        let (a, b) = (store.register_client("a"), store.register_client("b"));
+        let env = |name: &str| {
+            HostEnv::system().with_host(crate::repo::HostIdentity {
+                hostname: format!("host-{name}"),
+                pid: 1,
+                boot_id: None,
+                installation_id: None,
+                pid_ns: None,
+            })
+        };
+        (
+            store.clone(),
+            store.handle(a),
+            store.handle(b),
+            env("a"),
+            env("b"),
+        )
+    }
+
+    /// With a live lock listed, a contended acquire writes and deletes one
+    /// clock probe under `locks/` and never a lock key.
+    #[test]
+    fn contended_acquire_writes_only_a_clock_probe() {
+        let (store, ha, hb, env_a, env_b) = sim_pair();
+        let held = acquire_lock(&ha, &env_a).unwrap();
+        let from = store.log().len();
+        assert!(matches!(
+            acquire_lock(&hb, &env_b),
+            Err(VykarError::Locked(_))
+        ));
+        let log = store.log();
+        let ops: Vec<_> = log[from..]
+            .iter()
+            .filter(|r| r.client == hb.client() && r.key.starts_with("locks/"))
+            .filter(|r| r.op.is_mutation())
+            .collect();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(
+            ops[0].op.is_write() && ops[0].key.starts_with("locks/vykar-clock-"),
+            "{ops:?}"
+        );
+        assert!(ops[1].op.is_delete() && ops[1].key == ops[0].key, "{ops:?}");
+        assert!(store.keys("locks/vykar-clock-").is_empty());
+        release_lock(&ha, held).unwrap();
+    }
+
+    /// A probe that fails to write is "now unknown": the attempt reaps
+    /// nothing by age and ends `Locked`, not with the storage error; a
+    /// later attempt goes through.
+    #[test]
+    fn failed_clock_probe_reads_as_locked() {
+        let (store, ha, hb, env_a, env_b) = sim_pair();
+        store
+            .add_fault(
+                FaultRule::new(
+                    OpMatch::AnyWrite,
+                    KeyMatch::Prefix("locks/vykar-clock-".into()),
+                    FaultAction::Fail,
+                )
+                .client(hb.client()),
+            )
+            .unwrap();
+        let held = acquire_lock(&ha, &env_a).unwrap();
+        assert!(matches!(
+            acquire_lock(&hb, &env_b),
+            Err(VykarError::Locked(_))
+        ));
+        assert_eq!(store.keys("locks/").len(), 1);
+        release_lock(&ha, held).unwrap();
+        let guard = acquire_lock(&hb, &env_b).unwrap();
+        release_lock(&hb, guard).unwrap();
+    }
+
+    /// Two clients of one SimStore on distinct hosts, on a virtual clock
+    /// the store's clock follows; b's environment runs on it.
+    fn sim_pair_timed() -> (
+        SimStore,
+        std::sync::Arc<crate::sim::SimTime>,
+        crate::sim::SimClient,
+        crate::sim::SimClient,
+        HostEnv,
+    ) {
+        let (store, ha, hb, _, env_b) = sim_pair();
+        let time = crate::sim::SimTime::for_store(&store, crate::sim::TimeMode::Auto);
+        let env_b = env_b.with_clock(std::sync::Arc::new(time.clock(chrono::Duration::zero())));
+        (store, time, ha, hb, env_b)
+    }
+
+    /// PUTs of clock probes by `client` from log position `from`.
+    fn probe_puts(store: &SimStore, client: crate::sim::ClientId, from: usize) -> usize {
+        store.log()[from..]
+            .iter()
+            .filter(|r| r.client == client && r.op.is_write())
+            .filter(|r| r.key.starts_with("locks/vykar-clock-"))
+            .count()
+    }
+
+    /// A wait on a live lock probes the store's clock once while its
+    /// reading is younger than `STORE_READING_MAX_AGE`, and once more per
+    /// `STORE_READING_MAX_AGE` after; every probe uses one key.
+    #[test]
+    fn lock_wait_probes_once_per_reading() {
+        use crate::repo::ages::STORE_READING_MAX_AGE;
+        use crate::repo::control::CancelToken;
+        use crate::repo::lock::acquire_lock_with_deadline;
+
+        let (store, time, ha, hb, env_b) = sim_pair_timed();
+        let live = lock_key_at(store.now(), "foreign");
+        write_lock_marker(&ha, &live, "otherhost", 4242, store.now(), None);
+        let from = store.log().len();
+        let mut attempts = 0;
+        let wait = STORE_READING_MAX_AGE - Duration::from_secs(30);
+        let err = acquire_lock_with_deadline(&hb, &env_b, wait, 500, &CancelToken::new(), |_| {
+            attempts += 1;
+        })
+        .unwrap_err();
+        assert!(matches!(err, VykarError::Locked(_)), "{err:?}");
+        assert!(time.elapsed() >= wait);
+        let lists = store.log()[from..]
+            .iter()
+            .filter(|r| r.client == hb.client() && r.key == "locks/" && !r.op.is_mutation())
+            .count();
+        assert!(lists > 5, "few attempts: {lists} listings of locks/");
+        assert_eq!(attempts, 1, "on_contended once");
+        assert_eq!(probe_puts(&store, hb.client(), from), 1);
+
+        // A 10-minute wait re-probes after each STORE_READING_MAX_AGE, on
+        // the key of the first probe.
+        let from = store.log().len();
+        let err = acquire_lock_with_deadline(
+            &hb,
+            &env_b,
+            crate::repo::lock::COMMIT_LOCK_MAX_WAIT,
+            500,
+            &CancelToken::new(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, VykarError::Locked(_)), "{err:?}");
+        let probes = probe_puts(&store, hb.client(), from);
+        assert!((2..=3).contains(&probes), "{probes} probes");
+        let keys: std::collections::BTreeSet<_> = store
+            .log()
+            .iter()
+            .filter(|r| r.client == hb.client() && r.key.starts_with("locks/vykar-clock-"))
+            .map(|r| r.key.clone())
+            .collect();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert!(store.keys("locks/vykar-clock-").is_empty());
+        assert!(store.object(&live).is_some());
+    }
+
+    /// A lock that passes the stale age during a wait is reaped by a later
+    /// attempt through the extrapolated reading, without a second probe.
+    #[test]
+    fn lock_aging_during_a_wait_is_reaped_by_extrapolation() {
+        use crate::repo::control::CancelToken;
+        use crate::repo::lock::acquire_lock_with_deadline;
+
+        let (store, time, ha, hb, env_b) = sim_pair_timed();
+        let aged = lock_key_at(store.now(), "foreign");
+        write_lock_marker(&ha, &aged, "otherhost", 4242, store.now(), None);
+        // 30 s short of the 6 h stale age when b's wait starts.
+        time.advance(6 * HOUR - Duration::from_secs(30));
+        let from = store.log().len();
+        let mut contended = 0;
+        let guard = acquire_lock_with_deadline(
+            &hb,
+            &env_b,
+            Duration::from_secs(4 * 60),
+            500,
+            &CancelToken::new(),
+            |_| contended += 1,
+        )
+        .unwrap();
+        assert_eq!(contended, 1, "the first attempt saw the lock live");
+        assert!(store.object(&aged).is_none(), "reaped");
+        assert_eq!(probe_puts(&store, hb.client(), from), 1);
+        release_lock(&hb, guard).unwrap();
+    }
+
+    /// An uncontended acquisition probes nothing but lists the old probes
+    /// for `LockGuard::remove_probe_debris`; a young probe is left.
+    #[test]
+    fn uncontended_acquire_removes_probe_debris() {
+        let (dir, storage) = local();
+        let old = "locks/vykar-clock-0123456789abcdef0123456789abcdef";
+        let young = "locks/vykar-clock-fedcba9876543210fedcba9876543210";
+        storage.put(old, b"vykar clock probe").unwrap();
+        storage.put(young, b"vykar clock probe").unwrap();
+        age(dir.path(), old, 2 * HOUR);
+        age(dir.path(), young, Duration::from_secs(10 * 60));
+        let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
+        assert_eq!(probes(&storage).len(), 2, "acquisition deletes nothing");
+        guard.remove_probe_debris(&storage);
+        assert_eq!(probes(&storage), vec![young.to_string()]);
+        release_lock(&storage, guard).unwrap();
     }
 }

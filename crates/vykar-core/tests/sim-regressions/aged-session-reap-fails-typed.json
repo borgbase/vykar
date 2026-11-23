@@ -1,7 +1,9 @@
 {
   "name": "aged-session-reap-fails-typed",
-  "note": "An aged reap on distinct hosts (phase F part 5, promoted from tests::sim_driver::session_reap_claims_only_its_victim): a 6 h 1 min jump at the backup's fetch-head, then compact reaps its aged lock and marker and deletes its packs. It showed AgedSessionReaped (the commit failed with the untyped pack-missing error) until 04 step 2 (phase F part 6): the victim's pack check now finds its marker gone and fails typed (StaleChunksDuringCommit), so this schedule must stay clean (tests::sim_driver::aged_reap_fails_typed_and_claims_only_its_victim). AgedSessionReaped is shown by the seed aged-session-reaped-late-marker-write.",
-  "expect": [],
+  "note": "An aged reap on distinct hosts (phase F part 5, promoted from tests::sim_driver::session_reap_claims_only_its_victim): a 6 h 1 min jump at the backup's fetch-head, then compact reaps its aged lock and marker and deletes its packs. It showed AgedSessionReaped (the commit failed with the untyped pack-missing error) until 04 step 2 (phase F part 6): the victim's pack check now finds its marker gone and fails typed (StaleChunksDuringCommit), so this schedule must stay clean (tests::sim_driver::aged_reap_fails_typed_and_claims_only_its_victim). Since 04 step 5 (phase F part 7) young orphans are kept: with one jump the backup's packs are 6 h old at the compact and stay, so the backup no longer reaches the failing pack check; it writes its segment under the reaped lock and fails at its fence (LockExpired), which leaves AgedLockReaped. The typed path needs two jumps (tests::sim_driver::aged_reap_fails_typed_and_claims_only_its_victim). Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected.",
+  "expect": [
+    "AgedLockReaped"
+  ],
   "at": [
     [
       {

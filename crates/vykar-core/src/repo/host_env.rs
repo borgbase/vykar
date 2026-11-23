@@ -5,6 +5,7 @@
 //! and maintenance code that reads the system clock or the platform identity.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -178,6 +179,10 @@ pub struct HostEnv {
     pub host: HostIdentity,
     /// Same-host process liveness.
     pub pid_alive: Arc<PidAliveFn>,
+    /// Whether this run has warned that locks or markers were aged by
+    /// their timestamps ([`Self::first_timestamp_fallback`]). Shared by the clones of one
+    /// run's environment; [`Self::for_new_run`] gives a fresh one.
+    pub(crate) timestamp_fallback_warned: Arc<AtomicBool>,
 }
 
 impl HostEnv {
@@ -190,7 +195,25 @@ impl HostEnv {
             clock: Arc::new(SystemClock),
             host: HostIdentity::system(),
             pid_alive: Arc::new(|_, pid| crate::platform::is_pid_alive(pid)),
+            timestamp_fallback_warned: Arc::default(),
         }
+    }
+
+    /// This environment for a new run (one opened repository): the same
+    /// clock, identity and liveness check, with its once-per-run warnings
+    /// not yet given.
+    #[must_use]
+    pub fn for_new_run(&self) -> Self {
+        Self {
+            timestamp_fallback_warned: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the timestamp-fallback warning is still to be given in this
+    /// run; true once, false after.
+    pub(crate) fn first_timestamp_fallback(&self) -> bool {
+        !self.timestamp_fallback_warned.swap(true, Ordering::Relaxed)
     }
 
     /// Replace the clock.
@@ -239,6 +262,17 @@ impl fmt::Debug for HostEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_fallback_flag_is_shared_by_clones_and_reset_per_run() {
+        let env = HostEnv::system();
+        assert!(env.first_timestamp_fallback());
+        assert!(!env.clone().first_timestamp_fallback());
+        let next = env.for_new_run();
+        assert!(next.first_timestamp_fallback());
+        assert!(!next.first_timestamp_fallback());
+        assert!(!env.first_timestamp_fallback());
+    }
 
     #[test]
     fn system_clock_now_utc_matches_chrono() {

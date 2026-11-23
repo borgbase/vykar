@@ -11,9 +11,10 @@
 //! by age): [`h4_segment_regression`]. H1 and H1-session are regressions
 //! since 04 step 1 (installation ID): [`h1_regression`],
 //! [`h1_session_regression`]. H2-marker is a regression since 04 step 2
-//! (non-resurrecting marker refresh): [`h2_marker_regression`]. H4 reaches
-//! its two lock holders through a
-//! skewed clock since then ([`Hosts::Skewed`]).
+//! (non-resurrecting marker refresh): [`h2_marker_regression`]. 04 step 5
+//! (ages on the store's clock) moved H4's skew route to the regressions
+//! ([`h4_skew_regression`]) and kept H4 on a store clock step
+//! ([`Hosts::StoreStepped`]); H2 reaches its two holders the same way.
 
 use std::time::Duration;
 
@@ -42,9 +43,14 @@ pub enum Hosts {
     SharedUts,
     /// Hostnames "host-a" and "host-b".
     Distinct,
-    /// Distinct hosts, b's wall clock 6 h 1 min ahead: b reaps a's live
-    /// lock by age (04 issue 1, skew; 04 step 5 bounds it).
+    /// Distinct hosts, b's wall clock 6 h 1 min ahead. Before 04 step 5 b
+    /// reaped a's live lock by age (04 issue 1); since then it reaps nothing
+    /// (ages are on the store's clock).
     Skewed,
+    /// Distinct hosts; the scenario steps the store's clock forward by what
+    /// it needs right before the reaper runs (an NTP correction on the
+    /// server).
+    StoreStepped,
     /// As `SameHostname`, but b's machine boots 30 s after the scenario's
     /// clients are placed, and a scenario that uses it lets a minute pass
     /// once a holds its lock: b's uptime is then shorter than the age of
@@ -136,6 +142,15 @@ fn pair(sim: &mut Sim, hosts: Hosts) -> (ClientId, ClientId) {
             sim.set_skew(b, chrono::Duration::seconds(6 * 3600 + 60));
             (a, b)
         }
+        Hosts::StoreStepped => (sim.client("a"), sim.client("b")),
+    }
+}
+
+/// Step the store's clock forward by `by` for [`Hosts::StoreStepped`]; a
+/// no-op for the other placements.
+fn step_before_reaper(sim: &mut Sim, hosts: Hosts, by: chrono::Duration) {
+    if hosts == Hosts::StoreStepped {
+        sim.step_store_clock(by);
     }
 }
 
@@ -393,14 +408,7 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     let (a, b) = pair(&mut sim, hosts);
     // The 1st LIST of locks/ is the registration probe, the 2nd the commit
     // lock's sweep, after every pack is uploaded.
-    let ga = sim.gate(
-        GateRule::new(
-            a,
-            OpMatch::Kind(OpKind::List),
-            KeyMatch::Exact("locks/".into()),
-        )
-        .nth(2),
-    );
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -466,8 +474,9 @@ pub fn h2_lock_refresh_resurrects() -> HazardOutcome {
 /// H2 with the reap placed by `reap`; `BeforeFence` neutralises it.
 ///
 /// A deletes t0 and t2 and is held at its first fence check; time moves
-/// 3 h 1 min, so A's lock is due for refresh. B, its clock 3 h ahead, sees
-/// A's lock as older than 6 h and reaps it. A's fence before the second
+/// 3 h 1 min, so A's lock is due for refresh, and then the store's clock
+/// steps 3 h forward (an NTP correction on the server): B sees A's lock as
+/// older than 6 h on the store's clock and reaps it. A's fence before the second
 /// snapshot delete is the one that passes after the refresh rewrote its key
 /// (a delete writes no index since 05 step 8, so it has no later fence).
 pub fn h2_with(reap: H2Reap) -> HazardOutcome {
@@ -481,11 +490,10 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     ok(&sim.backup(c, "t1", &seeded("t1")), "control backup t1")?;
     ok(&sim.backup(c, "t2", &seeded("t2")), "control backup t2")?;
     let (a, b) = (sim.client("a"), sim.client("b"));
-    sim.set_skew(b, chrono::Duration::hours(3));
     let locks = || KeyMatch::Prefix("locks/".into());
     let g_fence = sim.gate(GateRule::new(a, OpMatch::Kind(OpKind::Exists), locks()));
-    // The 1st write under locks/ is the acquisition, the 2nd the refresh.
-    let g_refresh = sim.gate(GateRule::new(a, OpMatch::AnyWrite, locks()).nth(2));
+    // The 1st write of a lock key is the acquisition, the 2nd the refresh.
+    let g_refresh = sim.gate(GateRule::new(a, OpMatch::AnyWrite, KeyMatch::LockKey).nth(2));
     let gb = sim.gate(GateRule::new(b, OpMatch::Kind(OpKind::Exists), locks()));
     let sa = sim.spawn(
         a,
@@ -495,6 +503,7 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     );
     reach(&sim, g_fence, "a's first fence check")?;
     sim.advance(Duration::from_secs(3 * 3600 + 60));
+    sim.step_store_clock(chrono::Duration::hours(3));
     let delete_t1 = || Call::Delete {
         names: vec!["t1".into()],
     };
@@ -506,8 +515,8 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
             if sim.poll_paused(gb, GATE_TIMEOUT).map_err(broken)?.is_none() {
                 let rb = sim.join(sb);
                 return Err(broken(format!(
-                    "B did not reap A's lock; check the skew and advance against \
-                     the staleness constants: {:?}",
+                    "B did not reap A's lock; check the store clock step and advance \
+                     against the staleness constants: {:?}",
                     rb.outcome
                 )));
             }
@@ -570,8 +579,8 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
             HazardOutcome::NotReproduced { evidence }
         } else if reap == H2Reap::DuringRefresh && !rb.is_ok() {
             broken(format!(
-                "B did not reap A's lock; check the skew and advance against the \
-                 staleness constants\n{evidence}"
+                "B did not reap A's lock; check the store clock step and advance \
+                 against the staleness constants\n{evidence}"
             ))
         } else {
             different_damage(evidence)
@@ -631,7 +640,7 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
     let sessions = || KeyMatch::Prefix("sessions/".into());
     let g_main = sim.gate(GateRule::new(
         a,
-        OpMatch::Kind(OpKind::List),
+        OpMatch::AnyList,
         KeyMatch::Exact("sessions/".into()),
     ));
     let sa = sim.spawn(
@@ -754,16 +763,17 @@ enum BackupGate {
     Head,
 }
 
-/// H4: compact loses its lock (the age rule, read on a skewed clock) and
-/// deletes sources with no fence after its head PUT; a backup that read
-/// the head before then commits a head that names the deleted packs.
+/// H4: compact loses its lock (the age rule, after the store's clock
+/// stepped 6 h 1 min forward) and deletes sources with no fence after its
+/// head PUT; a backup that read the head before then commits a head that
+/// names the deleted packs.
 pub fn h4_compact_deletes_after_lost_lock() -> HazardOutcome {
-    h4_with(Hosts::Skewed, Order::Interleaved)
+    h4_with(Hosts::StoreStepped, Order::Interleaved)
 }
 
 /// H4 with the clients placed by `hosts` and ordered by `order`.
-/// `Sequential` neutralises it; a placement without the skew removes its
-/// prerequisite (a reaped live lock).
+/// `Sequential` neutralises it; a placement without the store clock step
+/// removes its prerequisite (a reaped live lock).
 ///
 /// Compact A is held at its second head PUT (the first is its sweep's),
 /// after the repack batch's segment PUT. Backup B, whose registration probe
@@ -786,7 +796,7 @@ pub fn h4_segment_with(hosts: Hosts, order: Order) -> HazardOutcome {
 /// regression's subject.
 pub fn h4_segment_regression() -> Report {
     let mut out = Report::default();
-    let (sim, b) = match h4_run(Hosts::Skewed, Order::Interleaved, BackupGate::Head) {
+    let (sim, b) = match h4_run(Hosts::StoreStepped, Order::Interleaved, BackupGate::Head) {
         Ok(Ok(run)) => run,
         Ok(Err(outcome)) | Err(outcome) => {
             out.add(
@@ -805,6 +815,31 @@ pub fn h4_segment_regression() -> Report {
         if sim.store().object(&k).is_none() {
             out.add(ViolationKind::HeadObjectAbsent, &k, "b's segment deleted");
         }
+    }
+    out
+}
+
+/// H4-skew: H4's old route, b's wall clock 6 h 1 min ahead. Since 04 step 5
+/// b judges a's lock by its mtime on the store's clock and does not reap
+/// it: the run ends early with b `Locked` and a `Ok`. Anything else is a
+/// `DisallowedError` "H4-skew" with the outcome.
+pub fn h4_skew_regression() -> Report {
+    let mut out = Report::default();
+    match h4_runs(Hosts::Skewed, Order::Interleaved, BackupGate::Segment) {
+        Ok(Err(HazardOutcome::PrerequisiteNotReproduced {
+            prerequisite: "a reaped live lock",
+            ..
+        })) => {}
+        Ok(Ok((_, _, _, ra, rb))) => out.add(
+            ViolationKind::DisallowedError,
+            "H4-skew",
+            format!("b reaped a's live lock\n{}", outcomes(&ra, &rb)),
+        ),
+        Ok(Err(outcome)) | Err(outcome) => out.add(
+            ViolationKind::DisallowedError,
+            "H4-skew",
+            format!("{outcome:?}"),
+        ),
     }
     out
 }
@@ -839,6 +874,7 @@ fn h4_runs(
     ));
     let sa = sim.spawn(a, Call::Compact);
     reach(&sim, ga, "compact a's second head PUT (nth 2)")?;
+    step_before_reaper(&mut sim, hosts, chrono::Duration::seconds(6 * 3600 + 60));
     if sim.store().keys_written_by(a, "packs/").is_empty() {
         return Err(broken(
             "compact repacked nothing before its second head PUT (nth 2); adjust the \
@@ -861,6 +897,12 @@ fn h4_runs(
                         "b ended before its gate: {}",
                         outcomes(&ra, &rb)
                     )));
+                }
+                if !ra.is_ok() {
+                    return Ok(Err(different_damage(format!(
+                        "b was locked out but a failed\n{}",
+                        outcomes(&ra, &rb)
+                    ))));
                 }
                 return Ok(Err(HazardOutcome::PrerequisiteNotReproduced {
                     prerequisite: "a reaped live lock",

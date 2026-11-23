@@ -595,6 +595,44 @@ pub struct ListedObject {
     pub mtime: Option<std::time::SystemTime>,
 }
 
+/// A reading of the storage's clock: the mtime the storage gave an object
+/// the caller has just written. Ages measured against it use the storage's
+/// clock alone, so no client clock enters (04 "Constants").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreNow(std::time::SystemTime);
+
+impl StoreNow {
+    /// The mtime of `key` in `listing`; `None` when the key is not listed
+    /// or was listed without an mtime.
+    #[must_use]
+    pub fn of_written(listing: &[ListedObject], key: &str) -> Option<Self> {
+        listing
+            .iter()
+            .find(|o| o.key == key)
+            .and_then(|o| o.mtime)
+            .map(Self)
+    }
+
+    /// A reading at `t` (tests, and callers that hold an mtime already).
+    #[must_use]
+    pub fn at(t: std::time::SystemTime) -> Self {
+        Self(t)
+    }
+
+    /// The storage time this reading stands for.
+    #[must_use]
+    pub fn time(self) -> std::time::SystemTime {
+        self.0
+    }
+
+    /// How long before this reading `mtime` was; zero for a later mtime
+    /// (a future mtime is the youngest possible, never "old").
+    #[must_use]
+    pub fn age_of(self, mtime: std::time::SystemTime) -> std::time::Duration {
+        self.0.duration_since(mtime).unwrap_or_default()
+    }
+}
+
 /// What [`BatchDelete::delete_keys`] removes besides the named keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchDeleteScope {
@@ -640,7 +678,7 @@ pub enum ServerOp {
     RepackTrailer,
     /// [`ServerOps::object_sizes`].
     ObjectSizes,
-    /// [`ServerOps::list_tree_sized`].
+    /// [`ServerOps::list_tree_meta`].
     ListTree,
 }
 
@@ -718,15 +756,15 @@ pub trait ServerOps: Send + Sync {
         Err(not_offered("object sizes"))
     }
 
-    /// [`StorageBackend::list_sized`] of the whole tree under `prefix` in one
+    /// [`StorageBackend::list_meta`] of the whole tree under `prefix` in one
     /// request (compact's 256 pack shards). Same result contract, including
-    /// `size: None` from a server older than `?list&sized`. Only after
-    /// `offers(ServerOp::ListTree)`.
+    /// `size: None` / `mtime: None` from a server older than `?list&sized` /
+    /// `&mtime`. Only after `offers(ServerOp::ListTree)`.
     ///
     /// # Errors
     ///
     /// The request failed; `Other` when not offered.
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+    fn list_tree_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         let _ = prefix;
         Err(not_offered("tree listing"))
     }
@@ -1680,6 +1718,41 @@ mod tests {
         assert!(
             (55_000..=85_000).contains(&avg_ms),
             "expected avg cumulative backoff near 1 minute, got {avg_ms}ms"
+        );
+    }
+
+    #[test]
+    fn store_now_age_of_earlier_equal_and_later_mtimes() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let now = StoreNow::at(t);
+        assert_eq!(now.time(), t);
+        let minute = std::time::Duration::from_secs(60);
+        assert_eq!(now.age_of(t - minute), minute);
+        assert_eq!(now.age_of(t), std::time::Duration::ZERO);
+        // A future mtime is the youngest possible.
+        assert_eq!(now.age_of(t + minute), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn store_now_of_written_needs_the_key_and_its_mtime() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let listing = vec![
+            ListedObject {
+                key: "locks/a".into(),
+                size: Some(1),
+                mtime: None,
+            },
+            ListedObject {
+                key: "locks/b".into(),
+                size: Some(1),
+                mtime: Some(t),
+            },
+        ];
+        assert_eq!(StoreNow::of_written(&listing, "locks/c"), None);
+        assert_eq!(StoreNow::of_written(&listing, "locks/a"), None);
+        assert_eq!(
+            StoreNow::of_written(&listing, "locks/b"),
+            Some(StoreNow::at(t))
         );
     }
 }

@@ -352,6 +352,8 @@ fn compact_empty_pack_deleted() {
     // Remove it — the pack is now entirely dead
     repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
+    // Subject: deletion mechanics, not the age guard.
+    repo.set_pack_grace(std::time::Duration::ZERO);
 
     let stats =
         compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
@@ -431,6 +433,8 @@ fn compact_sizes_packs_from_the_listing() {
             Listing::FailingTree,
         ] {
             let (mut repo, log) = repo_on_recording_backend(listing);
+            // Subject: the listing, not the age guard (no mtimes here).
+            repo.set_pack_grace(std::time::Duration::ZERO);
             // A data and a tree chunk land in two packs.
             let (data_id, _, _) = repo
                 .store_chunk(
@@ -777,6 +781,8 @@ mod server_side {
         .unwrap();
         repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
             .unwrap();
+        // Subject: repack and deletion mechanics, not the age guard.
+        repo.set_pack_grace(std::time::Duration::ZERO);
         (repo, log)
     }
 
@@ -1434,4 +1440,216 @@ fn compact_honours_shutdown_during_analysis() {
     );
     assert_eq!(counter.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(count_all_packs(&repo), packs_before);
+}
+
+/// 04 step 5: orphan packs (no index entry names them) go only once they are
+/// T_pack old on the store's clock, read against the lock's reading of
+/// "now"; of unknown age they stay.
+mod store_clock_ages {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    use crate::commands::compact::compact_repo_without_mark;
+    use crate::compress::Compression;
+    use crate::repo::control::CancelToken;
+    use crate::repo::pack::PackType;
+    use crate::repo::{ChunkerParams, EncryptionMode, Repository, WriteSessionOptions};
+    use crate::testutil::{MemoryBackend, init_test_environment};
+    use vykar_storage::{InnerBackend, StorageBackend, StoreNow, delegate_storage_backend};
+    use vykar_types::error::Result;
+
+    /// A memory backend whose `list_meta` reports mtimes: `now` for every
+    /// key unless `set_age` gave it another. With `tree` it is also a
+    /// server whose `list_tree_meta` answers the same listing in one
+    /// request (counted in `tree_lists`).
+    struct MtimeBackend {
+        inner: MemoryBackend,
+        now: SystemTime,
+        mtimes: Mutex<std::collections::HashMap<String, SystemTime>>,
+        tree: bool,
+        tree_lists: AtomicUsize,
+    }
+
+    impl MtimeBackend {
+        fn new(tree: bool) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                now: SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 31),
+                mtimes: Mutex::default(),
+                tree,
+                tree_lists: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_age(&self, key: &str, age: Duration) {
+            self.mtimes
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), self.now - age);
+        }
+
+        fn listing(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+            let mtimes = self.mtimes.lock().unwrap();
+            Ok(self
+                .inner
+                .list_sized(prefix)?
+                .into_iter()
+                .map(|mut o| {
+                    o.mtime = Some(mtimes.get(&o.key).copied().unwrap_or(self.now));
+                    o
+                })
+                .collect())
+        }
+    }
+
+    impl InnerBackend for MtimeBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    impl vykar_storage::ServerOps for MtimeBackend {
+        fn offers(&self, op: vykar_storage::ServerOp) -> bool {
+            op == vykar_storage::ServerOp::ListTree
+        }
+
+        fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+            Ok(crate::testutil::fake_server_caps())
+        }
+
+        fn init(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_tree_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+            self.tree_lists.fetch_add(1, Ordering::Relaxed);
+            self.listing(prefix)
+        }
+    }
+
+    delegate_storage_backend! {
+        for MtimeBackend;
+        except [list_meta, server_ops];
+
+        fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+            self.listing(prefix)
+        }
+
+        fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+            self.tree.then_some(self as &dyn vykar_storage::ServerOps)
+        }
+    }
+
+    /// Three orphan packs, one chunk each; returns their keys.
+    fn three_orphans(repo: &mut Repository) -> Vec<String> {
+        let mut keys = Vec::new();
+        for i in 0..3 {
+            repo.begin_write_session(&WriteSessionOptions::default())
+                .unwrap();
+            let data = format!("orphan-chunk-{i}-for-the-age-guard");
+            let (id, _, _) = repo
+                .store_chunk(data.as_bytes(), Compression::None, PackType::Data)
+                .unwrap();
+            repo.save_state().unwrap();
+            keys.push(repo.chunk_index().get(&id).unwrap().pack_id.storage_key());
+            repo.chunk_index_mut().remove(&id);
+            repo.save_state().unwrap();
+        }
+        keys.dedup();
+        assert_eq!(keys.len(), 3, "one pack per chunk");
+        keys
+    }
+
+    #[test]
+    fn young_orphans_are_kept_and_old_ones_deleted() {
+        young_orphans_kept_old_deleted(false);
+    }
+
+    /// The same through a one-request tree listing (a vykar-server): the
+    /// mtimes `list_tree_meta` reports reach the age guard.
+    #[test]
+    fn young_orphans_are_kept_through_a_tree_listing() {
+        young_orphans_kept_old_deleted(true);
+    }
+
+    fn young_orphans_kept_old_deleted(tree: bool) {
+        init_test_environment();
+        let backend = Arc::new(MtimeBackend::new(tree));
+        let shared: Arc<dyn StorageBackend> = backend.clone();
+        let mut repo = Repository::init(
+            Box::new(shared),
+            EncryptionMode::None,
+            ChunkerParams::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let keys = three_orphans(&mut repo);
+        let minute = Duration::from_secs(60);
+        backend.set_age(&keys[0], Duration::from_secs(3600));
+        backend.set_age(&keys[1], Duration::from_secs(12 * 3600) - minute);
+        backend.set_age(&keys[2], Duration::from_secs(12 * 3600) + minute);
+        repo.set_lock_store_time(Some(StoreNow::at(backend.now)));
+
+        let dry =
+            compact_repo_without_mark(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
+        assert_eq!(
+            (
+                dry.packs_orphan,
+                dry.packs_orphan_young,
+                dry.packs_deleted_empty
+            ),
+            (3, 2, 1)
+        );
+        assert!(keys.iter().all(|k| backend.exists(k).unwrap()));
+
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        assert_eq!(
+            (
+                stats.packs_orphan,
+                stats.packs_orphan_young,
+                stats.packs_deleted_empty
+            ),
+            (3, 2, 1)
+        );
+        assert!(backend.exists(&keys[0]).unwrap());
+        assert!(backend.exists(&keys[1]).unwrap());
+        assert!(!backend.exists(&keys[2]).unwrap());
+        assert_eq!(
+            backend.tree_lists.load(Ordering::Relaxed),
+            if tree { 2 } else { 0 },
+            "one tree listing per compact run"
+        );
+    }
+
+    /// No mtimes (and no reading of "now"): every orphan is kept.
+    #[test]
+    fn orphans_of_unknown_age_are_kept() {
+        init_test_environment();
+        let mut repo = Repository::init(
+            Box::new(MemoryBackend::new()),
+            EncryptionMode::None,
+            ChunkerParams::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let keys = three_orphans(&mut repo);
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        assert_eq!(
+            (
+                stats.packs_orphan,
+                stats.packs_orphan_young,
+                stats.packs_orphan_unknown_age
+            ),
+            (3, 0, 3)
+        );
+        assert_eq!(stats.packs_deleted_empty, 0);
+        assert!(keys.iter().all(|k| repo.storage.exists(k).unwrap()));
+    }
 }

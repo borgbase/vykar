@@ -1,3 +1,4 @@
+pub(crate) mod ages;
 pub(crate) mod blob_read;
 pub(crate) mod bounded;
 pub(crate) mod coalesce;
@@ -573,6 +574,13 @@ pub struct Repository {
     pending_sweep: Option<index_write::PendingSweep>,
     /// Grace of `collect_index_garbage`: `INDEX_GC_GRACE`; tests lower it.
     index_gc_grace: std::time::Duration,
+    /// The maintenance lock's own key's mtime: "now" on the store's clock for
+    /// the ages this lock holder judges. `None` outside a lock, or when the
+    /// storage reports no mtime.
+    lock_store_time: Option<vykar_storage::StoreNow>,
+    /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
+    /// (zero turns the guard off, so a test double without mtimes deletes).
+    pack_grace: std::time::Duration,
 }
 
 impl Repository {
@@ -722,9 +730,32 @@ impl Repository {
         self.lock_fence = Some(fence);
     }
 
-    /// Remove the lock fence.
+    /// Remove the lock fence, and the lock's reading of the store's clock
+    /// with it.
     pub fn clear_lock_fence(&mut self) {
         self.lock_fence = None;
+        self.lock_store_time = None;
+    }
+
+    /// Record the store's clock reading of the lock this handle works under.
+    pub(crate) fn set_lock_store_time(&mut self, t: Option<vykar_storage::StoreNow>) {
+        self.lock_store_time = t;
+    }
+
+    /// "Now" on the store's clock as the held lock read it, if any.
+    pub(crate) fn lock_store_time(&self) -> Option<vykar_storage::StoreNow> {
+        self.lock_store_time
+    }
+
+    /// Set the age below which orphan packs are kept (tests).
+    #[cfg(test)]
+    pub(crate) fn set_pack_grace(&mut self, grace: std::time::Duration) {
+        self.pack_grace = grace;
+    }
+
+    /// The age below which orphan packs are kept.
+    pub(crate) fn pack_grace(&self) -> std::time::Duration {
+        self.pack_grace
     }
 
     /// Check the lock fence if one is installed. No-op if no fence is set.

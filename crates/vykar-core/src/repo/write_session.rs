@@ -124,8 +124,8 @@ pub(crate) struct WriteSessionState {
     /// `.index` keys to delete after successful commit.
     /// `.json` markers are never deleted here — their lifecycle is managed
     /// exclusively by `deregister_session()` (normal exit) and
-    /// `cleanup_stale_sessions()` (>45 min since last refresh, under
-    /// maintenance lock).
+    /// `cleanup_stale_sessions()` (newest marker written >45 min ago by its
+    /// mtime, under maintenance lock).
     pub(crate) recovered_index_keys: Vec<String>,
     /// Number of distinct packs (data + tree) in the persisted index at load time.
     pub(crate) persisted_pack_count: usize,

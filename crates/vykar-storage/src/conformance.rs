@@ -149,6 +149,37 @@ fn run_cases(
         "list_sized reported an mtime".into()
     })?;
 
+    // 5b. "Now" on the store's clock: the mtime of a key just written
+    // measures the age of one written just before it.
+    if opts.expect_mtime {
+        let first = format!("{base}-a");
+        let second = format!("{base}-b");
+        written.push(first.clone());
+        written.push(second.clone());
+        store
+            .put(&first, b"a")
+            .map_err(|e| format!("store_now: put: {e}"))?;
+        store
+            .put(&second, b"b")
+            .map_err(|e| format!("store_now: put: {e}"))?;
+        let listing = store
+            .list_meta(&opts.prefix)
+            .map_err(|e| format!("store_now: list_meta: {e}"))?;
+        let now = crate::StoreNow::of_written(&listing, &second)
+            .ok_or_else(|| format!("store_now: {second} not listed with an mtime"))?;
+        let mtime = listing
+            .iter()
+            .find(|o| o.key == first)
+            .and_then(|o| o.mtime)
+            .ok_or_else(|| format!("store_now: {first} not listed with an mtime"))?;
+        let age = now.age_of(mtime);
+        ensure(
+            age < std::time::Duration::from_secs(60),
+            "store_now",
+            || format!("a key written just before is {age:?} old"),
+        )?;
+    }
+
     // 6. Re-create after delete.
     if !opts.tombstones {
         store

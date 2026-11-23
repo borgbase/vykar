@@ -3110,8 +3110,10 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     .unwrap();
     drop(repo);
 
-    // Fabricate a session marker with last_refresh 50 min ago — no live
-    // process owns it, so maintenance must reap it and proceed.
+    // Fabricate a session marker last written 50 min ago — no live process
+    // owns it, so maintenance must reap it and proceed. Its age is its
+    // mtime on the storage's clock (04 step 5), so the file is backdated
+    // too, not only the timestamps inside it.
     let fifty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(50)).to_rfc3339();
     let marker = format!(
         r#"{{"hostname":"ghost","pid":12345,"registered_at":"{fifty_min_ago}","last_refresh":"{fifty_min_ago}"}}"#
@@ -3120,6 +3122,12 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     std::fs::create_dir_all(&sessions_dir).unwrap();
     let marker_path = sessions_dir.join("stale-session.json");
     std::fs::write(&marker_path, marker.as_bytes()).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&marker_path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(50 * 60))
+        .unwrap();
     assert!(marker_path.exists());
 
     // Maintenance should clean the stale marker and succeed.
@@ -3164,8 +3172,9 @@ fn maintenance_blocks_on_malformed_session_marker() {
     let marker_path = sessions_dir.join("corrupt-session.json");
     std::fs::write(&marker_path, b"this is not json at all").unwrap();
 
-    // Maintenance must fail-close: we can't prove this marker is stale,
-    // so it blocks as an active session with placeholder host/pid.
+    // Maintenance must fail-close: the marker is unreadable and young by
+    // its mtime, so it blocks as an active session with placeholder
+    // host/pid (once 45 min old by its mtime it would be reaped).
     let mut repo2 = open_local_repo_cached(&repo_dir, None);
     let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
     match &err {

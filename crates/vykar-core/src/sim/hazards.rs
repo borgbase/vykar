@@ -9,7 +9,10 @@
 //! to `REGRESSIONS`, where the same scenario must then hold. 05 step 8 moved
 //! H5 (the mark refuses) and H4-segment (index garbage is collected by age)
 //! there; 04 step 1 moved H1 and H1-session (installation ID); 04 step 2
-//! moved H2-marker (non-resurrecting marker refresh).
+//! moved H2-marker (non-resurrecting marker refresh). 04 step 5 (ages on
+//! the store's clock) moved H4's skew route there (H4-skew) and kept H4 on
+//! a store clock step; H3-compact-young is a regression, and H3-compact and
+//! H5-repair now need orphans older than T_pack.
 //!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
 //! protocol, under random schedules; the shapes of damage it recognises are
@@ -19,9 +22,10 @@ use std::collections::BTreeSet;
 
 use super::checker::{Invariant, Report, ViolationKind, head_object_keys};
 use super::fault::{ClientId, FaultAction, FaultRule, KeyMatch, OpMatch};
+use super::gate::GateRule;
 use super::history::{AllowedError, ErrorClass};
 use super::interleavings;
-use super::runner::{Sim, SourceTree};
+use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree};
 
 #[derive(Clone, Debug)]
 pub enum HazardOutcome {
@@ -74,8 +78,8 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         id: "H3-compact",
         summary: "head PUT times out, a compact runs, then the stale head lands \
                   over compact's head and names the packs compact deleted as orphans",
-        fixed_by: "04-commit-protocol.md step 5 (orphan packs younger than T_pack are \
-                   kept) and step 8 (create-if-absent heads)",
+        fixed_by: "04-commit-protocol.md step 8 (create-if-absent heads); step 5 \
+                   narrowed it to orphans older than T_pack",
         run: h3_compact_then_late_head,
     },
     KnownHazard {
@@ -88,14 +92,16 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
     },
     KnownHazard {
         id: "H2",
-        summary: "lock refresh recreates a reaped key: two holders, both fences pass",
+        summary: "lock refresh recreates a reaped key: two holders, both fences pass \
+                  (route: the store's clock steps 3 h forward)",
         fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
         run: interleavings::h2_lock_refresh_resurrects,
     },
     KnownHazard {
         id: "H4",
         summary: "compact loses its lock, deletes sources with no fence after its head \
-                  PUT, and a stale head names the deleted packs",
+                  PUT, and a stale head names the deleted packs (route: the store's \
+                  clock steps 6 h 1 min forward)",
         fixed_by: "04-commit-protocol.md step 3 (fence before deletes; narrows) and \
                    step 8 (create-if-absent heads)",
         run: interleavings::h4_compact_deletes_after_lost_lock,
@@ -133,6 +139,18 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "compact upkeep no longer deletes a concurrent writer's fresh segment \
                   (age-gated GC)",
         run: interleavings::h4_segment_regression,
+    },
+    Regression {
+        id: "H4-skew",
+        summary: "a client 6 h 1 min ahead no longer reaps compact's live lock \
+                  (store-clock ages)",
+        run: interleavings::h4_skew_regression,
+    },
+    Regression {
+        id: "H3-compact-young",
+        summary: "a compact soon after a backup lost its head PUT keeps the backup's \
+                  orphan packs (younger than T_pack); the late head names present packs",
+        run: h3_compact_young_regression,
     },
 ];
 
@@ -212,6 +230,17 @@ pub(super) fn latest_head_key(sim: &Sim) -> Option<String> {
 /// `a` backs up `a1` with its head PUT (under `index.h/`) delayed, so the
 /// commit fails after `a` stored its segment and released the lock.
 fn park_a_head(sim: &mut Sim, a: ClientId) -> Result<(), String> {
+    park_a_head_with(sim, a, None)
+}
+
+/// [`park_a_head`]; with `packs_aged`, a is held at its first `index.d/`
+/// PUT, after its pack uploads, while the store's clock steps by that much:
+/// a's packs are then that old on the store's clock and its segment is new.
+fn park_a_head_with(
+    sim: &mut Sim,
+    a: ClientId,
+    packs_aged: Option<chrono::Duration>,
+) -> Result<(), String> {
     sim.fault(
         FaultRule::new(
             OpMatch::AnyWrite,
@@ -220,7 +249,31 @@ fn park_a_head(sim: &mut Sim, a: ClientId) -> Result<(), String> {
         )
         .client(a),
     );
-    let r = sim.backup(a, "a1", &SourceTree::seeded("a1", 3, FILE_SIZE));
+    let tree = SourceTree::seeded("a1", 3, FILE_SIZE);
+    let r = match packs_aged {
+        None => sim.backup(a, "a1", &tree),
+        Some(by) => {
+            let gate = sim.gate(GateRule::new(
+                a,
+                OpMatch::AnyWrite,
+                KeyMatch::Prefix("index.d/".into()),
+            ));
+            let run = sim.spawn(
+                a,
+                Call::Backup {
+                    snapshot: "a1".into(),
+                    tree,
+                },
+            );
+            if sim.poll_paused(gate, GATE_TIMEOUT)?.is_none() {
+                let r = sim.join(run);
+                return Err(format!("a1 ended before its segment PUT: {}", r.detail()));
+            }
+            sim.step_store_clock(by);
+            sim.resume(gate);
+            sim.join(run)
+        }
+    };
     if r.error_class() != Some(&ErrorClass::Allowed(AllowedError::Injected)) {
         return Err(format!(
             "a1 should fail with the injected fault, got {:?}: {}\n\
@@ -544,6 +597,10 @@ pub fn h5_with(late: LateHead) -> HazardOutcome {
 
 /// `check --repair` between H3 and the compact of H5.
 ///
+/// Since 04 step 5 the compact runs T_pack + 1 min after the repair: the
+/// packs the repair left without entries are true orphans, kept while
+/// younger than T_pack.
+///
 /// Observed on `f7181ea` plus this harness, three runs, all the same:
 /// repair applies `RemoveDanglingSnapshot { "b1", missing_chunks: 1 }` and
 /// `RemoveUnreferencedEntries`, so b1 is gone after the repair; the compact
@@ -577,6 +634,7 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
         .observations
         .last()
         .is_some_and(|o| o.names().any(|n| n == "b1"));
+    sim.advance(ORPHANS_OLD);
     let run = sim.compact(c);
     if !run.is_ok() {
         return broken(format!("compact failed: {}", run.detail()));
@@ -632,37 +690,103 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
 /// Now the head is valid and names deleted packs: silent until `check` or
 /// a restore, and later backups can dedup against those entries. It needs
 /// a lost lock plus a late PUT; 04 step 8 (create-if-absent heads) fixes it.
+///
+/// Since 04 step 5 the compact keeps orphan packs younger than T_pack. A
+/// plain wait of T_pack would also age a's segment past T_idx, and the
+/// compact's index GC would collect it (the loud shape again). The route
+/// is a store clock step of T_pack + 1 min between a's pack uploads and
+/// its segment PUT (an NTP correction on the server, as for H2 and H4):
+/// the packs are old orphans, the segment is new. Without the step it is
+/// the regression H3-compact-young.
 pub fn h3_compact_then_late_head() -> HazardOutcome {
     h3_compact_with(LateHead::AfterB)
 }
 
-/// H3-compact with the landing set by `late`; `AfterB` lands it after the
-/// compact, `BeforeB` before it.
-pub fn h3_compact_with(late: LateHead) -> HazardOutcome {
+/// The wait before a compact that must see a backup's packs as old orphans.
+const ORPHANS_OLD: std::time::Duration =
+    crate::repo::ages::T_PACK.saturating_add(std::time::Duration::from_secs(60));
+
+/// The H3-compact runs: a's head PUT parked (with a's packs aged by
+/// `packs_aged` on the store's clock), a compact runs alone, then the PUT
+/// lands as `late` says. Returns the sim, a, the compact's run and the
+/// report after the landing.
+fn h3_compact_runs(
+    late: LateHead,
+    packs_aged: Option<chrono::Duration>,
+) -> Result<(Sim, ClientId, super::history::RunRecord, Report), HazardOutcome> {
     let mut sim = Sim::new();
     let (a, c) = (sim.client("a"), sim.client("c"));
     let r = sim.backup(c, "c0", &SourceTree::seeded("c0", 3, FILE_SIZE));
     if !r.is_ok() {
-        return broken(format!("control backup c0 failed: {}", r.detail()));
+        return Err(broken(format!("control backup c0 failed: {}", r.detail())));
     }
-    if let Err(e) = park_a_head(&mut sim, a) {
-        return broken(e);
-    }
+    park_a_head_with(&mut sim, a, packs_aged).map_err(broken)?;
     if late == LateHead::BeforeB {
         land(&mut sim, late);
     }
     let run = sim.compact(c);
     if !run.is_ok() {
-        return broken(format!("compact failed: {}", run.detail()));
+        return Err(broken(format!("compact failed: {}", run.detail())));
     }
     let before = sim.check_invariants(Invariant::STEP1);
     if !before.is_clean() {
-        return broken(format!("not consistent before the release:\n{before}"));
+        return Err(broken(format!(
+            "not consistent before the release:\n{before}"
+        )));
     }
     if late != LateHead::BeforeB {
         land(&mut sim, late);
     }
     let report = sim.check_invariants(Invariant::STEP1);
+    Ok((sim, a, run, report))
+}
+
+/// H3-compact-young: H3-compact without the wait. The compact keeps a's
+/// packs (orphans younger than T_pack), so the late head names packs that
+/// exist: a clean STEP1 report with every pack a wrote present.
+pub fn h3_compact_young_regression() -> Report {
+    let mut out = Report::default();
+    let (sim, a, _, report) = match h3_compact_runs(LateHead::AfterB, None) {
+        Ok(run) => run,
+        Err(outcome) => {
+            out.add(
+                ViolationKind::DisallowedError,
+                "scenario",
+                format!("{outcome:?}"),
+            );
+            return out;
+        }
+    };
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    if a_packs.is_empty() {
+        out.add(
+            ViolationKind::DisallowedError,
+            "scenario",
+            "a wrote no packs",
+        );
+    }
+    for k in a_packs {
+        if sim.store().object(&k).is_none() {
+            out.add(
+                ViolationKind::IndexNamesAbsentPack,
+                &k,
+                "a's young orphan pack deleted",
+            );
+        }
+    }
+    out.extend(report);
+    out
+}
+
+/// H3-compact with the landing set by `late`; `AfterB` lands it after the
+/// compact, `BeforeB` before it.
+pub fn h3_compact_with(late: LateHead) -> HazardOutcome {
+    let step = chrono::Duration::from_std(ORPHANS_OLD).expect("T_pack in range");
+    let (sim, a, run, report) = match h3_compact_runs(late, Some(step)) {
+        Ok(run) => run,
+        Err(outcome) => return outcome,
+    };
+    let c = run.client;
     let a_packs = sim.store().keys_written_by(a, "packs/");
     let deleted = deleted_in_run(&sim, c, run.index);
     let dangling: Vec<&String> = a_packs

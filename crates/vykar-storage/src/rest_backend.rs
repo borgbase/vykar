@@ -1184,17 +1184,17 @@ impl ServerOps for RestBackend {
         Ok(sizes)
     }
 
-    /// One `GET <prefix>?list&sized`: the server walks the whole tree.
+    /// One `GET <prefix>?list&sized&mtime`: the server walks the whole tree.
     ///
     /// Not retried: the caller's per-directory fallback supplies the retries,
     /// and a retry after the admin timeout would hold the maintenance lock
     /// while the server is still walking the tree.
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+    fn list_tree_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         let retry = RetryConfig {
             max_retries: 0,
             ..self.retry
         };
-        let body = self.fetch_listing(prefix, "list&sized", &retry)?;
+        let body = self.fetch_listing(prefix, "list&sized&mtime", &retry)?;
         Self::parse_sized_listing(&body)
     }
 }
@@ -1530,19 +1530,20 @@ mod tests {
     }
 
     #[test]
-    fn list_tree_sized_is_one_sized_listing_of_the_prefix() {
+    fn list_tree_meta_requests_and_parses_mtime() {
         let (url, request) = capture_request(&json_response(
-            r#"[{"key":"packs/00/a","size":1},{"key":"packs/ff/b","size":2}]"#,
+            r#"[{"key":"packs/00/a","size":1,"mtime_ms":1700000000123},{"key":"packs/ff/b","size":2}]"#,
         ));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         assert_eq!(
-            backend.list_tree_sized("packs/").unwrap(),
+            backend.list_tree_meta("packs/").unwrap(),
             vec![
                 ListedObject {
                     key: "packs/00/a".into(),
                     size: Some(1),
-                    mtime: None,
+                    mtime: Some(std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
                 },
+                // A server older than `&mtime` omits `mtime_ms`.
                 ListedObject {
                     key: "packs/ff/b".into(),
                     size: Some(2),
@@ -1552,7 +1553,7 @@ mod tests {
         );
         let request = request.join().unwrap();
         assert!(
-            request.starts_with("GET /packs/?list&sized "),
+            request.starts_with("GET /packs/?list&sized&mtime "),
             "got:\n{request}"
         );
     }
@@ -1560,10 +1561,10 @@ mod tests {
     /// The tree listing gets one attempt (compact falls back per shard);
     /// `list_sized` keeps the configured retries.
     #[test]
-    fn list_tree_sized_is_not_retried() {
+    fn list_tree_meta_is_not_retried() {
         let (url, seen) = routing_server(|_| empty("500 Internal Server Error"));
         let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
-        assert!(backend.list_tree_sized("packs/").is_err());
+        assert!(backend.list_tree_meta("packs/").is_err());
         assert_eq!(seen.lock().unwrap().len(), 1);
 
         let (url, seen) = routing_server(|_| empty("500 Internal Server Error"));

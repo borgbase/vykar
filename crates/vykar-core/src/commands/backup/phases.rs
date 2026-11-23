@@ -491,11 +491,19 @@ impl PendingCommit {
         )
     }
 
-    /// One attempt at the commit lock (`lock::acquire_lock`): the
-    /// simulator's driver, which schedules the retries itself.
+    /// One attempt at the commit lock (`lock::acquire_lock_reading`): the
+    /// simulator's driver, which schedules the retries itself and keeps
+    /// `store_clock` across the attempts of one wait.
     #[cfg(any(test, feature = "sim"))]
-    pub(crate) fn try_lock(&self) -> Result<lock::LockGuard> {
-        lock::acquire_lock(self.repo.storage.as_ref(), self.repo.host_env())
+    pub(crate) fn try_lock(
+        &self,
+        store_clock: &mut crate::repo::ages::StoreClock,
+    ) -> Result<lock::LockGuard> {
+        lock::acquire_lock_reading(
+            self.repo.storage.as_ref(),
+            self.repo.host_env(),
+            store_clock,
+        )
     }
 
     /// Join the background journal write Phase 1 leaves running (the

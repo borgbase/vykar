@@ -239,6 +239,21 @@ impl State {
         let mut absent = Vec::new();
         match effect {
             Effect::Put(data) => {
+                // vykar-server's rule for content-addressed `index.d/` and
+                // write-once `index.h/` keys: a PUT of the stored bytes stores
+                // nothing and renews neither mtime nor writer (answered 204,
+                // in append-only mode too). A head PUT with other bytes is
+                // still stored here, where vykar-server answers 409: that
+                // difference is owed by 04 step 8 (phase F part 9).
+                if let Some(existing) = self.objects.get(key)
+                    && existing.data == *data
+                    && matches!(
+                        vykar_protocol::put_rule(key),
+                        vykar_protocol::PutRule::NamedByBlake3 | vykar_protocol::PutRule::WriteOnce
+                    )
+                {
+                    return Ok(absent);
+                }
                 if append_only && self.objects.contains_key(key) && !append_only_overwrite_ok(key) {
                     return Err(append_only_overwrite_refusal(key));
                 }
@@ -520,6 +535,14 @@ impl SimStore {
 
     pub fn advance_clock(&self, by: std::time::Duration) {
         let by = chrono::Duration::from_std(by).expect("clock advance out of range");
+        let mut st = self.state();
+        st.clock += by;
+    }
+
+    /// Step the store's clock alone, in either direction: an NTP correction
+    /// on the server. Client clocks do not move; later writes get mtimes on
+    /// the stepped clock.
+    pub fn step_clock(&self, by: chrono::Duration) {
         let mut st = self.state();
         st.clock += by;
     }
@@ -1246,6 +1269,58 @@ mod tests {
         assert_eq!(last(&store).outcome, OpOutcome::Released(parked[0].id));
         assert_eq!(last(&store).client, a.client());
         assert!(store.release(parked[0].id).is_err());
+    }
+
+    #[test]
+    fn identical_index_re_put_keeps_mtime_and_writer() {
+        let (store, a, b) = two_clients(SimConfig::default());
+        let segment = format!("index.d/{}", "ab".repeat(32));
+        a.put(&segment, b"seg").unwrap();
+        let first = store.object(&segment).unwrap();
+        store.advance_clock(std::time::Duration::from_secs(60));
+        b.put(&segment, b"seg").unwrap();
+        let again = store.object(&segment).unwrap();
+        assert_eq!((again.mtime, again.writer), (first.mtime, a.client()));
+        assert_eq!(last(&store).outcome, OpOutcome::Ok);
+
+        // Other bytes renew (the doubles do not refuse).
+        b.put(&segment, b"other").unwrap();
+        let other = store.object(&segment).unwrap();
+        assert_eq!((other.mtime, other.writer), (store.now(), b.client()));
+
+        // The same for a head.
+        a.put("index.h/3", b"head").unwrap();
+        let head = store.object("index.h/3").unwrap();
+        store.advance_clock(std::time::Duration::from_secs(60));
+        b.put("index.h/3", b"head").unwrap();
+        assert_eq!(store.object("index.h/3").unwrap().mtime, head.mtime);
+    }
+
+    #[test]
+    fn lock_re_put_renews_mtime() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        a.put("locks/x.json", b"l").unwrap();
+        store.advance_clock(std::time::Duration::from_secs(60));
+        a.put("locks/x.json", b"l").unwrap();
+        assert_eq!(store.object("locks/x.json").unwrap().mtime, store.now());
+    }
+
+    #[test]
+    fn step_clock_moves_later_mtimes_both_ways() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        let start = store.now();
+        store.step_clock(chrono::Duration::hours(3));
+        a.put("locks/x.json", b"l").unwrap();
+        assert_eq!(
+            store.object("locks/x.json").unwrap().mtime,
+            start + chrono::Duration::hours(3)
+        );
+        store.step_clock(chrono::Duration::hours(-5));
+        a.put("locks/y.json", b"l").unwrap();
+        assert_eq!(
+            store.object("locks/y.json").unwrap().mtime,
+            start - chrono::Duration::hours(2)
+        );
     }
 
     #[test]

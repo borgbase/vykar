@@ -365,6 +365,14 @@ impl Sim {
         self.time.advance(by);
     }
 
+    /// Step the store's clock alone, in either direction (an NTP correction
+    /// on the server): client clocks stay; every age on the store's clock
+    /// moves by `by`.
+    pub fn step_store_clock(&mut self, by: chrono::Duration) {
+        self.assert_settled();
+        self.store.step_clock(by);
+    }
+
     pub fn time(&self) -> &Arc<SimTime> {
         &self.time
     }
@@ -386,6 +394,7 @@ impl Sim {
             clock: Arc::new(self.time.clock(skew).booted_at(self.hosts.booted_at(c))),
             host: self.hosts.host(c),
             pid_alive: Arc::new(move |local, pid| hosts.pid_alive(local, pid)),
+            timestamp_fallback_warned: Arc::default(),
         }
     }
 
@@ -727,26 +736,11 @@ impl Sim {
     /// backup and a compact from a new client succeed. Runs on a fork, so the
     /// store and the history are not touched.
     ///
-    /// A lock left by a client skewed ahead by more than the ageing is not
-    /// covered, and on an append-only `SimConfig` the probe compact fails.
+    /// Malformed markers age out like the others since 04 step 5 (ages are
+    /// mtimes on the store's clock, so client skew does not matter either).
+    /// On an append-only `SimConfig` the probe compact fails.
     fn check_no_wedge(&self) -> Report {
         let mut report = Report::default();
-        for key in self.store.keys("sessions/") {
-            if !key.ends_with(".json") {
-                continue;
-            }
-            let Some(obj) = self.store.object(&key) else {
-                continue;
-            };
-            if serde_json::from_slice::<lock::SessionEntry>(&obj.data).is_err() {
-                report.skip(
-                    Invariant::NoPermanentWedge,
-                    key,
-                    "malformed session marker: the documented exception",
-                );
-                return report;
-            }
-        }
         let mut probe = Sim::from_store(self.store.fork());
         probe.advance(WEDGE_AGE);
         let c = probe.client("wedge-probe");
@@ -905,12 +899,14 @@ impl Sim {
                         Ok((
                             Vec::new(),
                             format!(
-                                "packs {} repacked {} deleted_empty {} orphan {} corrupt {} \
-                                 unreferenced {}",
+                                "packs {} repacked {} deleted_empty {} orphan {} young {} \
+                                 unknown_age {} corrupt {} unreferenced {}",
                                 s.packs_total,
                                 s.packs_repacked,
                                 s.packs_deleted_empty,
                                 s.packs_orphan,
+                                s.packs_orphan_young,
+                                s.packs_orphan_unknown_age,
                                 s.packs_corrupt,
                                 s.chunks_unreferenced
                             ),

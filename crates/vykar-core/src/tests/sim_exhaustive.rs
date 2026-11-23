@@ -47,6 +47,7 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         advances: false,
         choices: vec![],
         policy: Policy::Continue,
+        skews: vec![],
     }
 }
 
@@ -271,8 +272,11 @@ impl Contender {
     }
 }
 
-/// Two clients each run a no-op under the repo lock. Every `locks/` op of
-/// both is held at a gate; the search picks which held op proceeds next.
+/// Two clients each run a no-op under the repo lock. Every op of both on a
+/// lock key or a listing of `locks/` is held at a gate (a contended
+/// pre-check's clock probe PUT and DELETE are not: no lock reader lists a
+/// probe, so their order does not matter; its listing, by which the
+/// pre-check judges, is gated); the search picks which held op proceeds next.
 /// Continuing the client resumed last is free while it is held; when it is
 /// done (or at the start) every held client is free; anything else is a
 /// preemption.
@@ -292,12 +296,7 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
             .map(|&id| Contender {
                 id,
                 gates: (1..=MAX_LOCK_OPS as u32)
-                    .map(|n| {
-                        sim.gate(
-                            GateRule::new(id, OpMatch::Any, KeyMatch::Prefix("locks/".into()))
-                                .nth(n),
-                        )
-                    })
+                    .map(|n| sim.gate(GateRule::new(id, OpMatch::Any, KeyMatch::LockKey).nth(n)))
                     .collect(),
                 next: 0,
                 held: false,
@@ -366,7 +365,7 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
                     r.client == c
                         && r.step > s
                         && matches!(r.op, OpKind::Delete | OpKind::BatchDelete)
-                        && r.key.starts_with("locks/")
+                        && KeyMatch::LockKey.matches(&r.key)
                 })
                 .map_or_else(
                     || {
@@ -397,7 +396,7 @@ fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
         }
         let wrote = |c: ClientId| {
             log.iter()
-                .any(|r| r.client == c && r.op.is_write() && r.key.starts_with("locks/"))
+                .any(|r| r.client == c && r.op.is_write() && KeyMatch::LockKey.matches(&r.key))
         };
         if ids.iter().all(|&c| wrote(c)) && runs.iter().any(locked) {
             tally.contended_puts += 1;

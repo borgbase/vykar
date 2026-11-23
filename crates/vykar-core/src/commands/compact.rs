@@ -41,6 +41,15 @@ pub struct CompactStats {
     pub space_freed: u64,
     pub packs_corrupt: u64,
     pub packs_orphan: u64,
+    /// Orphan packs kept because they are younger than
+    /// [`ORPHAN_PACK_GRACE`] on the store's clock (counted in
+    /// `packs_orphan` too).
+    pub packs_orphan_young: u64,
+    /// Orphan packs kept because their age is unknown: the listing gave no
+    /// mtime, or there was no reading of "now" (counted in `packs_orphan`
+    /// too). On a storage that reports no modification times this is
+    /// every orphan pack, every run.
+    pub packs_orphan_unknown_age: u64,
     /// Stale `.tmp.*` upload debris removed by the sweep.
     pub temp_files_removed: u64,
     /// Snapshots the mark covered.
@@ -56,6 +65,27 @@ pub struct CompactStats {
 pub(crate) const MARK_REFUSED: &str = "compact refused: the live snapshots could not be marked";
 
 const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How old on the store's clock a pack no index entry names must be before
+/// compact deletes it (T_pack, 04-commit-protocol.md "Constants").
+pub const ORPHAN_PACK_GRACE: std::time::Duration = crate::repo::ages::T_PACK;
+
+/// Whether an orphan with mtime `mtime` may go: always at zero grace;
+/// otherwise only with an mtime, a reading of "now", and an age of at
+/// least `grace`.
+fn old_enough(
+    mtime: Option<std::time::SystemTime>,
+    now: Option<vykar_storage::StoreNow>,
+    grace: std::time::Duration,
+) -> bool {
+    if grace.is_zero() {
+        return true;
+    }
+    match (mtime, now) {
+        (Some(mtime), Some(now)) => now.age_of(mtime) >= grace,
+        _ => false,
+    }
+}
 
 /// Client-side repack persists the index once per batch of source packs (by
 /// count or by their bytes) and only then deletes that batch's sources.
@@ -289,6 +319,7 @@ pub fn compact_repo(
         dry_run,
         concurrency,
         shutdown,
+        &swept.packs,
     )?;
     stats.snapshots_marked = swept.snapshots;
     stats.chunks_unreferenced = swept.entries_removed;
@@ -315,10 +346,12 @@ pub(crate) fn compact_repo_without_mark(
         dry_run,
         concurrency,
         shutdown,
+        &HashSet::new(),
     )
 }
 
 /// Everything [`compact_repo`] does after the mark-and-sweep.
+/// `swept_packs` are the packs whose entries the sweep removed.
 fn compact_after_mark(
     repo: &mut Repository,
     threshold: f64,
@@ -326,6 +359,7 @@ fn compact_after_mark(
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
+    swept_packs: &HashSet<PackId>,
 ) -> Result<CompactStats> {
     let run = compact_packs(
         repo,
@@ -334,6 +368,7 @@ fn compact_after_mark(
         dry_run,
         concurrency,
         shutdown,
+        swept_packs,
     );
     if dry_run {
         repo.discard_index_edits();
@@ -385,6 +420,9 @@ struct Swept {
     snapshots: u64,
     entries_removed: u64,
     bytes_removed: u64,
+    /// The packs of the removed entries: committed once, so a pack the
+    /// sweep left without entries goes at once, whatever its age.
+    packs: HashSet<PackId>,
 }
 
 /// Strict listing, the guards on it, the tree-chunk set, then `mark_live`
@@ -550,10 +588,16 @@ fn apply_sweep(repo: &mut Repository, plan: &SweepPlan) -> Result<()> {
 /// caller discards those edits.
 fn mark_and_sweep(repo: &mut Repository, dry_run: bool, shutdown: &CancelToken) -> Result<Swept> {
     let plan = plan_sweep(repo, shutdown)?;
+    let packs = plan
+        .unreferenced
+        .iter()
+        .filter_map(|(id, _)| repo.chunk_index().get(id).map(|e| e.pack_id))
+        .collect();
     let swept = Swept {
         snapshots: plan.snapshots.len() as u64,
         entries_removed: plan.unreferenced.len() as u64,
         bytes_removed: plan.bytes_removed(),
+        packs,
     };
     debug!(
         snapshots = swept.snapshots,
@@ -592,6 +636,7 @@ fn compact_packs(
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
+    swept_packs: &HashSet<PackId>,
 ) -> Result<PackRun> {
     let mut stats = CompactStats::default();
     let mut deleted: HashSet<PackId> = HashSet::new();
@@ -649,7 +694,14 @@ fn compact_packs(
     let packs_total = AtomicU64::new(0);
     let packs_corrupt = AtomicU64::new(0);
     let packs_orphan = AtomicU64::new(0);
+    let packs_orphan_young = AtomicU64::new(0);
+    let packs_orphan_unknown_age = AtomicU64::new(0);
     let blobs_live = AtomicU64::new(0);
+    // "Now" on the store's clock: the maintenance lock's own key's mtime.
+    // Read at acquisition, before this listing: a pack written since has an
+    // mtime after it and is the youngest possible.
+    let store_now = repo.lock_store_time();
+    let pack_grace = repo.pack_grace();
 
     let storage = repo.storage.as_ref();
     crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |p: &ListedPack| {
@@ -734,6 +786,20 @@ fn compact_packs(
             // Case B: orphan pack (no index entries).
             packs_orphan.fetch_add(1, Ordering::Relaxed);
 
+            // 04 step 5: a pack no entry of the loaded head named may belong
+            // to an upload not yet committed; it goes only once it is T_pack
+            // old on the store's clock. A pack whose entries this run's
+            // sweep removed was committed, and goes now.
+            if !swept_packs.contains(pack_id) && !old_enough(p.mtime, store_now, pack_grace) {
+                if p.mtime.is_none() || store_now.is_none() {
+                    packs_orphan_unknown_age.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    packs_orphan_young.fetch_add(1, Ordering::Relaxed);
+                }
+                debug!(%pack_id, "keeping a young orphan pack");
+                return;
+            }
+
             let payload = pack_size.saturating_sub(pack_header_size);
             if payload > 0 {
                 analyses_mu
@@ -753,7 +819,16 @@ fn compact_packs(
     stats.packs_total = packs_total.load(Ordering::Relaxed);
     stats.packs_corrupt = packs_corrupt.load(Ordering::Relaxed);
     stats.packs_orphan = packs_orphan.load(Ordering::Relaxed);
+    stats.packs_orphan_young = packs_orphan_young.load(Ordering::Relaxed);
+    stats.packs_orphan_unknown_age = packs_orphan_unknown_age.load(Ordering::Relaxed);
     stats.blobs_live = blobs_live.load(Ordering::Relaxed);
+    let unknown_age = stats.packs_orphan_unknown_age;
+    if unknown_age > 0 {
+        warn!(
+            "compact: the storage reported no modification times; {unknown_age} orphan \
+             pack(s) of unknown age are kept"
+        );
+    }
 
     // Bail before Phase 2 if shutdown was requested during analysis.
     shutdown.check()?;

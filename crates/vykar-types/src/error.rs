@@ -19,8 +19,10 @@ pub struct ActiveSessionDetails {
 /// Summary of an active backup session blocking maintenance.
 ///
 /// `details` is `None` when the marker's JSON could not be parsed — such
-/// markers are preserved on storage so maintenance fails closed, and they
-/// require operator intervention (`vykar break-lock --sessions`) to remove.
+/// markers are preserved on storage while younger than the session
+/// staleness by their mtime, so maintenance fails closed; after that they
+/// are reaped like stale markers, and `vykar break-lock --sessions` removes
+/// them at once.
 #[derive(Debug, Clone)]
 pub struct ActiveSessionInfo {
     pub id: String,

@@ -294,6 +294,8 @@ impl Repository {
             fold_requested: false,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
+            lock_store_time: None,
+            pack_grace: super::ages::T_PACK,
         })
     }
 
@@ -503,7 +505,7 @@ impl Repository {
             file_cache_dirty: false,
             cache_dir_override: cache_dir,
             tree_cache,
-            host_env: opts.host_env.clone(),
+            host_env: opts.host_env.for_new_run(),
             write_session: None,
             lock_fence: None,
             key_blob,
@@ -512,6 +514,8 @@ impl Repository {
             fold_requested: false,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
+            lock_store_time: None,
+            pack_grace: super::ages::T_PACK,
         };
         Ok((repo, file_cache_load))
     }

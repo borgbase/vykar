@@ -34,6 +34,7 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         advances: true,
         choices: vec![],
         policy: Policy::First,
+        skews: vec![],
     }
 }
 
@@ -423,12 +424,47 @@ fn assert_victim_fails_typed(o: &Outcome, sig: Signature) -> Report {
     claimed
 }
 
-/// A marker reaped by age (`AgedSessionReaped`): compact runs after a jump
-/// past both stale ages at A's "fetch-head", reaps A's aged lock and marker
-/// and deletes its packs, and A's commit fails typed (D9 of 04 step 2). The
-/// signature claims an injected disallowed error of A's run and nothing
-/// else: an unrelated violation, or a skipped evaluation, added to the
-/// report is left to `Unknown`.
+/// `c` with `jumps` consecutive `Advance { secs: 21660 }` at client a's
+/// "fetch-head", then client b's step (the compact).
+fn jumps_then_compact(t: &Template, c: &Case, jumps: usize) -> Case {
+    let at = decision_of(t, c, 0, "fetch-head");
+    let jump = Action::Advance { secs: 21660 };
+    let mut c = c.clone();
+    c.choices.truncate(at);
+    for n in 0..jumps {
+        let probe = run_case(t, &c);
+        while c.choices.len() < at + n {
+            c.choices.push(0);
+        }
+        let advance = probe.trace.entries[at + n]
+            .actions
+            .iter()
+            .position(|a| *a == jump)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{jump:?} not offered at fetch-head (jump {n}):\n{}",
+                    probe.trace.render()
+                )
+            });
+        c.choices.push(u16::try_from(advance).unwrap());
+    }
+    let after = run_case(t, &c);
+    let b_step = after.trace.entries[at + jumps]
+        .actions
+        .iter()
+        .position(|a| matches!(a, Action::Step { client: 1, .. }))
+        .unwrap_or_else(|| panic!("no step of b after the jumps:\n{}", after.trace.render()));
+    c.choices.push(u16::try_from(b_step).unwrap());
+    c
+}
+
+/// A marker reaped by age (`AgedSessionReaped`): compact runs after two
+/// jumps past both stale ages at A's "fetch-head" (12 h 2 min, so A's
+/// packs are older than T_pack: 04 step 5 keeps younger orphans), reaps
+/// A's aged lock and marker and deletes its packs, and A's commit fails
+/// typed (D9 of 04 step 2). The signature claims an injected disallowed
+/// error of A's run and nothing else: an unrelated violation, or a skipped
+/// evaluation, added to the report is left to `Unknown`.
 #[test]
 fn aged_reap_fails_typed_and_claims_only_its_victim() {
     let t = Template::new();
@@ -443,28 +479,7 @@ fn aged_reap_fails_typed_and_claims_only_its_victim() {
         ],
         vec![],
     );
-    let at = decision_of(&t, &c, 0, "fetch-head");
-    let probe = run_case(&t, &c);
-    let jump = Action::Advance { secs: 21660 };
-    let advance = probe.trace.entries[at]
-        .actions
-        .iter()
-        .position(|a| *a == jump)
-        .unwrap_or_else(|| {
-            panic!(
-                "{jump:?} not offered at fetch-head:\n{}",
-                probe.trace.render()
-            )
-        });
-    c = with_choice(&c, at, u16::try_from(advance).unwrap());
-    // Then b's step: the compact.
-    let after = run_case(&t, &c);
-    let b_step = after.trace.entries[at + 1]
-        .actions
-        .iter()
-        .position(|a| matches!(a, Action::Step { client: 1, .. }))
-        .unwrap_or_else(|| panic!("no step of b after the jump:\n{}", after.trace.render()));
-    c.choices.push(u16::try_from(b_step).unwrap());
+    c = jumps_then_compact(&t, &c, 2);
     let o = run_case(&t, &c);
     let claimed = assert_victim_fails_typed(&o, Signature::AgedSessionReaped);
     assert!(!Signature::AgedSessionReaped.cascades());
@@ -491,6 +506,63 @@ fn aged_reap_fails_typed_and_claims_only_its_victim() {
     assert_eq!(
         classify(&o.sim, &skipped, &o.trace.entries),
         BTreeSet::from([Signature::Unknown])
+    );
+}
+
+/// The schedule above with one jump: A's packs are 6 h old at the compact,
+/// orphans younger than T_pack, so compact keeps them (04 step 5). A's
+/// lock is reaped by age, A writes its segment and then fails at its
+/// fence: an allowed error, `AgedLockReaped` for that write, nothing else.
+#[test]
+fn one_jump_keeps_the_victims_packs() {
+    let t = Template::new();
+    let c = case(
+        HostPlan::Distinct,
+        vec![
+            vec![Command::Backup {
+                shared: false,
+                fold: false,
+            }],
+            vec![Command::Compact],
+        ],
+        vec![],
+    );
+    let c = jumps_then_compact(&t, &c, 1);
+    let o = run_case(&t, &c);
+    let render = || o.trace.render();
+    let a = o
+        .sim
+        .history()
+        .runs
+        .iter()
+        .find(|r| o.sim.store().client_name(r.client) == "a")
+        .expect("a ran")
+        .client;
+    let packs = o.sim.store().keys_written_by(a, "packs/");
+    assert!(!packs.is_empty(), "{}", render());
+    for k in &packs {
+        assert!(
+            o.sim.store().object(k).is_some(),
+            "{k} deleted\n{}",
+            render()
+        );
+    }
+    let ra = driven_backups(&o)
+        .into_iter()
+        .find(|r| r.client == a)
+        .expect("a's backup");
+    assert!(
+        matches!(ra.error_class(), Some(ErrorClass::Allowed(_))),
+        "{}",
+        render()
+    );
+    assert!(
+        !o.signatures.is_empty()
+            && o.signatures
+                .iter()
+                .all(|s| matches!(s, Signature::AgedLockReaped | Signature::AgedSessionReaped)),
+        "{}",
+        render()
     );
 }
 
@@ -562,11 +634,12 @@ fn late_clone_reaps_live_lock() {
 }
 
 /// H1-late-clone for markers: a late-booted clone compacts at a's
-/// "fetch-head" a minute after its boot, reaps a's young marker and lock
-/// as its own earlier boot's and deletes a's packs. Since 04 step 2 a's
-/// commit fails typed (the re-probe after the failed pack check finds the
-/// marker gone), so the case is clean; a disallowed error of a's run would
-/// be exactly `SessionReaped`.
+/// "fetch-head" a minute after its boot and reaps a's young marker and lock
+/// as its own earlier boot's. Until 04 step 5 it also deleted a's packs
+/// and a's commit failed typed (04 step 2). Since then a's packs, a minute
+/// old, are orphans younger than T_pack and stay: a writes its segment
+/// under the reaped lock and fails at its fence (`LockExpired`), so what
+/// is left is the lock half of H1-late-clone, exactly `TwoLockHolders`.
 #[test]
 fn late_clone_reaps_live_marker() {
     let t = Template::new();
@@ -583,7 +656,30 @@ fn late_clone_reaps_live_marker() {
     );
     let c = jump_then_b(&t, &c, "fetch-head");
     let o = run_case(&t, &c);
-    assert_victim_fails_typed(&o, Signature::SessionReaped);
+    let render = || o.trace.render();
+    let ra = driven_backups(&o)
+        .into_iter()
+        .find(|r| o.sim.store().client_name(r.client) == "a")
+        .expect("a ran");
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::LockExpired)),
+        "{}",
+        render()
+    );
+    for k in o.sim.store().keys_written_by(ra.client, "packs/") {
+        assert!(
+            o.sim.store().object(&k).is_some(),
+            "{k} deleted\n{}",
+            render()
+        );
+    }
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::TwoLockHolders]),
+        "{}",
+        render()
+    );
 }
 
 #[test]

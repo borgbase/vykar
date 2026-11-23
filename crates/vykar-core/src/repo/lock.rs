@@ -6,9 +6,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::ages::{CLOCK_PROBE_DEBRIS_AGE, CLOCK_PROBE_PREFIX, StoreClock};
 use super::control::CancelToken;
 use super::host_env::{Clock, HostEnv, StopSignal};
-use vykar_storage::StorageBackend;
+use vykar_storage::{ListedObject, StorageBackend, StoreNow};
 use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
 
 /// A simple advisory lock stored in `locks/<uuid>.json`.
@@ -55,11 +56,35 @@ pub struct LockGuard {
     key: String,
     /// Wall-clock time of acquisition, read after the confirming LIST.
     acquired_at: DateTime<Utc>,
+    /// The lock key's mtime in the confirming LIST: "now" on the store's
+    /// clock at acquisition. `None` when the storage reports no mtime.
+    store_acquired: Option<StoreNow>,
+    /// Clock probes the confirming LIST showed older than
+    /// `CLOCK_PROBE_DEBRIS_AGE` by `store_acquired`: debris of failed
+    /// deletes, for [`Self::remove_probe_debris`].
+    probe_debris: Vec<String>,
 }
 
 impl LockGuard {
     pub fn key(&self) -> &str {
         &self.key
+    }
+
+    /// "Now" on the store's clock when the lock was acquired: the mtime the
+    /// storage gave this lock's key.
+    pub(crate) fn store_time(&self) -> Option<StoreNow> {
+        self.store_acquired
+    }
+
+    /// Delete the clock probes the acquisition listed as debris (best
+    /// effort, debug log). An uncontended acquirer never probes, so without
+    /// this nothing would remove debris while the lock is uncontended.
+    pub(crate) fn remove_probe_debris(&self, storage: &dyn StorageBackend) {
+        for key in &self.probe_debris {
+            if let Err(e) = storage.delete(key) {
+                debug!(key, error = %e, "could not delete an old clock probe");
+            }
+        }
     }
 }
 
@@ -73,9 +98,25 @@ impl LockGuard {
 /// Relies on the [`StorageBackend::list`] contract: a LIST reflects every PUT
 /// that completed before it started, including other clients' PUTs.
 pub fn acquire_lock(storage: &dyn StorageBackend, env: &HostEnv) -> Result<LockGuard> {
+    acquire_lock_reading(storage, env, &mut StoreClock::default())
+}
+
+/// [`acquire_lock`] with the store-clock reading of the wait it is an
+/// attempt of: the attempts of one wait share `clock`, so a contended
+/// wait probes the store's clock once, not once per attempt.
+pub(crate) fn acquire_lock_reading(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    clock: &mut StoreClock,
+) -> Result<LockGuard> {
     // Don't publish a key while a holder exists: waiters would otherwise
     // collide with each other on every retry.
-    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS), env)?;
+    let held = cleanup_stale_locks(
+        storage,
+        Duration::seconds(DEFAULT_STALE_LOCK_SECS),
+        env,
+        NowSource::Probe(clock),
+    )?;
     if let Some(holder_key) = held.first() {
         return Err(VykarError::Locked(build_lock_holder(
             storage,
@@ -103,14 +144,29 @@ pub fn acquire_lock(storage: &dyn StorageBackend, env: &HostEnv) -> Result<LockG
         return Err(e);
     }
 
-    let mut keys = match list_lock_keys(storage) {
-        Ok(keys) => keys,
+    let mut listing = match storage.list_meta(LOCKS_PREFIX) {
+        Ok(listing) => listing,
         Err(e) => {
             // Our key may be the only one: never leave it behind.
             let _ = storage.delete(&key);
             return Err(e);
         }
     };
+    let store_acquired = StoreNow::of_written(&listing, &key);
+    let probe_debris = store_acquired.map_or_else(Vec::new, |now| {
+        listing
+            .iter()
+            .filter(|o| {
+                o.key.starts_with(CLOCK_PROBE_PREFIX)
+                    && !is_lock_key(&o.key)
+                    && o.mtime
+                        .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
+            })
+            .map(|o| o.key.clone())
+            .collect()
+    });
+    listing.retain(|o| is_lock_key(&o.key));
+    let mut keys: Vec<String> = listing.into_iter().map(|o| o.key).collect();
     keys.sort();
     if !keys.contains(&key) {
         // PUT succeeded but LIST doesn't include our key — storage-layer bug
@@ -132,6 +188,8 @@ pub fn acquire_lock(storage: &dyn StorageBackend, env: &HostEnv) -> Result<LockG
     Ok(LockGuard {
         key,
         acquired_at: env.now_utc(),
+        store_acquired,
+        probe_debris,
     })
 }
 
@@ -144,22 +202,26 @@ pub fn release_lock(storage: &dyn StorageBackend, guard: LockGuard) -> Result<()
 ///
 /// This is a recovery mechanism for stale locks left by killed processes.
 /// No passphrase is needed — lock files are unencrypted JSON.
-/// Returns the number of locks removed.
+/// Returns the number of locks removed. Clock probes left under `locks/`
+/// (`locks/vykar-clock-*`, not locks) are deleted too and not counted.
 pub fn break_lock(storage: &dyn StorageBackend) -> Result<usize> {
     let mut removed: usize = 0;
 
-    for key in list_lock_keys(storage)? {
-        storage.delete(&key)?;
-        removed += 1;
+    for key in storage.list(LOCKS_PREFIX)? {
+        if is_lock_key(&key) {
+            storage.delete(&key)?;
+            removed += 1;
+        } else if key.starts_with(CLOCK_PROBE_PREFIX) {
+            storage.delete(&key)?;
+        }
     }
 
     Ok(removed)
 }
 
-fn list_lock_keys(storage: &dyn StorageBackend) -> Result<Vec<String>> {
-    let mut keys = storage.list(LOCKS_PREFIX)?;
-    keys.retain(|k| k.starts_with(LOCKS_PREFIX) && k.ends_with(".json"));
-    Ok(keys)
+/// Whether `key` is a lock key (`locks/*.json`); a clock probe is not.
+fn is_lock_key(key: &str) -> bool {
+    key.starts_with(LOCKS_PREFIX) && key.ends_with(".json")
 }
 
 /// Describe the process holding `lock_key`, for the `Locked` error message.
@@ -204,8 +266,16 @@ fn build_lock_holder(
 /// Safe against a concurrent maintenance lock without taking one: the caller
 /// writes its session marker before this LIST, and maintenance writes its lock
 /// before listing sessions, so at least one of the two sees the other.
-fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv) -> Result<()> {
-    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS), env)?;
+///
+/// `marker_key` is the marker the caller has just written: its mtime is
+/// "now" on the store's clock for the lock ages.
+fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv, marker_key: &str) -> Result<()> {
+    let held = cleanup_stale_locks(
+        storage,
+        Duration::seconds(DEFAULT_STALE_LOCK_SECS),
+        env,
+        NowSource::Written(marker_key),
+    )?;
     match held.first() {
         Some(key) => Err(VykarError::Locked(build_lock_holder(
             storage,
@@ -216,26 +286,167 @@ fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv) -> Result<()> {
     }
 }
 
+/// Where a reaper reads "now" on the store's clock. Resolved only when the
+/// listing it judges reports an mtime for at least one lock key.
+pub(crate) enum NowSource<'a> {
+    /// `key`, which this client has just written: LIST its directory with
+    /// mtimes and take the key's mtime.
+    Written(&'a str),
+    /// The wait's reading of the store's clock, extrapolated or refreshed
+    /// by a clock probe (`ages::StoreClock::now`).
+    Probe(&'a mut StoreClock),
+}
+
+impl NowSource<'_> {
+    /// The reading, and when a probe was made the fresher listing of
+    /// `locks/` it made. A failure to read is "now unknown", never an
+    /// error: a reaper then reaps nothing by age, and its caller retries as
+    /// it would on a live holder.
+    fn resolve(
+        self,
+        storage: &dyn StorageBackend,
+        env: &HostEnv,
+    ) -> (Option<StoreNow>, Option<Vec<ListedObject>>) {
+        match self {
+            Self::Written(key) => {
+                let dir = key.rfind('/').map_or("", |i| &key[..=i]);
+                match storage.list_meta(dir) {
+                    Ok(listing) => (StoreNow::of_written(&listing, key), None),
+                    Err(e) => {
+                        debug!(key, error = %e, "could not read the store's clock; reaping nothing by age");
+                        (None, None)
+                    }
+                }
+            }
+            Self::Probe(clock) => clock.now(storage, env),
+        }
+    }
+}
+
+/// An entry's age as a reaper judges it.
+#[derive(Clone, Copy, Debug)]
+enum EntryAge {
+    /// On the store's clock: (store now − the entry's mtime).
+    Store(std::time::Duration),
+    /// The listing reported no mtime (test doubles; a vykar-server older
+    /// than `?list&sized&mtime`; an S3 `LastModified` that does not
+    /// parse): the entry's own timestamp against `env`'s clock, as before
+    /// 04 step 5.
+    Timestamp(Option<Duration>),
+    /// The listing reported an mtime but "now" could not be read: never
+    /// stale by age (fail closed).
+    Unknown,
+}
+
+impl EntryAge {
+    /// The age of an entry listed with `mtime`, judged at `now`;
+    /// `timestamp` gives the fallback when there is no mtime (warned once
+    /// per run of `env`).
+    fn of(
+        mtime: Option<std::time::SystemTime>,
+        now: Option<StoreNow>,
+        env: &HostEnv,
+        timestamp: impl FnOnce() -> Option<Duration>,
+    ) -> Self {
+        match (mtime, now) {
+            (Some(mtime), Some(now)) => Self::Store(now.age_of(mtime)),
+            (Some(_), None) => Self::Unknown,
+            (None, _) => {
+                warn_timestamp_fallback(env);
+                Self::Timestamp(timestamp())
+            }
+        }
+    }
+
+    fn exceeds(self, max_age: Duration) -> bool {
+        match self {
+            Self::Store(age) => max_age.to_std().is_ok_and(|max| age > max),
+            Self::Timestamp(age) => age.is_some_and(|age| age > max_age),
+            Self::Unknown => false,
+        }
+    }
+
+    /// The age as the same-host rule compares it with local uptime.
+    fn as_std(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Store(age) => Some(age),
+            Self::Timestamp(age) => age.and_then(|a| a.to_std().ok()),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// One warning per opened repository (`HostEnv::for_new_run`), and one
+/// more for a backup's session registration, which runs before the open,
+/// when a lock or marker is aged by the timestamp inside it because the
+/// storage listed it without an mtime: those ages depend on the writer's
+/// and this machine's clocks.
+fn warn_timestamp_fallback(env: &HostEnv) {
+    if env.first_timestamp_fallback() {
+        warn!(
+            "the storage listed locks or session markers without modification times; \
+             judging their age by the timestamps inside them (client clocks)"
+        );
+    }
+}
+
 /// Remove stale locks and return the keys that remain.
+///
+/// Ages are on the store's clock: (store now − the lock key's mtime), with
+/// "now" read from `now`. When the listing reports no mtime the lock's own
+/// timestamp (or its key prefix) is aged against `env`'s clock instead;
+/// when "now" cannot be read nothing is stale by age (fail closed).
 ///
 /// A lock is stale when it is older than `max_age`, or when [`same_host`]
 /// finds it was left by a dead process or an earlier boot of this machine.
+/// With "now" known, clock probes older than an hour (debris of a failed
+/// delete) are removed, best effort.
 pub(crate) fn cleanup_stale_locks(
     storage: &dyn StorageBackend,
     max_age: Duration,
     env: &HostEnv,
+    now: NowSource<'_>,
 ) -> Result<Vec<String>> {
-    let now = env.now_utc();
+    let mut listing = storage.list_meta(LOCKS_PREFIX)?;
+    let mut store_now = None;
+    if listing
+        .iter()
+        .any(|o| is_lock_key(&o.key) && o.mtime.is_some())
+    {
+        let (reading, fresher) = now.resolve(storage, env);
+        store_now = reading;
+        if let Some(fresher) = fresher {
+            // The probe's listing is the later one: judge by it.
+            listing = fresher;
+        }
+    }
+    let local_now = env.now_utc();
     let mut surviving = Vec::new();
-    for key in list_lock_keys(storage)? {
-        let Some(data) = storage.get(&key)? else {
+    for object in &listing {
+        let key = object.key.as_str();
+        if !is_lock_key(key) {
+            if let Some(now) = store_now
+                && key.starts_with(CLOCK_PROBE_PREFIX)
+                && object
+                    .mtime
+                    .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
+                && let Err(e) = storage.delete(key)
+            {
+                debug!(key, error = %e, "could not delete an old clock probe");
+            }
+            continue;
+        }
+        let Some(data) = storage.get(key)? else {
             continue;
         };
         let entry = serde_json::from_slice::<LockEntry>(&data).ok();
-        if should_cleanup_lock(&key, entry.as_ref(), now, max_age, env) {
-            storage.delete(&key)?;
+        let age = EntryAge::of(object.mtime, store_now, env, || {
+            lock_timestamp(entry.as_ref(), key).map(|ts| local_now.signed_duration_since(ts))
+        });
+        if should_cleanup_lock(key, entry.as_ref(), age, max_age, env) {
+            storage.delete(key)?;
         } else {
-            surviving.push(key);
+            surviving.push(key.to_string());
         }
     }
     surviving.sort();
@@ -245,7 +456,7 @@ pub(crate) fn cleanup_stale_locks(
 fn should_cleanup_lock(
     key: &str,
     entry: Option<&LockEntry>,
-    now: DateTime<Utc>,
+    age: EntryAge,
     max_age: Duration,
     env: &HostEnv,
 ) -> bool {
@@ -257,9 +468,8 @@ fn should_cleanup_lock(
                 boot_id: entry.boot_id.as_deref(),
                 installation_id: entry.installation_id.as_deref(),
                 pid_ns: entry.pid_ns,
-                written_at: lock_timestamp(Some(entry), key),
+                age: age.as_std(),
             },
-            now,
             env,
         );
         if matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot) {
@@ -272,7 +482,7 @@ fn should_cleanup_lock(
         }
     }
 
-    lock_timestamp(entry, key).is_some_and(|acquired| now.signed_duration_since(acquired) > max_age)
+    age.exceeds(max_age)
 }
 
 /// Who wrote a lock or session entry, as the same-host rule reads it.
@@ -283,8 +493,9 @@ pub(crate) struct EntryHost<'a> {
     pub boot_id: Option<&'a str>,
     pub installation_id: Option<&'a str>,
     pub pid_ns: Option<u64>,
-    /// When the entry was last written, on its writer's clock.
-    pub written_at: Option<DateTime<Utc>>,
+    /// How long ago the entry was last written: on the store's clock (its
+    /// mtime), or by its own timestamp when the listing reports no mtime.
+    pub age: Option<std::time::Duration>,
 }
 
 /// What the same-host rule says about an entry.
@@ -300,7 +511,7 @@ pub(crate) enum SameHost {
     EarlierBoot,
 }
 
-/// The same-host verdict on `entry` for `env`, at `now` on `env`'s clock.
+/// The same-host verdict on `entry` for `env`.
 ///
 /// "This machine" needs the same hostname **and** the same installation ID
 /// (both known), so namesakes (other installations) and old clients (no
@@ -317,7 +528,7 @@ pub(crate) enum SameHost {
 /// Residual: a clone that booted after its sibling's last write reaps the
 /// sibling's live entry (for markers about one refresh interval after the
 /// clone's boot, for locks up to the lock refresh interval).
-pub(crate) fn same_host(entry: &EntryHost<'_>, now: DateTime<Utc>, env: &HostEnv) -> SameHost {
+pub(crate) fn same_host(entry: &EntryHost<'_>, env: &HostEnv) -> SameHost {
     let local = &env.host;
     if entry.hostname != local.hostname {
         return SameHost::Unknown;
@@ -334,8 +545,7 @@ pub(crate) fn same_host(entry: &EntryHost<'_>, now: DateTime<Utc>, env: &HostEnv
             // Our earlier boot, or a clone of this installation that wrote
             // it after both machines booted.
             let older = entry
-                .written_at
-                .and_then(|w| now.signed_duration_since(w).to_std().ok())
+                .age
                 .zip(env.clock.uptime())
                 .is_some_and(|(age, up)| age > up);
             return if older {
@@ -474,8 +684,9 @@ pub fn verify_lock_validity(
 /// journal `sessions/<id>.index`. Of a session's markers the newest
 /// generation is the live one.
 pub(crate) const SESSIONS_PREFIX: &str = "sessions/";
-/// Sessions whose `last_refresh` is strictly older than this threshold are
-/// treated as stale. Shared between maintenance cleanup
+/// Sessions whose newest marker was last written strictly longer ago than
+/// this (by its mtime on the store's clock; by its `last_refresh` when the
+/// listing reports no mtime) are treated as stale. Shared between maintenance cleanup
 /// ([`cleanup_stale_sessions`]) and pending-index recovery.
 ///
 /// Set to 3× the 15-minute session heartbeat interval — two missed refreshes
@@ -670,7 +881,7 @@ pub(crate) fn register_session_inner(
     let written = MarkerStamp::now(env.clock.as_ref());
 
     match retry_while_locked(max_attempts, base_delay_ms, env.clock.as_ref(), || {
-        probe_unlocked(storage, env)
+        probe_unlocked(storage, env, &key)
     }) {
         Ok(()) => {
             debug!(session_id, "session registered, no active lock");
@@ -1340,24 +1551,37 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// stale, every listed key of the session is deleted, and an older key of a
 /// session whose newest key is fresh is kept.
 ///
+/// Ages are on the store's clock: (`now` − the marker key's mtime), `now`
+/// being the mtime of an object the caller has just written (the
+/// maintenance lock's key). The timestamps inside a marker are used only
+/// when the listing reports no mtime; with an mtime but no `now` nothing is
+/// stale by age (fail closed). A malformed marker (unparseable JSON or bad
+/// timestamps) is judged by its mtime alone: it is preserved, and blocks
+/// maintenance, while younger than `max_age`, and is reaped like any stale
+/// marker after that; without an mtime it is preserved.
+///
 /// `.index` journals for cleaned sessions are **preserved** so the next backup
 /// can recover uploaded-but-uncommitted chunks via `recover_pending_index()`.
 /// Orphaned `.index` files from a *prior* cleanup run (no companion `.json`
 /// and not cleaned this invocation) are deleted — they already had their
 /// grace period.
 ///
-/// `env` gives the time and enables same-host detection: if `same_host`
-/// finds the session was left by a dead process or an earlier boot of this
-/// machine, it is treated as stale regardless of age. Sessions from other
-/// hosts, other installations and old clients are only cleaned by the
-/// `max_age` timeout.
+/// `env` gives the fallback time and enables same-host detection: if
+/// `same_host` finds the session was left by a dead process or an earlier
+/// boot of this machine, it is treated as stale regardless of age. Sessions
+/// from other hosts, other installations and old clients are only cleaned
+/// by the `max_age` timeout.
 pub fn cleanup_stale_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
     env: &HostEnv,
+    now: Option<StoreNow>,
 ) -> Result<Vec<String>> {
-    let now = env.now_utc();
-    let keys = storage.list(SESSIONS_PREFIX)?;
+    let local_now = env.now_utc();
+    let listing = storage.list_meta(SESSIONS_PREFIX)?;
+    let mtimes: std::collections::HashMap<&str, Option<std::time::SystemTime>> =
+        listing.iter().map(|o| (o.key.as_str(), o.mtime)).collect();
+    let keys: Vec<String> = listing.iter().map(|o| o.key.clone()).collect();
     let mut cleaned = Vec::new();
     // Track which session IDs survived the first pass (not deleted).
     let mut surviving_markers: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1370,32 +1594,46 @@ pub fn cleanup_stale_sessions(
         let Some(&(_, newest)) = markers.last() else {
             continue;
         };
+        let mtime = mtimes.get(newest).copied().flatten();
         let Some(data) = storage.get(newest)? else {
             // Gone since the LIST (a rotation or a deregistration): the
             // session may still be live, so its journal is kept.
             surviving_markers.insert(session_id.to_string());
             continue;
         };
-        let Ok(entry) = serde_json::from_slice::<SessionEntry>(&data) else {
-            // Unparseable .json — we cannot prove this is stale. Preserve it
-            // so `with_maintenance_lock` reports it as a blocking session
-            // (fail-closed). Operator must use `break-lock --sessions` to
-            // force-clear. Also preserve the companion `.index` so its
-            // journal isn't lost.
-            surviving_markers.insert(session_id.to_string());
-            continue;
-        };
-        let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
-            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at));
-        let Ok(ts) = ts else {
-            // Bad timestamp — same treatment: fail-closed, let maintenance
-            // surface it and require operator intervention.
-            surviving_markers.insert(session_id.to_string());
+        let entry = serde_json::from_slice::<SessionEntry>(&data).ok();
+        let ts = entry.as_ref().and_then(|entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
+                .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at))
+                .ok()
+                .map(|ts| ts.with_timezone(&Utc))
+        });
+        let age = EntryAge::of(mtime, now, env, || {
+            ts.map(|ts| local_now.signed_duration_since(ts))
+        });
+        let (Some(entry), Some(_)) = (entry, ts) else {
+            // Unparseable .json or a bad timestamp: we cannot read who wrote
+            // it. Judged by its mtime alone; while young (or without an
+            // mtime) it is preserved so `with_maintenance_lock` reports it as
+            // a blocking session (fail-closed), together with its `.index`.
+            if matches!(age, EntryAge::Store(_)) && age.exceeds(max_age) {
+                debug!(
+                    session_id,
+                    ?age,
+                    "cleaning malformed session marker, stale by its mtime"
+                );
+                for &(_, key) in &markers {
+                    storage.delete(key)?;
+                }
+                cleaned_ids.insert(session_id.to_string());
+                cleaned.push(session_id.to_string());
+            } else {
+                surviving_markers.insert(session_id.to_string());
+            }
             continue;
         };
 
-        let ts = ts.with_timezone(&Utc);
-        let is_stale_by_age = now.signed_duration_since(ts) > max_age;
+        let is_stale_by_age = age.exceeds(max_age);
         let verdict = same_host(
             &EntryHost {
                 hostname: &entry.hostname,
@@ -1403,16 +1641,15 @@ pub fn cleanup_stale_sessions(
                 boot_id: entry.boot_id.as_deref(),
                 installation_id: entry.installation_id.as_deref(),
                 pid_ns: entry.pid_ns,
-                written_at: Some(ts),
+                age: age.as_std(),
             },
-            now,
             env,
         );
         let is_left_local = matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot);
 
         if is_stale_by_age || is_left_local {
             if is_stale_by_age {
-                debug!(session_id, age_hours = %((now - ts).num_hours()), "cleaning stale session");
+                debug!(session_id, ?age, "cleaning stale session");
             } else {
                 debug!(
                     session_id,
@@ -1585,11 +1822,12 @@ pub fn acquire_lock_with_deadline(
     let start = env.clock.monotonic();
     let deadline = start + max_wait;
     let mut attempt: usize = 0;
+    let mut store_clock = StoreClock::default();
     loop {
         if shutdown.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
-        let holder = match acquire_lock(storage, env) {
+        let holder = match acquire_lock_reading(storage, env, &mut store_clock) {
             Ok(guard) => return Ok(guard),
             Err(VykarError::Locked(holder)) => holder,
             Err(e) => return Err(e),

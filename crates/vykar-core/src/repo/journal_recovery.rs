@@ -49,19 +49,23 @@ enum RecoverResult {
 /// `Active` over `Unknown` over `Stale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum MarkerState {
-    /// Marker exists, parseable, `last_refresh` strictly older than
-    /// `SESSION_STALE_SECS`.
+    /// Marker exists and was last written strictly more than
+    /// `SESSION_STALE_SECS` ago (by its mtime on the store's clock; by its
+    /// `last_refresh` when the listing reports no mtime).
     Stale,
-    /// Marker exists but unreadable or unparseable.
+    /// Marker exists but its age cannot be read: unreadable, or malformed
+    /// and not yet stale by its mtime, or listed with an mtime while this
+    /// session's own marker was not (no reading of "now").
     Unknown,
-    /// Marker exists, parseable, `last_refresh` within `SESSION_STALE_SECS`.
+    /// Marker exists and was written within `SESSION_STALE_SECS`.
     Active,
 }
 
 /// The parts of the write session that recovery fills in, and the clock it
-/// judges marker staleness by.
+/// judges marker staleness by when the listing reports no mtime.
 pub(crate) struct RecoveryTarget<'a> {
-    /// Read once, right after the LIST of `sessions/`.
+    /// Read once, right after the LIST of `sessions/`; used only for markers
+    /// listed without an mtime.
     pub(crate) clock: &'a dyn Clock,
     pub(crate) recovered_chunks: &'a mut StdHashMap<ChunkId, RecoveredChunkEntry>,
     pub(crate) recovered_index_keys: &'a mut Vec<String>,
@@ -77,8 +81,10 @@ pub(crate) struct RecoveryTarget<'a> {
 /// classifying each by the state of its session's `.json` markers.
 ///
 /// A journal is recoverable if it is **orphaned** (no companion `.json`)
-/// or **stale** (every companion `.json` has `last_refresh` older than 45 min).
-/// Active sessions and sessions with unreadable markers are skipped.
+/// or **stale** (no companion `.json` written for 45 min by the store's
+/// clock: its mtime against the newest mtime of this session's own marker
+/// keys in the same listing). Active sessions and sessions with unreadable
+/// markers are skipped.
 ///
 /// Must be called inside the repo lock, before any chunk is stored.
 /// Returns the total number of recovered chunk entries. `persisted_packs` and
@@ -92,8 +98,19 @@ pub(crate) fn recover_pending_index(
     width: usize,
     target: &mut RecoveryTarget<'_>,
 ) -> Result<PendingIndexRecovery> {
-    let all_keys = storage.list(SESSIONS_PREFIX)?;
+    let listing = storage.list_meta(SESSIONS_PREFIX)?;
     let now = target.clock.now_utc();
+    // "Now" on the store's clock: the newest write of this session's own
+    // marker, in the same listing.
+    let store_now = listing
+        .iter()
+        .filter(|o| parse_session_marker_key(&o.key).is_some_and(|(id, _)| id == own_session_id))
+        .filter_map(|o| o.mtime)
+        .max()
+        .map(vykar_storage::StoreNow::at);
+    let mtimes: StdHashMap<&str, Option<std::time::SystemTime>> =
+        listing.iter().map(|o| (o.key.as_str(), o.mtime)).collect();
+    let all_keys: Vec<String> = listing.iter().map(|o| o.key.clone()).collect();
 
     // Collect .index keys, skip our own session.
     let my_key = session_index_key(own_session_id);
@@ -122,25 +139,23 @@ pub(crate) fn recover_pending_index(
         if !journal_sessions.contains(session_id) {
             continue;
         }
+        let mtime = mtimes.get(key.as_str()).copied().flatten();
         let state = match storage.get(key) {
-            Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
-                Ok(entry) => {
-                    let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
-                        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at));
-                    match ts {
-                        Ok(ts) => {
-                            let age = now.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                            if age.num_seconds() > SESSION_STALE_SECS {
-                                MarkerState::Stale
-                            } else {
-                                MarkerState::Active
-                            }
-                        }
-                        Err(_) => MarkerState::Unknown,
-                    }
-                }
-                Err(_) => MarkerState::Unknown,
-            },
+            Ok(Some(data)) => {
+                let ts = serde_json::from_slice::<SessionEntry>(&data)
+                    .ok()
+                    .and_then(|entry| {
+                        chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
+                            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at))
+                            .ok()
+                    });
+                marker_state(
+                    mtime,
+                    store_now,
+                    ts.map(|ts| ts.with_timezone(&chrono::Utc)),
+                    now,
+                )
+            }
             _ => MarkerState::Unknown,
         };
         marker_states
@@ -176,8 +191,8 @@ pub(crate) fn recover_pending_index(
             Ok(RecoverResult::Corrupt) => {
                 // Only delete the corrupt .index — never touch .json markers.
                 // Session marker lifecycle is managed by deregister_session()
-                // and cleanup_stale_sessions() (>45 min since last_refresh,
-                // under maintenance lock).
+                // and cleanup_stale_sessions() (newest marker written >45 min
+                // ago by its mtime, under maintenance lock).
                 warn!(key = %index_key, "corrupt pending index journal, deleting");
                 let _ = storage.delete(index_key);
             }
@@ -207,6 +222,33 @@ pub(crate) fn recover_pending_index(
         recovered_chunks: total_recovered,
         recovered_sessions,
     })
+}
+
+/// The state of a marker listed with `mtime` whose timestamp parsed to `ts`
+/// (`None`: malformed). With an mtime it is judged on the store's clock
+/// alone: stale once more than `SESSION_STALE_SECS` older than `store_now`,
+/// malformed or not, and `Unknown` without a reading of "now" (fail closed).
+/// Without an mtime its timestamp is judged against `local_now`.
+fn marker_state(
+    mtime: Option<std::time::SystemTime>,
+    store_now: Option<vykar_storage::StoreNow>,
+    ts: Option<chrono::DateTime<chrono::Utc>>,
+    local_now: chrono::DateTime<chrono::Utc>,
+) -> MarkerState {
+    let stale_after = std::time::Duration::from_secs(SESSION_STALE_SECS as u64);
+    match (mtime, store_now, ts) {
+        (Some(mtime), Some(now), _) if now.age_of(mtime) > stale_after => MarkerState::Stale,
+        (Some(_), Some(_), Some(_)) => MarkerState::Active,
+        (Some(_), _, _) => MarkerState::Unknown,
+        (None, _, Some(ts)) => {
+            if local_now.signed_duration_since(ts).num_seconds() > SESSION_STALE_SECS {
+                MarkerState::Stale
+            } else {
+                MarkerState::Active
+            }
+        }
+        (None, _, None) => MarkerState::Unknown,
+    }
 }
 
 /// Attempt to recover a single session's pending index journal.
@@ -1096,5 +1138,45 @@ mod tests {
 
         ws.cleanup_recovered_indices(&storage);
         assert!(storage.exists(&key).unwrap(), "kept after cleanup");
+    }
+
+    #[test]
+    fn marker_state_ages_by_mtime_against_the_own_marker() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+        let now = Some(vykar_storage::StoreNow::at(t));
+        let stale = t - std::time::Duration::from_secs(46 * 60);
+        let fresh = t - std::time::Duration::from_secs(60);
+        let local = chrono::Utc::now();
+        // A timestamp that is old by the local clock does not matter.
+        let old_ts = Some(local - chrono::Duration::hours(5));
+        assert_eq!(
+            marker_state(Some(fresh), now, old_ts, local),
+            MarkerState::Active
+        );
+        assert_eq!(
+            marker_state(Some(stale), now, Some(local), local),
+            MarkerState::Stale
+        );
+        // Malformed: stale once old by its mtime, else unknown.
+        assert_eq!(
+            marker_state(Some(stale), now, None, local),
+            MarkerState::Stale
+        );
+        assert_eq!(
+            marker_state(Some(fresh), now, None, local),
+            MarkerState::Unknown
+        );
+        // An mtime but no reading of "now": unknown, never stale.
+        assert_eq!(
+            marker_state(Some(stale), None, Some(local), local),
+            MarkerState::Unknown
+        );
+        // No mtime: the timestamp rule.
+        assert_eq!(marker_state(None, None, old_ts, local), MarkerState::Stale);
+        assert_eq!(
+            marker_state(None, None, Some(local), local),
+            MarkerState::Active
+        );
+        assert_eq!(marker_state(None, None, None, local), MarkerState::Unknown);
     }
 }

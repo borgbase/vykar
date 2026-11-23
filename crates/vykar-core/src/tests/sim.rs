@@ -298,14 +298,7 @@ fn crash_then_break_lock_then_backup() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    sim.fault(
-        FaultRule::new(
-            OpMatch::AnyWrite,
-            KeyMatch::Prefix("locks/".into()),
-            FaultAction::Crash,
-        )
-        .client(a),
-    );
+    sim.fault(FaultRule::new(OpMatch::AnyWrite, KeyMatch::LockKey, FaultAction::Crash).client(a));
     let r = sim.compact(a);
     assert_eq!(
         r.error_class(),
@@ -346,17 +339,10 @@ fn crash_then_break_lock_then_backup() {
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
-/// A fault that crashes `c` on its first delete under `locks/`: its lock
+/// A fault that crashes `c` on its first delete of a lock key: its lock
 /// release, so the lock stays behind.
 fn crash_on_lock_release(sim: &Sim, c: ClientId) {
-    sim.fault(
-        FaultRule::new(
-            OpMatch::AnyDelete,
-            KeyMatch::Prefix("locks/".into()),
-            FaultAction::Crash,
-        )
-        .client(c),
-    );
+    sim.fault(FaultRule::new(OpMatch::AnyDelete, KeyMatch::LockKey, FaultAction::Crash).client(c));
 }
 
 /// `c` takes the lock and crashes releasing it.
@@ -780,6 +766,8 @@ const TESTED_IDS: &[&str] = &[
     "H2-marker",
     "H4",
     "H4-segment",
+    "H4-skew",
+    "H3-compact-young",
 ];
 
 #[test]
@@ -804,11 +792,7 @@ fn regressions_hold() {
 // ── Scripted pause points (08 step 3) ───────────────────────────────────
 
 fn sessions_list(c: ClientId) -> GateRule {
-    GateRule::new(
-        c,
-        OpMatch::Kind(OpKind::List),
-        KeyMatch::Exact("sessions/".into()),
-    )
+    GateRule::new(c, OpMatch::AnyList, KeyMatch::Exact("sessions/".into()))
 }
 
 fn backup_call(name: &str) -> Call {
@@ -1064,32 +1048,34 @@ fn lock_exclusion_other_and_several() {
     );
 }
 
+/// A lock whose body and key carry no time used to wedge the repository;
+/// since 04 step 5 it is aged by its mtime and reaped after 6 h. The check
+/// runs on a fork: the store is untouched.
 #[test]
-fn wedge_on_unageable_lock() {
+fn unparseable_lock_ages_out_by_mtime() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     sim.tamper_put("locks/planted.json", b"{}");
     let (keys, log_len) = (sim.store().keys(""), sim.store().log().len());
     let report = sim.check_invariants(&[Invariant::NoPermanentWedge]);
-    assert!(
-        report.has_kind(ViolationKind::WedgedBackup, "repository"),
-        "{report}"
-    );
+    report.assert_clean();
     assert_eq!(sim.store().keys(""), keys);
     assert_eq!(sim.store().log().len(), log_len);
 }
 
+/// A malformed marker is no longer a documented exception of invariant 9:
+/// it ages out by its mtime.
 #[test]
-fn wedge_check_skips_malformed_marker() {
+fn wedge_check_ages_out_malformed_marker() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     sim.tamper_put("sessions/bad.json", b"not json");
     let report = sim.check_invariants(&[Invariant::NoPermanentWedge]);
-    assert!(report.violations.is_empty(), "{report}");
+    report.assert_clean();
     assert!(
-        report.not_evaluated_for(Invariant::NoPermanentWedge, "sessions/bad.json"),
+        !report.not_evaluated_for(Invariant::NoPermanentWedge, "sessions/bad.json"),
         "{report}"
     );
 }
@@ -1140,7 +1126,7 @@ fn h2_marker_placements_not_reproduced() {
 fn neutralised_h4_not_reproduced() {
     expect_not_reproduced(
         "H4",
-        interleavings::h4_with(Hosts::Skewed, Order::Sequential),
+        interleavings::h4_with(Hosts::StoreStepped, Order::Sequential),
     );
 }
 
@@ -1148,16 +1134,16 @@ fn neutralised_h4_not_reproduced() {
 fn neutralised_h4_segment_not_reproduced() {
     expect_not_reproduced(
         "H4-segment",
-        interleavings::h4_segment_with(Hosts::Skewed, Order::Sequential),
+        interleavings::h4_segment_with(Hosts::StoreStepped, Order::Sequential),
     );
 }
 
-/// Without the skew no client reaps compact's live lock: on distinct hosts,
-/// and since 04 step 1 on cloned machines either (the H1 fix seen through
-/// H4).
+/// Without a store clock step no client reaps compact's live lock: on
+/// distinct hosts, since 04 step 1 on cloned machines either (the H1 fix
+/// seen through H4), and since 04 step 5 with b's clock 6 h 1 min ahead.
 #[test]
 fn h4_without_a_reaper_has_no_prerequisite() {
-    for hosts in [Hosts::Distinct, Hosts::SameHostname] {
+    for hosts in [Hosts::Distinct, Hosts::SameHostname, Hosts::Skewed] {
         for outcome in [
             interleavings::h4_with(hosts, Order::Interleaved),
             interleavings::h4_segment_with(hosts, Order::Interleaved),
@@ -1206,14 +1192,7 @@ fn sweep_against_a_live_backup_refuses() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    let gb = sim.gate(
-        GateRule::new(
-            b,
-            OpMatch::Kind(OpKind::List),
-            KeyMatch::Exact("locks/".into()),
-        )
-        .nth(2),
-    );
+    let gb = sim.gate(GateRule::new(b, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sb = sim.spawn(
         b,
         Call::Backup {
@@ -1351,9 +1330,10 @@ fn a_crash_at_every_write_of_the_sweep_is_recoverable() {
 }
 
 /// SIM-4: a reaped session that commits afterwards (H2-marker's net
-/// effect, modelled with tamper). The sweep removed t0's entries it reused
-/// and compact deleted its uploaded pack, so its commit fails as stale and
-/// no snapshot is written.
+/// effect, modelled with tamper). The sweep removed t0's entries it reused,
+/// so its commit fails as stale and no snapshot is written. Its own packs,
+/// seconds old, are orphans younger than T_pack: compact keeps them (04
+/// step 5).
 #[test]
 fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
     let mut sim = Sim::new();
@@ -1363,14 +1343,7 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
     sim.backup(c, "t0", &x).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
 
-    let ga = sim.gate(
-        GateRule::new(
-            a,
-            OpMatch::Kind(OpKind::List),
-            KeyMatch::Exact("locks/".into()),
-        )
-        .nth(2),
-    );
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1394,9 +1367,16 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
     assert!(!rb.detail().ends_with("unreferenced 0"), "{}", rb.detail());
     let a_packs = sim.store().keys_written_by(a, "packs/");
     assert!(
-        a_packs.iter().all(|k| sim.store().object(k).is_none()),
-        "orphans deleted"
+        a_packs.iter().all(|k| sim.store().object(k).is_some()),
+        "young orphans kept"
     );
+    let young: usize = rb
+        .detail()
+        .split_once(" young ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("compact detail names its young orphans");
+    assert!(young >= a_packs.len(), "{}", rb.detail());
 
     sim.tamper_put(&marker, &bytes);
     sim.resume(ga);
@@ -1426,14 +1406,7 @@ fn missing_pack_with_a_live_marker_stays_untyped() {
     let mut sim = Sim::new();
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(c, "c0", &tree("c0")).expect_ok();
-    let ga = sim.gate(
-        GateRule::new(
-            a,
-            OpMatch::Kind(OpKind::List),
-            KeyMatch::Exact("locks/".into()),
-        )
-        .nth(2),
-    );
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1473,7 +1446,9 @@ fn missing_pack_with_a_live_marker_stays_untyped() {
 
 /// A reaped session whose packs compact deleted, with nothing reused that
 /// the sweep removed (a tree of its own), so the reuse re-check passes and
-/// the pack check fails: typed as stale (D9). The commit's first marker
+/// the pack check fails: typed as stale (D9). The store's clock steps
+/// T_pack forward before the compact, so a's packs are old orphans (04
+/// step 5 keeps younger ones) while no client's time moves. The commit's first marker
 /// probe is made inconclusive (an injected EXISTS error, with a continuous
 /// record it falls through), else it would refuse first; the re-probe after
 /// the failed pack check finds the marker gone.
@@ -1486,14 +1461,7 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
     sim.backup(c, "t0", &x).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
 
-    let ga = sim.gate(
-        GateRule::new(
-            a,
-            OpMatch::Kind(OpKind::List),
-            KeyMatch::Exact("locks/".into()),
-        )
-        .nth(2),
-    );
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1509,6 +1477,10 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
         .find(|k| k.ends_with(".json"))
         .expect("a's marker");
     assert!(sim.tamper_delete(&marker));
+    sim.step_store_clock(
+        chrono::Duration::from_std(crate::repo::ages::T_PACK).unwrap()
+            + chrono::Duration::minutes(1),
+    );
     let rb = sim.compact(b);
     rb.expect_ok();
     let a_packs = sim.store().keys_written_by(a, "packs/");
@@ -1560,7 +1532,7 @@ fn a_marker_key_that_stays_unchecked_stops_the_commit() {
         // A's first main-thread operation after the heartbeat started.
         let g_main = sim.gate(GateRule::new(
             a,
-            OpMatch::Kind(OpKind::List),
+            OpMatch::AnyList,
             KeyMatch::Exact("sessions/".into()),
         ));
         let sa = sim.spawn(
@@ -1678,4 +1650,188 @@ fn a_head_that_drops_live_entries_makes_compact_refuse() {
     ] {
         assert!(!report.violated(inv), "{inv:?}: {report}");
     }
+}
+
+// ── Store-clock ages (04 step 5) ────────────────────────────────────────
+
+fn hours(h: i64) -> chrono::Duration {
+    chrono::Duration::hours(h)
+}
+
+/// a's compact is held at its first `index.h/` write, holding the lock; b
+/// backs up with its wall clock skewed by `b_skew`, a's by `a_skew`.
+fn lock_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.set_skew(a, a_skew);
+    sim.set_skew(b, b_skew);
+    let ga = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyWrite,
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let sa = sim.spawn(a, Call::Compact);
+    sim.expect_paused(ga, "a's first head PUT");
+    let rb = sim.backup(b, "b1", &tree("b1"));
+    assert!(allowed_as(&rb, AllowedError::Locked), "{:?}", rb.outcome);
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// a's backup is held at its commit-lock sweep, its marker live; b
+/// compacts with its wall clock skewed by `b_skew`, a's by `a_skew`.
+fn marker_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.set_skew(a, a_skew);
+    sim.set_skew(b, b_skew);
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let sa = sim.spawn(a, backup_call("a1"));
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    let rb = sim.compact(b);
+    assert!(
+        allowed_as(&rb, AllowedError::ActiveSessions),
+        "{:?}",
+        rb.outcome
+    );
+    sim.resume(ga);
+    sim.join(sa).expect_ok();
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// A client 7 h ahead no longer reaps a live lock (it was older than 6 h
+/// by that client's clock).
+#[test]
+fn client_ahead_does_not_reap_a_live_lock() {
+    lock_reap_attempt(chrono::Duration::zero(), hours(7));
+}
+
+/// A client 1 h ahead no longer reaps a live marker.
+#[test]
+fn client_ahead_does_not_reap_a_live_marker() {
+    marker_reap_attempt(chrono::Duration::zero(), hours(1));
+}
+
+/// A holder whose clock is behind writes entries that look old to others'
+/// clocks; they are judged by their mtimes and not reaped early.
+#[test]
+fn client_behind_is_not_reaped_early() {
+    lock_reap_attempt(hours(-7), chrono::Duration::zero());
+    marker_reap_attempt(hours(-1), chrono::Duration::zero());
+}
+
+/// a's backup fails after its uploads. A compact 46 min later by a client
+/// 13 h ahead keeps a's packs (younger than T_pack on the store's clock);
+/// T_pack later the next compact deletes them.
+#[test]
+fn young_orphans_survive_a_compact_hours_ahead() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("index.d/".into()),
+            FaultAction::Fail,
+        )
+        .client(a),
+    );
+    let ra = sim.backup(a, "a1", &tree("a1"));
+    assert!(!ra.is_ok(), "{:?}", ra.outcome);
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    assert!(!a_packs.is_empty());
+
+    sim.advance(Duration::from_secs(46 * 60));
+    sim.set_skew(b, hours(13));
+    sim.compact(b).expect_ok();
+    for k in &a_packs {
+        assert!(sim.store().object(k).is_some(), "{k} deleted while young");
+    }
+
+    sim.advance(crate::repo::ages::T_PACK);
+    sim.compact(b).expect_ok();
+    for k in &a_packs {
+        assert!(sim.store().object(k).is_none(), "{k} kept once old");
+    }
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// Packs whose entries this compact's sweep removed were committed: they go
+/// at once, seconds old.
+#[test]
+fn swept_packs_go_at_once() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let t0_packs: Vec<String> = sim
+        .store()
+        .keys_written_by(c, "packs/")
+        .into_iter()
+        .filter(|k| sim.store().object(k).is_some())
+        .collect();
+    sim.delete(c, &["t0"]).expect_ok();
+    sim.compact(c).expect_ok();
+    let gone = t0_packs
+        .iter()
+        .filter(|k| sim.store().object(k).is_none())
+        .count();
+    assert!(gone > 0, "no pack of t0 deleted");
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// D17: a forward step of the store's clock ages every object at once, a
+/// live lock too: b's backup reaps a's lock after a 6 h 1 min step. The
+/// route H2 and H4 take; not a hazard of its own.
+#[test]
+fn a_store_clock_step_ages_every_object() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let ga = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyWrite,
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let sa = sim.spawn(a, Call::Compact);
+    sim.expect_paused(ga, "a's first head PUT");
+    let lock = sim
+        .store()
+        .keys_written_by(a, "locks/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a holds a lock");
+    sim.step_store_clock(chrono::Duration::seconds(6 * 3600 + 60));
+    let rb = sim.backup(b, "b1", &tree("b1"));
+    assert!(sim.store().object(&lock).is_none(), "{:?}", rb.outcome);
+    sim.resume(ga);
+    let _ = sim.join(sa);
+}
+
+/// A malformed marker blocks maintenance while young and is reaped once
+/// 45 min old by its mtime; invariant 9 no longer skips it.
+#[test]
+fn malformed_marker_ages_out() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.tamper_put("sessions/x.json", b"{");
+    let r = sim.compact(c);
+    assert!(
+        allowed_as(&r, AllowedError::ActiveSessions),
+        "{:?}",
+        r.outcome
+    );
+    sim.advance(Duration::from_secs(46 * 60));
+    sim.compact(c).expect_ok();
+    assert!(sim.store().object("sessions/x.json").is_none());
+    let report = sim.check_invariants(Invariant::STEP3);
+    assert!(
+        !report.not_evaluated_for(Invariant::NoPermanentWedge, "sessions/x.json"),
+        "{report}"
+    );
+    report.assert_clean();
 }

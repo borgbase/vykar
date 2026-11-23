@@ -56,7 +56,7 @@ pub(crate) const SWEEP_RECORD_CONTEXT: &[u8] = b"index.d/sweep";
 
 /// How long an unreferenced index object or an old head is kept, by the
 /// storage's clock (04's T_idx).
-pub(crate) const INDEX_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+pub(crate) const INDEX_GC_GRACE: std::time::Duration = super::ages::T_IDX;
 
 /// Heads kept below the latest regardless of age (04: latest − 16).
 pub(crate) const HEADS_KEPT: u64 = 16;

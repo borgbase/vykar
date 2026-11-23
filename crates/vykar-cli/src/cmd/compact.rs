@@ -113,6 +113,19 @@ fn print_compact_warnings(stats: &commands::compact::CompactStats) {
             "  {} orphan pack(s) (present on disk but not in index)",
             stats.packs_orphan,
         );
+        if stats.packs_orphan_young > 0 {
+            eprintln!(
+                "  {} of them kept: younger than {} h (uploads not yet committed)",
+                stats.packs_orphan_young,
+                commands::compact::ORPHAN_PACK_GRACE.as_secs() / 3600,
+            );
+        }
+        if stats.packs_orphan_unknown_age > 0 {
+            eprintln!(
+                "  {} of them kept: age unknown (the storage reports no modification times)",
+                stats.packs_orphan_unknown_age,
+            );
+        }
     }
     if stats.temp_files_removed > 0 {
         eprintln!(

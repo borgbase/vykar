@@ -650,6 +650,20 @@ fn find_decodes_each_distinct_tree_chunk_once() {
     }
 }
 
+/// A snapshot listed at open whose object a prune removed during the find
+/// is skipped (readers register no marker); the rest are found as they are.
+#[test]
+fn find_skips_a_snapshot_deleted_during_the_run() {
+    let fx = changed(false);
+    let mut repo = fx.open();
+    let entries: Vec<SnapshotEntry> = ["s1", "s2"].iter().map(|n| entry(&repo, n)).collect();
+    std::fs::remove_file(fx.repo_dir.join(entries[0].id.storage_key())).unwrap();
+    let (timelines, stats) =
+        find_on_repo(&mut repo, &entries, &no_filter(), &CancelToken::new()).unwrap();
+    assert_eq!(stats.snapshots, 1);
+    assert_eq!(found(timelines), oracle_find(&fx, &["s2"], &no_filter()));
+}
+
 #[test]
 fn find_counts_a_repeated_pointer_per_occurrence() {
     let fx = four_chunks(false);

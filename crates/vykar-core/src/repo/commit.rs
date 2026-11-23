@@ -130,6 +130,7 @@ impl Repository {
     /// Make a synced index the in-memory index.
     pub(super) fn install_synced_index(&mut self, synced: SyncedIndex) {
         self.chunk_index = synced.index;
+        self.relocation.clear();
         self.index_generation = synced.head.generation;
         self.index_head = Some(synced.head);
         self.rebase_pack_target_from_index();

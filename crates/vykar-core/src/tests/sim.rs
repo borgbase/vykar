@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
-use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, classify};
+use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, RunOutcome, classify};
 use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap, Order};
 use crate::sim::{
     Call, ClientId, FaultAction, FaultRule, GateRule, INIT_PID_NS, KeyMatch, OpKind, OpMatch,
@@ -66,8 +66,10 @@ fn baseline_clean() {
     }
 }
 
+/// Readers register no marker and take no lock (04 step 7): a restore and a
+/// check make no request under `sessions/` or `locks/`.
 #[test]
-fn read_commands_register_session_before_open() {
+fn readers_register_no_marker() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
@@ -75,21 +77,12 @@ fn read_commands_register_session_before_open() {
     let log = sim.store().log();
     for run in &runs {
         run.expect_ok();
-        let ops: Vec<_> = log.iter().filter(|r| r.run == Some(run.index)).collect();
-        let marker = ops
+        let protocol: Vec<_> = log
             .iter()
-            .position(|r| {
-                r.op == OpKind::Put && r.key.starts_with("sessions/") && r.key.ends_with(".json")
-            })
-            .unwrap_or_else(|| panic!("run {} registered no session", run.index));
-        let key = &ops[marker].key;
-        let config_get = ops
-            .iter()
-            .position(|r| r.op == OpKind::Get && r.key == "config")
-            .expect("open reads config");
-        assert!(marker < config_get, "session registered after open");
-        let last_session_op = ops.iter().rev().find(|r| &r.key == key).unwrap();
-        assert_eq!(last_session_op.op, OpKind::Delete);
+            .filter(|r| r.run == Some(run.index))
+            .filter(|r| r.key.starts_with("sessions/") || r.key.starts_with("locks/"))
+            .collect();
+        assert!(protocol.is_empty(), "run {}: {protocol:?}", run.index);
     }
 }
 
@@ -1834,4 +1827,247 @@ fn malformed_marker_ages_out() {
         "{report}"
     );
     report.assert_clean();
+}
+
+// --- Readers without markers (04 step 7) ---
+
+/// `x` holds files A and B, `y` only A (the same bytes): deleting `x`
+/// leaves A's pack half dead, so a compact repacks it.
+fn two_file_tree() -> SourceTree {
+    SourceTree::new()
+        .file(
+            "a.bin",
+            crate::sim::runner::seeded_bytes("file-a", 64 * KIB),
+        )
+        .file(
+            "b.bin",
+            crate::sim::runner::seeded_bytes("file-b", 64 * KIB),
+        )
+}
+
+fn one_file_tree() -> SourceTree {
+    SourceTree::new().file(
+        "a.bin",
+        crate::sim::runner::seeded_bytes("file-a", 64 * KIB),
+    )
+}
+
+/// Gate on `c`'s first range read of a pack.
+fn first_pack_read(c: ClientId) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::GetRange),
+        KeyMatch::Prefix("packs/".into()),
+    )
+}
+
+/// The ops of run `index`.
+fn run_ops(sim: &Sim, index: usize) -> Vec<crate::sim::OpRecord> {
+    sim.store()
+        .log()
+        .into_iter()
+        .filter(|r| r.run == Some(index))
+        .collect()
+}
+
+/// Packs deleted by client `c` with an applied delete.
+fn packs_deleted_by(sim: &Sim, c: ClientId) -> BTreeSet<String> {
+    sim.store()
+        .log()
+        .into_iter()
+        .filter(|r| r.client == c && r.key.starts_with("packs/"))
+        .filter(|r| matches!(r.op, OpKind::Delete | OpKind::BatchDelete))
+        .filter(|r| matches!(r.outcome, OpOutcome::Ok))
+        .map(|r| r.key)
+        .collect()
+}
+
+/// "Compact runs during a restore" (04 step 7): a restore of `y` held at
+/// its first pack read; meanwhile `x` is deleted and compacted, which
+/// repacks the pack holding `y`'s data (no `ActiveSessions`: the restore
+/// registered no marker). The restore reads the moved chunks where the
+/// latest head stores them and restores `y` exactly.
+#[test]
+fn restore_during_compact_reads_relocated_chunks() {
+    let mut sim = Sim::new();
+    let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
+    sim.backup(c, "x", &two_file_tree()).expect_ok();
+    sim.backup(c, "y", &one_file_tree()).expect_ok();
+    let planned: BTreeSet<String> = sim.store().keys("packs/").into_iter().collect();
+
+    let gate = sim.gate(first_pack_read(r));
+    let spawned = sim.spawn(
+        r,
+        Call::Restore {
+            snapshot: "y".into(),
+        },
+    );
+    let held = sim.expect_paused(gate, "restore reads a pack");
+    sim.delete(b, &["x"]).expect_ok();
+    let compact = sim.compact(b);
+    compact.expect_ok();
+    let deleted = packs_deleted_by(&sim, b);
+    assert!(
+        deleted.iter().any(|p| planned.contains(p)),
+        "compact deleted none of the packs the restore planned from: {}",
+        compact.detail()
+    );
+    sim.resume(gate);
+    let run = sim.join(spawned);
+    run.expect_ok();
+    let restored = SourceTree::read_from(&sim.restore_dir(&run)).unwrap();
+    assert_eq!(restored, one_file_tree());
+    let ops = run_ops(&sim, run.index);
+    assert!(
+        ops.iter()
+            .any(|o| o.step > held.at_step && o.op == OpKind::List && o.key == "index.h/"),
+        "the restore did not read the head again (no relocation)"
+    );
+    let protocol: Vec<_> = ops
+        .into_iter()
+        .filter(|o| o.key.starts_with("sessions/") || o.key.starts_with("locks/"))
+        .collect();
+    assert!(protocol.is_empty(), "{protocol:?}");
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// A restore of `x` held at its first pack read while `x` is deleted and
+/// compacted ends with `ChunkRemovedDuringRead`, an allowed error.
+#[test]
+fn restore_of_a_snapshot_deleted_during_the_read_is_allowed() {
+    let mut sim = Sim::new();
+    let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
+    sim.backup(c, "x", &two_file_tree()).expect_ok();
+    sim.backup(c, "y", &one_file_tree()).expect_ok();
+
+    let gate = sim.gate(first_pack_read(r));
+    let spawned = sim.spawn(
+        r,
+        Call::Restore {
+            snapshot: "x".into(),
+        },
+    );
+    sim.expect_paused(gate, "restore reads a pack");
+    sim.delete(b, &["x"]).expect_ok();
+    sim.compact(b).expect_ok();
+    sim.resume(gate);
+    let run = sim.join(spawned);
+    let RunOutcome::Err(e) = &run.outcome else {
+        panic!("the restore of a removed snapshot succeeded: {run:?}");
+    };
+    assert_eq!(
+        e.class,
+        ErrorClass::Allowed(AllowedError::RemovedDuringRead),
+        "{}",
+        e.display
+    );
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// A check held at its first pack op while `x` is deleted and compacted
+/// (packs its index names go) finds them missing, sees the head moved, and
+/// checks again on the latest head: 0 errors.
+#[test]
+fn check_during_compact_reports_no_damage() {
+    let mut sim = Sim::new();
+    let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
+    sim.backup(c, "x", &two_file_tree()).expect_ok();
+    sim.backup(c, "y", &one_file_tree()).expect_ok();
+
+    let gate = sim.gate(GateRule::new(
+        r,
+        OpMatch::Any,
+        KeyMatch::Prefix("packs/".into()),
+    ));
+    let spawned = sim.spawn(r, Call::Check);
+    let held = sim.expect_paused(gate, "check reads packs");
+    sim.delete(b, &["x"]).expect_ok();
+    sim.compact(b).expect_ok();
+    assert!(!packs_deleted_by(&sim, b).is_empty());
+    sim.resume(gate);
+    let run = sim.join(spawned);
+    run.expect_ok();
+    assert!(run.detail().starts_with("0 errors"), "{}", run.detail());
+    let head_lists_after = run_ops(&sim, run.index)
+        .iter()
+        .filter(|o| o.step > held.at_step && o.op == OpKind::List && o.key == "index.h/")
+        .count();
+    assert!(head_lists_after >= 2, "no second pass: {head_lists_after}");
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// A pack lost under an unmoved head is reported, once, and the check does
+/// not run again. A lost data pack costs one extra head read (LIST and
+/// GET), the check's own after its scan; a lost tree pack costs that plus
+/// one for the relocation that finds it lost, however many reads of the
+/// pack fail afterwards.
+#[test]
+fn check_reports_a_lost_pack_once() {
+    lost_pack_head_reads(true, 1);
+    lost_pack_head_reads(false, 2);
+}
+
+/// Deletes the data pack (the larger one) or the tree pack of a two-file
+/// backup and asserts how many more head reads the check makes than a
+/// clean one.
+fn lost_pack_head_reads(data_pack: bool, extra: usize) {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "x", &two_file_tree()).expect_ok();
+    let head_reads = |sim: &Sim, index: usize| {
+        let ops = run_ops(sim, index);
+        let n = |op| {
+            ops.iter()
+                .filter(|o| o.op == op && o.key.starts_with("index.h/"))
+                .count()
+        };
+        (n(OpKind::List), n(OpKind::Get))
+    };
+    let clean = sim.check(c);
+    assert!(clean.detail().starts_with("0 errors"), "{}", clean.detail());
+    let (lists, gets) = head_reads(&sim, clean.index);
+
+    // Upload order varies; the data pack (128 KiB) is the larger one.
+    let mut packs = sim.store().keys_written_by(c, "packs/");
+    assert_eq!(packs.len(), 2, "{packs:?}");
+    packs.sort_by_key(|k| sim.store().object(k).map_or(0, |o| o.data.len()));
+    let pack = packs[usize::from(data_pack)].clone();
+    assert!(sim.tamper_delete(&pack));
+    let lost = sim.check(c);
+    assert!(!lost.detail().starts_with("0 errors"), "{}", lost.detail());
+    assert_eq!(
+        head_reads(&sim, lost.index),
+        (lists + extra, gets + extra),
+        "data_pack {data_pack}"
+    );
+}
+
+/// A2: a snapshot listed when the check opened and deleted (no compact)
+/// before the check loads its metadata is skipped, not reported corrupt:
+/// prune and delete write no head, so no second pass would excuse it.
+#[test]
+fn check_skips_a_snapshot_deleted_during_the_check() {
+    let mut sim = Sim::new();
+    let (c, r, b) = (sim.client("c"), sim.client("r"), sim.client("b"));
+    sim.backup(c, "x", &two_file_tree()).expect_ok();
+    sim.backup(c, "y", &one_file_tree()).expect_ok();
+
+    // The open lists the head once; the index load lists it again, before
+    // the snapshot metadata is read.
+    let gate = sim.gate(
+        GateRule::new(
+            r,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Prefix("index.h/".into()),
+        )
+        .nth(2),
+    );
+    let spawned = sim.spawn(r, Call::Check);
+    sim.expect_paused(gate, "check loads the index");
+    sim.delete(b, &["x"]).expect_ok();
+    sim.resume(gate);
+    let run = sim.join(spawned);
+    run.expect_ok();
+    assert!(run.detail().starts_with("0 errors"), "{}", run.detail());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
 }

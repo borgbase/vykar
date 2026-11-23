@@ -11,6 +11,7 @@ use super::blob_read::{
 use super::control::CancelToken;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
+use super::relocate::{Located, MAX_RELOCATE_ROUNDS, Relocator, pack_not_found};
 use super::tree_cache::TreeChunkCache;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
@@ -110,9 +111,15 @@ struct DecodedBlob {
 /// Fetch `group` with one range read and decode its blobs in `group.blobs`
 /// order through `decode_chunk_into`, which also verifies the chunk ID when
 /// the engine does not encrypt.
+///
+/// A pack that answers 404 is re-resolved through `relocator`: the blobs
+/// are read again where the latest head stores them, on this thread
+/// (`depth` relocations so far; at most [`MAX_RELOCATE_ROUNDS`]).
 fn fetch_group(
     reader: &BlobReader<'_>,
     group: &ReadGroup<CoalescedBlob>,
+    relocator: &Relocator<'_>,
+    depth: u32,
 ) -> Result<Vec<DecodedBlob>> {
     let mut bufs = ReadBuffers::default();
     let mut decoded = Vec::with_capacity(group.blobs.len());
@@ -131,14 +138,71 @@ fn fetch_group(
     )?;
     match end {
         GroupEnd::Done => Ok(decoded),
-        GroupEnd::PackNotFound => Err(VykarError::Other(format!(
-            "pack not found: {}",
-            group.pack_id
-        ))),
+        GroupEnd::PackNotFound => fetch_relocated(reader, group, relocator, depth),
         GroupEnd::OpenFailed(e) | GroupEnd::ReadFailed { error: e, .. } => Err(e),
         // Cannot happen with `|| false`; map it rather than panic.
         GroupEnd::Stopped => Err(VykarError::Interrupted),
     }
+}
+
+/// The blobs of `group`, whose pack answered 404, read where the latest
+/// head stores them; a blob the latest head no longer has fails the read
+/// with [`VykarError::ChunkRemovedDuringRead`] (the first in blob order).
+fn fetch_relocated(
+    reader: &BlobReader<'_>,
+    group: &ReadGroup<CoalescedBlob>,
+    relocator: &Relocator<'_>,
+    depth: u32,
+) -> Result<Vec<DecodedBlob>> {
+    if depth >= MAX_RELOCATE_ROUNDS {
+        return Err(pack_not_found(&group.pack_id));
+    }
+    let ids: Vec<ChunkId> = group.blobs.iter().map(|b| b.chunk_id).collect();
+    let located = relocator.relocate(&group.pack_id, &ids)?;
+    let mut by_pack: HashMap<PackId, Vec<CoalescedBlob>> = HashMap::new();
+    for (blob, at) in group.blobs.iter().zip(located) {
+        match at {
+            Located::Gone => {
+                return Err(VykarError::ChunkRemovedDuringRead {
+                    chunk_id: blob.chunk_id,
+                });
+            }
+            Located::At {
+                pack_id,
+                pack_offset,
+                stored_size,
+            } => by_pack.entry(pack_id).or_default().push(CoalescedBlob {
+                result_idxs: blob.result_idxs.clone(),
+                chunk_id: blob.chunk_id,
+                pack_offset,
+                stored_size,
+            }),
+        }
+    }
+    let mut decoded = Vec::with_capacity(group.blobs.len());
+    for moved in coalesce_groups(by_pack)? {
+        decoded.extend(fetch_group(reader, &moved, relocator, depth + 1)?);
+    }
+    Ok(decoded)
+}
+
+/// The stored bytes of one blob, `None` when the pack answers 404.
+fn try_read_blob(
+    storage: &dyn vykar_storage::StorageBackend,
+    pack_id: &PackId,
+    offset: u64,
+    length: u32,
+) -> Result<Option<Vec<u8>>> {
+    let Some(data) = storage.get_range(&pack_id.storage_key(), offset, u64::from(length))? else {
+        return Ok(None);
+    };
+    if data.len() != length as usize {
+        return Err(VykarError::Other(format!(
+            "short read from pack {pack_id} at offset {offset}: expected {length} bytes, got {}",
+            data.len()
+        )));
+    }
+    Ok(Some(data))
 }
 
 /// Holds out-of-order plaintext until every earlier chunk has arrived;
@@ -214,6 +278,8 @@ impl<'a> Assembler<'a> {
 
 impl Repository {
     /// Read and decrypt a chunk located through the in-memory chunk index.
+    /// A pack that answers 404 is re-resolved against the latest head
+    /// (`repo::relocate`).
     ///
     /// # Errors
     ///
@@ -226,12 +292,64 @@ impl Repository {
             .get(chunk_id)
             .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
 
-        self.read_chunk_at(
+        self.read_chunk_located(
             chunk_id,
-            &entry.pack_id,
+            entry.pack_id,
             entry.pack_offset,
             entry.stored_size,
         )
+    }
+
+    /// [`Self::read_chunk_at`] with relocation: a 404 reads the chunk where
+    /// the latest head stores it, at most [`MAX_RELOCATE_ROUNDS`] times; a
+    /// chunk the latest head no longer has is
+    /// [`VykarError::ChunkRemovedDuringRead`].
+    fn read_chunk_located(
+        &self,
+        chunk_id: &ChunkId,
+        mut pack_id: PackId,
+        mut pack_offset: u64,
+        mut stored_size: u32,
+    ) -> Result<Vec<u8>> {
+        let mut rounds = 0;
+        let mut blob_data = loop {
+            if let Some(data) =
+                try_read_blob(self.storage.as_ref(), &pack_id, pack_offset, stored_size)?
+            {
+                break data;
+            }
+            if rounds == MAX_RELOCATE_ROUNDS {
+                return Err(pack_not_found(&pack_id));
+            }
+            rounds += 1;
+            match self.relocator().relocate(&pack_id, &[*chunk_id])?.first() {
+                Some(&Located::At {
+                    pack_id: p,
+                    pack_offset: o,
+                    stored_size: s,
+                }) => (pack_id, pack_offset, stored_size) = (p, o, s),
+                _ => {
+                    return Err(VykarError::ChunkRemovedDuringRead {
+                        chunk_id: *chunk_id,
+                    });
+                }
+            }
+        };
+        let mut plaintext = Vec::new();
+        decode_chunk_into(
+            &mut blob_data,
+            BlobLocation {
+                chunk_id: *chunk_id,
+                pack_id,
+                pack_offset,
+                stored_size,
+            },
+            self.crypto.as_ref(),
+            None,
+            false,
+            &mut plaintext,
+        )?;
+        Ok(plaintext)
     }
 
     /// Read and decrypt a chunk given explicit pack location coordinates.
@@ -268,7 +386,8 @@ impl Repository {
     /// Each entry in `chunks` is `(ChunkId, PackId, pack_offset, stored_size)`.
     /// Output is appended to `out` in the same order as `chunks`.
     /// Chunks are grouped by pack and coalesced into large range reads to
-    /// minimise HTTP round-trips.
+    /// minimise HTTP round-trips. A pack that answers 404 is re-resolved
+    /// against the latest head (`repo::relocate`).
     ///
     /// Range reads go out on up to the backend's `request_width` threads (one
     /// at a time with width 1 or a single read). Each thread decrypts and
@@ -482,11 +601,12 @@ impl Repository {
         if let Some(sink) = sink {
             reader = reader.with_raw_sink(sink);
         }
+        let relocator = self.relocator();
         fetch_groups_bounded(
             width,
             &groups,
             shutdown,
-            |g| fetch_group(&reader, g),
+            |g| fetch_group(&reader, g, &relocator, 0),
             |blobs| asm.accept(blobs),
         )?;
 

@@ -3,8 +3,8 @@
 
 use super::fault::{ClientId, KeyMatch, OpKind, OpMatch};
 
-/// Stop `client`'s `nth` (1-based) operation matching `op` and `key`,
-/// counted from when the gate is added. Fires once.
+/// Stop `client`'s `nth` (1-based) operation matching `op`, `key` and
+/// `filter`, counted from when the gate is added. Fires once.
 ///
 /// A held operation has taken no step, is not logged and has no effect
 /// until it is resumed; crash state and fault rules are judged when it
@@ -17,6 +17,9 @@ pub struct GateRule {
     /// `BatchDelete`).
     pub key: KeyMatch,
     pub nth: u32,
+    /// Applied after `op` and `key`, to the same key (any key of a
+    /// `BatchDelete`); `None` matches everything.
+    pub filter: Option<fn(OpKind, &str) -> bool>,
 }
 
 impl GateRule {
@@ -27,12 +30,27 @@ impl GateRule {
             op,
             key,
             nth: 1,
+            filter: None,
         }
     }
 
     pub fn nth(mut self, n: u32) -> Self {
         self.nth = n;
         self
+    }
+
+    /// Match only operations for which `f(op, key)` holds.
+    pub fn filter(mut self, f: fn(OpKind, &str) -> bool) -> Self {
+        self.filter = Some(f);
+        self
+    }
+
+    /// Whether `op` on `keys` counts against this gate (its client aside).
+    pub(crate) fn matches(&self, op: OpKind, keys: &[&str]) -> bool {
+        self.op.matches(op)
+            && keys
+                .iter()
+                .any(|k| self.key.matches(k) && self.filter.is_none_or(|f| f(op, k)))
     }
 }
 

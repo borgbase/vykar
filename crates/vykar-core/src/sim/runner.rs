@@ -918,8 +918,8 @@ impl Sim {
             Call::Check => {
                 let body: Body = Box::new(
                     move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
-                        let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
-                            Arc::new(store.handle(c)),
+                        let mut repo = util::open_repo_on(
+                            Box::new(store.handle(c)),
                             &util::open_request(&cfg),
                             None,
                             OpenOptions::new().host_env(env),
@@ -988,8 +988,8 @@ impl Sim {
                           dir: &Path,
                           idx: usize,
                           env: HostEnv| {
-                        let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
-                            Arc::new(store.handle(c)),
+                        let mut repo = util::open_repo_on(
+                            Box::new(store.handle(c)),
                             &util::open_request(&cfg),
                             None,
                             OpenOptions::new().host_env(env),

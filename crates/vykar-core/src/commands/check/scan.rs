@@ -57,8 +57,9 @@ pub(super) struct ScanOptions<'a> {
     pub(super) verify_data: bool,
     /// Packs already verified server-side — skip existence and data checks for these.
     pub(super) skip_packs: Option<&'a HashSet<PackId>>,
-    /// If set, sample only this percentage of snapshots in Phase 1.
-    pub(super) snapshot_sample_percent: Option<u8>,
+    /// If set, Phase 1 checks only the listed snapshots with these IDs
+    /// (a sampled check's snapshot sample).
+    pub(super) snapshot_sample: Option<&'a HashSet<SnapshotId>>,
 }
 
 /// Counters collected during an integrity scan.
@@ -430,7 +431,7 @@ pub(crate) fn scan_for_test(
         detect_orphans: false,
         verify_data: false,
         skip_packs: None,
-        snapshot_sample_percent: None,
+        snapshot_sample: None,
     };
     let scan = integrity_scan(repo, config, &opts, &mut None, &CancelToken::new())?;
     Ok(ScanForTest {
@@ -557,27 +558,12 @@ pub(super) fn integrity_scan(
 
     // Phase 1: Check each snapshot in manifest
     let all_snapshot_entries = repo.manifest().snapshots.clone();
-    let snapshot_entries: Vec<_> = if let Some(pct) = opts.snapshot_sample_percent {
-        let total = all_snapshot_entries.len();
-        if total == 0 || pct >= 100 {
-            all_snapshot_entries
-        } else {
-            let keep = (total as u64 * pct as u64).div_ceil(100) as usize;
-            let keep = keep.max(1).min(total);
-            let mut rng = rand::rng();
-            let indices: std::collections::HashSet<usize> =
-                rand::seq::index::sample(&mut rng, total, keep)
-                    .into_iter()
-                    .collect();
-            all_snapshot_entries
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| indices.contains(i))
-                .map(|(_, e)| e)
-                .collect()
-        }
-    } else {
-        all_snapshot_entries
+    let snapshot_entries: Vec<_> = match opts.snapshot_sample {
+        Some(sample) => all_snapshot_entries
+            .into_iter()
+            .filter(|e| sample.contains(&e.id))
+            .collect(),
+        None => all_snapshot_entries,
     };
     let snapshot_count = snapshot_entries.len();
 
@@ -632,6 +618,18 @@ pub(super) fn integrity_scan(
             }
             // A cancelled storage read is not corruption (see below).
             Err(e @ VykarError::Interrupted) => return Err(e),
+            // Listed when the repository was opened, its object gone now:
+            // a prune or delete removed it during the check (readers
+            // register no marker since 04 step 7). Skipped, as the orphan
+            // pass skips one; an object that exists and does not decode
+            // stays corrupt.
+            Err(VykarError::SnapshotNotFound(_)) => {
+                tracing::warn!(
+                    "snapshot {} was deleted during the check, skipping",
+                    entry.name
+                );
+                continue;
+            }
             Err(e) => {
                 if is_transient_io(&e) {
                     pass.issues.push(IntegrityIssue::SnapshotReadFailed {

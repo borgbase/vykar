@@ -578,7 +578,7 @@ mod tests {
             detect_orphans: false,
             verify_data: false,
             skip_packs: None,
-            snapshot_sample_percent: None,
+            snapshot_sample: None,
         };
         let scan =
             integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
@@ -645,7 +645,7 @@ mod tests {
             detect_orphans: false,
             verify_data: false,
             skip_packs: None,
-            snapshot_sample_percent: None,
+            snapshot_sample: None,
         };
         let scan =
             integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();

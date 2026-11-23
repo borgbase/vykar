@@ -83,7 +83,9 @@ pub(super) fn handle_restore_selected(
                     });
                 }
                 Err(e) => {
-                    let message = if matches!(e, VykarError::RestoreSourceUnreadable(_)) {
+                    let message = if matches!(e, VykarError::RestoreSourceUnreadable(_))
+                        && !e.is_removed_during_read()
+                    {
                         format!(
                             "{e}. To restore the intact files, run \
                              `vykar restore --continue-on-error` from the command line."

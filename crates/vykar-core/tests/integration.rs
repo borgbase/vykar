@@ -3045,7 +3045,7 @@ fn session_guard_blocks_maintenance() {
     .unwrap();
     drop(repo);
 
-    // Register a read session and adopt it with a guard
+    // Register a session (as a backup does) and adopt it with a guard
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
         std::sync::Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let session_id = format!("{:032x}", rand::random::<u128>());

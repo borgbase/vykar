@@ -789,10 +789,7 @@ impl SimStore {
             let GatePhase::Armed { count } = &mut g.phase else {
                 continue;
             };
-            if g.rule.client != client
-                || !g.rule.op.matches(op)
-                || !keys.iter().any(|k| g.rule.key.matches(k))
-            {
+            if g.rule.client != client || !g.rule.matches(op, keys) {
                 continue;
             }
             *count += 1;

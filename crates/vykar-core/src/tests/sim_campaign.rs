@@ -297,6 +297,7 @@ fn campaign_writes_failing_traces() {
         choices: vec![],
         policy: Policy::Continue,
         skews: vec![],
+        maintenance: Maintenance::Whole,
     };
     let cfg = CampaignConfig {
         deadline: Instant::now() + Duration::from_secs(600),

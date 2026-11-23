@@ -38,9 +38,15 @@ pub(crate) fn run_restore(
     .map_err(|e| match e {
         // Repo-level hooks flatten the error to its message, so the hint has
         // to travel inside it.
-        CliError::Vykar(e @ VykarError::RestoreSourceUnreadable(_)) => CliError::Msg(format!(
-            "{e}\nhint: --continue-on-error restores the files that are intact"
-        )),
+        // A chunk removed by a concurrent prune and compact is not damage:
+        // the message already says to run the command again.
+        CliError::Vykar(e @ VykarError::RestoreSourceUnreadable(_))
+            if !e.is_removed_during_read() =>
+        {
+            CliError::Msg(format!(
+                "{e}\nhint: --continue-on-error restores the files that are intact"
+            ))
+        }
         e => e,
     })?;
 

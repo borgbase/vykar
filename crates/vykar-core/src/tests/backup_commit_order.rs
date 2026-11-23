@@ -767,11 +767,12 @@ fn open_failure_deregisters_backup_session() {
     assert!(session_markers(&config).is_empty());
 }
 
-/// A read session whose open fails removes its session marker.
+/// A reader's open (every read command opens this way since 04 step 7)
+/// that fails writes no session marker: readers register none.
 #[test]
-fn open_failure_deregisters_read_session() {
+fn reader_open_failure_writes_no_session_marker() {
     let (_dir, config, _src) = setup_encrypted();
-    let res = crate::commands::util::open_repo_with_read_session(
+    let res = crate::commands::util::open_repo(
         &config,
         Some("wrong"),
         crate::repo::OpenOptions::new(),

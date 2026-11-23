@@ -9,9 +9,12 @@ use super::types::{
     RepairMode, RepairPlan, RepairResult, ServerVerifyOutcome,
 };
 use crate::config::VykarConfig;
+use crate::index::table::IndexState;
 use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::control::CancelToken;
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::index_store;
+use crate::repo::{OpenOptions, Repository, needs_recheck};
+use tracing::info;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -167,12 +170,8 @@ pub fn run_with_progress(
     }
 
     // Open repo (needed for fingerprint check and actual scan).
-    let (mut repo, _session_guard) = crate::commands::util::open_repo_with_read_session(
-        config,
-        passphrase,
-        OpenOptions::new(),
-        shutdown,
-    )?;
+    let mut repo =
+        crate::commands::util::open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
 
     run_on_repo(
         &mut repo,
@@ -187,7 +186,7 @@ pub fn run_with_progress(
 }
 
 /// [`run_with_progress`] on an already opened repository (opened with
-/// `OpenOptions::new()`; any read session is the caller's).
+/// `OpenOptions::new()`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
@@ -226,16 +225,195 @@ pub(crate) fn run_on_repo(
         return Ok(skipped_result());
     }
 
+    // 04 step 7: readers register no marker, so a compact may move or
+    // remove what a pass loaded. Findings against a head that can have lost
+    // entries or packs since (the test the backup commit's reuse re-check
+    // uses) are checked again on the latest head; a compact publishes per
+    // batch, so this repeats, at most MAX_CHECK_PASSES passes in all. A
+    // sampled check draws its sample once: every pass checks the same packs
+    // and snapshots, so a finding is not lost to a new draw.
+    let mut sample = None;
+    let mut passes = 1;
+    let mut result = check_pass(
+        repo,
+        config,
+        verify_data,
+        distrust_server,
+        &mut progress,
+        effective,
+        &mut sample,
+        shutdown,
+    )?;
+    while !result.errors.is_empty() {
+        let latest = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())?;
+        let Some(head) = repo.index_head() else {
+            break;
+        };
+        let loaded = head.generation;
+        let from = IndexState::of_head(head);
+        if latest.generation <= loaded
+            || !needs_recheck(Some((&from, head.sweep.generation)), &latest)
+        {
+            break;
+        }
+        let latest = latest.generation;
+        if passes == MAX_CHECK_PASSES {
+            result.errors.push(CheckError {
+                context: "check".into(),
+                message: format!(
+                    "the repository's index was rewritten during every pass \
+                     ({passes} passes; maintenance, or backups folding the index); the \
+                     problems above may be work in progress. Re-run check when it is quiet"
+                ),
+            });
+            break;
+        }
+        info!(
+            loaded,
+            latest,
+            "check found problems and the index changed during the check; checking again on the latest head"
+        );
+        shutdown.check()?;
+        repo.refresh_snapshot_list()?;
+        passes += 1;
+        result = check_pass(
+            repo,
+            config,
+            verify_data,
+            distrust_server,
+            &mut progress,
+            effective,
+            &mut sample,
+            shutdown,
+        )?;
+    }
+
+    // Completion guard, before the success timestamp *and* before the result
+    // is handed back. An aborted-but-clean-so-far scan has an empty `errors`
+    // vec, so an extra `&&` term here would still return `Ok(partial_result)` —
+    // which the cycle orchestrator maps to `StepOutcome::Ok` and the CLI prints
+    // as a completed summary. Cancellation must be an error, not a short `Ok`.
+    shutdown.check()?;
+
+    // Record full check timestamp if this was a 100% run and succeeded.
+    if record_state && effective == 100 && result.errors.is_empty() {
+        super::state::record_full_check(&config.repository.url, &fingerprint, cache_dir);
+    }
+
+    Ok(result)
+}
+
+/// Passes one check makes at most: a pass that finds problems while the
+/// head moved during it in a way that can remove entries or packs (a
+/// concurrent compact) is followed by another.
+const MAX_CHECK_PASSES: u32 = 3;
+
+/// What a sampled check looks at, drawn in its first pass and kept for the
+/// later ones: of these, each pass checks the packs its index still names
+/// and the snapshots still listed.
+struct CheckSample {
+    packs: HashSet<PackId>,
+    snapshots: HashSet<SnapshotId>,
+}
+
+impl CheckSample {
+    /// Draw `percent` of the packs of `pack_chunks` and of the snapshots
+    /// `repo` lists (at least one of each when there are any).
+    fn draw(repo: &Repository, pack_chunks: &PackChunks, percent: u8) -> Self {
+        let mut pack_ids: Vec<PackId> = pack_chunks.keys().copied().collect();
+        // Sorted, so that a pinned draw (tests) names the same packs.
+        pack_ids.sort_by_cached_key(PackId::storage_key);
+        let picked = sample_indices(SampleOf::Packs, pack_ids.len(), percent);
+        let packs = pick(pack_ids, &picked);
+        let snapshot_ids: Vec<SnapshotId> =
+            repo.manifest().snapshots.iter().map(|e| e.id).collect();
+        let picked = sample_indices(SampleOf::Snapshots, snapshot_ids.len(), percent);
+        let snapshots = pick(snapshot_ids, &picked);
+        Self { packs, snapshots }
+    }
+}
+
+/// The items of `items` at the positions `picked`.
+fn pick<T: std::hash::Hash + Eq>(items: Vec<T>, picked: &HashSet<usize>) -> HashSet<T> {
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picked.contains(i))
+        .map(|(_, x)| x)
+        .collect()
+}
+
+/// What a sample is drawn of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SampleOf {
+    Packs,
+    Snapshots,
+}
+
+/// Tests: a draw of the positions to sample, `(of, total, keep)` to the
+/// positions, in place of the random one, on this thread.
+#[cfg(test)]
+pub(crate) type PinnedSample = Box<dyn FnMut(SampleOf, usize, usize) -> Vec<usize>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PINNED_SAMPLE: std::cell::RefCell<Option<PinnedSample>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `percent` of the positions `0..total`, drawn at random: at least one
+/// when `total > 0`.
+fn sample_indices(of: SampleOf, total: usize, percent: u8) -> HashSet<usize> {
+    if total == 0 || percent >= 100 {
+        return (0..total).collect();
+    }
+    let keep = (total as u64 * percent as u64).div_ceil(100) as usize;
+    let keep = keep.max(1).min(total);
+    #[cfg(test)]
+    if let Some(picked) = PINNED_SAMPLE.with_borrow_mut(|f| f.as_mut().map(|f| f(of, total, keep)))
+    {
+        return picked.into_iter().collect();
+    }
+    // `of` is read only by the test pin.
+    let _ = of;
+    rand::seq::index::sample(&mut rand::rng(), total, keep)
+        .into_iter()
+        .collect()
+}
+
+/// One pass of [`run_on_repo`] at the latest head: index load, server
+/// verify and the integrity scan. A sampled pass (`effective < 100`) draws
+/// `sample` when it is `None`, and checks what it names otherwise.
+#[allow(clippy::too_many_arguments)]
+fn check_pass(
+    repo: &mut Repository,
+    config: &VykarConfig,
+    verify_data: bool,
+    distrust_server: bool,
+    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    effective: u8,
+    sample: &mut Option<CheckSample>,
+    shutdown: &CancelToken,
+) -> Result<CheckResult> {
     repo.load_chunk_index_uncached()?;
 
     // Build per-pack grouping from chunk index (needed for server verify).
     let mut pack_chunks = group_by_pack(repo.chunk_index());
 
-    // If sampling (effective < 100), select a subset of packs.
-    let sampled_out: HashSet<PackId> = if effective < 100 {
-        sample_packs_out(&pack_chunks, effective)
+    // If sampling (effective < 100), the packs this index names outside the
+    // sample are skipped.
+    let sample: Option<&CheckSample> = if effective < 100 {
+        Some(sample.get_or_insert_with(|| CheckSample::draw(repo, &pack_chunks, effective)))
     } else {
-        HashSet::new()
+        None
+    };
+    let sampled_out: HashSet<PackId> = match sample {
+        Some(s) => pack_chunks
+            .keys()
+            .filter(|p| !s.packs.contains(p))
+            .copied()
+            .collect(),
+        None => HashSet::new(),
     };
 
     // Server verification and its counters only need sampled-in packs.
@@ -251,7 +429,7 @@ pub(crate) fn run_on_repo(
             &pack_chunks,
             verify_data,
             repo.content_hash(),
-            &mut progress,
+            progress,
             shutdown,
         )
     } else {
@@ -292,13 +470,6 @@ pub(crate) fn run_on_repo(
         Some(&combined_skip)
     };
 
-    // Sample snapshots if effective < 100.
-    let snapshot_sample_percent = if effective < 100 {
-        Some(effective)
-    } else {
-        None
-    };
-
     let scan = integrity_scan(
         repo,
         config,
@@ -307,9 +478,9 @@ pub(crate) fn run_on_repo(
             detect_orphans: false,
             verify_data,
             skip_packs: skip,
-            snapshot_sample_percent,
+            snapshot_sample: sample.map(|s| &s.snapshots),
         },
-        &mut progress,
+        progress,
         shutdown,
     )?;
 
@@ -322,19 +493,6 @@ pub(crate) fn run_on_repo(
     }
     // Server errors are reported ahead of the local scan's.
     result.errors.splice(0..0, srv_errors);
-
-    // Completion guard, before the success timestamp *and* before the result
-    // is handed back. An aborted-but-clean-so-far scan has an empty `errors`
-    // vec, so an extra `&&` term here would still return `Ok(partial_result)` —
-    // which the cycle orchestrator maps to `StepOutcome::Ok` and the CLI prints
-    // as a completed summary. Cancellation must be an error, not a short `Ok`.
-    shutdown.check()?;
-
-    // Record full check timestamp if this was a 100% run and succeeded.
-    if record_state && effective == 100 && result.errors.is_empty() {
-        super::state::record_full_check(&config.repository.url, &fingerprint, cache_dir);
-    }
-
     Ok(result)
 }
 
@@ -359,35 +517,6 @@ fn compute_repo_fingerprint(repo: &crate::repo::Repository) -> String {
         repo.crypto.chunk_hasher().key(),
     );
     hex::encode(fp)
-}
-
-/// Select which packs to skip (sample out) for a partial check.
-/// Returns the set of pack IDs that should NOT be checked.
-fn sample_packs_out(
-    pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
-    percent: u8,
-) -> HashSet<PackId> {
-    use rand::seq::index::sample;
-
-    let total = pack_chunks.len();
-    if total == 0 || percent >= 100 {
-        return HashSet::new();
-    }
-
-    let keep = (total as u64 * percent as u64).div_ceil(100) as usize;
-    let keep = keep.max(1).min(total);
-
-    let pack_ids: Vec<PackId> = pack_chunks.keys().copied().collect();
-    let mut rng = rand::rng();
-    let indices = sample(&mut rng, total, keep);
-
-    let kept: HashSet<usize> = indices.into_iter().collect();
-    pack_ids
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !kept.contains(i))
-        .map(|(_, pid)| pid)
-        .collect()
 }
 
 /// Refuse to build or apply a repair plan when any snapshot is too new to
@@ -439,8 +568,7 @@ pub fn run_with_repair(
 
     let opts = repair_open_options(mode);
     if mode == RepairMode::PlanOnly {
-        let (mut repo, _session_guard) =
-            crate::commands::util::open_repo_with_read_session(config, passphrase, opts, shutdown)?;
+        let mut repo = crate::commands::util::open_repo(config, passphrase, opts, shutdown)?;
         run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
     } else {
         // A token nothing cancels: past its mutation boundary a repair must
@@ -455,7 +583,7 @@ pub fn run_with_repair(
 /// Open options `run_with_repair` uses for `mode`.
 pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
     if mode == RepairMode::PlanOnly {
-        // PlanOnly: read session, no lock, purely read-only. `skip_key_backfill`
+        // PlanOnly: no marker, no lock, purely read-only. `skip_key_backfill`
         // is what keeps that promise: the dry run prints "no changes applied",
         // and a key-copy backfill firing during the open underneath would make
         // that statement false.
@@ -468,8 +596,8 @@ pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
 }
 
 /// [`run_with_repair`] on a repository opened with
-/// [`repair_open_options`]`(mode)`. PlanOnly takes no lock (the caller holds
-/// the read session); Apply/ApplyShown take the maintenance lock here.
+/// [`repair_open_options`]`(mode)`. PlanOnly takes no lock and registers no
+/// marker; Apply/ApplyShown take the maintenance lock here.
 pub(crate) fn run_with_repair_on_repo(
     repo: &mut Repository,
     config: &VykarConfig,
@@ -483,7 +611,7 @@ pub(crate) fn run_with_repair_on_repo(
         detect_orphans: true,
         verify_data,
         skip_packs: None,
-        snapshot_sample_percent: None,
+        snapshot_sample: None,
     };
 
     if mode == RepairMode::PlanOnly {
@@ -630,7 +758,7 @@ mod tests {
             detect_orphans: false,
             verify_data: false,
             skip_packs: None,
-            snapshot_sample_percent: None,
+            snapshot_sample: None,
         };
         let scan =
             integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();

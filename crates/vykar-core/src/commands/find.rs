@@ -137,12 +137,8 @@ pub fn run(
     scope: &FindScope,
     filter: &FindFilter,
 ) -> Result<Vec<PathTimeline>> {
-    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
-        config,
-        passphrase,
-        OpenOptions::new(),
-        &CancelToken::new(),
-    )?;
+    let mut repo =
+        super::util::open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
 
     let entries = select_snapshots(&repo.manifest().snapshots, scope);
     let (timelines, _stats) = find_on_repo(&mut repo, &entries, filter, &CancelToken::new())?;
@@ -206,10 +202,24 @@ pub(crate) fn find_on_repo(
     if entries.is_empty() {
         return Ok((Vec::new(), stats));
     }
-    let ptrs: Vec<Vec<ChunkId>> = entries
-        .iter()
-        .map(|e| list::load_snapshot_meta(repo, &e.name).map(|m| m.item_ptrs))
-        .collect::<Result<_>>()?;
+    // A snapshot listed at open whose object is gone now was removed by a
+    // prune or delete during the find (readers register no marker since 04
+    // step 7): skipped, as check skips one.
+    let mut found: Vec<&SnapshotEntry> = Vec::with_capacity(entries.len());
+    let mut ptrs: Vec<Vec<ChunkId>> = Vec::with_capacity(entries.len());
+    for e in entries {
+        match list::load_snapshot_meta(repo, &e.name) {
+            Ok(meta) => {
+                found.push(e);
+                ptrs.push(meta.item_ptrs);
+            }
+            Err(VykarError::SnapshotNotFound(_)) => {
+                tracing::warn!("snapshot {} was deleted during the find, skipping", e.name);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stats.snapshots = found.len();
     ItemStreamReader::new(repo).ensure_index(repo)?;
     let lists: Vec<&[ChunkId]> = ptrs.iter().map(Vec::as_slice).collect();
     let set = TreeChunkSet::build(&lists);
@@ -270,7 +280,7 @@ pub(crate) fn find_on_repo(
     // last use.
     let mut uses_left: Vec<u32> = (0..set.len()).map(|k| set.occurrences(k)).collect();
     let mut hits_by_path: BTreeMap<String, Vec<FindHit>> = BTreeMap::new();
-    for (entry, list) in entries.iter().zip(&ptrs) {
+    for (entry, list) in found.iter().zip(&ptrs) {
         for id in list {
             let not_decoded =
                 || VykarError::Other(format!("internal error: tree chunk {id} not decoded"));

@@ -119,7 +119,9 @@ fn one_delete(mut clients: Vec<Vec<Command>>) -> Vec<Vec<Command>> {
 }
 
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
-/// faults of any class and kind, a crash or not, any hosts.
+/// faults of any class and kind, a crash or not, any hosts; compact whole,
+/// or gate-stepped in a case without crashes and time jumps (see
+/// `Maintenance`; shrinking prefers whole).
 pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
         .prop_flat_map(|n| {
@@ -129,17 +131,23 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
                 any::<bool>(),
                 hosts(),
                 choices(),
+                prop::bool::weighted(0.25),
             )
         })
-        .prop_map(|(clients, faults, crash, hosts, choices)| Case {
+        .prop_map(|(clients, faults, crash, hosts, choices, stepped)| Case {
             hosts,
             clients: one_delete(clients),
             faults,
-            crash,
-            advances: true,
+            crash: crash && !stepped,
+            advances: !stepped,
             choices,
             policy: Policy::First,
             skews: vec![],
+            maintenance: if stepped {
+                Maintenance::Stepped
+            } else {
+                Maintenance::Whole
+            },
         })
 }
 
@@ -164,6 +172,7 @@ fn one_hostname_family() -> impl Strategy<Value = Case> {
         choices,
         policy: Policy::First,
         skews: vec![],
+        maintenance: Maintenance::Whole,
     })
 }
 
@@ -189,6 +198,7 @@ fn h3_family() -> impl Strategy<Value = Case> {
         choices,
         policy: Policy::First,
         skews: vec![],
+        maintenance: Maintenance::Whole,
     })
 }
 

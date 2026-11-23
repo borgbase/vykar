@@ -20,6 +20,8 @@ vykar prune --compact
 
 `delete` and `prune` free no space: they only delete snapshot objects. `compact` reclaims it. On every run it first marks every live snapshot and removes the index entries none of them references (the sweep), then rewrites and deletes packs.
 
+Restores, listings, `find`, `diff` and `check` running elsewhere do not hold compact (or `prune`, `delete`) back: readers register nothing, and read what compact moved from its new place. A restore of a snapshot that is deleted and compacted meanwhile fails and says so. A snapshot that `prune` or `delete` removes while `check` or `find` runs is skipped with a warning; `diff` of such a snapshot fails with "snapshot not found". Running backups still make compact refuse.
+
 Compact fails closed: when a snapshot object cannot be read or decoded, an object under `snapshots/` is not a snapshot, or a listing chunk or a data reference is missing from the index, it refuses with "compact refused: the live snapshots could not be marked, nothing was changed". Every compact refuses until `vykar check --repair` removes the object. A snapshot written by a newer vykar also makes compact refuse, and repair deliberately does not remove it: upgrade vykar instead. Compact also refuses when no snapshot is listed while the index still holds chunks (it does not sweep a repository to empty; `vykar delete` removes a repository).
 
 ```bash

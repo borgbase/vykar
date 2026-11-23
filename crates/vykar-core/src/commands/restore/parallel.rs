@@ -11,8 +11,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::repo::blob_read::{BlobReader, GroupEnd, ReadBuffers};
+use crate::repo::blob_read::{BlobReader, GroupEnd, ReadBuffers, coalesce_groups};
 use crate::repo::control::CancelToken;
+use crate::repo::relocate::{Located, MAX_RELOCATE_ROUNDS, Relocator, pack_not_found};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
@@ -278,6 +279,9 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
 /// With `failures` set, source-side failures are recorded in it (against the
 /// files they affect) and the pass carries on; without it the first one stops the pass as
 /// `ReadError::Source`.
+///
+/// With `relocator` set, a group whose pack answers 404 is read again where
+/// the latest head stores its chunks (`repo::relocate`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_parallel_restore(
     files: &[PlannedFile],
@@ -288,6 +292,7 @@ pub(super) fn execute_parallel_restore(
     readers: usize,
     verify_chunks: bool,
     shutdown: &CancelToken,
+    relocator: Option<&Relocator<'_>>,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<u64, ReadError> {
     shutdown.check()?;
@@ -333,6 +338,7 @@ pub(super) fn execute_parallel_restore(
                         root,
                         verify_chunks,
                         shutdown,
+                        relocator,
                         failures,
                     ) {
                         cancelled.store(true, Ordering::Release);
@@ -364,6 +370,7 @@ struct BlobCtx<'a> {
     cancelled: &'a AtomicBool,
     root: &'a Path,
     shutdown: &'a CancelToken,
+    relocator: Option<&'a Relocator<'a>>,
     failures: Option<&'a BatchFailures>,
 }
 
@@ -420,6 +427,7 @@ fn process_read_group(
     root: &Path,
     verify_chunks: bool,
     shutdown: &CancelToken,
+    relocator: Option<&Relocator<'_>>,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<(), ReadError> {
     let ctx = BlobCtx {
@@ -429,14 +437,27 @@ fn process_read_group(
         cancelled,
         root,
         shutdown,
+        relocator,
         failures,
     };
+    process_group_with(&ctx, group, bufs, pw, 0)
+}
 
+/// [`process_read_group`] with its context built; `depth` relocations led
+/// to `group`.
+fn process_group_with(
+    ctx: &BlobCtx<'_>,
+    group: &ReadGroup,
+    bufs: &mut ReadBuffers,
+    pw: &mut PendingWrite,
+    depth: u32,
+) -> std::result::Result<(), ReadError> {
+    let failures = ctx.failures;
     // `failed_at`: index of the blob whose own read failed (a streamed piece,
     // or the only blob of the group); `None` when the group request failed as
     // a whole.
     let (err, failed_at) = match process_blobs(
-        &ctx,
+        ctx,
         &group.pack_id,
         group.read_start,
         group.range_len(),
@@ -446,15 +467,7 @@ fn process_read_group(
     )? {
         GroupEnd::Done | GroupEnd::Stopped => return Ok(()),
         GroupEnd::ReadFailed { index, error } => (error, Some(index)),
-        GroupEnd::PackNotFound => {
-            if failures.is_none() {
-                return Err(ReadError::source(pack_not_found(&group.pack_id)));
-            }
-            for blob in &group.blobs {
-                ctx.source_failure(blob, pack_not_found(&group.pack_id))?;
-            }
-            return Ok(());
-        }
+        GroupEnd::PackNotFound => return process_relocated(ctx, group, bufs, pw, depth),
         GroupEnd::OpenFailed(e) => (e, (group.blobs.len() == 1).then_some(0)),
     };
 
@@ -478,7 +491,74 @@ fn process_read_group(
         }
         None => (&group.blobs[..], 0),
     };
-    retry_blobs_one_by_one(&ctx, &group.pack_id, rest, consecutive, bufs, pw)
+    retry_blobs_one_by_one(ctx, &group.pack_id, rest, consecutive, bufs, pw)
+}
+
+/// `group`'s pack answered 404: read its blobs where the latest head stores
+/// them (each new group on this thread). Blobs the latest head no longer
+/// has fail with [`VykarError::ChunkRemovedDuringRead`]; a failed
+/// relocation (the pack is lost, or no relocator) is today's
+/// pack-not-found failure of every blob.
+fn process_relocated(
+    ctx: &BlobCtx<'_>,
+    group: &ReadGroup,
+    bufs: &mut ReadBuffers,
+    pw: &mut PendingWrite,
+    depth: u32,
+) -> std::result::Result<(), ReadError> {
+    let located = match ctx.relocator {
+        Some(relocator) if depth < MAX_RELOCATE_ROUNDS => {
+            let ids: Vec<_> = group.blobs.iter().map(|b| b.chunk_id).collect();
+            relocator.relocate(&group.pack_id, &ids)
+        }
+        _ => Err(pack_not_found(&group.pack_id)),
+    };
+    let located = match located {
+        Ok(located) => located,
+        Err(e) => {
+            if ctx.failures.is_none() || matches!(e, VykarError::Interrupted) {
+                return Err(ReadError::source(e));
+            }
+            let msg = e.to_string();
+            let mut first = Some(e);
+            for blob in &group.blobs {
+                let e = first
+                    .take()
+                    .unwrap_or_else(|| VykarError::Other(msg.clone()));
+                ctx.source_failure(blob, e)?;
+            }
+            return Ok(());
+        }
+    };
+    let mut by_pack: HashMap<PackId, Vec<PlannedBlob>> = HashMap::new();
+    for (blob, at) in group.blobs.iter().zip(located) {
+        match at {
+            Located::Gone => ctx.source_failure(
+                blob,
+                VykarError::ChunkRemovedDuringRead {
+                    chunk_id: blob.chunk_id,
+                },
+            )?,
+            Located::At {
+                pack_id,
+                pack_offset,
+                stored_size,
+            } => by_pack.entry(pack_id).or_default().push(PlannedBlob {
+                chunk_id: blob.chunk_id,
+                pack_offset,
+                stored_size,
+                expected_size: blob.expected_size,
+                targets: blob.targets.clone(),
+            }),
+        }
+    }
+    for moved in coalesce_groups(by_pack)? {
+        if ctx.stopping() {
+            return Ok(());
+        }
+        process_group_with(ctx, &moved, bufs, pw, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Continue-mode salvage: read `blobs` with one request each, recording the
@@ -534,10 +614,6 @@ fn retry_blobs_one_by_one(
 /// Per-blob retries of a failed group read stop after this many consecutive
 /// storage failures; the remaining blobs of the group are marked damaged.
 const MAX_CONSECUTIVE_BLOB_READ_ERRORS: usize = 3;
-
-fn pack_not_found(pack_id: &PackId) -> VykarError {
-    VykarError::Other(format!("pack not found: {pack_id}"))
-}
 
 /// Open `[offset, offset + length)` of `pack_id`, then read, decode and
 /// write `blobs` (all inside that range) through `ctx.reader`.
@@ -815,6 +891,7 @@ mod tests {
             false,
             &CancelToken::new(),
             None,
+            None,
         )
         .map_err(ReadError::into_inner)
         .unwrap_err()
@@ -879,6 +956,7 @@ mod tests {
             temp.path(),
             false,
             &CancelToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -961,6 +1039,7 @@ mod tests {
             temp.path(),
             false,
             &CancelToken::new(),
+            None,
             None,
         )
         .unwrap();
@@ -1056,6 +1135,7 @@ mod tests {
             false,
             &CancelToken::new(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1129,6 +1209,7 @@ mod tests {
             false,
             &CancelToken::new(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1194,6 +1275,7 @@ mod tests {
             true,
             &CancelToken::new(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1222,6 +1304,7 @@ mod tests {
             root,
             verify_chunks,
             &CancelToken::new(),
+            None,
             None,
         )
         .map_err(ReadError::into_inner)?;
@@ -1481,6 +1564,7 @@ mod tests {
             false,
             &shutdown,
             None,
+            None,
         )
         .map_err(ReadError::into_inner)
         .unwrap_err();
@@ -1551,6 +1635,7 @@ mod tests {
             2,
             false,
             &shutdown,
+            None,
             None,
         )
         .map_err(ReadError::into_inner)
@@ -1653,6 +1738,7 @@ mod tests {
             root,
             false,
             &CancelToken::new(),
+            None,
             failures,
         )
     }
@@ -1839,6 +1925,7 @@ mod tests {
                 2,
                 false,
                 &CancelToken::new(),
+                None,
                 None,
             )
             .unwrap_err();
@@ -2172,6 +2259,7 @@ mod tests {
             false,
             &shutdown,
             None,
+            None,
         )
         .unwrap();
         assert!(shutdown.is_cancelled(), "the first piece raises the flag");
@@ -2373,6 +2461,7 @@ mod tests {
                 temp.path(),
                 false,
                 &CancelToken::new(),
+                None,
                 Some(&failures),
             )
             .unwrap();

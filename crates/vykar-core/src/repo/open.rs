@@ -296,6 +296,7 @@ impl Repository {
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,
             pack_grace: super::ages::T_PACK,
+            relocation: Default::default(),
         })
     }
 
@@ -516,6 +517,7 @@ impl Repository {
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,
             pack_grace: super::ages::T_PACK,
+            relocation: Default::default(),
         };
         Ok((repo, file_cache_load))
     }

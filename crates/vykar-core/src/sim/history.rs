@@ -34,6 +34,9 @@ pub enum AllowedError {
     Injected,
     /// Compact refused because the live snapshots could not be marked.
     MarkRefused,
+    /// A reader whose planned chunk a concurrent compact removed
+    /// (`ChunkRemovedDuringRead`, also inside `RestoreSourceUnreadable`).
+    RemovedDuringRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +69,9 @@ pub fn classify(err: &VykarError) -> ErrorClass {
     };
     if let Some(a) = allowed {
         return ErrorClass::Allowed(a);
+    }
+    if err.is_removed_during_read() {
+        return ErrorClass::Allowed(AllowedError::RemovedDuringRead);
     }
     let mut cur: Option<&dyn std::error::Error> = Some(err);
     while let Some(e) = cur {

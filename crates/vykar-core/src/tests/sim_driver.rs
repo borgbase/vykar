@@ -35,6 +35,7 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         choices: vec![],
         policy: Policy::First,
         skews: vec![],
+        maintenance: Maintenance::Whole,
     }
 }
 
@@ -718,3 +719,319 @@ fn replay_from_env() {
     let o = run_case(&Template::new(), &c);
     eprintln!("{}", o.trace.render());
 }
+
+// --- Gate-stepped compact (04 step 7) ---
+
+/// `c` with its compact gate-stepped.
+fn stepped(c: &Case) -> Case {
+    Case {
+        maintenance: Maintenance::Stepped,
+        ..c.clone()
+    }
+}
+
+/// The compact cases of the op-order and determinism tests, no time jumps:
+/// (1) one client deletes c0 and compacts; (2) one client backs up, deletes
+/// c0 and compacts; (3) `commit_vs_compact` on its default schedule, which
+/// runs the backup to its finish before b starts.
+fn compact_cases() -> Vec<(&'static str, Case)> {
+    let quiet = |clients: Vec<Vec<Command>>| Case {
+        advances: false,
+        ..case(HostPlan::Distinct, clients, vec![])
+    };
+    vec![
+        (
+            "delete-compact",
+            quiet(vec![vec![Command::DeleteControl, Command::Compact]]),
+        ),
+        (
+            "backup-delete-compact",
+            quiet(vec![vec![
+                backup(),
+                Command::DeleteControl,
+                Command::Compact,
+            ]]),
+        ),
+        (
+            "commit-vs-compact",
+            Case {
+                policy: Policy::First,
+                ..super::sim_exhaustive::commit_vs_compact(HostPlan::Distinct)
+            },
+        ),
+    ]
+}
+
+/// The compact runs of `o`.
+fn compact_runs(o: &Outcome) -> Vec<RunRecord> {
+    o.sim
+        .history()
+        .runs
+        .iter()
+        .filter(|r| matches!(r.op, ClientOp::Compact))
+        .cloned()
+        .collect()
+}
+
+/// Every op of `o`'s compact runs as (op, key class, outcome), in issue
+/// order.
+fn compact_ops(o: &Outcome) -> Vec<String> {
+    let runs: BTreeSet<usize> = compact_runs(o).iter().map(|r| r.index).collect();
+    o.sim
+        .store()
+        .log()
+        .iter()
+        .filter(|r| r.run.is_some_and(|i| runs.contains(&i)))
+        .map(|r| {
+            format!(
+                "{:?} {} {}",
+                r.op,
+                crate::sim::log::key_class(&r.key),
+                r.outcome.name()
+            )
+        })
+        .collect()
+}
+
+/// Run outcomes as text, without random names.
+fn outcomes(o: &Outcome) -> Vec<String> {
+    o.sim
+        .history()
+        .runs
+        .iter()
+        .map(|r| format!("{:?} {}", r.op, r.is_ok()))
+        .collect()
+}
+
+/// A stepped compact issues the same operations as the whole one, and the
+/// runs end the same: gate-stepping changes when compact's ops run, not
+/// which.
+#[test]
+fn stepped_compact_issues_the_ops_of_the_whole_one() {
+    let t = Template::new();
+    for (name, c) in compact_cases() {
+        let whole = run_case(&t, &c);
+        let step = run_case(&t, &stepped(&c));
+        assert_eq!(
+            compact_ops(&whole),
+            compact_ops(&step),
+            "{name}:\n{}\n{}",
+            whole.trace.render(),
+            step.trace.render()
+        );
+        assert_eq!(outcomes(&whole), outcomes(&step), "{name}");
+        assert!(
+            whole.signatures.is_empty(),
+            "{name}: {}",
+            whole.trace.render()
+        );
+        assert!(
+            step.signatures.is_empty(),
+            "{name}: {}",
+            step.trace.render()
+        );
+        assert_eq!(whole.report.to_string(), step.report.to_string(), "{name}");
+    }
+}
+
+/// The decisions of a stepped compact: each issues exactly one step op
+/// (`is_maintenance_step`), the first ("compact start") none. Returns
+/// their count.
+fn check_stepped_decisions(name: &str, o: &Outcome) -> usize {
+    let log = o.sim.store().log();
+    let runs: BTreeSet<usize> = compact_runs(o).iter().map(|r| r.index).collect();
+    let mut steps = 0;
+    for e in &o.trace.entries {
+        if e.label != "compact start" && !e.label.starts_with("compact ") {
+            continue;
+        }
+        let step_ops = log
+            .iter()
+            .filter(|r| r.step > e.steps.0 && r.step <= e.steps.1)
+            .filter(|r| r.run.is_some_and(|i| runs.contains(&i)))
+            .filter(|r| is_maintenance_step(r.op, &r.key))
+            .count();
+        let want = usize::from(e.label != "compact start");
+        assert_eq!(
+            step_ops,
+            want,
+            "{name}: decision {} ({}) issued {step_ops} step ops:\n{}",
+            e.n,
+            e.label,
+            o.trace.render()
+        );
+        steps += want;
+    }
+    steps
+}
+
+/// A stepped case replays identically, and every stepped decision issues
+/// one step op. Also measures the largest step count, which
+/// `MAX_MAINTENANCE_STEPS` must be at least twice of.
+#[test]
+fn stepped_compact_replays_identically() {
+    let t = Template::new();
+    let mut cases: Vec<(String, Case)> = compact_cases()
+        .into_iter()
+        .map(|(n, c)| (n.to_string(), stepped(&c)))
+        .collect();
+    let base = stepped(&super::sim_exhaustive::commit_vs_compact(
+        HostPlan::Distinct,
+    ));
+    let mut state: u64 = 0x5eed;
+    for k in 0..20 {
+        let choices = (0..40)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u16 % 4
+            })
+            .collect();
+        cases.push((
+            format!("random-{k}"),
+            Case {
+                choices,
+                ..base.clone()
+            },
+        ));
+    }
+    let mut most = 0;
+    for (name, c) in &cases {
+        let a = run_case(&t, c);
+        let b = run_case(&t, c);
+        assert_eq!(
+            a.trace.canonical(),
+            b.trace.canonical(),
+            "{name}:\n{}\n{}",
+            a.trace.render(),
+            b.trace.render()
+        );
+        most = most.max(check_stepped_decisions(name, &a));
+    }
+    if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
+        eprintln!("stepped compact: at most {most} step ops");
+    }
+    assert!(
+        2 * most <= MAX_MAINTENANCE_STEPS,
+        "a stepped compact made {most} step ops; raise MAX_MAINTENANCE_STEPS"
+    );
+}
+
+/// The decisions of a stepped compact after a backup and the delete of c0,
+/// as measured. A change of compact's op order fails here first.
+#[test]
+fn stepped_compact_steps_in_this_order() {
+    let t = Template::new();
+    let (_, c) = &compact_cases()[1];
+    let o = run_case(&t, &stepped(c));
+    let labels: Vec<&str> = o
+        .trace
+        .entries
+        .iter()
+        .map(|e| e.label.as_str())
+        .filter(|l| l.starts_with("compact"))
+        .collect();
+    if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
+        eprintln!("{labels:#?}");
+    }
+    assert_eq!(labels, STEPPED_COMPACT_LABELS, "{}", o.trace.render());
+}
+
+/// A4: the driver refuses a stepped compact in a case with time jumps.
+#[test]
+#[should_panic(expected = "runs only in cases without time jumps")]
+fn stepped_compact_with_time_jumps_is_refused() {
+    let c = Case {
+        advances: true,
+        ..stepped(&super::sim_exhaustive::commit_vs_compact(
+            HostPlan::Distinct,
+        ))
+    };
+    run_case(&Template::new(), &c);
+}
+
+/// A crash of b inside a stepped compact, after its head PUT and before
+/// its pack deletes: the rest of its ops fail, the run is joined, and the
+/// end state is clean.
+#[test]
+fn crash_inside_a_stepped_compact() {
+    let t = Template::new();
+    let base = Case {
+        crash: true,
+        ..stepped(&Case {
+            policy: Policy::First,
+            ..super::sim_exhaustive::commit_vs_compact(HostPlan::Distinct)
+        })
+    };
+    let plain = run_case(&t, &base);
+    let n = plain
+        .trace
+        .entries
+        .iter()
+        .position(|e| e.label == "compact Put index.h/")
+        .unwrap_or_else(|| panic!("no head PUT step:\n{}", plain.trace.render()))
+        + 1;
+    let crash = Action::Crash { client: 1 };
+    let options = &plain.trace.entries[n].actions;
+    let pick = options
+        .iter()
+        .position(|a| *a == crash)
+        .unwrap_or_else(|| panic!("no crash of b at decision {n}: {options:?}"));
+    let c = with_choice(&base, n, u16::try_from(pick).unwrap());
+    let o = run_case(&t, &c);
+    assert_eq!(o.trace.entries[n].action, crash, "{}", o.trace.render());
+    let deletes_after = o.trace.entries[n..]
+        .iter()
+        .flat_map(|e| &e.ops)
+        .any(|op| op.starts_with("b Delete packs/") && op.ends_with(" ok"));
+    assert!(!deletes_after, "{}", o.trace.render());
+    assert!(o.signatures.is_empty(), "{}", o.trace.render());
+    assert!(o.report.is_clean(), "{}", o.trace.render());
+}
+
+const STEPPED_COMPACT_LABELS: &[&str] = &[
+    "compact start",
+    // open: snapshot listing, head
+    "compact List snapshots/",
+    "compact List index.h/",
+    "compact Get index.h/",
+    // (the maintenance lock is taken in the decision before) the session
+    // check
+    "compact ListMeta sessions/",
+    "compact List sessions/",
+    // index load under the lock, marks
+    "compact List index.h/",
+    "compact Get index.h/",
+    "compact List snapshots/",
+    "compact Get snapshots/",
+    // the sweep: head re-read, sweep record and segment, fence, head
+    "compact List index.h/",
+    "compact Get index.h/",
+    "compact Put index.d/",
+    "compact Put index.d/",
+    "compact Exists locks/",
+    "compact Put index.h/",
+    // pack listing (the first shard; the rest in the same decision)
+    "compact ListMeta packs/",
+    // the repack batch: fence, head re-read, segment, fence, head, deletes
+    "compact Exists locks/",
+    "compact List index.h/",
+    "compact Get index.h/",
+    "compact Put index.d/",
+    "compact Exists locks/",
+    "compact Put index.h/",
+    "compact Delete packs/",
+    "compact Delete packs/",
+    // index upkeep, pack maps, lock release
+    "compact List index.h/",
+    "compact Get index.h/",
+    "compact ListMeta index.h/",
+    "compact ListMeta index.d/",
+    "compact Get index.h/",
+    "compact Get index.h/",
+    "compact Get index.h/",
+    "compact Get index.h/",
+    // pack maps; the lock release runs in this last decision
+    "compact List packmaps/",
+];

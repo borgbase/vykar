@@ -48,6 +48,16 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         choices: vec![],
         policy: Policy::Continue,
         skews: vec![],
+        maintenance: Maintenance::Whole,
+    }
+}
+
+/// `c` with its compact gate-stepped (one decision per protocol-key
+/// operation).
+pub(super) fn stepped(c: Case) -> Case {
+    Case {
+        maintenance: Maintenance::Stepped,
+        ..c
     }
 }
 
@@ -128,6 +138,11 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         .map(|(name, c)| (format!("{name}-k2"), c.clone(), 2))
         .collect();
     out.push(("pair-distinct-k3".into(), bases[0].1.clone(), 3));
+    // The compact bases with compact gate-stepped, at K = 2; never with
+    // time jumps or crashes (see `Maintenance`).
+    for (name, c) in bases.iter().filter(|(n, _)| !n.starts_with("pair")) {
+        out.push((format!("{name}-stepped-k2"), stepped(c.clone()), 2));
+    }
     for (name, c) in &bases {
         let mut c = c.clone();
         c.advances = true;
@@ -145,6 +160,17 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
             c.faults = vec![f];
             out.push((label, c, 1));
         }
+    }
+    for f in fault_plans() {
+        let label = format!(
+            "compact-distinct-stepped-fault-{}-{:?}-{:?}-k1",
+            ["a", "b"][usize::from(f.client)],
+            f.class,
+            f.kind
+        );
+        let mut c = stepped(commit_vs_compact(HostPlan::Distinct));
+        c.faults = vec![f];
+        out.push((label, c, 1));
     }
     out
 }
@@ -216,15 +242,21 @@ fn lock_pair_on_one_hostname_is_clean() {
     assert_clean("pair-hostname", &lock_pair(HostPlan::SameHostname));
 }
 
-/// A backup against delete + compact, compact one step at every boundary of
-/// the backup: before its registration (compact removes c0's chunks and the
-/// backup uploads the shared file anew), between upload and lock (compact
-/// refuses with `ActiveSessions`, allowed; this changes when 04 step 7
-/// removes the zero-sessions refusal), inside the commit window (`Locked`,
-/// allowed), after its finish.
+/// A backup against delete + compact, compact one protocol-key operation at
+/// a time (`Maintenance::Stepped`) against every boundary of the backup:
+/// before its registration (compact removes c0's chunks and the backup
+/// uploads the shared file anew); between upload and lock compact still
+/// refuses with `ActiveSessions` at its session check (allowed; the second
+/// half of 04 step 7 removes the refusal); a backup whose registration probe
+/// meets compact's lock fails `Locked` (allowed); inside the commit window
+/// compact fails `Locked`; after the finish. At K = 1 57 runs in about
+/// 0.55 s, against 48 runs in 0.4 s with the compact whole.
 #[test]
 fn backup_against_compact_is_clean() {
-    assert_clean("compact-distinct", &commit_vs_compact(HostPlan::Distinct));
+    assert_clean(
+        "compact-distinct-stepped",
+        &stepped(commit_vs_compact(HostPlan::Distinct)),
+    );
 }
 
 /// Most `locks/` ops one client makes in one raw acquisition, release
@@ -454,6 +486,10 @@ fn measure_bounds() {
             ("pair-distinct", lock_pair(HostPlan::Distinct)),
             ("pair-hostname", lock_pair(HostPlan::SameHostname)),
             ("compact-distinct", commit_vs_compact(HostPlan::Distinct)),
+            (
+                "compact-distinct-stepped",
+                stepped(commit_vs_compact(HostPlan::Distinct)),
+            ),
         ] {
             let e = explore(
                 &t,

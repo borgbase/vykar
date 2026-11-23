@@ -73,6 +73,8 @@ vykar restore latest /tmp/restored
 
 Restore applies extended attributes (`xattrs`) by default. Control this with the top-level `xattrs.enabled` config setting.
 
+Restore, like every read command, takes no lock and needs only read access to the repository, so it runs while backups, `prune` or `compact` run elsewhere: data a concurrent compact moves is read from its new place. A snapshot that is deleted and compacted while it is being restored fails with "chunk … was removed from the repository while it was being read"; nothing is published to the destination. Run the restore again (of a snapshot that still exists), and run `vykar check` if the snapshot is still listed.
+
 ### Restore part of a snapshot
 
 `--pattern` takes a single glob, matched against paths **as they are stored in the snapshot** — exactly what `vykar snapshot list` prints. Check that form before writing a pattern.

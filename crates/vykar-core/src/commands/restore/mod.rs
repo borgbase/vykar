@@ -231,8 +231,7 @@ fn compile_pattern(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>
         .map_err(|e| VykarError::Config(format!("invalid pattern: {e}")))
 }
 
-/// [`run_with_options`] on an already opened repository (read session, if
-/// any, is the caller's).
+/// [`run_with_options`] on an already opened repository.
 #[cfg(any(test, feature = "sim"))]
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
@@ -444,7 +443,7 @@ fn forced() -> bool {
 
 /// Where restore streams items from.
 enum RestoreSource<'a> {
-    Lazy(LazyItemStream<'a>),
+    Lazy(Box<LazyItemStream<'a>>),
     Subtrees {
         view: ListingView<'a>,
         meta: &'a SnapshotMeta,
@@ -545,7 +544,7 @@ where
     F: FnMut(&str) -> bool,
 {
     shutdown.check()?;
-    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+    let mut repo = super::util::open_repo(
         config,
         passphrase,
         crate::repo::OpenOptions::new(),
@@ -565,7 +564,42 @@ where
 
 /// The restore. Also returns what the subtree reads cost (`None` for the
 /// lazy whole-listing read).
+///
+/// A chunk missing from the index because the snapshot was deleted and
+/// compacted before the index load fails as `ChunkRemovedDuringRead`
+/// (`ReadOrigin::explain`).
 fn restore_on_repo_with_filter<F>(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    dest: &str,
+    opts: RestoreOptions,
+    scope: ReadScope,
+    include_path: F,
+    shutdown: &CancelToken,
+) -> Result<(RestoreStats, Option<ListingRead>)>
+where
+    F: FnMut(&str) -> bool,
+{
+    let resolved = repo
+        .manifest()
+        .resolve_snapshot(snapshot_name)?
+        .name
+        .clone();
+    let origin = super::list::ReadOrigin::of(repo, &resolved)?;
+    restore_planned(
+        repo,
+        snapshot_name,
+        dest,
+        opts,
+        scope,
+        include_path,
+        shutdown,
+    )
+    .map_err(|e| origin.explain(repo, e))
+}
+
+/// The body of [`restore_on_repo_with_filter`].
+fn restore_planned<F>(
     repo: &mut Repository,
     snapshot_name: &str,
     dest: &str,
@@ -658,7 +692,11 @@ where
         _ => None,
     };
     let mut source = match dirs {
-        None => RestoreSource::Lazy(LazyItemStream::open(ro, &meta.item_ptrs, shutdown)?),
+        None => RestoreSource::Lazy(Box::new(LazyItemStream::open(
+            ro,
+            &meta.item_ptrs,
+            shutdown,
+        )?)),
         Some(dirs) => {
             // A pointer the chunk index lacks is refused before anything is
             // written, as the lazy read refuses it, even where the subtree
@@ -768,6 +806,8 @@ where
             plan::stage_batch_files(&batch_files, &temp_root, verified_dirs, shutdown)?;
 
             // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
+            // A pack a concurrent compact removed is re-resolved (04 step 7).
+            let relocator = ro.relocator();
             let bytes = parallel::execute_parallel_restore(
                 &batch_files,
                 groups,
@@ -777,6 +817,7 @@ where
                 readers,
                 verify_chunks,
                 shutdown,
+                Some(&relocator),
                 failures.as_ref(),
             )
             .map_err(restore_error)?;

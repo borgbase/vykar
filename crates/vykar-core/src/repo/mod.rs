@@ -21,6 +21,7 @@ pub(crate) mod write_session;
 
 mod chunks;
 mod commit;
+pub(crate) use commit::needs_recheck;
 mod commit_machine;
 pub(crate) use commit_machine::{BackupCommit, Committed};
 pub(crate) mod index_rebuild;
@@ -42,6 +43,7 @@ pub use key::{LoadedKey, select_repository_key};
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
 pub(crate) use read::TreeChunkSource;
+pub(crate) mod relocate;
 mod session;
 pub use session::WriteSessionOptions;
 mod upgrade;
@@ -581,6 +583,8 @@ pub struct Repository {
     /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
     /// (zero turns the guard off, so a test double without mtimes deletes).
     pack_grace: std::time::Duration,
+    /// The latest index a relocation loaded, see [`relocate`].
+    relocation: relocate::RelocationCache,
 }
 
 impl Repository {
@@ -641,7 +645,6 @@ impl Repository {
     pub fn index_generation(&self) -> u64 {
         self.index_generation
     }
-
     /// Read-only access to the manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
@@ -691,10 +694,12 @@ impl Repository {
         self.index_dirty = false;
     }
 
-    /// Drop the chunk index (unmaps its table, frees its edits).
+    /// Drop the chunk index (unmaps its table, frees its edits) and the
+    /// index a relocation loaded (a later relocation loads one again).
     /// Does not mark dirty — intended for memory optimization (e.g. restore).
     pub fn clear_chunk_index(&mut self) {
         self.chunk_index = LiveIndex::empty();
+        self.relocation.clear();
     }
 
     /// Read-only access to the file cache.

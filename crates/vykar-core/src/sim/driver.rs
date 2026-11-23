@@ -17,8 +17,12 @@
 //! [`LOCK_ATTEMPTS`] single attempts at the commit lock, then one decision
 //! per step of its `BackupCommit` machine
 //! (`Local` steps run right after the step before them), then its finish.
-//! Compact and delete are one decision each: their index writes run the
-//! same publish machine, driven to the end inside the command.
+//! Compact is one decision (`Maintenance::Whole`, every seed recorded
+//! before 04 step 7) or one decision per protocol-key operation
+//! (`Stepped`: gate-stepped on its own thread; the commit machines are
+//! steppable, compact is not a machine; see [`is_maintenance_step`]).
+//! Delete is one decision. Both run their index writes through the same
+//! publish machine, driven to the end inside the command.
 //!
 //! [`run_case`] judges the end state with the checker and classifies what
 //! it found by [`Signature`]. The [`Trace`] names no random key or time,
@@ -34,11 +38,12 @@ use serde::{Deserialize, Serialize};
 use super::checker::{Invariant, Report, Violation, ViolationKind, run_subject};
 use super::env::SimMachine;
 use super::fault::{
-    ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpMatch, ParkedId,
+    ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedId,
 };
+use super::gate::{GateId, GateRule};
 use super::history::{ClientOp, RunOutcome};
 use super::log::{OpOutcome, OpRecord, key_class};
-use super::runner::{Call, RunResult, Sim, SourceTree, seeded_bytes};
+use super::runner::{Call, GATE_TIMEOUT, RunResult, Sim, SourceTree, Spawned, seeded_bytes};
 use crate::commands::backup::{self, BackupRequest, CommitInProgress, PendingCommit};
 use crate::compress::Compression;
 use crate::repo::Committed;
@@ -189,6 +194,86 @@ pub struct Case {
     /// wall clock, so a case must behave the same under any skews.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skews: Vec<i64>,
+    /// How Compact runs; DeleteControl is always one decision.
+    #[serde(default, skip_serializing_if = "Maintenance::is_whole")]
+    pub maintenance: Maintenance,
+}
+
+/// How the driver runs a Compact command.
+///
+/// Searches and the campaign draw `Stepped` only in cases without time
+/// jumps and without crashes: a compact held between its fence check and
+/// its head PUT, or between the head PUT and its pack deletes, across a
+/// 6 h jump becomes the aged-lock victim itself, and the signatures
+/// describe backups as victims. [`run_case`] refuses a `Stepped` case
+/// with time jumps; a crash stays possible (`crash_inside_a_stepped_compact`
+/// crashes the compact's client: without a jump no lock it leaves is
+/// reaped). 04 step 7's second half (maintenance beside live backups) and
+/// 04 step 8 lift that restriction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Maintenance {
+    /// One decision for the whole command (every seed recorded before 04
+    /// step 7).
+    #[default]
+    Whole,
+    /// One decision per step operation ([`is_maintenance_step`]), the
+    /// command on its own thread, held at a gate between decisions.
+    Stepped,
+}
+
+impl Maintenance {
+    // serde's `skip_serializing_if` passes a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_whole(&self) -> bool {
+        *self == Maintenance::Whole
+    }
+}
+
+/// Most step operations one stepped compact makes; one more is a harness
+/// bug (at least twice the largest count the determinism test measures).
+pub const MAX_MAINTENANCE_STEPS: usize = 96;
+
+/// The shard listing `list_packs` issues first on a backend without a
+/// tree listing (the simulator's store): the step "before compact lists
+/// packs".
+const FIRST_PACK_SHARD: &str = "packs/00/";
+
+/// Whether `op` on `key` is a step boundary of a stepped compact: every
+/// operation under `sessions/`, `index.h/`, `index.d/`, `snapshots/` and
+/// `packmaps/`, the lock fence (an EXISTS of the lock key), every delete
+/// under `packs/`, and the listing of the first pack shard. Pack PUTs
+/// (repack outputs) and pack reads are not steps: they are not where
+/// clients interact, and the listing of the other shards runs inside the
+/// decision of the first.
+///
+/// The other operations under `locks/` (the acquisition with its pre-check
+/// listing, clock probe, PUT and listing, a reap, the release) run inside a
+/// decision, as a backup's lock attempt is one decision: the checker counts
+/// a lock key as held from its PUT (`sim::checker`, invariant 7), so a
+/// contender's tentative key must not outlive a decision. Held between its
+/// pre-check and its PUT, compact would publish a key after another client
+/// acquired the lock compact had found free, and back off only at its next
+/// step. The raw lock protocol op by op is `tests::sim_exhaustive`'s
+/// gate-stepped search.
+pub fn is_maintenance_step(op: OpKind, key: &str) -> bool {
+    if key.starts_with("locks/") {
+        return op == OpKind::Exists;
+    }
+    const PROTOCOL: [&str; 5] = [
+        "sessions/",
+        "index.h/",
+        "index.d/",
+        "snapshots/",
+        "packmaps/",
+    ];
+    if PROTOCOL.iter().any(|p| key.starts_with(p)) {
+        return true;
+    }
+    if key.starts_with("packs/") {
+        return matches!(op, OpKind::Delete | OpKind::BatchDelete)
+            || (op == OpKind::ListMeta && key == FIRST_PACK_SHARD);
+    }
+    false
 }
 
 /// What the driver does past the end of a case's choices.
@@ -458,10 +543,15 @@ pub enum Signature {
     AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
     /// chunks: invariant 1 fails with no lock violation other than late
-    /// index writes (`LateIndexWrite`) and writes beside an orphan lock
-    /// key (`OrphanLockKey`). Claims the violations of the
-    /// snapshot whose PUT was the released write. Fixed by 04 step 8 (the
-    /// commit point is the head).
+    /// index writes (`LateIndexWrite`), writes beside an orphan lock key
+    /// (`OrphanLockKey`), and `index.d/` writes of another run than the
+    /// late snapshot's after an aged reap of that run's lock
+    /// (`AgedLockReaped`; seed `late-snapshot-beside-aged-lock-reap`): a
+    /// segment no head names leaves the late snapshot's index coverage
+    /// alone, while the reaped run's `index.h/` or `snapshots/` writes, or a
+    /// reap of the late snapshot's own run, do not qualify. Claims the
+    /// violations of the snapshot whose PUT was the released write. Fixed
+    /// by 04 step 8 (the commit point is the head).
     LateSnapshotWrite,
     /// A released write of `index.h/` or `index.d/` that landed outside
     /// the lock and damaged nothing else (invariant 7 only): the late-write
@@ -614,6 +704,12 @@ pub struct Outcome {
 
 /// Run `case` on a fork of `template`'s store and judge the end state.
 pub fn run_case(template: &Template, case: &Case) -> Outcome {
+    assert!(
+        !(case.maintenance == Maintenance::Stepped && case.advances),
+        "a Stepped compact runs only in cases without time jumps (advances: false) until \
+         04 step 7's second half: held across a jump it becomes the aged-lock victim \
+         itself, which no signature describes"
+    );
     let mut d = Driver::new(template, case);
     d.run();
     d.verdict()
@@ -635,6 +731,17 @@ enum Phase {
     Commit(Box<Running>),
     /// The machine ended with this result; the finish is next.
     Finish(Box<Running>, Box<vykar_types::error::Result<Committed>>),
+    /// A stepped compact, held at `gates[next]`.
+    Maint(Box<MaintRun>),
+}
+
+/// A gate-stepped maintenance run: its thread, one gate per step
+/// operation (the `n`th matches the `n`th step op) and the gate it is
+/// held at.
+struct MaintRun {
+    spawned: Spawned,
+    gates: Vec<GateId>,
+    next: usize,
 }
 
 struct LockWait {
@@ -665,9 +772,10 @@ impl Actor {
         !matches!(self.phase, Phase::Idle) || !self.script.is_empty()
     }
 
-    /// Its session is registered and its heartbeat runs.
+    /// Its session is registered and its heartbeat runs. A stepped compact
+    /// registers no session.
     fn heartbeat(&self) -> bool {
-        !matches!(self.phase, Phase::Idle)
+        !matches!(self.phase, Phase::Idle | Phase::Maint(_))
     }
 }
 
@@ -922,9 +1030,113 @@ impl<'c> Driver<'c> {
             Phase::Lock(w) => self.lock_attempt(i, w),
             Phase::Commit(r) => self.commit_step(i, r, pick),
             Phase::Finish(r, result) => self.finish(i, r, *result),
+            Phase::Maint(m) => self.maint_step(i, m),
         };
         self.unlabel(i);
         label
+    }
+
+    /// Start a stepped compact on its own thread and wait until it is held
+    /// at its first step operation.
+    fn start_stepped_compact(&mut self, i: usize) -> String {
+        let c = self.actors[i].client;
+        let gates: Vec<GateId> = (1..=MAX_MAINTENANCE_STEPS as u32)
+            .map(|n| {
+                self.sim.gate(
+                    GateRule::new(c, OpMatch::Any, KeyMatch::Any)
+                        .filter(is_maintenance_step)
+                        .nth(n),
+                )
+            })
+            .collect();
+        self.label(i, "compact");
+        let spawned = self.sim.spawn(c, Call::Compact);
+        let m = Box::new(MaintRun {
+            spawned,
+            gates,
+            next: 0,
+        });
+        self.await_maint(i, m);
+        "compact start".into()
+    }
+
+    /// Let the operation a stepped compact is held at run, then wait until
+    /// it is held at the next one or has ended.
+    fn maint_step(&mut self, i: usize, mut m: Box<MaintRun>) -> String {
+        let gate = m.gates[m.next];
+        let held = self.sim.store().gate_paused(gate).unwrap_or_else(|| {
+            panic!(
+                "harness: stepped compact not held at its gate:
+{}",
+                self.trace_text()
+            )
+        });
+        let label = format!("compact {:?} {}", held.op, key_class(&held.key));
+        self.label(i, "compact");
+        self.sim.resume(gate);
+        m.next += 1;
+        self.await_maint(i, m);
+        label
+    }
+
+    /// Wait for `m` to be held at `gates[next]` (phase `Maint`) or to
+    /// end (joined and recorded; phase `Idle`). Asserts that every held op
+    /// comes from the run's own thread and that no gate was missed.
+    fn await_maint(&mut self, i: usize, m: Box<MaintRun>) {
+        assert!(
+            m.next < m.gates.len(),
+            "harness: a stepped compact made more than {MAX_MAINTENANCE_STEPS} step ops:
+{}",
+            self.trace_text()
+        );
+        let held = self
+            .sim
+            .poll_paused(m.gates[m.next], GATE_TIMEOUT)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "harness: {e}:
+{}",
+                    self.trace_text()
+                )
+            });
+        match held {
+            Some(p) => {
+                let thread = format!(
+                    "sim-{}-{}",
+                    self.sim.store().client_name(self.actors[i].client),
+                    m.spawned.index()
+                );
+                assert_eq!(
+                    p.thread,
+                    thread,
+                    "harness: a stepped compact held off its main thread:
+{}",
+                    self.trace_text()
+                );
+                self.actors[i].phase = Phase::Maint(m);
+            }
+            None => self.end_maint(*m),
+        }
+    }
+
+    /// Open every gate of `m` not passed yet (each must still be armed or
+    /// held: one that is neither was missed) and join the run.
+    fn end_maint(&mut self, m: MaintRun) {
+        let MaintRun {
+            spawned,
+            gates,
+            next,
+        } = m;
+        for g in &gates[next..] {
+            if let Err(e) = self.sim.store().resume_gate(*g) {
+                panic!(
+                    "harness: stepped compact gate {g:?}: {e}:
+{}",
+                    self.trace_text()
+                );
+            }
+        }
+        self.sim.join(spawned);
     }
 
     fn start_command(&mut self, i: usize) -> String {
@@ -991,6 +1203,9 @@ impl<'c> Driver<'c> {
                     Err((_, e)) => self.end_run(i, run, Err(e)),
                 }
                 "upload".into()
+            }
+            Command::Compact if self.case.maintenance == Maintenance::Stepped => {
+                self.start_stepped_compact(i)
             }
             Command::Compact => {
                 self.label(i, "whole");
@@ -1124,6 +1339,12 @@ impl<'c> Driver<'c> {
                 let Running { run, commit } = *r;
                 drop(commit);
                 Some(run)
+            }
+            // The crashed client's ops fail from here on; let the thread
+            // run to its end and record it as `Sim::crash` leaves it.
+            Phase::Maint(m) => {
+                self.end_maint(*m);
+                None
             }
         };
         if let Some(run) = run {
@@ -1342,6 +1563,9 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
     // cascades from its earliest reap.
     let mut two_holders: Option<u64> = None;
     let mut orphan_key_violations: BTreeSet<usize> = BTreeSet::new();
+    // The violations `AgedLockReaped` claims, with the violating write's
+    // run and key.
+    let mut aged_reap_violations: BTreeMap<usize, (Option<usize>, &str)> = BTreeMap::new();
     for (i, v) in report.violations.iter().enumerate() {
         if v.invariant != Invariant::LockExclusion {
             continue;
@@ -1363,6 +1587,7 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
             two_holders = Some(two_holders.map_or(s, |h| h.min(s)));
         } else if reaped.iter().any(|x| x.aged()) {
             claims.claim_index(Signature::AgedLockReaped, i);
+            aged_reap_violations.insert(i, (rec.run, rec.key.as_str()));
         } else if log
             .iter()
             .any(|r| r.step < rec.step && r.op.is_write() && released(r) && is_lock_key(&r.key))
@@ -1656,31 +1881,40 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
         claims.cascade(Signature::TwoLockHolders, hazard);
     }
 
-    // A released snapshot PUT: the violations of the snapshot it wrote,
-    // when no lock violation is one of two holders: each is a late index
-    // write (judged below) or a write beside an orphan lock key.
-    let no_second_holder = report.violations.iter().enumerate().all(|(i, v)| {
-        v.invariant != Invariant::LockExclusion
-            || orphan_key_violations.contains(&i)
-            || v.step
-                .and_then(|s| log.iter().find(|r| r.step == s))
-                .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
-    });
-    if no_second_holder {
-        for r in log
-            .iter()
-            .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("snapshots/"))
+    // A released snapshot PUT of run `late`: the violations of the snapshot
+    // it wrote, when no lock violation is one of two holders: each is a
+    // late index write (judged below), a write beside an orphan lock key,
+    // or an `index.d/` write of another run after an aged reap of its lock
+    // (a segment no head names cannot change the late snapshot's index
+    // coverage; the reaped run's `index.h/` or `snapshots/` writes can, and
+    // a reap of the late snapshot's own run is the cause itself).
+    let no_second_holder = |late: Option<usize>| {
+        report.violations.iter().enumerate().all(|(i, v)| {
+            v.invariant != Invariant::LockExclusion
+                || orphan_key_violations.contains(&i)
+                || aged_reap_violations
+                    .get(&i)
+                    .is_some_and(|(run, key)| key.starts_with("index.d/") && *run != late)
+                || v.step
+                    .and_then(|s| log.iter().find(|r| r.step == s))
+                    .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
+        })
+    };
+    for r in log
+        .iter()
+        .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("snapshots/"))
+    {
+        let Some(ClientOp::Backup { snapshot }) = r
+            .run
+            .and_then(|i| runs.iter().find(|x| x.index == i))
+            .map(|x| &x.op)
+        else {
+            continue;
+        };
+        if no_second_holder(r.run)
+            && report.violated_for(Invariant::CommittedSnapshotsRestore, snapshot)
         {
-            let Some(ClientOp::Backup { snapshot }) = r
-                .run
-                .and_then(|i| runs.iter().find(|x| x.index == i))
-                .map(|x| &x.op)
-            else {
-                continue;
-            };
-            if report.violated_for(Invariant::CommittedSnapshotsRestore, snapshot) {
-                claims.claim(Signature::LateSnapshotWrite, |v| v.subject == *snapshot);
-            }
+            claims.claim(Signature::LateSnapshotWrite, |v| v.subject == *snapshot);
         }
     }
 

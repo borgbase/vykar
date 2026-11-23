@@ -10,6 +10,7 @@ use crate::repo::format::{
     BlobLocation, ObjectType, decode_chunk_into, unpack_object_expect_with_context,
 };
 use crate::repo::manifest::SnapshotEntry;
+use crate::repo::relocate::{self, MAX_RELOCATE_ROUNDS, RelocationSource, pack_not_found};
 use crate::repo::tree_cache::TreeChunkCache;
 use crate::repo::{Repository, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
@@ -25,7 +26,6 @@ use super::listing::{ListingRead, ListingView};
 use super::mark::{Located, cut_batches_with, push_spans};
 use super::util::open_repo;
 use crate::repo::OpenOptions;
-use crate::repo::lock::SessionGuard;
 
 /// List all snapshots in the repository.
 pub fn list_snapshots(
@@ -91,7 +91,7 @@ fn for_each_listed_item_inner(
     snapshot_name: &str,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<Vec<String>> {
-    let (repo, _session_guard, meta) = open_listing(config, passphrase, snapshot_name)?;
+    let (repo, meta, origin) = open_listing(config, passphrase, snapshot_name)?;
     for_each_item_by_chunk(
         &repo,
         &meta.item_ptrs,
@@ -100,23 +100,20 @@ fn for_each_listed_item_inner(
         LISTING_BATCH_STORED_BYTES,
         &CancelToken::new(),
         visit,
-    )?;
+    )
+    .map_err(|e| origin.explain(&repo, e))?;
     Ok(meta.source_paths)
 }
 
-/// Open the repository with a read session, resolve `snapshot_name`, load
-/// its meta and the chunk index. The guard must live until the read ends.
+/// Open the repository, resolve `snapshot_name`, load its meta and the
+/// chunk index. Also returns where the read started, for
+/// [`ReadOrigin::explain`].
 fn open_listing(
     config: &VykarConfig,
     passphrase: Option<&str>,
     snapshot_name: &str,
-) -> Result<(Repository, SessionGuard, SnapshotMeta)> {
-    let (mut repo, session_guard) = super::util::open_repo_with_read_session(
-        config,
-        passphrase,
-        OpenOptions::new(),
-        &CancelToken::new(),
-    )?;
+) -> Result<(Repository, SnapshotMeta, ReadOrigin)> {
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
 
     let resolved_name = repo
         .manifest()
@@ -124,9 +121,10 @@ fn open_listing(
         .name
         .clone();
 
+    let origin = ReadOrigin::of(&repo, &resolved_name)?;
     let meta = load_snapshot_meta(&repo, &resolved_name)?;
     ItemStreamReader::new(&repo).ensure_index(&mut repo)?;
-    Ok((repo, session_guard, meta))
+    Ok((repo, meta, origin))
 }
 
 /// Call `visit` for every item whose display path (`Item::path`) equals
@@ -146,8 +144,67 @@ pub fn for_each_listed_item_under(
     if dir.is_empty() {
         return for_each_listed_item(config, passphrase, snapshot_name, visit);
     }
-    let (repo, _session_guard, meta) = open_listing(config, passphrase, snapshot_name)?;
-    list_under_on_repo(&repo, &meta, dir, &CancelToken::new(), visit).map(|_| ())
+    let (repo, meta, origin) = open_listing(config, passphrase, snapshot_name)?;
+    list_under_on_repo(&repo, &meta, dir, &CancelToken::new(), visit)
+        .map(|_| ())
+        .map_err(|e| origin.explain(&repo, e))
+}
+
+/// Where a read of one snapshot started: the generation of the head it
+/// was opened at and the snapshot.
+///
+/// A snapshot deleted and compacted between the open and the index load
+/// finds its chunks gone from the index the load installed (it re-read a
+/// newer head because a fold removed an object of the open one), and fails
+/// with [`VykarError::ChunkNotInIndex`]. [`Self::explain`] tells that
+/// apart from damage.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadOrigin {
+    opened_at: u64,
+    snapshot: SnapshotId,
+}
+
+impl ReadOrigin {
+    /// Before the index load: the handle's head generation and the
+    /// snapshot `snapshot_name` names.
+    pub(crate) fn of(repo: &Repository, snapshot_name: &str) -> Result<Self> {
+        let entry = repo
+            .manifest()
+            .find_snapshot(snapshot_name)
+            .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
+        Ok(Self {
+            opened_at: repo.index_generation(),
+            snapshot: entry.id,
+        })
+    }
+
+    /// `e`, or [`VykarError::ChunkRemovedDuringRead`] in its place (wrapped
+    /// as `e` was) when `e` is a chunk missing from the index, the index
+    /// was loaded at a head newer than the open one, and the snapshot is no
+    /// longer stored (one existence probe). Otherwise it is damage and `e`
+    /// stays.
+    pub(crate) fn explain(&self, repo: &Repository, e: VykarError) -> VykarError {
+        let chunk_id = match &e {
+            VykarError::ChunkNotInIndex(id) => *id,
+            VykarError::RestoreSourceUnreadable(inner) => match **inner {
+                VykarError::ChunkNotInIndex(id) => id,
+                _ => return e,
+            },
+            _ => return e,
+        };
+        if repo.index_generation() <= self.opened_at
+            || !matches!(repo.storage.exists(&self.snapshot.storage_key()), Ok(false))
+        {
+            return e;
+        }
+        let removed = VykarError::ChunkRemovedDuringRead { chunk_id };
+        match e {
+            VykarError::RestoreSourceUnreadable(_) => {
+                VykarError::RestoreSourceUnreadable(Box::new(removed))
+            }
+            _ => removed,
+        }
+    }
 }
 
 /// How [`list_under_on_repo`] read, for the debug line and tests.
@@ -574,15 +631,24 @@ pub(crate) fn resolve_from_index(
 /// authenticated (AEAD) or, for unencrypted repositories, checked against its
 /// chunk ID, exactly like [`Repository::read_chunks_coalesced_into`].
 ///
-/// When a chunk cannot be read or decoded at its location (a compaction
-/// moved it after the index was loaded), the remaining locations are
-/// re-resolved once through the index at a freshly read head, downloaded
-/// and dropped right after, and the read retried.
+/// A pack that answers 404 (a concurrent compact repacked or removed it
+/// after the index was loaded) is re-resolved against the latest head
+/// (`repo::relocate`), on every such 404: the remaining chunks of that pack
+/// are looked up again and the read retried where the latest head stores
+/// them; a chunk the latest head no longer has fails the stream with
+/// [`VykarError::ChunkRemovedDuringRead`]. Any other failure to read or
+/// decode a chunk at its location re-resolves the remaining locations once
+/// through the index at a freshly read head, downloaded and dropped right
+/// after, and the read is retried.
 pub struct LazyItemStream<'a> {
     storage: Arc<dyn StorageBackend>,
     crypto: Arc<dyn CryptoEngine>,
     shutdown: &'a CancelToken,
     chunks: Vec<ChunkLoc>,
+    /// Re-resolves the chunks of a pack that answered 404.
+    relocation: RelocationSource,
+    /// The last error came from the 404 path, which re-resolved already.
+    pack_missing: bool,
     /// The local tree-chunk cache: read before a window is planned, filled
     /// from every window. `None` reads storage only.
     cache: Option<TreeChunkCache>,
@@ -628,6 +694,8 @@ impl<'a> LazyItemStream<'a> {
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
+            relocation: repo.relocation_source(),
+            pack_missing: false,
             cache: repo.tree_cache().cloned(),
             cache_hits: 0,
             retried: false,
@@ -664,6 +732,8 @@ impl<'a> LazyItemStream<'a> {
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
+            relocation: repo.relocation_source(),
+            pack_missing: false,
             cache: None,
             cache_hits: 0,
             retried: !retry,
@@ -755,11 +825,27 @@ impl<'a> LazyItemStream<'a> {
             if self.load_cached(idx) {
                 return Ok(());
             }
-            let (pack, start, end, end_chunk) = self.plan_window(idx)?;
-            self.window = self
-                .storage
-                .get_range(&pack.storage_key(), start, end - start)?
-                .ok_or_else(|| VykarError::Other(format!("pack not found: {pack}")))?;
+            let mut rounds = 0;
+            let (window, start, end_chunk) = loop {
+                let (pack, start, end, end_chunk) = self.plan_window(idx)?;
+                if let Some(window) =
+                    self.storage
+                        .get_range(&pack.storage_key(), start, end - start)?
+                {
+                    break (window, start, end_chunk);
+                }
+                let relocated = if rounds == MAX_RELOCATE_ROUNDS {
+                    Err(pack_not_found(&pack))
+                } else {
+                    self.relocate_rest(&pack)
+                };
+                if let Err(e) = relocated {
+                    self.pack_missing = true;
+                    return Err(e);
+                }
+                rounds += 1;
+            };
+            self.window = window;
             self.window_start = start;
             self.window_end = end_chunk;
             self.reads += 1;
@@ -802,6 +888,36 @@ impl<'a> LazyItemStream<'a> {
         self.cur = plaintext;
         self.pos = 0;
         self.next += 1;
+        Ok(())
+    }
+
+    /// `pack` answered 404: look the stream's remaining chunks in it up at
+    /// the latest head and move them there. A chunk the latest head no
+    /// longer has is [`VykarError::ChunkRemovedDuringRead`].
+    fn relocate_rest(&mut self, pack: &PackId) -> Result<()> {
+        let at: Vec<usize> = (self.next..self.chunks.len())
+            .filter(|&i| self.chunks.get(i).is_some_and(|c| c.1 == *pack))
+            .collect();
+        let ids: Vec<ChunkId> = at
+            .iter()
+            .filter_map(|&i| self.chunks.get(i).map(|c| c.0))
+            .collect();
+        let located = self.relocation.relocator().relocate(pack, &ids)?;
+        for (i, loc) in at.into_iter().zip(located) {
+            let Some(chunk) = self.chunks.get_mut(i) else {
+                continue;
+            };
+            match loc {
+                relocate::Located::Gone => {
+                    return Err(VykarError::ChunkRemovedDuringRead { chunk_id: chunk.0 });
+                }
+                relocate::Located::At {
+                    pack_id,
+                    pack_offset,
+                    stored_size,
+                } => *chunk = (chunk.0, pack_id, pack_offset, stored_size),
+            }
+        }
         Ok(())
     }
 
@@ -851,6 +967,11 @@ impl<'a> LazyItemStream<'a> {
             Ok(()) => Ok(()),
             // A cancellation is not a stale location.
             Err(e @ VykarError::Interrupted) => Err(e),
+            // A 404 was re-resolved against the latest head already.
+            Err(e) if self.pack_missing => {
+                self.pack_missing = false;
+                Err(e)
+            }
             Err(e) if !self.retried => {
                 info!("item-stream chunk unreadable, re-resolving against the latest index: {e}");
                 self.retried = true;

@@ -287,6 +287,17 @@ pub enum VykarError {
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
 
+    /// A reader planned a chunk read from a head that a concurrent prune and
+    /// compact made obsolete: the pack answered 404 and the latest head has no
+    /// entry for the chunk. Retrying reads the repository as it is now. Not
+    /// damage by itself; `vykar check` tells.
+    #[error(
+        "chunk {chunk_id} was removed from the repository while it was being read \
+         (its snapshot was deleted and compacted meanwhile); run the command again, \
+         and run `vykar check` if the snapshot still exists"
+    )]
+    ChunkRemovedDuringRead { chunk_id: crate::chunk_id::ChunkId },
+
     #[error("lock expired: {0}")]
     LockExpired(String),
 
@@ -408,6 +419,17 @@ pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
 }
 
 impl VykarError {
+    /// Whether this is, or wraps (`RestoreSourceUnreadable`), a
+    /// [`VykarError::ChunkRemovedDuringRead`]: a concurrent prune and compact
+    /// removed what a reader planned, not damage.
+    pub fn is_removed_during_read(&self) -> bool {
+        match self {
+            VykarError::ChunkRemovedDuringRead { .. } => true,
+            VykarError::RestoreSourceUnreadable(inner) => inner.is_removed_during_read(),
+            _ => false,
+        }
+    }
+
     /// Returns `true` for I/O errors that indicate a file was unreadable
     /// (permission denied, file vanished, EIO, or a Windows-specific
     /// unsupported-reparse / cloud-file / locked-file (sharing or lock
@@ -438,6 +460,21 @@ mod tests {
         assert!(msg.starts_with("vykar compact deletes data"), "{msg}");
         assert!(msg.contains("maintenance window"), "{msg}");
         assert!(e.is_write_refusal());
+    }
+
+    /// One line, naming `vykar check` for the case it was real damage.
+    #[test]
+    fn chunk_removed_during_read_message() {
+        let e = VykarError::ChunkRemovedDuringRead {
+            chunk_id: crate::chunk_id::ChunkId::from_bytes([7; 32]),
+        };
+        let msg = e.to_string();
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(
+            msg.contains("removed from the repository while it was being read"),
+            "{msg}"
+        );
+        assert!(msg.contains("`vykar check`"), "{msg}");
     }
 
     #[test]

@@ -35,6 +35,8 @@ mod passphrase;
 mod proptest;
 mod prune;
 mod prune_command;
+mod readers_read_only;
+mod relocate;
 mod repair;
 mod repo;
 mod rest_server;

@@ -244,3 +244,83 @@ fn lazy_stream_reads_an_aead_repo() {
     lazy.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, pieces.concat());
 }
+
+/// Move every index entry of `from` to a copy of the pack at `to` (same
+/// offsets), publish that as a new head and delete `from`: what a compact
+/// that repacks one pack looks like to a reader.
+fn move_pack(w: &mut Repository, dir: &std::path::Path, from: PackId, to: PackId) {
+    std::fs::copy(dir.join(from.storage_key()), dir.join(to.storage_key())).unwrap();
+    let moved: Vec<(ChunkId, crate::index::ChunkIndexEntry)> = w
+        .chunk_index()
+        .iter()
+        .filter(|(_, e)| e.pack_id == from)
+        .collect();
+    assert!(!moved.is_empty());
+    let trailer = w.chunk_index().pack_trailer_len(&from).unwrap_or(0);
+    w.chunk_index_mut().set_pack_trailer(to, trailer);
+    for (id, e) in moved {
+        let index = w.chunk_index_mut();
+        index.remove(&id);
+        index.add(id, e.stored_size, to, e.pack_offset);
+    }
+    w.save_state().unwrap();
+    w.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    std::fs::remove_file(dir.join(from.storage_key())).unwrap();
+}
+
+/// A1 (04 step 7): one stream meets two packs that a compact moved at two
+/// different heads, the second after the stream had relocated the first.
+/// Each 404 is re-resolved against the latest head (the once-only retry is
+/// off here), and the stream completes.
+#[test]
+fn lazy_stream_follows_two_packs_moved_at_two_heads() {
+    init_test_environment();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let local = || {
+        Box::new(vykar_storage::local_backend::LocalBackend::new(dir.to_str().unwrap()).unwrap())
+    };
+    let mut w = Repository::init(
+        local(),
+        crate::repo::EncryptionMode::None,
+        crate::repo::ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    w.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    let (first, mut locs) = stored_stream(&mut w, 200, 33);
+    let (second, more) = stored_stream(&mut w, 300, 64);
+    let (p1, p2) = (locs[0].1, more[0].1);
+    assert_ne!(p1, p2, "two saves, two packs");
+    locs.extend(more);
+    let mut expected = eager_paths(&first);
+    expected.extend(eager_paths(&second));
+
+    let h = Repository::open(
+        local(),
+        None,
+        None,
+        crate::repo::OpenOptions::new().with_index(),
+    )
+    .unwrap();
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&h, locs, false, u64::MAX, &never);
+    move_pack(&mut w, &dir, p1, PackId::from_bytes([0xA1; 32]));
+    let mut paths = Vec::new();
+    lazy.for_each_item(|item| {
+        if paths.is_empty() {
+            // The stream has relocated p1's chunks at the first new head;
+            // p2 moves at a second one before the stream reaches it.
+            move_pack(&mut w, &dir, p2, PackId::from_bytes([0xA2; 32]));
+        }
+        paths.push(item.path);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(paths, expected);
+}

@@ -1,0 +1,262 @@
+{
+  "name": "aged-session-reaped-swept-packs-old-segment-conditional",
+  "note": "Conditional twin of aged-session-reaped-swept-packs-old-segment (the same case on \"storage\": \"Conditional\"). Left by part 9: the sweep cannot mark a snapshot not yet written (part 10); positive coverage of AgedSessionReaped's swept-packs route on a conditional store.",
+  "expect": [
+    "AgedSessionReaped"
+  ],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 10860
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "collect-garbage +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-snapshot"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "finish"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "whole delete"
+    ],
+    [
+      "Stop",
+      "stop"
+    ]
+  ],
+  "case": {
+    "hosts": "SameHostname",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": true
+          }
+        },
+        "DeleteControl"
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [
+      {
+        "client": 1,
+        "class": "IndexObject",
+        "nth": 1,
+        "kind": "Duplicate"
+      }
+    ],
+    "crash": true,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      5,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      6,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    "policy": "First",
+    "storage": "Conditional"
+  }
+}

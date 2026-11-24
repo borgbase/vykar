@@ -1,6 +1,6 @@
 {
   "name": "orphan-lock-key",
-  "note": "First OrphanLockKey case of a 10-minute make sim-campaign (phase F part 2): a delayed or duplicated lock PUT leaves a key with no holder. Fixed by 04 step 8 (no lock on the commit path).",
+  "note": "First OrphanLockKey case of a 10-minute make sim-campaign (phase F part 2): a delayed or duplicated lock PUT leaves a key with no holder. Fixed by 04 step 8 (no lock on the commit path). Since 04 step 8 (phase F part 9) orphan-lock-key-conditional is the same case on a conditional store, which keeps it too.",
   "expect": [
     "OrphanLockKey"
   ],

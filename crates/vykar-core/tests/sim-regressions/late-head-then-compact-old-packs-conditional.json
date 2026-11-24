@@ -1,0 +1,264 @@
+{
+  "name": "late-head-then-compact-old-packs-conditional",
+  "note": "Conditional twin of late-head-then-compact-old-packs (the same case on \"storage\": \"Conditional\"). Narrowed by 04 step 8 (phase F part 9), not closed: compact's late head lands under the next backup's lock at a generation nobody had created yet (it extends the head compact built on); the backup's create then finds that generation taken and rebases onto it. The late head is still a write outside its lock (LateIndexWrite, invariant 7: part 10).",
+  "expect": [
+    "LateIndexWrite"
+  ],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "finish"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Release": {
+          "parked": 0
+        }
+      },
+      "release"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "fence"
+    ]
+  ],
+  "case": {
+    "hosts": "SameHostname",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        },
+        "Compact"
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        },
+        {
+          "Backup": {
+            "shared": true,
+            "fold": true
+          }
+        }
+      ]
+    ],
+    "faults": [
+      {
+        "client": 1,
+        "class": "Session",
+        "nth": 1,
+        "kind": "Duplicate"
+      },
+      {
+        "client": 0,
+        "class": "IndexHead",
+        "nth": 1,
+        "kind": "Delay"
+      }
+    ],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      0,
+      6,
+      6,
+      7,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    "policy": "First",
+    "storage": "Conditional"
+  }
+}

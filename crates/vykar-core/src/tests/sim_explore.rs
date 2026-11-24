@@ -118,10 +118,17 @@ fn one_delete(mut clients: Vec<Vec<Command>>) -> Vec<Vec<Command>> {
     clients
 }
 
+/// The store kinds a random case is drawn on: the fallback and the
+/// conditional store (04 step 8); shrinking prefers the fallback.
+fn storage() -> impl Strategy<Value = StoreKind> {
+    prop_oneof![Just(StoreKind::Plain), Just(StoreKind::Conditional)]
+}
+
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
 /// faults of any class and kind, a crash or not, any hosts, time jumps;
 /// compact whole or gate-stepped (no jump inside a stepped compact, see
-/// `Maintenance`; shrinking prefers whole).
+/// `Maintenance`; shrinking prefers whole); the fallback or the
+/// conditional store.
 pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
         .prop_flat_map(|n| {
@@ -131,24 +138,27 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
                 any::<bool>(),
                 hosts(),
                 choices(),
-                prop::bool::weighted(0.25),
+                (prop::bool::weighted(0.25), storage()),
             )
         })
-        .prop_map(|(clients, faults, crash, hosts, choices, stepped)| Case {
-            hosts,
-            clients: one_delete(clients),
-            faults,
-            crash,
-            advances: true,
-            choices,
-            policy: Policy::First,
-            skews: vec![],
-            maintenance: if stepped {
-                Maintenance::Stepped
-            } else {
-                Maintenance::Whole
+        .prop_map(
+            |(clients, faults, crash, hosts, choices, (stepped, storage))| Case {
+                hosts,
+                clients: one_delete(clients),
+                faults,
+                crash,
+                advances: true,
+                choices,
+                policy: Policy::First,
+                skews: vec![],
+                maintenance: if stepped {
+                    Maintenance::Stepped
+                } else {
+                    Maintenance::Whole
+                },
+                storage,
             },
-        })
+        )
 }
 
 fn two_backups() -> Vec<Vec<Command>> {
@@ -173,6 +183,7 @@ fn one_hostname_family() -> impl Strategy<Value = Case> {
         policy: Policy::First,
         skews: vec![],
         maintenance: Maintenance::Whole,
+        storage: StoreKind::Plain,
     })
 }
 
@@ -199,6 +210,7 @@ fn h3_family() -> impl Strategy<Value = Case> {
         policy: Policy::First,
         skews: vec![],
         maintenance: Maintenance::Whole,
+        storage: StoreKind::Plain,
     })
 }
 
@@ -317,6 +329,38 @@ fn random_exploration_finds_h3() {
         Signature::LateHeadWrite,
         "04 step 8 (create-if-absent heads)",
     );
+}
+
+/// H3's family on a conditional store (04 step 8): a delayed head create
+/// that lands later finds its generation taken or extends the head it was
+/// built on, so no case shows a late head write's damage, or anything
+/// unexplained.
+#[test]
+fn random_exploration_on_conditional_finds_no_late_head() {
+    let template = Template::new();
+    let family = h3_family().prop_map(|c| Case {
+        storage: StoreKind::Conditional,
+        ..c
+    });
+    let result = runner(256).run(&family, |case| {
+        let o = run_case(&template, &case);
+        for sig in [
+            Signature::LateHeadWrite,
+            Signature::LateHeadThenCompact,
+            Signature::LateHeadSegmentCollected,
+            Signature::Unknown,
+        ] {
+            prop_assert!(!o.signatures.contains(&sig), "{sig:?}");
+        }
+        Ok(())
+    });
+    if let Err(TestError::Fail(_, case)) = &result {
+        panic!(
+            "{}",
+            report_failure("conditional-no-late-head", &template, case)
+        );
+    }
+    result.unwrap();
 }
 
 #[test]

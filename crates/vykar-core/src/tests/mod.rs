@@ -9,6 +9,7 @@ mod coalesced_read;
 mod commit_machine_seams;
 mod commit_op_order;
 mod compact;
+mod conditional_heads;
 mod corruption;
 mod delete;
 mod delete_repo;

@@ -49,6 +49,7 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         policy: Policy::Continue,
         skews: vec![],
         maintenance: Maintenance::Whole,
+        storage: StoreKind::Plain,
     }
 }
 
@@ -57,6 +58,14 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
 pub(super) fn stepped(c: Case) -> Case {
     Case {
         maintenance: Maintenance::Stepped,
+        ..c
+    }
+}
+
+/// `c` on the conditional store (04 step 8).
+pub(super) fn conditional(c: Case) -> Case {
+    Case {
+        storage: StoreKind::Conditional,
         ..c
     }
 }
@@ -180,6 +189,13 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         c.faults = vec![f];
         out.push((label, c, 1));
     }
+    // Every scenario on the conditional store too (04 step 8, N6): local,
+    // OpenSSH SFTP, AWS S3 and vykar-server all offer put-if-absent.
+    let twins: Vec<(String, Case, u32)> = out
+        .iter()
+        .map(|(name, c, k)| (format!("{name}-conditional"), conditional(c.clone()), *k))
+        .collect();
+    out.extend(twins);
     out
 }
 
@@ -242,6 +258,20 @@ fn lock_pair_on_distinct_hosts_is_clean() {
     assert_clean("pair-distinct", &lock_pair(HostPlan::Distinct));
 }
 
+/// The same pairs on the conditional store (04 step 8): every schedule is
+/// clean, invariant 12 and every retained head included.
+#[test]
+fn lock_pair_on_a_conditional_store_is_clean() {
+    assert_clean(
+        "pair-distinct-conditional",
+        &conditional(lock_pair(HostPlan::Distinct)),
+    );
+    assert_clean(
+        "pair-hostname-conditional",
+        &conditional(lock_pair(HostPlan::SameHostname)),
+    );
+}
+
 /// On one hostname (cloned machines: one installation, other boot IDs) the
 /// second backup's registration no longer reaps the first one's live lock
 /// (H1 before 04 step 1): every schedule is clean.
@@ -274,6 +304,21 @@ fn backup_against_compact_is_clean() {
     );
 }
 
+/// The backup against delete + compact on the conditional store (04 step
+/// 8), whole and stepped: every schedule is clean; under the lock no create
+/// meets a taken generation, so the creates change no outcome.
+#[test]
+fn backup_against_compact_is_clean_on_a_conditional_store() {
+    assert_clean(
+        "compact-distinct-conditional",
+        &conditional(commit_vs_compact(HostPlan::Distinct)),
+    );
+    assert_clean(
+        "compact-distinct-stepped-conditional",
+        &conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
+    );
+}
+
 /// The same pair over the young template (c0's segment younger than
 /// T_pack, 04 step 7), whole and stepped: compact's sweep keeps c0's
 /// entries, so the backup's reuse of the shared file holds and it never
@@ -290,6 +335,10 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
         (
             "compact-young-distinct-stepped",
             stepped(commit_vs_compact(HostPlan::Distinct)),
+        ),
+        (
+            "compact-young-distinct-stepped-conditional",
+            conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
         ),
     ] {
         let mut stale = 0usize;
@@ -547,7 +596,7 @@ fn measure_bounds() {
     let t = Template::new();
     for k in [1, 2] {
         let mut total = Duration::ZERO;
-        for (name, c) in [
+        let bases = [
             ("pair-distinct", lock_pair(HostPlan::Distinct)),
             ("pair-hostname", lock_pair(HostPlan::SameHostname)),
             ("compact-distinct", commit_vs_compact(HostPlan::Distinct)),
@@ -555,7 +604,16 @@ fn measure_bounds() {
                 "compact-distinct-stepped",
                 stepped(commit_vs_compact(HostPlan::Distinct)),
             ),
-        ] {
+        ];
+        let twins: Vec<(String, Case)> = bases
+            .iter()
+            .map(|(n, c)| (format!("{n}-conditional"), conditional(c.clone())))
+            .collect();
+        for (name, c) in bases
+            .iter()
+            .map(|(n, c)| (n.to_string(), c.clone()))
+            .chain(twins)
+        {
             let e = explore(
                 &t,
                 &c,

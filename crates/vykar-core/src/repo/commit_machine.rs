@@ -20,9 +20,15 @@
 //!    deleted the packs of a reaped session.
 //!    The publish's fence before the head PUT also runs the commit rule's
 //!    pack-age term ([`HeadCheck`]).
+//!    4b. If another writer created the head's generation (04 step 8): back
+//!    off, then repeat from 2 with the additions kept (at most
+//!    [`HEAD_CREATE_ATTEMPTS`] attempts). The sync re-checks reused chunks
+//!    when the head moved, since the session began, in a way that can
+//!    remove entries; only packs not verified yet are verified.
 //! 5. Check the fence (and, when a head was written, the pack-age term
 //!    again with no allowance: the binding check) and PUT the snapshot.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,20 +37,52 @@ use tracing::{debug, warn};
 use super::Repository;
 use super::commit::{check_reused_chunks, commit_additions, needs_recheck};
 use super::index_store::{self, SyncedIndex};
-use super::lock::{self, SessionMarker};
+use super::index_write::head_contention_error;
+use super::lock::{self, MarkerStamp, SessionMarker};
 use super::machine::{
     Machine, StepCx, StepKind, bad_pick, emit_stage, join_scoped, log_stage_elapsed,
 };
 use super::manifest::SnapshotEntry;
-use super::publish_machine::{HeadCheck, PublishMachine};
+use super::publish_machine::{HeadCheck, PublishMachine, Published};
 use super::snapshot_cache::{self, SnapshotRefresh};
 use super::write_session::SessionView;
-use crate::index::IndexDelta;
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::{Location, SegmentBody};
+use crate::index::table::IndexState;
+use crate::index::{IndexDelta, NewChunkEntry, ReusedChunks};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
+
+/// Attempts at creating a backup's head (04 "Backup commit" 7).
+pub(crate) const HEAD_CREATE_ATTEMPTS: u32 = 8;
+
+/// The wait before attempt `attempt` (2..): 200 ms × 2^(attempt − 2), at
+/// most 5 s, plus a jitter in [0, base/2) taken from BLAKE3(session_id ‖
+/// attempt), so a simulated case replays. About 16–24 s for all eight.
+pub(crate) fn retry_delay(session_id: &str, attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(2).min(5);
+    let base_ms = (200u64 << exp).min(5_000);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update(&attempt.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&digest.as_bytes()[..8]);
+    let jitter_ms = u64::from_le_bytes(word) % (base_ms / 2).max(1);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+/// What a backup commit keeps of its session's delta across the publish,
+/// for a retry after a taken generation: the reuse record, the new entries
+/// the additions left out because the index held their chunks (a later
+/// head may have removed them), and the trailer lengths. The additions
+/// themselves come back from the publish (`Published::Taken`).
+struct RetryDelta {
+    reused: ReusedChunks,
+    dropped: Vec<NewChunkEntry>,
+    pack_trailers: HashMap<PackId, u32>,
+}
 
 /// The snapshot a finished [`BackupCommit`] wrote at its commit point.
 pub(crate) struct Committed {
@@ -61,9 +99,22 @@ pub(crate) struct BackupCommit {
     marker: Option<Arc<SessionMarker>>,
     /// The open `CommitEvent::Stage`, closed with `log_stage_elapsed`.
     stage: Option<(std::time::Instant, &'static str)>,
-    /// This commit's index write PUT a head: the fence before the snapshot
-    /// PUT runs the pack-age term again, with no allowance.
+    /// This commit's index write created a head: the fence before the
+    /// snapshot PUT runs the pack-age term again, with no allowance.
     wrote_head: bool,
+    /// The attempt at creating the head, from 1.
+    attempt: u32,
+    /// The session view's state and `sweep.gen`, from the first sync: a
+    /// retry's reuse re-check is judged against where the session began.
+    start_view: Option<(IndexState, u64)>,
+    /// Packs whose presence an earlier attempt verified.
+    verified_packs: HashSet<PackId>,
+    /// Kept from the pack check until the head is created.
+    retry: Option<RetryDelta>,
+    /// The delta a retry starts from (between a taken create and the reads).
+    delta: Option<IndexDelta>,
+    /// Just before the head read that chose this attempt's generation.
+    listed_at: Option<MarkerStamp>,
     state: CommitState,
 }
 
@@ -76,6 +127,8 @@ enum CommitState {
     SyncIndex(Box<SyncIndex>),
     VerifyPacks(Box<Verify>),
     Publish(Box<PublishMachine>),
+    /// Wait before the next attempt (`Backoff`).
+    Backoff,
     PersistIndex,
     Fence,
     PutSnapshot,
@@ -194,6 +247,12 @@ impl BackupCommit {
             marker,
             stage: None,
             wrote_head: false,
+            attempt: 1,
+            start_view: None,
+            verified_packs: HashSet::new(),
+            retry: None,
+            delta: None,
+            listed_at: None,
             state: CommitState::Flush,
         }
     }
@@ -253,14 +312,35 @@ impl BackupCommit {
                 }
                 if m.enabled().is_empty() {
                     self.wrote_head = m.wrote_head();
-                    m.take_output().ok_or_else(|| {
+                    let published = m.take_output().ok_or_else(|| {
                         VykarError::Other("BUG: the index write finished without a head".into())
                     })?;
                     self.close_stage();
-                    after_index(cx.repo)
+                    match published {
+                        Published::Head(_) => {
+                            self.retry = None;
+                            after_index(cx.repo)
+                        }
+                        Published::Taken { generation, seg } => self.taken(generation, seg)?,
+                    }
                 } else {
                     CommitState::Publish(m)
                 }
+            }
+            CommitState::Backoff => {
+                cx.repo
+                    .host_env()
+                    .clock
+                    .sleep(retry_delay(&self.session_id, self.attempt + 1));
+                self.attempt += 1;
+                self.open_stage(cx, "refresh snapshots");
+                CommitState::Reads(Box::new(StartReads {
+                    delta: self.delta.take(),
+                    view: None,
+                    refresh: Slot::Pending,
+                    marker: Slot::needed(self.marker.is_some()),
+                    head: Slot::Pending,
+                }))
             }
             CommitState::PersistIndex => {
                 // Unreachable today (a backup session records every change
@@ -289,6 +369,43 @@ impl BackupCommit {
             }
         };
         Ok(())
+    }
+
+    /// The head create found `generation` taken: rebuild the delta from the
+    /// additions the publish handed back and what [`RetryDelta`] kept, and
+    /// back off; after [`HEAD_CREATE_ATTEMPTS`] the "index changed" error.
+    fn taken(&mut self, generation: u64, seg: Option<SegmentBody>) -> Result<CommitState> {
+        if self.attempt >= HEAD_CREATE_ATTEMPTS {
+            return Err(head_contention_error(generation, self.attempt));
+        }
+        let (Some(seg), Some(kept)) = (seg, self.retry.take()) else {
+            return Err(VykarError::Other(
+                "BUG: a backup's taken index write returned no segment".into(),
+            ));
+        };
+        tracing::info!(
+            attempt = self.attempt,
+            generation,
+            "index head taken by another writer; rebasing the commit"
+        );
+        let mut new_entries: Vec<NewChunkEntry> = seg
+            .additions
+            .iter()
+            .map(|(id, loc)| NewChunkEntry {
+                chunk_id: *id,
+                stored_size: loc.stored_size,
+                pack_id: loc.pack_id,
+                pack_offset: loc.pack_offset,
+            })
+            .collect();
+        drop(seg);
+        new_entries.extend(kept.dropped);
+        self.delta = Some(IndexDelta {
+            new_entries,
+            reused: kept.reused,
+            pack_trailers: kept.pack_trailers,
+        });
+        Ok(CommitState::Backoff)
     }
 
     /// The binding pack-age check (04 I8): once this commit's head PUT has
@@ -332,7 +449,7 @@ impl BackupCommit {
         })))
     }
 
-    fn read_one(&self, repo: &Repository, reads: &mut StartReads, read: Read) {
+    fn read_one(&mut self, repo: &Repository, reads: &mut StartReads, read: Read) {
         match read {
             Read::Refresh => reads.refresh = Slot::Done(refresh_snapshots(repo)),
             Read::Marker => {
@@ -341,6 +458,7 @@ impl BackupCommit {
                 }
             }
             Read::Head => {
+                self.listed_at = Some(MarkerStamp::now(repo.host_env().clock.as_ref()));
                 reads.head = Slot::Done(index_store::fetch_head(
                     repo.storage.as_ref(),
                     repo.crypto.as_ref(),
@@ -353,7 +471,7 @@ impl BackupCommit {
     /// refreshes the snapshot list and then probes the marker, while this
     /// thread fetches the head. All are reads under the commit lock; every
     /// write follows them.
-    fn read_all(&self, repo: &Repository, reads: &mut StartReads) {
+    fn read_all(&mut self, repo: &Repository, reads: &mut StartReads) {
         let do_refresh = reads.refresh.pending();
         let marker = reads
             .marker
@@ -361,6 +479,11 @@ impl BackupCommit {
             .then(|| self.marker.clone())
             .flatten();
         let do_head = reads.head.pending();
+        if do_head {
+            // Before the refresh's share too: an over-estimate of the time
+            // since the head listing is the safe direction.
+            self.listed_at = Some(MarkerStamp::now(repo.host_env().clock.as_ref()));
+        }
         let storage = repo.storage.as_ref();
         let crypto = repo.crypto.as_ref();
         let repo_id = repo.config.id.as_slice();
@@ -443,6 +566,7 @@ impl BackupCommit {
                 let head = match head {
                     Slot::Done(head) => head?,
                     Slot::NotNeeded | Slot::Pending => {
+                        self.listed_at = Some(MarkerStamp::now(repo.host_env().clock.as_ref()));
                         index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())?
                     }
                 };
@@ -463,7 +587,13 @@ impl BackupCommit {
         self.open_stage(cx, "fetch index");
         let synced = cx.repo.sync_index(Some(head), true)?;
         self.close_stage();
-        let recheck = needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head);
+        let recheck = match &self.start_view {
+            Some((state, sweep_gen)) => needs_recheck(Some((state, *sweep_gen)), &synced.head),
+            None => needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head),
+        };
+        if self.attempt == 1 {
+            self.start_view = view.as_ref().map(|v| (v.state.clone(), v.sweep_gen));
+        }
         // Nothing else may hold the view's applied layer when the segment
         // is applied (`Arc::make_mut` would copy it).
         drop(view);
@@ -498,9 +628,20 @@ impl BackupCommit {
         let persisted_packs = repo.persisted_pack_count();
         let width = repo.request_width();
         let storage = repo.storage.as_ref();
+        // A retry verifies only the packs an earlier attempt did not.
+        let unverified: HashSet<PackId> = pack_ids
+            .iter()
+            .filter(|p| !self.verified_packs.contains(*p))
+            .copied()
+            .collect();
         let (verified, reused) = std::thread::scope(|scope| {
             let verify = scope.spawn(|| {
-                super::pack_verify::verify_packs_present(storage, &pack_ids, persisted_packs, width)
+                super::pack_verify::verify_packs_present(
+                    storage,
+                    &unverified,
+                    persisted_packs,
+                    width,
+                )
             });
             let reused = if recheck {
                 check_reused_chunks(&delta, &synced.index)
@@ -533,6 +674,7 @@ impl BackupCommit {
             }
             return Err(e);
         }
+        self.verified_packs.extend(unverified);
         let mut pack_trailers: Vec<(PackId, u32)> = Vec::with_capacity(pack_ids.len());
         for pack in &pack_ids {
             let trailer_len = delta.pack_trailers.get(pack).copied().ok_or_else(|| {
@@ -543,7 +685,19 @@ impl BackupCommit {
             pack_trailers.push((*pack, trailer_len));
         }
         pack_trailers.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        drop(delta);
+        // A retry needs the reuse record and the new entries the additions
+        // left out; the additions come back from a taken publish.
+        let IndexDelta {
+            new_entries,
+            reused,
+            pack_trailers: trailers,
+        } = delta;
+        let dropped = dropped_entries(new_entries, &synced.index);
+        self.retry = Some(RetryDelta {
+            reused,
+            dropped,
+            pack_trailers: trailers,
+        });
         self.close_stage();
 
         self.open_stage(cx, "write index");
@@ -552,6 +706,7 @@ impl BackupCommit {
         repo.install_synced_index(synced);
         if additions.is_empty() {
             debug!("backup added no chunks; no index write");
+            self.retry = None;
             self.close_stage();
             return Ok(after_index(repo));
         }
@@ -567,9 +722,24 @@ impl BackupCommit {
             marker: Arc::clone(marker),
         });
         Ok(CommitState::Publish(Box::new(
-            PublishMachine::publish(repo, Some(head), Some(seg), true).with_head_check(check),
+            PublishMachine::publish(repo, Some(head), Some(seg), true)
+                .with_head_check(check)
+                .listed_at(self.listed_at),
         )))
     }
+}
+
+/// The new entries [`commit_additions`] leaves out because `index` holds
+/// their chunks, in their order (normally none: another session committed
+/// the same chunks first).
+fn dropped_entries(
+    new_entries: Vec<NewChunkEntry>,
+    index: &crate::index::LiveIndex,
+) -> Vec<NewChunkEntry> {
+    new_entries
+        .into_iter()
+        .filter(|e| index.contains(&e.chunk_id))
+        .collect()
 }
 
 /// After the index write (or none): the defensive persist of a dirty index,
@@ -593,6 +763,7 @@ impl Machine for BackupCommit {
             CommitState::SyncIndex(_) => vec![StepKind::SyncIndex],
             CommitState::VerifyPacks(_) => vec![StepKind::VerifyPacks],
             CommitState::Publish(m) => m.enabled(),
+            CommitState::Backoff => vec![StepKind::Backoff],
             CommitState::PersistIndex => vec![StepKind::PersistIndex],
             CommitState::Fence => vec![StepKind::Fence],
             CommitState::PutSnapshot => vec![StepKind::PutSnapshot],

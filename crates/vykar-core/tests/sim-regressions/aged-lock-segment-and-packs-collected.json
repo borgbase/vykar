@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-and-packs-collected",
-  "note": "Third campaign of phase F part 2 (random-2299828320597253367): aged lock; compact takes the holder's unpublished segment and its orphan packs; the holder's head names the segment, a backup fails on it, then the holder's next fold publishes a base from its cache naming the absent packs. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the holder's packs are about 6 h old at the compact, younger than T_pack, and stay; the segment (older than T_idx) is still collected. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected.",
+  "note": "Third campaign of phase F part 2 (random-2299828320597253367): aged lock; compact takes the holder's unpublished segment and its orphan packs; the holder's head names the segment, a backup fails on it, then the holder's next fold publishes a base from its cache naming the absent packs. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the holder's packs are about 6 h old at the compact, younger than T_pack, and stay; the segment (older than T_idx) is still collected. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-and-packs-collected-conditional is the same case on a conditional store.",
   "expect": [
     "AgedLockReaped",
     "AgedLockSegmentCollected"

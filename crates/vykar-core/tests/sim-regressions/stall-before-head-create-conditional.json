@@ -1,0 +1,173 @@
+{
+  "name": "stall-before-head-create-conditional",
+  "note": "From a 300 s make sim-campaign of phase F part 9 (random-1939588445034951012), on the conditional store: a's fold commit stalls 6 h 1 min between its fence and its head create, after another 6 h 1 min jump before its lock. The put-if-absent check ran inside the head step then, after the fence, so the head landed after ops the checker dates past the pack-age limit (invariant 11, Unknown). The check now runs at the fence, before the lock and pack-age checks, which stay the last ops before the create; the binding post-create check refuses a's snapshot (no signature).",
+  "expect": [],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ]
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": true
+          }
+        }
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ]
+    ],
+    "faults": [],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      0,
+      6,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6
+    ],
+    "policy": "First",
+    "storage": "Conditional"
+  }
+}

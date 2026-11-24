@@ -6,8 +6,12 @@
 //! it is the head the in-memory index was loaded from, express the edits as
 //! one keyed segment ([`LiveIndex::pending_segment`], a walk over the
 //! overlay only), then PUT the segment (and a sweep record, when a sweep is
-//! pending), check the lock fence and PUT the head of the next generation at
-//! `index.h/<gen>`. The segment is then applied in memory; nothing local is
+//! pending), check the lock fence and create the head of the next generation
+//! at `index.h/<gen>` (put-if-absent where the backend offers it and its
+//! check passed, else a plain PUT under the lock: 04 step 8). A generation
+//! another writer took ends a maintenance write with "index changed …
+//! retry"; a backup commit rebases and tries again. The segment is then
+//! applied in memory; nothing local is
 //! rewritten. A chain past the hard limit, a write without a head (repair,
 //! upgrade) or an explicit request (compact, repair) writes a base instead:
 //! a *fold*, which also becomes the repository's local table file.
@@ -22,10 +26,11 @@
 //! never is at the production grace); the fold limits count only the
 //! prefix, and a fold with nothing to fold writes a plain segment. A write
 //! without a head, `check --repair`'s fold and a plaintext repeat fold
-//! every segment (a *full* fold). Nothing is deleted before the head PUT. After it, old heads and unreferenced
-//! `index.d/` objects are deleted by age
-//! ([`index_store::collect_index_garbage`]), so a reader still on a recent
-//! head can finish and a concurrent writer's fresh object survives.
+//! every segment (a *full* fold). Nothing is deleted before the head PUT.
+//! After it, old heads and unreferenced `index.d/` objects are deleted by
+//! age ([`index_store::collect_index_garbage`]), so a reader still on a
+//! recent head can finish and a concurrent writer's fresh object survives;
+//! only right after this handle created the latest head.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,8 +41,9 @@ use super::Repository;
 use super::control::{CancelToken, CommitEvent};
 use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
 use super::index_store::{self, PackedObject, StoredHead};
+use super::lock::MarkerStamp;
 use super::machine::{StepCx, drive_blocking};
-use super::publish_machine::PublishMachine;
+use super::publish_machine::{PublishMachine, Published};
 use crate::index::LiveIndex;
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
 use crate::index::head::{SegmentKind, SweepState};
@@ -335,9 +341,11 @@ impl Repository {
     /// maintenance segment over the loaded head, which must be the latest, or
     /// a base without a head (repair, upgrade).
     pub(super) fn persist_segmented_index(&mut self) -> Result<()> {
+        let listed_at = MarkerStamp::now(self.host_env().clock.as_ref());
         let head = self.current_head_for_write()?;
         let Some(head) = head else {
-            return self.publish_index_state(None, None, false);
+            // The fold's own listing chooses the generation.
+            return self.publish_index_state(None, None, false, None);
         };
         if !self.chunk_index.is_loaded() {
             if !head.is_empty() {
@@ -360,7 +368,7 @@ impl Repository {
             relocations = seg.relocations.len(),
             "index edits collected"
         );
-        self.publish_index_state(Some(head), Some(seg), false)
+        self.publish_index_state(Some(head), Some(seg), false, Some(listed_at))
     }
 
     /// Publish `seg` as the successor of `prev`: as a segment, or with a
@@ -383,23 +391,29 @@ impl Repository {
     /// as an add of a present chunk, are discarded), or only a head when a
     /// sweep is pending. On error nothing
     /// local changes (a requested fold stays requested) and at most an
-    /// unreferenced object is left on storage.
+    /// unreferenced object is left on storage. A generation another writer
+    /// created is the "index changed" error (04 "Compact" 4: a maintenance
+    /// write stops). `listed_at`: when the head listing that chose the
+    /// generation started (`PublishMachine::listed_at`).
     pub(super) fn publish_index_state(
         &mut self,
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
         backup: bool,
+        listed_at: Option<MarkerStamp>,
     ) -> Result<()> {
-        let mut m = PublishMachine::publish(self, prev, seg, backup);
+        let mut m = PublishMachine::publish(self, prev, seg, backup).listed_at(listed_at);
         let events = |_: CommitEvent| {};
-        drive_blocking(
+        match drive_blocking(
             &mut m,
             &mut StepCx {
                 repo: self,
                 events: &events,
             },
-        )
-        .map(|_| ())
+        )? {
+            Published::Head(_) => Ok(()),
+            Published::Taken { .. } => Err(stale_index_error()),
+        }
     }
 
     /// Fold: write the index's current state as a base (no object for the
@@ -412,22 +426,28 @@ impl Repository {
     /// best-effort. The base's body becomes the repository's table
     /// (`index_base.<name>`), with the kept segments applied over it and no
     /// edits. `removes`: the new state lacks entries `prev`'s has (for the
-    /// sweep bookkeeping).
+    /// sweep bookkeeping). A generation another writer created is the
+    /// "index changed" error. `listed_at` as for
+    /// [`Self::publish_index_state`].
     pub(super) fn put_base(
         &mut self,
         prev: Option<&IndexHead>,
         removes: bool,
         request: FoldRequest,
+        listed_at: Option<MarkerStamp>,
     ) -> Result<IndexHead> {
-        let mut m = PublishMachine::base(prev.cloned(), removes, request);
+        let mut m = PublishMachine::base(prev.cloned(), removes, request).listed_at(listed_at);
         let events = |_: CommitEvent| {};
-        drive_blocking(
+        match drive_blocking(
             &mut m,
             &mut StepCx {
                 repo: self,
                 events: &events,
             },
-        )
+        )? {
+            Published::Head(head) => Ok(head),
+            Published::Taken { .. } => Err(stale_index_error()),
+        }
     }
 
     /// Index upkeep at the end of `compact`, under the lock: fold when the
@@ -435,11 +455,14 @@ impl Repository {
     /// `index.d/` objects. The deletion is age-gated, so it never deletes a
     /// concurrent writer's fresh segment (H4-segment). The soft limit counts
     /// only the foldable prefix; young backup segments stay in the head
-    /// (04 step 7).
+    /// (04 step 7). The deletion runs only when this handle created the
+    /// latest head (the fold's, or the run's last index write): a writer
+    /// that read an older head then finds its generation taken (04 step 8).
     pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
         if self.index_dirty {
             self.save_state()?;
         }
+        let listed_at = MarkerStamp::now(self.host_env().clock.as_ref());
         let Some(head) = self.current_head_for_write()? else {
             return Ok(());
         };
@@ -454,13 +477,18 @@ impl Repository {
                 self.install_synced_index(synced);
             }
             // A fold writes the same state as a base and the kept segments.
-            let new_head = self.put_base(Some(&head), false, FoldRequest::Eligible)?;
+            let new_head =
+                self.put_base(Some(&head), false, FoldRequest::Eligible, Some(listed_at))?;
             self.index_generation = new_head.generation;
             self.index_head = Some(new_head.clone());
             new_head
         } else {
             head
         };
+        if self.created_head != Some(latest.generation) {
+            debug!("no index head written by this run; index garbage collection skipped");
+            return Ok(());
+        }
         let gc = index_store::collect_index_garbage(
             self.storage.as_ref(),
             self.crypto.as_ref(),
@@ -650,11 +678,21 @@ impl Repository {
     }
 }
 
-/// The error a write returns when the head moved since the index was loaded.
+/// The error a write returns when the head moved since the index was loaded,
+/// or another writer created the generation it tried.
 fn stale_index_error() -> VykarError {
     VykarError::Other(
         "the index changed on storage after it was loaded; retry the operation".into(),
     )
+}
+
+/// The error of a backup commit whose head generation another writer took
+/// on each of its `attempts` (04 "Backup commit" 7).
+pub(crate) fn head_contention_error(generation: u64, attempts: u32) -> VykarError {
+    VykarError::Other(format!(
+        "the index changed on storage after it was loaded: index head {generation} was created \
+         by another writer on each of {attempts} attempts; retry the backup"
+    ))
 }
 
 /// The error `check --repair` returns when reading the chain fails in a way

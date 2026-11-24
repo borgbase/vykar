@@ -2759,6 +2759,34 @@ mod store_clock {
         assert_eq!(probes(&storage), vec![young.to_string()]);
     }
 
+    /// The put-if-absent check's probe left by a failed delete is debris
+    /// of the same kind (04 step 8): removed once an hour old.
+    #[test]
+    fn put_if_absent_probe_debris_is_removed_after_an_hour() {
+        let (dir, storage) = local();
+        let live = lock_key_at(Utc::now(), "foreign");
+        write_lock_marker(&storage, &live, "otherhost", 4242, Utc::now(), None);
+        let old = "locks/vykar-probe-1700000000-0123456789abcdef0123456789abcdef";
+        let young = "locks/vykar-probe-1700000001-fedcba9876543210fedcba9876543210";
+        storage.put(old, b"probe").unwrap();
+        storage.put(young, b"probe").unwrap();
+        age(dir.path(), old, 2 * HOUR);
+        age(dir.path(), young, Duration::from_secs(10 * 60));
+
+        assert!(matches!(
+            acquire_lock(&storage, &HostEnv::system()),
+            Err(VykarError::Locked(_))
+        ));
+        assert!(storage.exists(&live).unwrap());
+        let left: Vec<String> = storage
+            .list("locks/")
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.starts_with("locks/vykar-probe-"))
+            .collect();
+        assert_eq!(left, vec![young.to_string()]);
+    }
+
     /// `break-lock` also removes clock probes, which are not locks and are
     /// not counted.
     #[test]

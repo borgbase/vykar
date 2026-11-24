@@ -573,6 +573,13 @@ pub struct Repository {
     fold_policy: index_write::FoldPolicy,
     /// What fold the next index write was asked for.
     fold_requested: index_write::FoldRequest,
+    /// The last head generation this handle created (04 step 8): the index
+    /// garbage collection runs only right after its caller created the
+    /// latest head (`index_store::collect_index_garbage`'s precondition).
+    created_head: Option<u64>,
+    /// The notice this handle logged when its heads fell back to plain PUTs
+    /// (04 "Fallback"): logged once per handle, set when logged.
+    head_fallback: Option<index_store::HeadFallback>,
     /// What the next index write records in the head's `sweep`; consumed by it.
     pending_sweep: Option<index_write::PendingSweep>,
     /// Grace of `collect_index_garbage`: `INDEX_GC_GRACE`; tests lower it.
@@ -790,6 +797,14 @@ impl Repository {
     /// "Now" on the store's clock as the held lock read it, if any.
     pub(crate) fn lock_store_time(&self) -> Option<vykar_storage::StoreNow> {
         self.lock_store_time
+    }
+
+    /// The fallback notice this handle logged, if its heads are written
+    /// with plain PUTs (04 "Fallback"); `None` until its first index write
+    /// reached the fence, and on a backend whose check passed.
+    #[cfg(test)]
+    pub(crate) fn head_fallback(&self) -> Option<index_store::HeadFallback> {
+        self.head_fallback
     }
 
     /// Set the age below which orphan packs are kept (tests).

@@ -17,6 +17,8 @@ pub enum OpKind {
     ListSized,
     ListMeta,
     Put,
+    /// A create (put-if-absent), raw or the check's.
+    PutIfAbsent,
     PutOwned,
     PutPack,
     StagedCommit,
@@ -29,7 +31,11 @@ impl OpKind {
     pub fn is_write(self) -> bool {
         matches!(
             self,
-            OpKind::Put | OpKind::PutOwned | OpKind::PutPack | OpKind::StagedCommit
+            OpKind::Put
+                | OpKind::PutIfAbsent
+                | OpKind::PutOwned
+                | OpKind::PutPack
+                | OpKind::StagedCommit
         )
     }
 
@@ -84,8 +90,8 @@ pub enum KeyMatch {
     Exact(String),
     Prefix(String),
     /// A lock key (`locks/*.json`), or the `locks/` directory itself (the
-    /// key its listings are logged under); never a clock probe
-    /// (`locks/vykar-clock-*`).
+    /// key its listings are logged under); never a probe
+    /// (`locks/vykar-clock-*`, `locks/vykar-probe-*`).
     LockKey,
 }
 
@@ -192,7 +198,20 @@ pub struct ParkedEffect {
 #[derive(Clone, Debug)]
 pub(crate) enum Effect {
     Put(Vec<u8>),
+    /// Stored only when the key is absent (unless the store's kind
+    /// overwrites).
+    PutIfAbsent(Vec<u8>),
     Delete(Vec<String>),
+}
+
+impl Effect {
+    /// Bytes written, for the op log.
+    pub(crate) fn len(&self) -> Option<u64> {
+        match self {
+            Effect::Put(d) | Effect::PutIfAbsent(d) => Some(d.len() as u64),
+            Effect::Delete(_) => None,
+        }
+    }
 }
 
 /// Every injected error's message starts with this.

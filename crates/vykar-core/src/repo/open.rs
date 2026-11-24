@@ -255,6 +255,9 @@ impl Repository {
         // that predates them refuses to start with the directories present.
         storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         storage.create_dir(index_store::HEAD_PREFIX)?;
+        // A plain PUT (04 step 8 D5): nothing can contend before the
+        // repository has a config, and a put-if-absent check here would
+        // write under `locks/` before it exists. The first commit checks.
         let head = IndexHead::initial();
         index_store::put_head(storage.as_ref(), &head, crypto.as_ref())?;
         let index_generation = head.generation;
@@ -292,6 +295,8 @@ impl Repository {
             index_head,
             fold_policy: Default::default(),
             fold_requested: super::index_write::FoldRequest::None,
+            created_head: None,
+            head_fallback: None,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,
@@ -516,6 +521,8 @@ impl Repository {
             index_head,
             fold_policy: Default::default(),
             fold_requested: super::index_write::FoldRequest::None,
+            created_head: None,
+            head_fallback: None,
             pending_sweep: None,
             index_gc_grace: index_store::INDEX_GC_GRACE,
             lock_store_time: None,

@@ -1,6 +1,6 @@
 {
   "name": "late-index-write",
-  "note": "First LateIndexWrite case of a 10-minute make sim-campaign (phase F part 2): a released index write lands outside the lock and damages nothing else. Fixed by 04 step 8.",
+  "note": "First LateIndexWrite case of a 10-minute make sim-campaign (phase F part 2): a released index write lands outside the lock and damages nothing else. Fixed by 04 step 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-index-write-conditional is the same case on a conditional store.",
   "expect": [
     "LateIndexWrite"
   ],

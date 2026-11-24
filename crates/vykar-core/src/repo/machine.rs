@@ -45,16 +45,25 @@ pub(crate) enum StepKind {
     PutSegment,
     /// PUT a base `index.d/<name>`.
     PutBase,
-    /// Compound: EXISTS the lock key, PUT it when the refresh is due.
+    /// Compound: the put-if-absent check on a handle's first index write
+    /// (two creates, a GET and a DELETE of a probe under `locks/`), then
+    /// EXISTS the lock key, PUT it when the refresh is due.
     Fence,
-    /// PUT `index.h/<gen>`.
+    /// Compound: create `index.h/<gen>` (put-if-absent where offered and
+    /// checked at the fence; a plain PUT otherwise), GET it after an
+    /// `AlreadyExists` or an error; LIST `index.h/` after a slow create, and
+    /// DELETE the head it re-made when that generation had been collected.
     PutHead,
-    /// Compound, best-effort: index garbage collection after a fold.
+    /// Compound, best-effort: index garbage collection after a fold
+    /// (`index.d/` listed before `index.h/`).
     CollectGarbage,
     /// Compound, unreachable today: the defensive persist of a dirty index.
     PersistIndex,
     /// PUT `snapshots/<id>`: the commit point.
     PutSnapshot,
+    /// Wait before the next attempt of a backup commit whose head
+    /// generation another writer took. No storage access.
+    Backoff,
 }
 
 /// A kind of storage access, as [`StepKind::may_touch`] lists them.
@@ -84,10 +93,18 @@ const PERSIST_INDEX: &[(Access, &str)] = &[
     (Read, "index.d/"),
     (Read, "locks/"),
     (Write, "locks/"),
+    (Delete, "locks/"),
     (Write, "index.h/"),
     (List, "index.d/"),
     (Delete, "index.h/"),
     (Delete, "index.d/"),
+];
+#[cfg(test)]
+const PUT_HEAD: &[(Access, &str)] = &[
+    (Write, "index.h/"),
+    (Read, "index.h/"),
+    (List, "index.h/"),
+    (Delete, "index.h/"),
 ];
 
 #[cfg(any(test, feature = "sim"))]
@@ -111,6 +128,7 @@ impl StepKind {
             StepKind::CollectGarbage => "collect-garbage",
             StepKind::PersistIndex => "persist-index",
             StepKind::PutSnapshot => "put-snapshot",
+            StepKind::Backoff => "backoff",
         }
     }
 
@@ -141,8 +159,8 @@ impl StepKind {
             StepKind::PutSweepRecord | StepKind::PutSegment | StepKind::PutBase => {
                 &[(Write, "index.d/")]
             }
-            StepKind::Fence => &[(Read, "locks/"), (Write, "locks/")],
-            StepKind::PutHead => &[(Write, "index.h/")],
+            StepKind::Fence => &[(Read, "locks/"), (Write, "locks/"), (Delete, "locks/")],
+            StepKind::PutHead => PUT_HEAD,
             StepKind::CollectGarbage => &[
                 (List, "index.h/"),
                 (List, "index.d/"),
@@ -152,6 +170,7 @@ impl StepKind {
             ],
             StepKind::PersistIndex => PERSIST_INDEX,
             StepKind::PutSnapshot => &[(Write, "snapshots/")],
+            StepKind::Backoff => &[],
         }
     }
 }
@@ -172,6 +191,7 @@ const ALL: &[StepKind] = &[
     StepKind::PutBase,
     StepKind::Fence,
     StepKind::PutHead,
+    StepKind::Backoff,
     StepKind::CollectGarbage,
     StepKind::PersistIndex,
     StepKind::PutSnapshot,

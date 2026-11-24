@@ -48,6 +48,7 @@ use super::gate::{GateId, GateRule};
 use super::history::{ClientOp, RunOutcome};
 use super::log::{OpOutcome, OpRecord, key_class};
 use super::runner::{Call, GATE_TIMEOUT, RunResult, Sim, SourceTree, Spawned, seeded_bytes};
+pub use super::store::StoreKind;
 use crate::commands::backup::{self, BackupRequest, CommitInProgress, PendingCommit};
 use crate::compress::Compression;
 use crate::repo::Committed;
@@ -203,6 +204,11 @@ pub struct Case {
     /// How Compact runs; DeleteControl is always one decision.
     #[serde(default, skip_serializing_if = "Maintenance::is_whole")]
     pub maintenance: Maintenance,
+    /// The store's kind (04 step 8): `Plain` (the fallback, every seed
+    /// recorded before 04 step 8) or one with put-if-absent. On `Conditional`
+    /// the checker also judges invariant 12 and every retained head.
+    #[serde(default, skip_serializing_if = "StoreKind::is_plain")]
+    pub storage: StoreKind,
 }
 
 /// How the driver runs a Compact command.
@@ -218,8 +224,10 @@ pub struct Case {
 /// commit. That a jump between compact's listings only makes its "now"
 /// (the lock key's mtime) older, which errs young, is argued, not searched.
 /// A crash of the compact's client stays as before
-/// (`crash_inside_a_stepped_compact`). 04 step 8 makes maintenance heads
-/// put-if-absent and can offer jumps inside it.
+/// (`crash_inside_a_stepped_compact`). 04 step 8 (phase F part 9) makes
+/// maintenance heads put-if-absent; jumps inside a stepped compact on a
+/// conditional store are its separable step 3.12, not built (part 9's
+/// report).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Maintenance {
     /// One decision for the whole command (every seed recorded before 04
@@ -380,6 +388,12 @@ impl Template {
     pub fn fork(&self) -> Sim {
         self.sim.fork_for_case()
     }
+
+    /// A fork of the template on a store of `kind` (the template itself is
+    /// built on `Plain`).
+    pub fn fork_as(&self, kind: StoreKind) -> Sim {
+        self.sim.fork_for_case_as(kind)
+    }
 }
 
 /// The tree the driver backs up as snapshot `name` (client `a`'s first
@@ -439,7 +453,12 @@ pub enum Action {
 /// their entries from a sweep and stay out of folds; packs a sweep empties
 /// are kept while young) narrowed `AgedSessionReaped` and
 /// `LateSnapshotWrite` and put `AgedLockPacksCollected` out of the
-/// driver's reach; part 9 (04 step 8) removes the late head writes.
+/// driver's reach; part 9 (04 step 8: heads created with put-if-absent)
+/// closes `LateHeadWrite`, `LateHeadThenCompact`,
+/// `LateHeadSegmentCollected`, `AgedLockSegmentCollected` and
+/// `AgedLockPacksCollected` on conditional stores (`Case::storage`) and
+/// narrows `LateIndexWrite` there; the fallback store (`StoreKind::Plain`)
+/// keeps them all.
 ///
 /// The driver's time jumps move the store and every client clock together,
 /// so a jump is a genuine stall of every client, and ages on the store's
@@ -512,28 +531,34 @@ pub enum Signature {
     /// leaves its additions, and packs a sweep empties are kept while
     /// young: the swept-packs route needs a stall of T_pack in all between
     /// the victim's head PUT and the compact (seed
-    /// `aged-session-reaped-swept-packs-old-segment`). Fixed by 04 step 8.
+    /// `aged-session-reaped-swept-packs-old-segment`). Left by part 9 (04
+    /// step 8): the sweep cannot mark a snapshot not yet written; part 10
+    /// (04 step 9 and 05's `reused` section).
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
     /// age (not written for more than the 6 h stale age: the driver's time
     /// jumps, a genuine stall of the holder). The fallback protocol's
     /// documented limit; since 04 step 5 the age is the lock key's mtime on
     /// the store's clock, which only a stall (or a store clock step) moves
-    /// past the stale age. 04 steps 8 and 9 take the lock off the commit
-    /// path. Claims the lock-exclusion violation it is derived from.
+    /// past the stale age. Left by part 9 (04 step 8): the lock stays on
+    /// the commit path; on conditional stores fewer of its writes remain (a
+    /// taken create writes nothing). Part 10 (04 step 9) takes the lock off
+    /// it. Claims the lock-exclusion violation it is derived from.
     AgedLockReaped,
     /// A protected write while the store held a lock key that a delayed or
     /// duplicated lock PUT left behind after its writer had deleted it (a
-    /// key with no holder). The fallback protocol's limit; 04 step 8 takes
-    /// the lock off the commit path. Claims the lock-exclusion violation it
-    /// is derived from.
+    /// key with no holder). The fallback protocol's limit; left by part 9,
+    /// part 10 (04 step 9) takes the lock off the commit path. Claims the
+    /// lock-exclusion violation it is derived from.
     OrphanLockKey,
     /// H3: a released write of `index.h/` (a head PUT that timed out and
     /// landed after the lock was released), and a committed snapshot lost
     /// its index coverage: one whose backup returned Ok, whose
     /// `snapshots/` PUT applied before the release, or whose backup's own
     /// head the release overwrote before its (not delayed) snapshot PUT.
-    /// Fixed by 04 step 8.
+    /// Closed on conditional stores by 04 step 8 (phase F part 9): a
+    /// released create finds its generation taken; the fallback (`Plain`)
+    /// keeps it.
     LateHeadWrite,
     /// H3-compact: a released write of `index.h/`, and the index names an
     /// absent pack. Since 04 step 5 compact deletes only orphan packs older
@@ -551,7 +576,9 @@ pub enum Signature {
     /// production still reaches it; the driver never refreshes markers (its
     /// clock moves only by jumps), and the scripted test
     /// `a_late_head_of_a_refreshed_backup_names_packs_compact_deleted`
-    /// (tests/sim.rs) covers it. Fixed by 04 step 8.
+    /// (tests/sim.rs) covers it. Closed on conditional stores by 04 step 8
+    /// (phase F part 9): the late create cannot replace compact's head; the
+    /// fallback (`Plain`) keeps it.
     LateHeadThenCompact,
     /// H3 meeting index GC (04 "Current issues" 2 and 3): a head PUT that
     /// timed out names a segment of its failed commit; before the late
@@ -564,9 +591,10 @@ pub enum Signature {
     /// issued (while it was in flight), or, when the delete came
     /// after h (the deleter's GC judged by its own head at the generation
     /// the release then overwrote), an object written by the released
-    /// head's own run; cascades from h like `LateHeadWrite`. Fixed by 04
-    /// step 8 (create-if-absent commits: the late head finds its
-    /// generation taken).
+    /// head's own run; cascades from h like `LateHeadWrite`. Closed on
+    /// conditional stores by 04 step 8 (phase F part 9): a collector runs
+    /// only right after it created the latest head, so the late create
+    /// finds its generation taken; the fallback (`Plain`) keeps it.
     LateHeadSegmentCollected,
     /// 04 "Current issues" 3 with the second holder coming from the 6 h
     /// lock staleness: victim V wrote an `index.d/` segment S under its
@@ -584,8 +612,11 @@ pub enum Signature {
     /// `DisallowedError` naming S of runs that end after V's head PUT, and
     /// the skipped evaluations; the head PUT's own lock violation stays
     /// `AgedLockReaped`'s. Left by 04 step 5 (the lock is reaped by genuine
-    /// age, the segment collected at T_idx = 1 h); fixed by 04 step 8
-    /// (create-if-absent commits take the lock off the commit path).
+    /// age, the segment collected at T_idx = 1 h). Closed on conditional
+    /// stores by 04 step 8 (phase F part 9): the reaper's compact created
+    /// the generation before collecting, so the victim's create finds it
+    /// taken (its retry's writes after the reap stay `AgedLockReaped`'s);
+    /// the fallback (`Plain`) keeps it.
     AgedLockSegmentCollected,
     /// The same aged reap with packs instead of a segment: victim V's lock
     /// and session marker age past their staleness in one jump of time;
@@ -619,7 +650,9 @@ pub enum Signature {
     /// segment after its packs went: a failed best-effort delete, a GC
     /// stopped by an unreadable retained head, a compact that ends between
     /// its pack deletes and its index maintenance, or a later full fold of
-    /// V's from its warm index. Fixed by 04 step 8.
+    /// V's from its warm index. Closed on conditional stores by 04 step 8
+    /// (phase F part 9), as `AgedLockSegmentCollected`; the fallback
+    /// (`Plain`) keeps it.
     AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
     /// chunks: invariant 1 fails with no lock violation other than late
@@ -636,14 +669,18 @@ pub enum Signature {
     /// what remains needs a stall of T_pack between its head and the
     /// compact (seed `late-snapshot-write-old-segment`), or a chunk it
     /// reused from a snapshot whose segment is old and that nothing else
-    /// visible references. Fixed by 04 step 8 (the commit point is the
-    /// head).
+    /// visible references. Left by part 9: a head visible before its
+    /// snapshot needs 05's `reused` section or snapshot-before-head (part 10,
+    /// 04 step 9).
     LateSnapshotWrite,
     /// A released write of `index.h/` or `index.d/` that landed outside
     /// the lock and damaged nothing else (invariant 7 only): the late-write
     /// mechanism of H3 without its damage. Claims the lock-exclusion
     /// violations at released index writes that nothing else claims.
-    /// Fixed by 04 step 8.
+    /// Narrowed on conditional stores by 04 step 8 (phase F part 9): a
+    /// released head lands only at a generation nobody created, extending
+    /// the head it was built on; released `index.d/` writes remain. Retires
+    /// with invariant 7 when part 10 takes the lock off the commit path.
     LateIndexWrite,
     /// A violation no signature above claims, or anything not evaluated
     /// with no cascading signature.
@@ -888,7 +925,7 @@ impl<'c> Driver<'c> {
                 <= 1,
             "at most one DeleteControl per case"
         );
-        let mut sim = template.fork();
+        let mut sim = template.fork_as(case.storage);
         let actors: Vec<Actor> = case
             .clients
             .iter()
@@ -1471,7 +1508,7 @@ impl<'c> Driver<'c> {
     }
 
     fn verdict(self) -> Outcome {
-        let report = self.sim.check_invariants(&[
+        let mut set = vec![
             Invariant::CommittedSnapshotsRestore,
             Invariant::AcknowledgedCommitsDurable,
             Invariant::NoSilentRemoval,
@@ -1480,7 +1517,11 @@ impl<'c> Driver<'c> {
             Invariant::LockExclusion,
             Invariant::OrphanGrace,
             Invariant::MarkerGapCommit,
-        ]);
+        ];
+        if self.case.storage.honours_creates() {
+            set.push(Invariant::HeadsImmutable);
+        }
+        let report = self.sim.check_invariants(&set);
         let signatures = classify(&self.sim, &report, &self.entries);
         let trace = self.trace(&report, &signatures);
         Outcome {

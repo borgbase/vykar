@@ -69,8 +69,11 @@ impl OpRecord {
 pub enum OpOutcome {
     Ok,
     NotFound,
-    /// Append-only overwrite, or a write on the observer handle.
+    /// Append-only overwrite, a head overwrite with other bytes on the
+    /// conditional kind (409), or a write on the observer handle.
     Refused,
+    /// A create (put-if-absent) that found its key: not applied.
+    Exists,
     /// Returned the backend's own error (e.g. short range read).
     Error,
     /// Fail / FailApplied / Crash fired on this op.
@@ -81,7 +84,8 @@ pub enum OpOutcome {
     Crashed,
     /// A parked effect applied by `release` (logged under its original client).
     Released(ParkedId),
-    /// A released effect the store refused (append-only overwrite).
+    /// A released effect the store refused (append-only overwrite), or a
+    /// released create that found its key: not applied.
     ReleasedRefused(ParkedId),
 }
 
@@ -92,6 +96,7 @@ impl OpOutcome {
             OpOutcome::Ok => "ok",
             OpOutcome::NotFound => "not-found",
             OpOutcome::Refused => "refused",
+            OpOutcome::Exists => "exists",
             OpOutcome::Error => "error",
             OpOutcome::Injected(_) => "injected",
             OpOutcome::Parked(..) => "parked",

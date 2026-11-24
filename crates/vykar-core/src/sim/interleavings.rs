@@ -822,6 +822,53 @@ pub fn h4_segment_regression() -> Report {
     out
 }
 
+/// H4-conditional: H4's schedule on a conditional store. Compact a, its
+/// lock reaped, and backup b both create the generation after a's sweep:
+/// b finds it taken and rebases (or a stops before its deletes), so no head
+/// names a pack a deleted and t1 restores. Invariant 7 is not judged: the
+/// lost lock is the fallback lock's (H2's family, part 10); the report
+/// holds every other STEP8 violation, and a `DisallowedError` "scenario"
+/// unless one of the two met a taken generation.
+pub fn h4_conditional_regression() -> Report {
+    let mut out = Report::default();
+    let (sim, a, b, ra, rb) =
+        match h4_runs(Hosts::StoreStepped, Order::Interleaved, BackupGate::Segment) {
+            Ok(Ok(run)) => run,
+            Ok(Err(outcome)) | Err(outcome) => {
+                out.add(
+                    ViolationKind::DisallowedError,
+                    "scenario",
+                    format!("{outcome:?}"),
+                );
+                return out;
+            }
+        };
+    let report = sim.check_invariants(Invariant::STEP8);
+    out.violations.extend(
+        report
+            .violations
+            .into_iter()
+            .filter(|v| v.invariant != Invariant::LockExclusion),
+    );
+    out.not_evaluated.extend(report.not_evaluated);
+    let taken = sim.store().log().iter().any(|r| {
+        (r.client == a || r.client == b)
+            && r.key.starts_with("index.h/")
+            && r.outcome == super::log::OpOutcome::Exists
+    }) || allowed(&ra, AllowedError::IndexChanged);
+    if !taken {
+        out.add(
+            ViolationKind::DisallowedError,
+            "scenario",
+            format!(
+                "neither writer met a taken generation\n{}",
+                outcomes(&ra, &rb)
+            ),
+        );
+    }
+    out
+}
+
 /// H4-skew: H4's old route, b's wall clock 6 h 1 min ahead. Since 04 step 5
 /// b judges a's lock by its mtime on the store's clock and does not reap
 /// it: the run ends early with b `Locked` and a `Ok`. Anything else is a

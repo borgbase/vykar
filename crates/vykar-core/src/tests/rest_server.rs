@@ -450,6 +450,52 @@ fn a_backup_against_an_append_only_server_issues_no_refused_delete() {
     }
 }
 
+/// 04 step 8: a backup through vykar-server creates its head with
+/// `If-None-Match: *`, in normal and in append-only mode (`locks/*` is
+/// ephemeral there: the probe may be created and deleted). The in-process
+/// harness logs no request headers; what shows the conditional path is the
+/// check's second create of its probe answered 412, its DELETE answered
+/// with success, the head's create answered 201, and `locks/` holding no
+/// probe afterwards.
+#[test]
+fn backup_creates_heads_with_if_none_match() {
+    for append_only in [false, true] {
+        let server = Server::start(append_only);
+        let c = Client::init(&server);
+        c.write("a", "alpha");
+        server.take_requests();
+        c.backup("s1");
+        let reqs = server.take_requests();
+        let answers = |method: axum::http::Method, prefix: &str| -> Vec<u16> {
+            reqs.iter()
+                .filter(|(m, uri, _)| *m == method && request_key(uri).starts_with(prefix))
+                .map(|r| r.2)
+                .collect()
+        };
+        let ctx = format!("append_only={append_only}: {reqs:?}");
+        assert_eq!(
+            answers(axum::http::Method::PUT, "locks/vykar-probe-"),
+            vec![201, 412],
+            "{ctx}"
+        );
+        let deletes = answers(axum::http::Method::DELETE, "locks/vykar-probe-");
+        assert_eq!(deletes.len(), 1, "{ctx}");
+        assert!((200..300).contains(&deletes[0]), "{ctx}");
+        assert_eq!(
+            answers(axum::http::Method::PUT, "index.h/"),
+            vec![201],
+            "{ctx}"
+        );
+        let probes: Vec<String> = std::fs::read_dir(server.data.path().join("locks"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("vykar-probe-"))
+            .collect();
+        assert!(probes.is_empty(), "append_only={append_only}: {probes:?}");
+        check_clean(&c.config);
+    }
+}
+
 /// The snapshot objects on the server, sorted.
 fn server_snapshots(server: &Server) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(server.data.path().join("snapshots"))

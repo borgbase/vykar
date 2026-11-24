@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-reaped",
-  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8.",
+  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) aged-lock-reaped-conditional is the same case on a conditional store, which keeps it too.",
   "expect": [
     "AgedLockReaped"
   ],

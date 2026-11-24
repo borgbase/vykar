@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-collected-later-runs",
-  "note": "Second campaign of phase F part 2 (random-2011597032612029699): shape A (aged lock, compact's index GC takes the unpublished segment, the holder's head names it), with a later backup that started before the head PUT and fails on the missing segment after it. Fixed by 04 steps 5 and 8.",
+  "note": "Second campaign of phase F part 2 (random-2011597032612029699): shape A (aged lock, compact's index GC takes the unpublished segment, the holder's head names it), with a later backup that started before the head PUT and fails on the missing segment after it. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-later-runs-conditional is the same case on a conditional store.",
   "expect": [
     "AgedLockReaped",
     "AgedLockSegmentCollected"

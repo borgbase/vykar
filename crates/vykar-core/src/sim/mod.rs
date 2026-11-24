@@ -58,5 +58,5 @@ pub use fault::{
 pub use gate::{GateId, GateRule, Paused};
 pub use history::{AllowedError, ClientOp, ErrorClass, History, RunOutcome, RunRecord};
 pub use log::{OpOutcome, OpRecord};
-pub use runner::{Call, CustomFn, Sim, SourceTree, Spawned};
-pub use store::{SimClient, SimConfig, SimStore, StoredObject};
+pub use runner::{Call, CustomFn, Sim, SourceTree, Spawned, with_store_kind};
+pub use store::{SimClient, SimConfig, SimStore, StoreKind, StoredObject};

@@ -1,0 +1,228 @@
+{
+  "name": "late-head-crashed-snapshot-conditional",
+  "note": "Conditional twin of late-head-crashed-snapshot (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): compact's late create finds the generation taken; the crashed backup's committed snapshot keeps its coverage.",
+  "expect": [],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "lock"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-snapshot"
+    ],
+    [
+      {
+        "Crash": {
+          "client": 0
+        }
+      },
+      "crash"
+    ],
+    [
+      {
+        "Release": {
+          "parked": 0
+        }
+      },
+      "release"
+    ]
+  ],
+  "case": {
+    "hosts": "SameHostname",
+    "clients": [
+      [
+        "Compact",
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ]
+    ],
+    "faults": [
+      {
+        "client": 0,
+        "class": "IndexHead",
+        "nth": 1,
+        "kind": "Delay"
+      }
+    ],
+    "crash": true,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3,
+      3,
+      0,
+      3,
+      3
+    ],
+    "policy": "First",
+    "storage": "Conditional"
+  }
+}

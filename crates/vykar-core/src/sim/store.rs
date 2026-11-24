@@ -10,8 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use vykar_storage::{
-    BackendProfile, BatchDelete, BatchDeleteScope, ListedObject, PackData, StagedPut,
+    BackendProfile, BatchDelete, BatchDeleteScope, ConditionalSupport, ConditionalWrite, Created,
+    ListedObject, PackData, StagedPut, Verifier,
 };
 use vykar_types::error::{Result, VykarError};
 
@@ -25,12 +27,53 @@ use super::log::{OpOutcome, OpRecord, thread_label};
 const OBSERVER: ClientId = ClientId(0);
 const TAMPER: ClientId = ClientId(1);
 
+/// What the store's backend does with heads and conditional writes (04 step
+/// 8). Every kind keeps an identical re-PUT of an `index.d/` or `index.h/`
+/// key as a no-op with its first mtime (vykar-server's rule).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoreKind {
+    /// No put-if-absent (`conditional()` is None): a backend that does not
+    /// offer it (S3 off AWS with `s3_conditional_writes: auto`, SFTP without
+    /// `hardlink@openssh.com`) or whose check failed. Heads are plain PUTs
+    /// under the lock, and one with other bytes replaces the head. The
+    /// fallback; every seed recorded before 04 step 8 runs on it.
+    #[default]
+    Plain,
+    /// vykar-server, local, OpenSSH SFTP and AWS S3: honest put-if-absent;
+    /// a plain PUT of an existing head with other bytes is refused (409, as
+    /// vykar-server answers).
+    Conditional,
+    /// Garage 2.5.0: put-if-absent overwrites and answers Yes; the client's
+    /// check concludes Unsupported and it falls back to plain PUTs, which
+    /// overwrite.
+    Ignoring,
+    /// IDrive e2: passes the sequential check; a delayed or duplicated
+    /// create that lands later overwrites whatever is there (the
+    /// concurrent-create failure the check cannot see).
+    RacyRelease,
+}
+
+impl StoreKind {
+    // serde's `skip_serializing_if` passes a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_plain(&self) -> bool {
+        *self == StoreKind::Plain
+    }
+
+    /// Whether the store honours put-if-absent, so heads are immutable
+    /// (04 I3) and the checker judges it.
+    pub fn honours_creates(self) -> bool {
+        self == StoreKind::Conditional
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SimConfig {
     pub profile: BackendProfile,
     pub append_only: bool,
     /// `batch_delete()` offered (REST/S3-like) instead of None.
     pub batch_delete: bool,
+    pub kind: StoreKind,
 }
 
 impl Default for SimConfig {
@@ -44,6 +87,7 @@ impl Default for SimConfig {
             },
             append_only: false,
             batch_delete: false,
+            kind: StoreKind::Plain,
         }
     }
 }
@@ -79,6 +123,19 @@ struct State {
     labels: BTreeMap<ClientId, &'static str>,
     gates: Vec<GateState>,
     next_gate: u32,
+    /// Every replacement of a stored head by other bytes: (key, step, writer).
+    head_overwrites: Vec<(String, u64, ClientId)>,
+}
+
+/// How [`State::apply`] treats an effect.
+#[derive(Clone, Copy)]
+struct Rules {
+    append_only: bool,
+    kind: StoreKind,
+    /// A parked effect landing late.
+    release: bool,
+    /// Tampering: no refusal (it models damage, not a client).
+    tamper: bool,
 }
 
 struct Shared {
@@ -134,6 +191,10 @@ fn append_only_overwrite_ok(key: &str) -> bool {
 fn append_only_delete_ok(key: &str) -> bool {
     vykar_protocol::key_class(key)
         .is_none_or(|c| c.append_only_allows(vykar_protocol::Verb::Delete))
+}
+
+fn is_head_key(key: &str) -> bool {
+    key.starts_with("index.h/")
 }
 
 fn observer_refusal() -> VykarError {
@@ -230,13 +291,14 @@ impl State {
 
     /// Apply an effect at the current clock. Refuses what an append-only
     /// server refuses (key-class table); a refused batch deletes nothing.
+    /// `Ok(None)`: a create found its key and applied nothing.
     fn apply(
         &mut self,
-        append_only: bool,
+        rules: Rules,
         writer: ClientId,
         key: &str,
         effect: &Effect,
-    ) -> std::result::Result<Vec<String>, VykarError> {
+    ) -> std::result::Result<Option<Vec<String>>, VykarError> {
         let mut absent = Vec::new();
         match effect {
             Effect::Put(data) => {
@@ -244,31 +306,50 @@ impl State {
                 // write-once `index.h/` keys: a PUT of the stored bytes stores
                 // nothing and renews neither mtime nor writer (answered 204,
                 // in append-only mode too). A head PUT with other bytes is
-                // still stored here, where vykar-server answers 409: that
-                // difference is owed by 04 step 8 (phase F part 9).
-                if let Some(existing) = self.objects.get(key)
-                    && existing.data == *data
-                    && matches!(
+                // refused 409 on the conditional kind (vykar-server) and
+                // replaces the head on the others.
+                if let Some(existing) = self.objects.get(key) {
+                    let write_once = matches!(
                         vykar_protocol::put_rule(key),
                         vykar_protocol::PutRule::NamedByBlake3 | vykar_protocol::PutRule::WriteOnce
-                    )
-                {
-                    return Ok(absent);
+                    );
+                    if existing.data == *data && write_once {
+                        return Ok(Some(absent));
+                    }
+                    if !rules.tamper
+                        && rules.kind == StoreKind::Conditional
+                        && is_head_key(key)
+                        && existing.data != *data
+                    {
+                        return Err(VykarError::Other(format!(
+                            "409 Conflict: index head {key} exists with other bytes; heads are \
+                             write-once"
+                        )));
+                    }
                 }
-                if append_only && self.objects.contains_key(key) && !append_only_overwrite_ok(key) {
+                if !rules.tamper
+                    && rules.append_only
+                    && self.objects.contains_key(key)
+                    && !append_only_overwrite_ok(key)
+                {
                     return Err(append_only_overwrite_refusal(key));
                 }
-                self.objects.insert(
-                    key.to_string(),
-                    StoredObject {
-                        data: data.clone(),
-                        mtime: self.clock,
-                        writer,
-                    },
-                );
+                self.store_object(writer, key, data);
+            }
+            Effect::PutIfAbsent(data) => {
+                let overwrite = match rules.kind {
+                    StoreKind::Ignoring => true,
+                    StoreKind::RacyRelease => rules.release,
+                    StoreKind::Plain | StoreKind::Conditional => false,
+                };
+                if self.objects.contains_key(key) && !overwrite {
+                    return Ok(None);
+                }
+                self.store_object(writer, key, data);
             }
             Effect::Delete(keys) => {
-                if append_only
+                if !rules.tamper
+                    && rules.append_only
                     && let Some(refused) = keys.iter().find(|k| !append_only_delete_ok(k))
                 {
                     return Err(append_only_delete_refusal(refused));
@@ -283,7 +364,29 @@ impl State {
                 }
             }
         }
-        Ok(absent)
+        Ok(Some(absent))
+    }
+
+    /// Store `data` at `key` at the current clock, noting a head replaced
+    /// by other bytes.
+    fn store_object(&mut self, writer: ClientId, key: &str, data: &[u8]) {
+        if is_head_key(key)
+            && self
+                .objects
+                .get(key)
+                .is_some_and(|existing| existing.data != data)
+        {
+            self.head_overwrites
+                .push((key.to_string(), self.step, writer));
+        }
+        self.objects.insert(
+            key.to_string(),
+            StoredObject {
+                data: data.to_vec(),
+                mtime: self.clock,
+                writer,
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -354,6 +457,7 @@ impl SimStore {
                     labels: BTreeMap::new(),
                     gates: Vec::new(),
                     next_gate: 0,
+                    head_overwrites: Vec::new(),
                 }),
                 gate_cv: Condvar::new(),
             }),
@@ -364,14 +468,38 @@ impl SimStore {
     /// client names and config; empty log; no rules, parked effects,
     /// crashes, runs or gates (faults have stopped).
     pub fn fork(&self) -> SimStore {
+        self.fork_as(self.shared.config.kind)
+    }
+
+    /// [`Self::fork`] with another [`StoreKind`] (a driver case's
+    /// `storage` on the template's store).
+    pub fn fork_as(&self, kind: StoreKind) -> SimStore {
         let st = self.state();
         Self::from_parts(
-            self.shared.config.clone(),
+            SimConfig {
+                kind,
+                ..self.shared.config.clone()
+            },
             st.objects.clone(),
             st.step,
             st.clock,
             st.names.clone(),
         )
+    }
+
+    /// Every replacement of a stored head by other bytes since the store
+    /// (or fork) was made: (key, step, writer).
+    pub fn head_overwrites(&self) -> Vec<(String, u64, ClientId)> {
+        self.state().head_overwrites.clone()
+    }
+
+    fn rules(&self, release: bool) -> Rules {
+        Rules {
+            append_only: self.shared.config.append_only,
+            kind: self.shared.config.kind,
+            release,
+            tamper: false,
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -412,6 +540,7 @@ impl SimStore {
             store: self.clone(),
             client,
             observer: false,
+            cond: Arc::new(Verifier::new()),
         }
     }
 
@@ -421,6 +550,7 @@ impl SimStore {
             store: self.clone(),
             client: OBSERVER,
             observer: true,
+            cond: Arc::new(Verifier::new()),
         }
     }
 
@@ -476,19 +606,13 @@ impl SimStore {
             .remove(&id)
             .ok_or_else(|| VykarError::Other(format!("vykar-sim: no parked effect {id:?}")))?;
         st.step += 1;
-        let (outcome, absent) = match st.apply(
-            self.shared.config.append_only,
-            parked.client,
-            &parked.key,
-            &parked.effect,
-        ) {
-            Ok(absent) => (OpOutcome::Released(id), absent),
-            Err(_) => (OpOutcome::ReleasedRefused(id), Vec::new()),
-        };
-        let len = match &parked.effect {
-            Effect::Put(d) => Some(d.len() as u64),
-            Effect::Delete(_) => None,
-        };
+        let (outcome, absent) =
+            match st.apply(self.rules(true), parked.client, &parked.key, &parked.effect) {
+                Ok(Some(absent)) => (OpOutcome::Released(id), absent),
+                // A create that found its key, or a refusal.
+                Ok(None) | Err(_) => (OpOutcome::ReleasedRefused(id), Vec::new()),
+            };
+        let len = parked.effect.len();
         st.record_for_run(
             parked.client,
             parked.run,
@@ -583,8 +707,13 @@ impl SimStore {
         let mut st = self.state();
         st.step += 1;
         let effect = Effect::Put(data.to_vec());
-        // Tampering bypasses append-only: it models damage, not a client.
-        st.apply(false, TAMPER, key, &effect)
+        // Tampering bypasses append-only and write-once heads: it models
+        // damage, not a client.
+        let rules = Rules {
+            tamper: true,
+            ..self.rules(false)
+        };
+        st.apply(rules, TAMPER, key, &effect)
             .expect("unrestricted put");
         st.record(
             TAMPER,
@@ -853,6 +982,7 @@ impl SimStore {
     }
 
     /// One mutation. `keys` is non-empty only for a batch delete.
+    /// `Ok(false)`: a create found its key and applied nothing.
     fn mutate_op(
         &self,
         client: ClientId,
@@ -861,12 +991,9 @@ impl SimStore {
         key: &str,
         keys: &[String],
         effect: Effect,
-    ) -> Result<()> {
-        let append_only = self.shared.config.append_only;
-        let len = match &effect {
-            Effect::Put(d) => Some(d.len() as u64),
-            Effect::Delete(_) => None,
-        };
+    ) -> Result<bool> {
+        let rules = self.rules(false);
+        let len = effect.len();
         let match_keys: Vec<&str> = if op == OpKind::BatchDelete {
             keys.iter().map(String::as_str).collect()
         } else {
@@ -884,46 +1011,56 @@ impl SimStore {
                 st.record(client, op, key, keys, len, OpOutcome::Injected(action));
                 Err(injected(action, op, key))
             }
-            Verdict::Fault(FaultAction::FailApplied) => {
-                match st.apply(append_only, client, key, &effect) {
-                    Ok(absent) => {
-                        let outcome = OpOutcome::Injected(FaultAction::FailApplied);
-                        st.record(client, op, key, keys, len, outcome);
-                        st.note_absent(absent);
-                        Err(injected(FaultAction::FailApplied, op, key))
-                    }
-                    Err(e) => {
-                        st.record(client, op, key, keys, len, OpOutcome::Refused);
-                        Err(e)
-                    }
+            Verdict::Fault(FaultAction::FailApplied) => match st.apply(rules, client, key, &effect)
+            {
+                Ok(Some(absent)) => {
+                    let outcome = OpOutcome::Injected(FaultAction::FailApplied);
+                    st.record(client, op, key, keys, len, outcome);
+                    st.note_absent(absent);
+                    Err(injected(FaultAction::FailApplied, op, key))
                 }
-            }
+                Ok(None) => {
+                    // The create found its key; the reply is lost all the same.
+                    st.record(client, op, key, keys, len, OpOutcome::Exists);
+                    Err(injected(FaultAction::FailApplied, op, key))
+                }
+                Err(e) => {
+                    st.record(client, op, key, keys, len, OpOutcome::Refused);
+                    Err(e)
+                }
+            },
             Verdict::Fault(FaultAction::Delay) => {
                 let id = st.park(client, op, key, keys, FaultAction::Delay, effect);
                 let outcome = OpOutcome::Parked(id, FaultAction::Delay);
                 st.record(client, op, key, keys, len, outcome);
                 Err(injected(FaultAction::Delay, op, key))
             }
-            Verdict::Fault(FaultAction::Duplicate) => {
-                match st.apply(append_only, client, key, &effect) {
-                    Ok(absent) => {
-                        let id = st.park(client, op, key, keys, FaultAction::Duplicate, effect);
-                        let outcome = OpOutcome::Parked(id, FaultAction::Duplicate);
-                        st.record(client, op, key, keys, len, outcome);
-                        st.note_absent(absent);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        st.record(client, op, key, keys, len, OpOutcome::Refused);
-                        Err(e)
-                    }
+            Verdict::Fault(FaultAction::Duplicate) => match st.apply(rules, client, key, &effect) {
+                Ok(Some(absent)) => {
+                    let id = st.park(client, op, key, keys, FaultAction::Duplicate, effect);
+                    let outcome = OpOutcome::Parked(id, FaultAction::Duplicate);
+                    st.record(client, op, key, keys, len, outcome);
+                    st.note_absent(absent);
+                    Ok(true)
                 }
-            }
-            Verdict::Clean => match st.apply(append_only, client, key, &effect) {
-                Ok(absent) => {
+                Ok(None) => {
+                    st.record(client, op, key, keys, len, OpOutcome::Exists);
+                    Ok(false)
+                }
+                Err(e) => {
+                    st.record(client, op, key, keys, len, OpOutcome::Refused);
+                    Err(e)
+                }
+            },
+            Verdict::Clean => match st.apply(rules, client, key, &effect) {
+                Ok(Some(absent)) => {
                     st.record(client, op, key, keys, len, OpOutcome::Ok);
                     st.note_absent(absent);
-                    Ok(())
+                    Ok(true)
+                }
+                Ok(None) => {
+                    st.record(client, op, key, keys, len, OpOutcome::Exists);
+                    Ok(false)
                 }
                 Err(e) => {
                     st.record(client, op, key, keys, len, OpOutcome::Refused);
@@ -950,6 +1087,9 @@ pub struct SimClient {
     store: SimStore,
     client: ClientId,
     observer: bool,
+    /// The put-if-absent check's cache, as a production backend instance
+    /// has one: shared by this handle's clones (one per run).
+    cond: Arc<Verifier>,
 }
 
 impl SimClient {
@@ -969,6 +1109,35 @@ impl SimClient {
     fn write(&self, op: OpKind, key: &str, data: Vec<u8>) -> Result<()> {
         self.store
             .mutate_op(self.client, self.observer, op, key, &[], Effect::Put(data))
+            .map(|_| ())
+    }
+
+    /// The store's raw create, unverified (what the check runs).
+    fn raw_create(&self, key: &str, data: &[u8]) -> Result<Created> {
+        let created = self.store.mutate_op(
+            self.client,
+            self.observer,
+            OpKind::PutIfAbsent,
+            key,
+            &[],
+            Effect::PutIfAbsent(data.to_vec()),
+        )?;
+        Ok(if created {
+            Created::Yes
+        } else {
+            Created::AlreadyExists
+        })
+    }
+}
+
+impl ConditionalWrite for SimClient {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+        self.cond
+            .put_if_absent("sim", self, &|k, d| self.raw_create(k, d), key, data)
+    }
+
+    fn verify(&self) -> Result<ConditionalSupport> {
+        self.cond.verify(self, &|k, d| self.raw_create(k, d))
     }
 }
 
@@ -993,14 +1162,16 @@ impl vykar_storage::StorageBackend for SimClient {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        self.store.mutate_op(
-            self.client,
-            self.observer,
-            OpKind::Delete,
-            key,
-            &[],
-            Effect::Delete(vec![key.to_string()]),
-        )
+        self.store
+            .mutate_op(
+                self.client,
+                self.observer,
+                OpKind::Delete,
+                key,
+                &[],
+                Effect::Delete(vec![key.to_string()]),
+            )
+            .map(|_| ())
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -1130,7 +1301,14 @@ impl vykar_storage::StorageBackend for SimClient {
         self.store.shared.config.profile
     }
 
-    vykar_storage::unsupported_server_ops!(except[batch_delete]);
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        match self.store.shared.config.kind {
+            StoreKind::Plain => None,
+            _ => (!self.cond.refused()).then_some(self as &dyn ConditionalWrite),
+        }
+    }
+
+    vykar_storage::unsupported_server_ops!(except[conditional, batch_delete]);
 }
 
 impl BatchDelete for SimClient {
@@ -1138,14 +1316,16 @@ impl BatchDelete for SimClient {
         // The scope only matters for directories and temp files, and the
         // store has neither.
         let first = keys.first().map(String::as_str).unwrap_or("");
-        self.store.mutate_op(
-            self.client,
-            self.observer,
-            OpKind::BatchDelete,
-            first,
-            keys,
-            Effect::Delete(keys.to_vec()),
-        )
+        self.store
+            .mutate_op(
+                self.client,
+                self.observer,
+                OpKind::BatchDelete,
+                first,
+                keys,
+                Effect::Delete(keys.to_vec()),
+            )
+            .map(|_| ())
     }
 }
 
@@ -1813,6 +1993,157 @@ mod tests {
                 .add_gate(GateRule::new(a.client(), OpMatch::Any, KeyMatch::Any).nth(0))
                 .is_err()
         );
+    }
+
+    fn of_kind(kind: StoreKind) -> (SimStore, SimClient, SimClient) {
+        two_clients(SimConfig {
+            kind,
+            ..SimConfig::default()
+        })
+    }
+
+    #[test]
+    fn put_if_absent_creates_once() {
+        let (store, a, b) = of_kind(StoreKind::Conditional);
+        let cond = a.conditional().expect("offered");
+        assert_eq!(cond.put_if_absent("index.h/2", b"a").unwrap(), Created::Yes);
+        assert_eq!(last(&store).op, OpKind::PutIfAbsent);
+        assert_eq!(last(&store).outcome, OpOutcome::Ok);
+        let cond_b = b.conditional().expect("offered");
+        assert_eq!(
+            cond_b.put_if_absent("index.h/2", b"b").unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(last(&store).outcome, OpOutcome::Exists);
+        assert!(!last(&store).applied());
+        assert_eq!(store.object("index.h/2").unwrap().data, b"a");
+        // Each handle ran the check once: its probe is gone.
+        assert!(store.keys("locks/").is_empty());
+        let probes = store
+            .log()
+            .iter()
+            .filter(|r| r.key.starts_with("locks/vykar-probe-") && r.op == OpKind::PutIfAbsent)
+            .count();
+        assert_eq!(probes, 4, "two creates per handle's check");
+        assert!(store.head_overwrites().is_empty());
+    }
+
+    #[test]
+    fn released_create_finds_the_key() {
+        let (store, a, b) = of_kind(StoreKind::Conditional);
+        a.conditional().unwrap().verify().unwrap();
+        store
+            .add_fault(
+                FaultRule::new(
+                    OpMatch::Kind(OpKind::PutIfAbsent),
+                    KeyMatch::Exact("index.h/2".into()),
+                    FaultAction::Delay,
+                )
+                .client(a.client()),
+            )
+            .unwrap();
+        assert!(
+            a.conditional()
+                .unwrap()
+                .put_if_absent("index.h/2", b"a")
+                .is_err()
+        );
+        b.conditional()
+            .unwrap()
+            .put_if_absent("index.h/2", b"b")
+            .unwrap();
+        store.release_all();
+        assert!(matches!(
+            last(&store).outcome,
+            OpOutcome::ReleasedRefused(_)
+        ));
+        assert_eq!(store.object("index.h/2").unwrap().data, b"b");
+    }
+
+    #[test]
+    fn conditional_kind_refuses_a_head_overwrite() {
+        let (store, a, _) = of_kind(StoreKind::Conditional);
+        a.put("index.h/2", b"one").unwrap();
+        a.put("index.h/2", b"one").unwrap();
+        let err = a.put("index.h/2", b"two").unwrap_err().to_string();
+        assert!(err.contains("409"), "{err}");
+        assert_eq!(last(&store).outcome, OpOutcome::Refused);
+        assert_eq!(store.object("index.h/2").unwrap().data, b"one");
+        assert!(store.head_overwrites().is_empty());
+        // Tampering bypasses it, and is recorded.
+        store.tamper_put("index.h/2", b"three");
+        assert_eq!(store.head_overwrites().len(), 1);
+    }
+
+    #[test]
+    fn plain_kind_records_a_head_overwrite() {
+        let (store, a, _) = of_kind(StoreKind::Plain);
+        assert!(a.conditional().is_none());
+        a.put("index.h/2", b"one").unwrap();
+        a.put("index.h/2", b"two").unwrap();
+        assert_eq!(store.object("index.h/2").unwrap().data, b"two");
+        let overwrites = store.head_overwrites();
+        assert_eq!(overwrites.len(), 1);
+        assert_eq!(overwrites[0].0, "index.h/2");
+        assert_eq!(overwrites[0].2, a.client());
+    }
+
+    #[test]
+    fn ignoring_kind_fails_the_check() {
+        let (store, a, _) = of_kind(StoreKind::Ignoring);
+        let cond = a.conditional().expect("offered before the check");
+        assert!(matches!(
+            cond.verify().unwrap(),
+            ConditionalSupport::Unsupported { .. }
+        ));
+        assert!(a.conditional().is_none());
+        assert!(store.keys("locks/").is_empty());
+    }
+
+    #[test]
+    fn racy_release_overwrites() {
+        let (store, a, b) = of_kind(StoreKind::RacyRelease);
+        assert_eq!(
+            a.conditional().unwrap().verify().unwrap(),
+            ConditionalSupport::Verified
+        );
+        store
+            .add_fault(
+                FaultRule::new(
+                    OpMatch::Kind(OpKind::PutIfAbsent),
+                    KeyMatch::Exact("index.h/2".into()),
+                    FaultAction::Delay,
+                )
+                .client(a.client()),
+            )
+            .unwrap();
+        assert!(
+            a.conditional()
+                .unwrap()
+                .put_if_absent("index.h/2", b"a")
+                .is_err()
+        );
+        assert_eq!(
+            b.conditional()
+                .unwrap()
+                .put_if_absent("index.h/2", b"b")
+                .unwrap(),
+            Created::Yes
+        );
+        store.release_all();
+        assert!(matches!(last(&store).outcome, OpOutcome::Released(_)));
+        assert_eq!(store.object("index.h/2").unwrap().data, b"a");
+        assert_eq!(store.head_overwrites().len(), 1);
+    }
+
+    #[test]
+    fn fork_as_changes_the_kind() {
+        let (store, a, _) = of_kind(StoreKind::Plain);
+        a.put("k", b"v").unwrap();
+        let fork = store.fork_as(StoreKind::Conditional);
+        assert_eq!(fork.config().kind, StoreKind::Conditional);
+        assert_eq!(fork.keys(""), vec!["k"]);
+        assert_eq!(store.fork().config().kind, StoreKind::Plain);
     }
 
     #[test]

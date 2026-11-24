@@ -32,8 +32,8 @@ pub use delegate::__macro_support;
 pub use delegate::InnerBackend;
 
 pub use conditional::{
-    ConditionalSupport, ConditionalWrite, Created, MAX_PUT_IF_ABSENT_BYTES,
-    put_if_absent_unavailable,
+    ConditionalSupport, ConditionalWrite, Created, IGNORES_CONDITION, MAX_PUT_IF_ABSENT_BYTES,
+    RawPut, Verifier, put_if_absent_unavailable,
 };
 // `S3ConditionalWrites` is defined below, next to `StorageConfig`.
 

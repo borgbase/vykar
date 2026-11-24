@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-and-late-head",
-  "note": "Second campaign of phase F part 2 (random-2011597334903818936): a backup's snapshot PUT is delayed and its commit fails; the same client's compact runs without that snapshot and its own delayed head lands later under another backup's lock; the snapshot PUT then lands over chunks the index no longer covers. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; LateIndexWrite remains. Fixed by 04 step 8.",
+  "note": "Second campaign of phase F part 2 (random-2011597334903818936): a backup's snapshot PUT is delayed and its commit fails; the same client's compact runs without that snapshot and its own delayed head lands later under another backup's lock; the snapshot PUT then lands over chunks the index no longer covers. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; LateIndexWrite remains. Fixed by 04 step 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-snapshot-and-late-head-conditional is the same case on a conditional store.",
   "expect": [
     "LateIndexWrite"
   ],

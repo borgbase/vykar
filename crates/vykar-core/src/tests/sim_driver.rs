@@ -36,6 +36,7 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         policy: Policy::First,
         skews: vec![],
         maintenance: Maintenance::Whole,
+        storage: StoreKind::Plain,
     }
 }
 
@@ -53,6 +54,7 @@ fn access(op: OpKind) -> Access {
         OpKind::List | OpKind::ListSized | OpKind::ListMeta => Access::List,
         OpKind::Delete | OpKind::BatchDelete => Access::Delete,
         OpKind::Put
+        | OpKind::PutIfAbsent
         | OpKind::PutOwned
         | OpKind::PutPack
         | OpKind::StagedCommit
@@ -1099,11 +1101,12 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact Put index.h/",
     "compact Delete packs/",
     "compact Delete packs/",
-    // index upkeep, pack maps, lock release
+    // index upkeep (objects listed before heads, 04 step 8), pack maps,
+    // lock release
     "compact List index.h/",
     "compact Get index.h/",
-    "compact ListMeta index.h/",
     "compact ListMeta index.d/",
+    "compact ListMeta index.h/",
     "compact Get index.h/",
     "compact Get index.h/",
     "compact Get index.h/",

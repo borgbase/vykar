@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::ages::{
-    CLOCK_PROBE_DEBRIS_AGE, CLOCK_PROBE_PREFIX, HEAD_LANDING_ALLOWANCE, MARGIN, PACK_AGE_LIMIT,
-    StoreClock,
+    CLOCK_PROBE_DEBRIS_AGE, HEAD_LANDING_ALLOWANCE, MARGIN, PACK_AGE_LIMIT, StoreClock,
+    is_probe_key,
 };
 use super::control::CancelToken;
 use super::host_env::{Clock, HostEnv, StopSignal};
@@ -65,9 +65,9 @@ pub struct LockGuard {
     /// The lock key's mtime in the confirming LIST: "now" on the store's
     /// clock at acquisition. `None` when the storage reports no mtime.
     store_acquired: Option<StoreNow>,
-    /// Clock probes the confirming LIST showed older than
-    /// `CLOCK_PROBE_DEBRIS_AGE` by `store_acquired`: debris of failed
-    /// deletes, for [`Self::remove_probe_debris`].
+    /// Probes (clock probes, the put-if-absent check's) the confirming LIST
+    /// showed older than `CLOCK_PROBE_DEBRIS_AGE` by `store_acquired`:
+    /// debris of failed deletes, for [`Self::remove_probe_debris`].
     probe_debris: Vec<String>,
 }
 
@@ -82,7 +82,7 @@ impl LockGuard {
         self.store_acquired
     }
 
-    /// Delete the clock probes the acquisition listed as debris (best
+    /// Delete the probes the acquisition listed as debris (best
     /// effort, debug log). An uncontended acquirer never probes, so without
     /// this nothing would remove debris while the lock is uncontended.
     pub(crate) fn remove_probe_debris(&self, storage: &dyn StorageBackend) {
@@ -163,7 +163,7 @@ pub(crate) fn acquire_lock_reading(
         listing
             .iter()
             .filter(|o| {
-                o.key.starts_with(CLOCK_PROBE_PREFIX)
+                is_probe_key(&o.key)
                     && !is_lock_key(&o.key)
                     && o.mtime
                         .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
@@ -209,7 +209,8 @@ pub fn release_lock(storage: &dyn StorageBackend, guard: LockGuard) -> Result<()
 /// This is a recovery mechanism for stale locks left by killed processes.
 /// No passphrase is needed — lock files are unencrypted JSON.
 /// Returns the number of locks removed. Clock probes left under `locks/`
-/// (`locks/vykar-clock-*`, not locks) are deleted too and not counted.
+/// (`locks/vykar-clock-*`, `locks/vykar-probe-*`; not locks) are deleted too
+/// and not counted.
 pub fn break_lock(storage: &dyn StorageBackend) -> Result<usize> {
     let mut removed: usize = 0;
 
@@ -217,7 +218,7 @@ pub fn break_lock(storage: &dyn StorageBackend) -> Result<usize> {
         if is_lock_key(&key) {
             storage.delete(&key)?;
             removed += 1;
-        } else if key.starts_with(CLOCK_PROBE_PREFIX) {
+        } else if is_probe_key(&key) {
             storage.delete(&key)?;
         }
     }
@@ -405,8 +406,8 @@ fn warn_timestamp_fallback(env: &HostEnv) {
 ///
 /// A lock is stale when it is older than `max_age`, or when [`same_host`]
 /// finds it was left by a dead process or an earlier boot of this machine.
-/// With "now" known, clock probes older than an hour (debris of a failed
-/// delete) are removed, best effort.
+/// With "now" known, probes (clock probes, the put-if-absent check's) older
+/// than an hour (debris of a failed delete) are removed, best effort.
 pub(crate) fn cleanup_stale_locks(
     storage: &dyn StorageBackend,
     max_age: Duration,
@@ -432,7 +433,7 @@ pub(crate) fn cleanup_stale_locks(
         let key = object.key.as_str();
         if !is_lock_key(key) {
             if let Some(now) = store_now
-                && key.starts_with(CLOCK_PROBE_PREFIX)
+                && is_probe_key(key)
                 && object
                     .mtime
                     .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)

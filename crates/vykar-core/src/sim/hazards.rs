@@ -14,6 +14,14 @@
 //! a store clock step; H3-compact-young is a regression, and H3-compact and
 //! H5-repair now need orphans older than T_pack.
 //!
+//! 04 step 8 (put-if-absent heads) closes H3, H3-compact and H4 on stores
+//! that honour put-if-absent: each hazard states what it does on the
+//! conditional store ([`OnConditional`]); the scenarios run there under
+//! [`with_store_kind`], and their conditional twins are regressions
+//! (H3-conditional, H3-compact-conditional, H4-conditional). Every
+//! regression names the store kinds it holds on. H-racy is a known hazard of
+//! a store that passes the sequential check yet lets a late create win.
+//!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
 //! protocol, under random schedules; the shapes of damage it recognises are
 //! documented on `driver::Signature`, each with the plan that removes it.
@@ -25,7 +33,8 @@ use super::fault::{ClientId, FaultAction, FaultRule, KeyMatch, OpMatch};
 use super::gate::GateRule;
 use super::history::{AllowedError, ErrorClass};
 use super::interleavings;
-use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree};
+use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree, with_store_kind};
+use super::store::{SimConfig, StoreKind};
 
 #[derive(Clone, Debug)]
 pub enum HazardOutcome {
@@ -44,19 +53,40 @@ pub enum HazardOutcome {
     },
 }
 
+/// What a known hazard does on a store that honours put-if-absent
+/// ([`StoreKind::Conditional`]); `run` reproduces it on the fallback
+/// ([`StoreKind::Plain`]).
+#[derive(Clone, Copy, Debug)]
+pub enum OnConditional {
+    /// It reproduces there too: the lock still carries it.
+    Reproduces,
+    /// It does not reproduce; the regression of this id holds there.
+    Closed(&'static str),
+    /// Its prerequisite does not reproduce there.
+    NoPrerequisite,
+    /// The scenario sets its own store kind.
+    OwnKind,
+}
+
 pub struct KnownHazard {
     pub id: &'static str,
     pub summary: &'static str,
     /// The plan expected to remove it.
     pub fixed_by: &'static str,
     pub run: fn() -> HazardOutcome,
+    pub conditional: OnConditional,
 }
 
-/// Scenarios that once reproduced a hazard and must now hold.
+/// The fallback and the conditional store.
+pub const BOTH_KINDS: &[StoreKind] = &[StoreKind::Plain, StoreKind::Conditional];
+
+/// Scenarios that once reproduced a hazard and must now hold, on each of
+/// `kinds` (`run` under [`with_store_kind`]).
 pub struct Regression {
     pub id: &'static str,
     pub summary: &'static str,
     pub run: fn() -> Report,
+    pub kinds: &'static [StoreKind],
 }
 
 pub const KNOWN_HAZARDS: &[KnownHazard] = &[
@@ -64,8 +94,10 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         id: "H3",
         summary: "head PUT times out and lands after the lock is released; \
                   B's committed entries are dropped",
-        fixed_by: "04-commit-protocol.md (conditional-create commit point)",
+        fixed_by: "04-commit-protocol.md step 8 on conditional backends (the late create \
+                   finds its generation taken); the fallback keeps it",
         run: h3_late_head_put,
+        conditional: OnConditional::Closed("H3-conditional"),
     },
     KnownHazard {
         id: "H5-repair",
@@ -73,14 +105,16 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                   instead of re-indexing it",
         fixed_by: "05-index-gc-format.md (rebuild from packs)",
         run: h5_repair_then_compact,
+        conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {
         id: "H3-compact",
         summary: "head PUT times out, a compact runs, then the stale head lands \
                   over compact's head and names the packs compact deleted as orphans",
-        fixed_by: "04-commit-protocol.md step 8 (create-if-absent heads); step 5 \
-                   narrowed it to orphans older than T_pack",
+        fixed_by: "04-commit-protocol.md step 8 on conditional backends; the fallback \
+                   keeps it; step 5 narrowed it to orphans older than T_pack",
         run: h3_compact_then_late_head,
+        conditional: OnConditional::Closed("H3-compact-conditional"),
     },
     KnownHazard {
         id: "H1-late-clone",
@@ -89,6 +123,7 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         fixed_by: "not planned: a history of this installation's own boot IDs; \
                    04 step 5 narrows it for markers",
         run: interleavings::h1_late_clone,
+        conditional: OnConditional::Reproduces,
     },
     KnownHazard {
         id: "H2",
@@ -96,15 +131,28 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                   (route: the store's clock steps 3 h forward)",
         fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
         run: interleavings::h2_lock_refresh_resurrects,
+        conditional: OnConditional::Reproduces,
     },
     KnownHazard {
         id: "H4",
         summary: "compact loses its lock, deletes sources with no fence after its head \
                   PUT, and a stale head names the deleted packs (route: the store's \
                   clock steps 6 h 1 min forward)",
-        fixed_by: "04-commit-protocol.md step 3 (fence before deletes; narrows) and \
-                   step 8 (create-if-absent heads)",
+        fixed_by: "04-commit-protocol.md step 8 on conditional backends (compact's \
+                   and the backup's creates of one generation: one wins, the backup \
+                   rebases); the fallback keeps it",
         run: interleavings::h4_compact_deletes_after_lost_lock,
+        conditional: OnConditional::Closed("H4-conditional"),
+    },
+    KnownHazard {
+        id: "H-racy",
+        summary: "a store that passes the sequential put-if-absent check but lets a late \
+                  create overwrite (IDrive e2): two writers both believe they created \
+                  the generation; a head is replaced (invariant 12)",
+        fixed_by: "not planned: s3_conditional_writes: on is the user's assertion \
+                   (03 step 4 open decision); harmless while the lock is held",
+        run: h_racy,
+        conditional: OnConditional::OwnKind,
     },
 ];
 
@@ -114,6 +162,9 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "after a lost update, compact refuses (the mark fails) and deletes \
                   none of the unindexed packs",
         run: h5_regression,
+        // Built on H3's lost update, which a conditional store does not
+        // produce (H3-conditional).
+        kinds: &[StoreKind::Plain],
     },
     Regression {
         id: "H1",
@@ -121,12 +172,14 @@ pub const REGRESSIONS: &[Regression] = &[
                   one booted after the holder's write) and containers (installation ID, \
                   boot ID and uptime, PID namespace)",
         run: interleavings::h1_regression,
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H1-session",
         summary: "same hostname: a live backup's marker is kept; compact proceeds beside it \
                   and keeps its uploads",
         run: interleavings::h1_session_regression,
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H2-marker",
@@ -134,24 +187,50 @@ pub const REGRESSIONS: &[Regression] = &[
                   missing; the backup commits while its uploads are young (I8) and its \
                   snapshot restores",
         run: interleavings::h2_marker_regression,
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H4-segment",
         summary: "compact upkeep no longer deletes a concurrent writer's fresh segment \
                   (age-gated GC)",
         run: interleavings::h4_segment_regression,
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H4-skew",
         summary: "a client 6 h 1 min ahead no longer reaps compact's live lock \
                   (store-clock ages)",
         run: interleavings::h4_skew_regression,
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H3-compact-young",
         summary: "a compact soon after a backup lost its head PUT keeps the backup's \
                   orphan packs (younger than T_pack); the late head names present packs",
         run: h3_compact_young_regression,
+        kinds: BOTH_KINDS,
+    },
+    Regression {
+        id: "H3-conditional",
+        summary: "on a conditional store the late head finds its generation taken \
+                  (released-refused); b1 keeps its entries",
+        run: h3_conditional_regression,
+        kinds: &[StoreKind::Conditional],
+    },
+    Regression {
+        id: "H3-compact-conditional",
+        summary: "on a conditional store the late head cannot replace compact's head; the \
+                  index names no pack compact deleted",
+        run: h3_compact_conditional_regression,
+        kinds: &[StoreKind::Conditional],
+    },
+    Regression {
+        id: "H4-conditional",
+        summary: "on a conditional store compact (its lock lost) and the backup both create \
+                  the next head: one wins, the backup rebases; nothing names a deleted pack \
+                  (the lost lock stays invariant 7's)",
+        run: interleavings::h4_conditional_regression,
+        kinds: &[StoreKind::Conditional],
     },
 ];
 
@@ -161,7 +240,7 @@ pub fn assert_reproduces(id: &str) {
         .iter()
         .find(|h| h.id == id)
         .unwrap_or_else(|| panic!("{id} is not in KNOWN_HAZARDS"));
-    match (hazard.run)() {
+    match with_store_kind(StoreKind::Plain, hazard.run) {
         HazardOutcome::Reproduced { .. } => {}
         HazardOutcome::NotReproduced { evidence } => panic!(
             "{id} no longer reproduces: move it from KNOWN_HAZARDS to REGRESSIONS \
@@ -187,11 +266,43 @@ pub fn assert_regression_holds(id: &str) {
         .iter()
         .find(|r| r.id == id)
         .unwrap_or_else(|| panic!("{id} is not in REGRESSIONS"));
-    let report = (regression.run)();
+    for &kind in regression.kinds {
+        let report = with_store_kind(kind, regression.run);
+        assert!(
+            report.is_clean(),
+            "regression {id} ({}) fails on {kind:?}:\n{report}",
+            regression.summary
+        );
+    }
+}
+
+/// Panics unless known hazard `id` does on a conditional store what its
+/// [`OnConditional`] says.
+pub fn assert_conditional_expectation(id: &str) {
+    let hazard = KNOWN_HAZARDS
+        .iter()
+        .find(|h| h.id == id)
+        .unwrap_or_else(|| panic!("{id} is not in KNOWN_HAZARDS"));
+    let outcome = with_store_kind(StoreKind::Conditional, hazard.run);
+    let ok = match hazard.conditional {
+        OnConditional::Reproduces | OnConditional::OwnKind => {
+            matches!(outcome, HazardOutcome::Reproduced { .. })
+        }
+        OnConditional::Closed(regression) => {
+            assert!(
+                REGRESSIONS.iter().any(|r| r.id == regression),
+                "{id}: its conditional regression {regression} is not in REGRESSIONS"
+            );
+            matches!(outcome, HazardOutcome::NotReproduced { .. })
+        }
+        OnConditional::NoPrerequisite => {
+            matches!(outcome, HazardOutcome::PrerequisiteNotReproduced { .. })
+        }
+    };
     assert!(
-        report.is_clean(),
-        "regression {id} ({}) fails:\n{report}",
-        regression.summary
+        ok,
+        "{id} on a conditional store: expected {:?}, got {outcome:?}",
+        hazard.conditional
     );
 }
 
@@ -445,6 +556,75 @@ pub fn h3_with(late: LateHead) -> HazardOutcome {
     }
     HazardOutcome::Reproduced {
         evidence: format!("{report}"),
+    }
+}
+
+/// Whether `client`'s parked head create landed refused (it found its
+/// generation taken): what closes H3 on a conditional store.
+pub(super) fn late_head_refused(sim: &Sim, client: ClientId) -> bool {
+    sim.store().log().iter().any(|r| {
+        r.client == client
+            && r.key.starts_with("index.h/")
+            && matches!(r.outcome, super::log::OpOutcome::ReleasedRefused(_))
+    })
+}
+
+/// H3-conditional: H3's schedule on a conditional store. a's late create
+/// of the generation b created lands refused; STEP8 holds (invariant 12
+/// and every retained head included).
+pub fn h3_conditional_regression() -> Report {
+    let mut out = Report::default();
+    let (sim, a, _, _) = match h3_setup(LateHead::AfterB) {
+        Ok(s) => s,
+        Err(e) => {
+            out.add(ViolationKind::DisallowedError, "setup", e);
+            return out;
+        }
+    };
+    if !late_head_refused(&sim, a) {
+        out.add(
+            ViolationKind::DisallowedError,
+            "scenario",
+            "a's late head create did not land refused",
+        );
+    }
+    out.extend(sim.check_invariants(Invariant::STEP8));
+    out
+}
+
+/// H-racy: on a store that passes the sequential check but lets a late
+/// create overwrite (`StoreKind::RacyRelease`), H3's schedule replaces b's
+/// head with a's: `HeadOverwritten` (invariant 12), and b1 unindexed.
+pub fn h_racy() -> HazardOutcome {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::RacyRelease,
+        ..SimConfig::default()
+    });
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    let r = sim.backup(c, "c0", &SourceTree::seeded("c0", 3, FILE_SIZE));
+    if !r.is_ok() {
+        return broken(format!("control backup c0 failed: {}", r.detail()));
+    }
+    if let Err(e) = park_a_head(&mut sim, a) {
+        return broken(e);
+    }
+    let r = sim.backup(b, "b1", &SourceTree::seeded("b1", 3, FILE_SIZE));
+    if !r.is_ok() {
+        return broken(format!("b1 should commit: {}", r.detail()));
+    }
+    sim.release_all();
+    let report = sim.check_invariants(Invariant::STEP8);
+    let overwritten = report
+        .violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::HeadOverwritten);
+    let evidence = format!("{report}");
+    if overwritten && b1_unindexed(&report) {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
     }
 }
 
@@ -776,6 +956,34 @@ pub fn h3_compact_young_regression() -> Report {
         }
     }
     out.extend(report);
+    out
+}
+
+/// H3-compact-conditional: H3-compact's schedule (a's packs old orphans) on
+/// a conditional store. The late head cannot replace compact's head: it
+/// lands refused, and STEP8 holds.
+pub fn h3_compact_conditional_regression() -> Report {
+    let mut out = Report::default();
+    let step = chrono::Duration::from_std(ORPHANS_OLD).expect("T_pack in range");
+    let (sim, a, _, _) = match h3_compact_runs(LateHead::AfterB, Some(step)) {
+        Ok(run) => run,
+        Err(outcome) => {
+            out.add(
+                ViolationKind::DisallowedError,
+                "scenario",
+                format!("{outcome:?}"),
+            );
+            return out;
+        }
+    };
+    if !late_head_refused(&sim, a) {
+        out.add(
+            ViolationKind::DisallowedError,
+            "scenario",
+            "a's late head create did not land refused",
+        );
+    }
+    out.extend(sim.check_invariants(Invariant::STEP8));
     out
 }
 

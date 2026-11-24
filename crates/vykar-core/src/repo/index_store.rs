@@ -129,14 +129,134 @@ pub(crate) fn pack_head(head: &IndexHead, crypto: &dyn CryptoEngine) -> Result<V
     pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, &head.encode()?, crypto)
 }
 
-/// PUT the head at `head_key(head.generation)`: a plain put under the lock (04
-/// step 8 makes it put-if-absent).
+/// PUT the head at `head_key(head.generation)` with a plain put: init's
+/// first head (nothing can contend before the repository exists) and tests.
+/// Every index write creates its head with [`create_head`].
 pub(crate) fn put_head(
     storage: &dyn StorageBackend,
     head: &IndexHead,
     crypto: &dyn CryptoEngine,
 ) -> Result<()> {
     storage.put(&head_key(head.generation), &pack_head(head, crypto)?)
+}
+
+/// How a head create ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadPut {
+    /// The head at the key is the one this write sent (this call created
+    /// it, or an earlier attempt of the same bytes did).
+    Created,
+    /// Another head holds the generation (or held it and was collected).
+    Taken,
+}
+
+/// The notice a repository handle logged when its heads fell back to plain
+/// PUTs under the lock (04 "Fallback"). Kept on the handle
+/// (`Repository::head_fallback`), so every opened repository logs once: the
+/// backend's verdict holds for the backend instance, which the handle owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadFallback {
+    /// Logged at info: the backend does not offer put-if-absent, or its
+    /// storage refuses the mechanism.
+    NotOffered,
+    /// Logged at warn: the storage accepted the creates but ignored the
+    /// condition, or an S3 endpoint with conditional writes enabled
+    /// (`s3_conditional_writes: on`, or `auto` on AWS) refused the header.
+    Refused,
+}
+
+/// Create the head bytes `packed` at `head_key(generation)` (04 step 8):
+/// put-if-absent where the backend offers it, else a plain PUT (the lock
+/// protocol of 04 "Fallback").
+///
+/// - `Ok(Yes)` → `Created`.
+/// - `Ok(AlreadyExists)` → GET the key: the same bytes → `Created` (the
+///   backend's own retry after a lost reply, or a plaintext head of the same
+///   state); other bytes or none (collected since, or a soft-deleted key on
+///   S3) → `Taken`.
+/// - `Err(UnsupportedBackend)` (a check concluded the storage refuses or
+///   ignores the condition; normally seen at the fence first) → noted in
+///   `fallback` ([`note_fallback`]), then a plain PUT → `Created`. Never
+///   silently unconditional.
+/// - Any other `Err` (outcome unknown) → GET the key: the same bytes →
+///   `Created`; other bytes → `Taken`; absent, or the GET fails → the
+///   original error (the create may still land, and only at a generation
+///   nobody created).
+///
+/// A head over [`vykar_storage::MAX_PUT_IF_ABSENT_BYTES`] fails with
+/// `InvalidFormat` (about 200 000 segments; unreachable) rather than being
+/// written unconditionally.
+pub(crate) fn create_head(
+    storage: &dyn StorageBackend,
+    generation: u64,
+    packed: &[u8],
+    fallback: &mut Option<HeadFallback>,
+) -> Result<HeadPut> {
+    let key = head_key(generation);
+    let Some(cond) = storage.conditional() else {
+        storage.put(&key, packed)?;
+        return Ok(HeadPut::Created);
+    };
+    let compare = |storage: &dyn StorageBackend| -> Result<Option<HeadPut>> {
+        Ok(storage.get(&key)?.map(|stored| {
+            if stored == packed {
+                HeadPut::Created
+            } else {
+                HeadPut::Taken
+            }
+        }))
+    };
+    match cond.put_if_absent(&key, packed) {
+        Ok(vykar_storage::Created::Yes) => Ok(HeadPut::Created),
+        Ok(vykar_storage::Created::AlreadyExists) => {
+            Ok(compare(storage)?.unwrap_or(HeadPut::Taken))
+        }
+        Err(VykarError::UnsupportedBackend(reason)) => {
+            note_fallback(fallback, Some(&reason));
+            storage.put(&key, packed)?;
+            Ok(HeadPut::Created)
+        }
+        Err(VykarError::InvalidFormat(m)) => Err(VykarError::InvalidFormat(m)),
+        Err(e) => match compare(storage) {
+            Ok(Some(outcome)) => Ok(outcome),
+            Ok(None) | Err(_) => Err(e),
+        },
+    }
+}
+
+/// Log that heads fall back to plain PUTs under the lock, once per handle:
+/// nothing when `noted` is already set. `reason`: the check's verdict, or
+/// `None` for a backend that does not offer put-if-absent at all. At warn
+/// when the storage ignored the condition or an S3 endpoint with
+/// conditional writes enabled refused the header (the reason names
+/// `s3_conditional_writes`), at info otherwise. Returns whether it logged.
+pub(crate) fn note_fallback(noted: &mut Option<HeadFallback>, reason: Option<&str>) -> bool {
+    if noted.is_some() {
+        return false;
+    }
+    let refused = reason.is_some_and(|r| {
+        r.contains(vykar_storage::IGNORES_CONDITION) || r.contains("s3_conditional_writes")
+    });
+    match reason {
+        Some(reason) if refused => tracing::warn!(
+            "the storage did not pass the put-if-absent check ({reason}); index heads are \
+             written with plain PUTs under the repository lock"
+        ),
+        Some(reason) => tracing::info!(
+            "put-if-absent not offered ({reason}); index heads are written with plain PUTs \
+             under the repository lock"
+        ),
+        None => tracing::info!(
+            "the storage backend offers no put-if-absent; index heads are written with plain \
+             PUTs under the repository lock"
+        ),
+    }
+    *noted = Some(if refused {
+        HeadFallback::Refused
+    } else {
+        HeadFallback::NotOffered
+    });
+    true
 }
 
 /// What the object at `index.h/<gen>` is.
@@ -897,6 +1017,21 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// ([`vykar_storage::ServerOps::append_only`]) nothing is listed or deleted
 /// (`skipped = "append-only server"`): old heads and objects accumulate until
 /// a compact in a maintenance window.
+///
+/// Precondition: the caller **created** `latest` (04 step 8), so a writer
+/// that read an older head creates a generation at or below `latest` and
+/// finds it taken; it never publishes a head naming what this run deletes.
+/// `index.d/` is listed before `index.h/` (04's order): a writer that read
+/// `latest` or later PUTs its new objects after that read, so an object the
+/// heads listing does not cover was PUT after the object listing (not
+/// listed, not deleted) or is younger than `grace` at "now" (the heads
+/// listing includes `latest`, so "now" is at least its mtime) — unless the
+/// writer's head lands more than `grace` after it read `latest`, which the
+/// lock excludes today. On a plaintext repository an index object's name is a
+/// function of its content, so a writer can re-create an old unreferenced
+/// name the listing saw as old; harmless while the lock keeps collectors away
+/// from writers (recorded for the owner with 04 step 9: plaintext
+/// repositories may keep the lock for index writes).
 pub(crate) fn collect_index_garbage(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
@@ -909,15 +1044,16 @@ pub(crate) fn collect_index_garbage(
         stats.skipped = Some("append-only server");
         return Ok(stats);
     }
-    let heads: Vec<(u64, Option<std::time::SystemTime>)> = storage
-        .list_meta(HEAD_PREFIX)?
-        .into_iter()
-        .filter_map(|o| Some((vykar_protocol::head_generation(&o.key)?, o.mtime)))
-        .collect();
+    // Objects before heads (04 "Compact" 1 and 7): see the doc.
     let objects: Vec<(ObjectName, Option<std::time::SystemTime>)> = storage
         .list_meta(INDEX_OBJECT_DIR)?
         .into_iter()
         .filter_map(|o| Some((object_name_of_key(&o.key)?, o.mtime)))
+        .collect();
+    let heads: Vec<(u64, Option<std::time::SystemTime>)> = storage
+        .list_meta(HEAD_PREFIX)?
+        .into_iter()
+        .filter_map(|o| Some((vykar_protocol::head_generation(&o.key)?, o.mtime)))
         .collect();
     let Some(now) = heads
         .iter()

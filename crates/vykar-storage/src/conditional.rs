@@ -77,20 +77,33 @@ pub trait ConditionalWrite: Send + Sync {
 }
 
 /// A backend's unverified primitive. `Err(VykarError::UnsupportedBackend(_))`
-/// means "the storage refuses the mechanism itself" (a convention internal to
-/// this module). Any other `Err` is undecided.
-pub(crate) type RawPut<'a> = &'a dyn Fn(&str, &[u8]) -> Result<Created>;
+/// means "the storage refuses the mechanism itself". Any other `Err` is
+/// undecided.
+pub type RawPut<'a> = &'a dyn Fn(&str, &[u8]) -> Result<Created>;
 
-/// The per-backend cache of [`ConditionalWrite::verify`].
-pub(crate) struct Verifier {
+/// Start of the reason of an `Unsupported` answer when the storage accepted
+/// the creates but ignored the condition (a second create succeeded, or
+/// replaced the object), as opposed to refusing the mechanism.
+pub const IGNORES_CONDITION: &str = "ignores the condition";
+
+/// The per-backend-instance cache of [`ConditionalWrite::verify`]. Public
+/// for backends outside this crate (test doubles), which must run the same
+/// check as the backends here.
+pub struct Verifier {
     /// Conclusive results only.
     state: Mutex<Option<ConditionalSupport>>,
     /// Set together with a cached `Unsupported`; read lock-free.
     refused: AtomicBool,
 }
 
+impl Default for Verifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Verifier {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: Mutex::new(None),
             refused: AtomicBool::new(false),
@@ -98,13 +111,17 @@ impl Verifier {
     }
 
     /// `conditional()` returns `None` once this is true.
-    pub(crate) fn refused(&self) -> bool {
+    pub fn refused(&self) -> bool {
         self.refused.load(Ordering::Acquire)
     }
 
     /// The cached answer, or the sequential check run under the mutex
     /// (concurrent callers wait for the one check). Caches only `Ok(..)`.
-    pub(crate) fn verify(
+    ///
+    /// # Errors
+    ///
+    /// Undecided, as [`ConditionalWrite::verify`].
+    pub fn verify(
         &self,
         store: &dyn StorageBackend,
         raw: RawPut<'_>,
@@ -135,6 +152,27 @@ impl Verifier {
                 Err(put_if_absent_unavailable(format_args!("{label}: {reason}")))
             }
         }
+    }
+
+    /// The whole [`ConditionalWrite::put_if_absent`] of a backend whose raw
+    /// primitive is `raw`: the argument checks, the check (once), the raw
+    /// create, and a refusal after a passed check read as a failed write.
+    /// `label` names the backend in the "unavailable" error.
+    ///
+    /// # Errors
+    ///
+    /// As [`ConditionalWrite::put_if_absent`].
+    pub fn put_if_absent(
+        &self,
+        label: &str,
+        store: &dyn StorageBackend,
+        raw: RawPut<'_>,
+        key: &str,
+        data: &[u8],
+    ) -> Result<Created> {
+        check_args(key, data)?;
+        self.require(label, store, raw)?;
+        after_verified(raw(key, data))
     }
 }
 
@@ -220,18 +258,18 @@ fn check_steps(
     match raw(key, b) {
         Ok(Created::AlreadyExists) => {}
         Ok(Created::Yes) => {
-            return Ok(unsupported(
-                "ignores the condition: a second create of the same key succeeded",
-            ));
+            return Ok(unsupported(format!(
+                "{IGNORES_CONDITION}: a second create of the same key succeeded"
+            )));
         }
         Err(VykarError::UnsupportedBackend(m)) => return Ok(unsupported(m)),
         Err(e) => return Err(e),
     }
     match store.get(key)? {
         Some(stored) if stored == a => Ok(ConditionalSupport::Verified),
-        Some(_) => Ok(unsupported(
-            "ignores the condition: the second create replaced the object",
-        )),
+        Some(_) => Ok(unsupported(format!(
+            "{IGNORES_CONDITION}: the second create replaced the object"
+        ))),
         None => Err(VykarError::Other(
             "put-if-absent check: probe object vanished".into(),
         )),
@@ -462,6 +500,39 @@ mod tests {
             }
             other => panic!("expected UnsupportedBackend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verifier_put_if_absent_checks_then_creates() {
+        let map = Map::default();
+        let v = Verifier::new();
+        let raw = |k: &str, d: &[u8]| honest(&map, k, d);
+        assert_eq!(
+            v.put_if_absent("test", &map, &raw, "index.h/1", b"a")
+                .unwrap(),
+            Created::Yes
+        );
+        assert_eq!(
+            v.put_if_absent("test", &map, &raw, "index.h/1", b"b")
+                .unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(map.objects.lock().unwrap().get("index.h/1").unwrap(), b"a");
+
+        let ignoring = Map::default();
+        let v = Verifier::new();
+        let raw = |k: &str, d: &[u8]| {
+            ignoring.set(k, d);
+            Ok(Created::Yes)
+        };
+        match v.put_if_absent("test", &ignoring, &raw, "index.h/1", b"a") {
+            Err(VykarError::UnsupportedBackend(m)) => {
+                assert!(m.contains(IGNORES_CONDITION), "{m}");
+            }
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        }
+        assert!(v.refused());
+        assert!(!ignoring.objects.lock().unwrap().contains_key("index.h/1"));
     }
 
     #[test]

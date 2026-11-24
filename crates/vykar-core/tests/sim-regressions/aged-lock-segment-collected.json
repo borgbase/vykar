@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-collected",
-  "note": "Shape A of the phase F part 2 campaign (random-2155709920513612321): a backup puts its index.d segment, a time jump past the 6 h lock staleness and INDEX_GC_GRACE, compact reaps the aged lock and its index GC deletes the unpublished segment, then the backup's head names it (04 Current issues 3). Fixed by 04 steps 5 and 8.",
+  "note": "Shape A of the phase F part 2 campaign (random-2155709920513612321): a backup puts its index.d segment, a time jump past the 6 h lock staleness and INDEX_GC_GRACE, compact reaps the aged lock and its index GC deletes the unpublished segment, then the backup's head names it (04 Current issues 3). Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-conditional is the same case on a conditional store.",
   "expect": [
     "AgedLockReaped",
     "AgedLockSegmentCollected"

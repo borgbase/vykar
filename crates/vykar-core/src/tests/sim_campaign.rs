@@ -58,9 +58,23 @@ struct CampaignReport {
     searches: Vec<(String, usize, bool, Duration)>,
 }
 
-/// The campaign's rule: damage no signature explains.
+/// The signatures 04 step 8 closes on a store that honours put-if-absent.
+const CLOSED_ON_CONDITIONAL: [Signature; 5] = [
+    Signature::LateHeadWrite,
+    Signature::LateHeadThenCompact,
+    Signature::LateHeadSegmentCollected,
+    Signature::AgedLockSegmentCollected,
+    Signature::AgedLockPacksCollected,
+];
+
+/// The campaign's rule: damage no signature explains, or, on the
+/// conditional store, damage of a shape 04 step 8 closed there.
 fn unknown(o: &Outcome) -> bool {
     o.signatures.contains(&Signature::Unknown)
+        || (o.trace.case.storage == StoreKind::Conditional
+            && CLOSED_ON_CONDITIONAL
+                .iter()
+                .any(|s| o.signatures.contains(s)))
 }
 
 fn lock(r: &Mutex<CampaignReport>) -> MutexGuard<'_, CampaignReport> {
@@ -298,6 +312,7 @@ fn campaign_writes_failing_traces() {
         policy: Policy::Continue,
         skews: vec![],
         maintenance: Maintenance::Whole,
+        storage: StoreKind::Plain,
     };
     let cfg = CampaignConfig {
         deadline: Instant::now() + Duration::from_secs(600),

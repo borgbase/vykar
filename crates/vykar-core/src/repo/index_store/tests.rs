@@ -1105,6 +1105,8 @@ struct Aged {
     now: std::time::SystemTime,
     mtimes: Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
     refused: Vec<String>,
+    /// The prefixes `list_meta` was called with, in order.
+    listings: Mutex<Vec<String>>,
 }
 
 impl Aged {
@@ -1114,6 +1116,7 @@ impl Aged {
             now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30),
             mtimes: Mutex::new(Default::default()),
             refused: Vec::new(),
+            listings: Mutex::new(Vec::new()),
         }
     }
 
@@ -1144,6 +1147,7 @@ delegate_storage_backend! {
     }
 
     fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.listings.lock().unwrap().push(prefix.to_string());
         let mtimes = self.mtimes.lock().unwrap();
         Ok(self
             .inner
@@ -1251,6 +1255,20 @@ fn collect_index_garbage_keeps_recent_young_and_named() {
     // A second run finds nothing more.
     let again = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
     assert_eq!((again.heads_deleted, again.objects_deleted), (0, 0));
+}
+
+/// 04's order (step 8): the objects are listed before the heads, so an
+/// object the heads listing does not cover is younger than the listing.
+#[test]
+fn collect_index_garbage_lists_objects_before_heads() {
+    let storage = Aged::new();
+    let latest = gc_fixture(&storage);
+    storage.listings.lock().unwrap().clear();
+    collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(
+        *storage.listings.lock().unwrap(),
+        vec![INDEX_OBJECT_DIR.to_string(), HEAD_PREFIX.to_string()]
+    );
 }
 
 /// The objects a kept head names as retired or as its sweep record stay.
@@ -2005,4 +2023,147 @@ fn a_v1_or_oversized_base_body_is_refused() {
     let e = decode_base_v2_to_temp(&base_ref, bytes, crypto.as_ref(), &dir.path().join("a"))
         .unwrap_err();
     assert!(is_object_damage(&e), "{e:?}");
+}
+
+/// A scripted put-if-absent answer: it sees the store and may write to it.
+type Answer =
+    Box<dyn Fn(&dyn StorageBackend, &str, &[u8]) -> Result<vykar_storage::Created> + Send + Sync>;
+
+/// A memory backend whose put-if-absent answers as the test scripts it
+/// (`answer` sees the store and may write to it first).
+struct ScriptedCreate {
+    inner: Arc<dyn StorageBackend>,
+    answer: Answer,
+}
+
+impl InnerBackend for ScriptedCreate {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for ScriptedCreate;
+    except [conditional];
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        Some(self)
+    }
+}
+
+impl vykar_storage::ConditionalWrite for ScriptedCreate {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<vykar_storage::Created> {
+        (self.answer)(&*self.inner, key, data)
+    }
+    fn verify(&self) -> Result<vykar_storage::ConditionalSupport> {
+        Ok(vykar_storage::ConditionalSupport::Verified)
+    }
+}
+
+fn scripted(
+    stored: Option<&[u8]>,
+    answer: impl Fn(&dyn StorageBackend, &str, &[u8]) -> Result<vykar_storage::Created>
+    + Send
+    + Sync
+    + 'static,
+) -> ScriptedCreate {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    if let Some(bytes) = stored {
+        inner.put(&head_key(2), bytes).unwrap();
+    }
+    ScriptedCreate {
+        inner,
+        answer: Box::new(answer),
+    }
+}
+
+#[test]
+fn create_head_classifies_every_answer() {
+    use vykar_storage::Created;
+    let mine: &[u8] = b"mine";
+    let other: &[u8] = b"other";
+    let lost = || VykarError::Other("connection reset".into());
+
+    let s = scripted(None, |st, k, d| st.put(k, d).map(|_| Created::Yes));
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None).unwrap(),
+        HeadPut::Created
+    );
+
+    // AlreadyExists: our own bytes (a lost reply retried), another head's,
+    // or nothing any more.
+    let s = scripted(Some(mine), |_, _, _| Ok(Created::AlreadyExists));
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None).unwrap(),
+        HeadPut::Created
+    );
+    let s = scripted(Some(other), |_, _, _| Ok(Created::AlreadyExists));
+    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+    let s = scripted(None, |_, _, _| Ok(Created::AlreadyExists));
+    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+
+    // An unknown outcome: the GET decides; absent keeps the error.
+    let s = scripted(None, move |st, k, d| {
+        st.put(k, d)?;
+        Err(lost())
+    });
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None).unwrap(),
+        HeadPut::Created
+    );
+    let s = scripted(None, move |_, _, _| Err(lost()));
+    let err = create_head(&s, 2, mine, &mut None).unwrap_err();
+    assert!(err.to_string().contains("connection reset"), "{err}");
+    let s = scripted(Some(other), move |_, _, _| Err(lost()));
+    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+
+    // The check concluded Unsupported: today's plain PUT.
+    let s = scripted(None, |_, _, _| {
+        Err(vykar_storage::put_if_absent_unavailable(
+            "test: ignores the condition",
+        ))
+    });
+    let mut noted = None;
+    assert_eq!(
+        create_head(&s, 2, mine, &mut noted).unwrap(),
+        HeadPut::Created
+    );
+    assert_eq!(s.inner.get(&head_key(2)).unwrap().as_deref(), Some(mine));
+    assert_eq!(noted, Some(HeadFallback::Refused));
+
+    // Over the size cap: refused, never written unconditionally.
+    let s = scripted(None, |_, _, _| {
+        Err(VykarError::InvalidFormat("put-if-absent: too large".into()))
+    });
+    assert!(matches!(
+        create_head(&s, 2, mine, &mut None),
+        Err(VykarError::InvalidFormat(_))
+    ));
+    assert!(s.inner.get(&head_key(2)).unwrap().is_none());
+}
+
+/// The fallback notice: warn for a storage that ignored the condition or an
+/// S3 endpoint the user set to `on`, info for a mechanism not offered;
+/// logged once per slot (a repository handle), the first verdict kept.
+#[test]
+fn fallback_notice_is_logged_once_per_slot() {
+    let cases = [
+        (
+            Some("ignores the condition: a second create succeeded"),
+            HeadFallback::Refused,
+        ),
+        (
+            Some("S3 endpoint refuses If-None-Match (s3_conditional_writes): 501"),
+            HeadFallback::Refused,
+        ),
+        (Some("no hardlink@openssh.com"), HeadFallback::NotOffered),
+        (None, HeadFallback::NotOffered),
+    ];
+    for (reason, want) in cases {
+        let mut noted = None;
+        assert!(note_fallback(&mut noted, reason), "{reason:?}");
+        assert_eq!(noted, Some(want), "{reason:?}");
+        assert!(!note_fallback(&mut noted, Some("ignores the condition")));
+        assert_eq!(noted, Some(want), "the first verdict is kept: {reason:?}");
+    }
 }

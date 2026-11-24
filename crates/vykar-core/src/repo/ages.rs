@@ -9,7 +9,11 @@
 //! not sound commits only while its packs stay younger than
 //! [`PACK_AGE_LIMIT`] at its head's landing ([`HEAD_LANDING_ALLOWANCE`]
 //! before the head PUT, none after it); journal recovery adopts packs
-//! younger than [`RECOVERY_MAX_PACK_AGE`].
+//! younger than [`RECOVERY_MAX_PACK_AGE`]; an index write whose head
+//! create returns more than [`HEAD_FRESHNESS_LIMIT`] after the listing that
+//! chose its generation checks that generation again (04 step 8); index
+//! garbage collection deletes unreferenced objects and old heads older than
+//! [`T_IDX`].
 //!
 //! Segment age (04 step 7): a backup segment's age is the store's "now"
 //! minus the mtime of its `index.d/` key in one LIST_META ([`SegmentAges`]).
@@ -74,9 +78,30 @@ const _: () = assert!(
     PACK_AGE_LIMIT.as_secs() > HEAD_LANDING_ALLOWANCE.as_secs() + RECOVERY_MAX_PACK_AGE.as_secs()
 );
 
+/// Longest time from the head listing that chose a write's generation to
+/// the return of its head create after which the generation is checked
+/// against a fresh listing (04 step 8). Old heads are collected only below
+/// `latest − HEADS_KEPT` and once older than [`T_IDX`], so within
+/// `T_IDX − MARGIN` of the listing no generation created after it can have
+/// been collected and re-made by this create (`MARGIN` absorbs the rate
+/// difference of the two clocks). Measured suspend included, as markers
+/// measure elapsed time.
+pub(crate) const HEAD_FRESHNESS_LIMIT: Duration =
+    Duration::from_secs(T_IDX.as_secs() - MARGIN.as_secs());
+
 /// Key prefix of a clock probe. Not `.json`, so no lock reader (this
 /// binary's `is_lock_key`, or 0.24's `list_lock_keys`) takes it for a lock.
 pub(crate) const CLOCK_PROBE_PREFIX: &str = "locks/vykar-clock-";
+/// Key prefix of the put-if-absent check's probe (vykar-storage's
+/// `sequential_check`). Not `.json`, as [`CLOCK_PROBE_PREFIX`]; one left
+/// by a failed delete is removed by age like a clock probe.
+pub(crate) const PUT_IF_ABSENT_PROBE_PREFIX: &str = "locks/vykar-probe-";
+
+/// Whether `key` is a probe under `locks/` (a clock probe or the
+/// put-if-absent check's), which lock readers skip and old ones are debris.
+pub(crate) fn is_probe_key(key: &str) -> bool {
+    key.starts_with(CLOCK_PROBE_PREFIX) || key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)
+}
 /// A probe older than this is debris of a failed delete.
 pub(crate) const CLOCK_PROBE_DEBRIS_AGE: Duration = Duration::from_secs(3600);
 

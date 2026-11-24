@@ -6,6 +6,11 @@
 //! makes them fail as drifted. `VYKAR_SIM_PROMOTE=<trace file>` prints a
 //! seed for a trace (name from `VYKAR_SIM_PROMOTE_NAME`, else the file
 //! stem).
+//!
+//! A seed without `storage` runs on the fallback store (`StoreKind::Plain`,
+//! every seed recorded before 04 step 8); a `<name>-conditional` seed is
+//! the same case on the conditional store (phase F part 9), with what that
+//! store leaves of the hazard.
 
 // Printing a seed is the point of the promotion helper; every other path
 // asserts.
@@ -52,20 +57,27 @@ fn taken(o: &Outcome, choices: usize) -> Vec<(Action, String)> {
 fn fixed_by(s: Signature) -> &'static str {
     match s {
         Signature::TwoLockHolders | Signature::SessionReaped => "04 step 1",
-        Signature::AgedLockReaped => "04 steps 8 and 9 (the lock leaves the commit path)",
+        Signature::AgedLockReaped | Signature::OrphanLockKey => {
+            "part 10 (04 step 9: the lock leaves the commit path)"
+        }
         Signature::AgedSessionReaped => {
-            "04 step 8 (narrowed by step 7: horizon, I8, young segments)"
+            "part 10 (04 step 9 and the reused section; narrowed by step 7: horizon, I8, \
+             young segments)"
         }
         Signature::LateSnapshotWrite => {
-            "04 step 8 (narrowed by step 7: needs a segment older than T_pack)"
+            "part 10 (04 step 9 and the reused section; narrowed by step 7: needs a segment \
+             older than T_pack)"
         }
-        Signature::OrphanLockKey
-        | Signature::LateHeadWrite
-        | Signature::LateIndexWrite
+        Signature::LateHeadWrite
+        | Signature::LateHeadThenCompact
         | Signature::LateHeadSegmentCollected
-        | Signature::AgedLockSegmentCollected => "04 step 8",
-        Signature::LateHeadThenCompact | Signature::AgedLockPacksCollected => {
-            "04 step 8 (narrowed by step 5: needs packs older than T_pack)"
+        | Signature::AgedLockSegmentCollected
+        | Signature::AgedLockPacksCollected => {
+            "04 step 8 on conditional backends (phase F part 9); the fallback keeps it"
+        }
+        Signature::LateIndexWrite => {
+            "head writes: 04 step 8 on conditional backends; index.d/ writes: with \
+             invariant 7, part 10"
         }
         Signature::Unknown => "nothing: Unknown is never expected",
     }

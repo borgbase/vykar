@@ -135,7 +135,7 @@ impl S3Backend {
             Answer::Created => Ok(Created::Yes),
             Answer::Exists => Ok(Created::AlreadyExists),
             Answer::Refused(detail) => Err(VykarError::UnsupportedBackend(format!(
-                "S3 endpoint refuses If-None-Match: {detail}"
+                "S3 endpoint refuses If-None-Match (s3_conditional_writes): {detail}"
             ))),
         }
     }

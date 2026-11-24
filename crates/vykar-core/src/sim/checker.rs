@@ -11,8 +11,8 @@
 //! | 04 | Here |
 //! |---|---|
 //! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist), plus 10: no pack deleted younger than T_pack or while its own session's marker was live, repack sources excepted |
-//! | I2 (every retained head names only objects that exist) | 4, for the latest head |
-//! | I3 (heads immutable, one per generation) | not yet; 7 (lock exclusion) stands in on today's protocol |
+//! | I2 (every retained head names only objects that exist) | 4, for every retained head (latest − 16 and newer) on stores that honour put-if-absent; the latest head elsewhere |
+//! | I3 (heads immutable, one per generation) | 12 on stores that honour put-if-absent; 7 (lock exclusion) stands in on the fallback |
 //! | I4 (every listed snapshot covered by some retained head) | 1, against the latest head |
 //! | I5 (no removal without a completed mark) | not yet (the H5 regression is scripted) |
 //! | I6 (no snapshot references a chunk missing from its commit head) | 1 approximates it against the latest head |
@@ -62,6 +62,11 @@ pub enum Invariant {
     /// HEAD_LANDING_ALLOWANCE at the last op it issued before that PUT,
     /// publishes no head.
     MarkerGapCommit = 11,
+    /// I3 (04 step 8): no stored head is replaced by other bytes, and each
+    /// retained head names every live object of its predecessor (it was
+    /// written over it). Asked for (`STEP8`) on stores that honour
+    /// put-if-absent; with it, invariant 4 judges every retained head.
+    HeadsImmutable = 12,
 }
 
 impl Invariant {
@@ -97,6 +102,21 @@ impl Invariant {
         Invariant::OrphanGrace,
         Invariant::MarkerGapCommit,
     ];
+
+    /// STEP7 plus invariant 12 (04 step 8), for stores that honour
+    /// put-if-absent; there invariant 4 also judges every retained head.
+    pub const STEP8: &'static [Invariant] = &[
+        Invariant::CommittedSnapshotsRestore,
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::AllowedErrors,
+        Invariant::LockExclusion,
+        Invariant::NoPermanentWedge,
+        Invariant::OrphanGrace,
+        Invariant::MarkerGapCommit,
+        Invariant::HeadsImmutable,
+    ];
 }
 
 /// What exactly was wrong; each kind belongs to one invariant.
@@ -108,6 +128,9 @@ pub enum ViolationKind {
     HeadObjectSizeMismatch,
     ChainUnloadable,
     IndexNamesAbsentPack,
+    /// A retained head other than the latest names an absent object (on
+    /// stores that honour put-if-absent).
+    RetainedHeadObjectAbsent,
     // 1
     MetaUnreadable,
     /// A tree (item-stream) chunk of this snapshot is not in the index.
@@ -145,6 +168,11 @@ pub enum ViolationKind {
     /// A backup published a head after a marker reap or gap with packs
     /// past the commit rule's age limit.
     OldPackCommittedAfterMarkerGap,
+    // 12
+    /// A stored head was replaced by other bytes.
+    HeadOverwritten,
+    /// A retained head does not name a live object of its predecessor.
+    HeadSkipsPredecessor,
 }
 
 impl ViolationKind {
@@ -155,7 +183,8 @@ impl ViolationKind {
             | K::HeadObjectAbsent
             | K::HeadObjectSizeMismatch
             | K::ChainUnloadable
-            | K::IndexNamesAbsentPack => Invariant::IndexIntegrity,
+            | K::IndexNamesAbsentPack
+            | K::RetainedHeadObjectAbsent => Invariant::IndexIntegrity,
             K::MetaUnreadable
             | K::TreeChunkNotInIndex
             | K::FileChunkNotInIndex
@@ -173,6 +202,7 @@ impl ViolationKind {
             K::WedgedBackup | K::WedgedCompact => Invariant::NoPermanentWedge,
             K::YoungOrphanDeleted | K::LiveSessionPackDeleted => Invariant::OrphanGrace,
             K::OldPackCommittedAfterMarkerGap => Invariant::MarkerGapCommit,
+            K::HeadOverwritten | K::HeadSkipsPredecessor => Invariant::HeadsImmutable,
         }
     }
 }
@@ -461,6 +491,115 @@ fn check_index(store: &SimStore, repo: &mut Repository, report: &mut Report) -> 
         }
     }
     true
+}
+
+/// The retained heads (latest − `HEADS_KEPT` and newer) that decode, by
+/// generation, read from the store map.
+fn retained_heads(
+    store: &SimStore,
+    repo: &Repository,
+) -> BTreeMap<u64, crate::index::head::IndexHead> {
+    let gens: Vec<u64> = store
+        .keys(index_store::HEAD_PREFIX)
+        .iter()
+        .filter_map(|k| vykar_protocol::head_generation(k))
+        .collect();
+    let Some(&latest) = gens.iter().max() else {
+        return BTreeMap::new();
+    };
+    let floor = latest.saturating_sub(index_store::HEADS_KEPT);
+    gens.into_iter()
+        .filter(|g| *g >= floor)
+        .filter_map(|g| {
+            let data = store.object(&index_store::head_key(g))?.data;
+            index_store::classify_head(g, &data, repo.crypto.as_ref())
+                .into_head()
+                .ok()
+                .map(|h| (g, h))
+        })
+        .collect()
+}
+
+/// Invariant 4 for the retained heads other than the latest (04 I2): each
+/// names only objects that exist.
+fn check_retained_heads(store: &SimStore, repo: &Repository, report: &mut Report) {
+    let heads = retained_heads(store, repo);
+    let latest = heads.keys().max().copied();
+    for (g, head) in &heads {
+        if Some(*g) == latest {
+            continue;
+        }
+        for name in head.named_objects() {
+            let key = index_store::object_key(&name);
+            if store.object(&key).is_none() {
+                report.add(
+                    ViolationKind::RetainedHeadObjectAbsent,
+                    &key,
+                    format!("named by retained head {g}, absent"),
+                );
+            }
+        }
+    }
+}
+
+/// Invariant 12 (04 I3): no head replaced by other bytes, and every
+/// retained head names (live or retired) each live object of the retained
+/// head one generation below it. A head written by `check --repair`, the
+/// upgrade or init (a write without a previous head) is exempt from the
+/// second part.
+fn check_heads_immutable(
+    store: &SimStore,
+    history: &History,
+    repo: &Repository,
+    report: &mut Report,
+) {
+    for (key, step, writer) in store.head_overwrites() {
+        report.add_at(
+            ViolationKind::HeadOverwritten,
+            &key,
+            Some(step),
+            format!(
+                "step {step}: {key} replaced by {} with other bytes",
+                store.client_name(writer)
+            ),
+        );
+    }
+    let log = store.log();
+    let headless_writer = |key: &str| {
+        log.iter()
+            .rev()
+            .find(|r| r.op.is_write() && r.applied() && r.key == key)
+            .and_then(|r| r.run)
+            .and_then(|i| history.runs.iter().find(|x| x.index == i))
+            .is_some_and(|run| match &run.op {
+                ClientOp::Init | ClientOp::CheckRepair => true,
+                ClientOp::Custom { label } => label.contains("upgrade"),
+                _ => false,
+            })
+    };
+    let heads = retained_heads(store, repo);
+    for (g, head) in &heads {
+        let Some(prev) = g.checked_sub(1).and_then(|p| heads.get(&p)) else {
+            continue;
+        };
+        let key = index_store::head_key(*g);
+        if headless_writer(&key) {
+            continue;
+        }
+        let named: std::collections::HashSet<_> = head.named_objects().collect();
+        let skipped: Vec<String> = prev
+            .live_objects()
+            .filter(|n| !named.contains(n))
+            .map(|n| index_store::object_key(&n))
+            .collect();
+        if !skipped.is_empty() {
+            report.add(
+                ViolationKind::HeadSkipsPredecessor,
+                &key,
+                format!("does not name {skipped:?} of head {}", g - 1),
+            );
+        }
+    }
 }
 
 /// Invariant 1 over every manifest snapshot.
@@ -997,8 +1136,17 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
 
     let mut index_report = Report::default();
     let index_ok = check_index(store, &mut repo, &mut index_report);
+    // Invariant 12 and the retained heads' part of 4 are asked for
+    // together (`STEP8`): on the fallback (`StoreKind::Plain`) a lost lock
+    // or a late head replaces heads by design (07 stands in for I3 there).
     if want(Invariant::IndexIntegrity) {
         report.violations.extend(index_report.violations);
+        if want(Invariant::HeadsImmutable) {
+            check_retained_heads(store, &repo, &mut report);
+        }
+    }
+    if want(Invariant::HeadsImmutable) {
+        check_heads_immutable(store, history, &repo, &mut report);
     }
 
     if want(Invariant::CommittedSnapshotsRestore) {

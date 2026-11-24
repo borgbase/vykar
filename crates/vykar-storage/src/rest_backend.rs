@@ -661,7 +661,8 @@ impl RestBackend {
                 "vykar-server: conditional PUT not implemented on its storage".into(),
             )),
             ConditionalAnswer::Replaced(s) => Err(VykarError::UnsupportedBackend(format!(
-                "vykar-server answered {s} to a conditional PUT (overwrote?)"
+                "vykar-server {}: answered {s} to a conditional PUT (overwrote?)",
+                crate::conditional::IGNORES_CONDITION
             ))),
         }
     }

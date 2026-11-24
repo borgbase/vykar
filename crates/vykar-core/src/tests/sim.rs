@@ -816,6 +816,10 @@ const TESTED_IDS: &[&str] = &[
     "H4-segment",
     "H4-skew",
     "H3-compact-young",
+    "H-racy",
+    "H3-conditional",
+    "H3-compact-conditional",
+    "H4-conditional",
 ];
 
 #[test]
@@ -830,10 +834,28 @@ fn known_hazard_ids_unique_and_listed() {
     assert_eq!(unique, TESTED_IDS.iter().copied().collect::<BTreeSet<_>>());
 }
 
+/// Every regression holds on each store kind it names.
 #[test]
 fn regressions_hold() {
     for r in REGRESSIONS {
         hazards::assert_regression_holds(r.id);
+    }
+}
+
+/// H-racy (04 step 8): a store that passes the sequential check but lets a
+/// late create win replaces a head.
+#[test]
+fn known_hazard_h_racy() {
+    hazards::assert_reproduces("H-racy");
+}
+
+/// What each known hazard does on a store that honours put-if-absent: H3,
+/// H3-compact and H4 are closed (their twins are regressions), H5-repair
+/// loses its prerequisite, the lock hazards remain.
+#[test]
+fn known_hazards_on_a_conditional_store() {
+    for h in KNOWN_HAZARDS {
+        hazards::assert_conditional_expectation(h.id);
     }
 }
 

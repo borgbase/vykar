@@ -20,7 +20,27 @@ use super::gate::{GateId, GateRule, Paused};
 use super::history::{
     ClientOp, ErrorRecord, History, Observation, ObservationCause, RunOutcome, RunRecord, classify,
 };
-use super::store::{SimConfig, SimStore};
+use super::store::{SimConfig, SimStore, StoreKind};
+
+thread_local! {
+    /// The store kind `Sim::new` uses on this thread (`with_store_kind`).
+    static DEFAULT_KIND: std::cell::Cell<StoreKind> =
+        const { std::cell::Cell::new(StoreKind::Plain) };
+}
+
+/// Run `f` with `Sim::new` making stores of `kind` on this thread: how a
+/// hazard or regression scenario runs on both the fallback and the
+/// conditional store without a parameter of its own.
+pub fn with_store_kind<T>(kind: StoreKind, f: impl FnOnce() -> T) -> T {
+    struct Restore(StoreKind);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEFAULT_KIND.with(|k| k.set(self.0));
+        }
+    }
+    let _restore = Restore(DEFAULT_KIND.with(|k| k.replace(kind)));
+    f()
+}
 use crate::commands::check::{self, RepairAction, RepairMode};
 use crate::commands::restore::{self, RestoreOptions};
 use crate::commands::{backup, compact, delete, prune, util};
@@ -257,8 +277,13 @@ impl Drop for Sim {
 }
 
 impl Sim {
+    /// A store of the default config, whose kind is
+    /// [`with_store_kind`]'s when called inside it.
     pub fn new() -> Self {
-        Self::with_config(SimConfig::default())
+        Self::with_config(SimConfig {
+            kind: DEFAULT_KIND.with(std::cell::Cell::get),
+            ..SimConfig::default()
+        })
     }
 
     /// Creates the store, registers client "init" and runs Init as run 0.
@@ -1079,11 +1104,16 @@ impl Sim {
     /// observations, source trees) and run counter, for one case of the
     /// driver. Its clients are new: this one's are not carried over.
     pub(super) fn fork_for_case(&self) -> Sim {
+        self.fork_for_case_as(self.store.config().kind)
+    }
+
+    /// [`Self::fork_for_case`] on a store of another kind.
+    pub(super) fn fork_for_case_as(&self, kind: StoreKind) -> Sim {
         assert!(
             self.in_flight.is_empty(),
             "fork_for_case with runs in flight"
         );
-        let mut sim = Sim::from_store(self.store.fork());
+        let mut sim = Sim::from_store(self.store.fork_as(kind));
         sim.history = self.history.clone();
         sim.next_run = self.next_run;
         sim

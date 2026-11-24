@@ -1,6 +1,6 @@
 {
   "name": "h3-random",
-  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h3 (default seed): a delayed head PUT lands after the lock was released, over a later commit. Fixed by 04 step 8 (create-if-absent heads).",
+  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h3 (default seed): a delayed head PUT lands after the lock was released, over a later commit. Fixed by 04 step 8 (create-if-absent heads). Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; h3-random-conditional is the same case on a conditional store.",
   "expect": [
     "LateHeadWrite"
   ],

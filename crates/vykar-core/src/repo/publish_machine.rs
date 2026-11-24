@@ -16,6 +16,15 @@
 //!
 //! A backup's write also runs the commit rule's pack-age term at its fence
 //! ([`HeadCheck`]), the last step before the head PUT on every path.
+//!
+//! The head step creates the head (04 step 8, [`index_store::create_head`]):
+//! put-if-absent where the backend offers it and its check passed (the
+//! check runs at the fence, before the lock and pack-age checks), else a
+//! plain PUT under the lock. When another writer holds the generation the
+//! write ends there: nothing local changes (the error cleanup runs), the
+//! objects it PUT are unreferenced garbage, no garbage collection runs, and
+//! the output is [`Published::Taken`]. A backup commit rebases and tries
+//! again; every other writer stops with "index changed".
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,9 +32,10 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
-use super::index_store::{self, PackedObject};
+use super::ages::HEAD_FRESHNESS_LIMIT;
+use super::index_store::{self, HeadPut, PackedObject};
 use super::index_write::FoldRequest;
-use super::lock::{self, SessionMarker};
+use super::lock::{self, MarkerStamp, SessionMarker};
 use super::machine::{Machine, StepCx, StepKind, bad_pick};
 use crate::index::LiveIndex;
 use crate::index::head::{
@@ -35,11 +45,25 @@ use crate::index::segment_v2::SegmentBody;
 use crate::index::table::{self, ChunkTable, IndexState, TableFileWriter};
 use vykar_types::error::{Result, VykarError};
 
+/// What an index write ended with.
+pub(crate) enum Published {
+    /// The head this write created, or the previous head when nothing was
+    /// written.
+    Head(IndexHead),
+    /// Another head holds the generation this write tried. Nothing local
+    /// changed; the objects it PUT are unreferenced garbage. `seg`: a
+    /// backup's own segment body, handed back for its retry.
+    Taken {
+        generation: u64,
+        seg: Option<SegmentBody>,
+    },
+}
+
 /// One index write, from the state to publish to the head that names it.
 /// Built by [`PublishMachine::publish`] (what
 /// `Repository::publish_index_state` does) or [`PublishMachine::base`]
 /// (`Repository::put_base`); its output is the head written, or the
-/// previous head when nothing was.
+/// previous head when nothing was, or [`Published::Taken`].
 pub(crate) struct PublishMachine {
     /// `Some(request)`: a publish, which took `request` from the
     /// repository's `fold_requested` and restores it on error, and which
@@ -54,8 +78,12 @@ pub(crate) struct PublishMachine {
     added: bool,
     /// A backup's pack-age term, run at the fence before the head PUT.
     head_check: Option<HeadCheck>,
-    /// The head PUT returned.
+    /// This write created its head.
     wrote_head: bool,
+    /// Just before the head listing that chose this write's generation
+    /// (suspend included, [`MarkerStamp::until`]); the machine's first step
+    /// when the caller gave none.
+    listed_at: Option<MarkerStamp>,
     start: std::time::Instant,
     state: State,
 }
@@ -102,6 +130,8 @@ enum State {
     /// The PUTs, fence and garbage collection, then the finish.
     Write(Box<Writes>),
     Done(Option<IndexHead>),
+    /// The head create found `generation` taken; a backup's own segment.
+    Lost(u64, Option<SegmentBody>),
     Failed,
 }
 
@@ -153,19 +183,27 @@ struct FoldBase {
     kept: Vec<(SegmentRef, Option<Vec<u8>>)>,
     /// The write's own segment, listed after the kept ones.
     appended: Option<(PackedObject, SegmentBody)>,
+    /// A backup's own segment folded into the base (a full fold), kept for
+    /// a retry after a taken generation.
+    folded: Option<SegmentBody>,
 }
 
 /// The rest of a write: storage steps in order, then the finish.
 struct Writes {
     steps: VecDeque<StepKind>,
     head: IndexHead,
-    /// The head's bytes; a head-only write packs them at its PUT.
+    /// The head's bytes; a head-only write packs them at its PUT. Kept
+    /// after the create, which compares them with what the key holds.
     packed_head: Option<Vec<u8>>,
     base: Option<PackedObject>,
     record: Option<PackedObject>,
     segment: Option<PackedObject>,
     /// The size of the segment PUT, logged once the head is written.
     segment_written: Option<u64>,
+    /// When the write's first object PUT returned (D11's slow-head log).
+    first_put: Option<MarkerStamp>,
+    /// How the head create ended.
+    outcome: Option<HeadPut>,
     finish: Finish,
 }
 
@@ -190,6 +228,8 @@ struct FoldFinish {
     kept: Vec<(SegmentRef, Option<Vec<u8>>)>,
     /// The write's own segment, applied last.
     appended: Option<(ObjectName, SegmentBody)>,
+    /// See [`FoldBase::folded`].
+    folded: Option<SegmentBody>,
 }
 
 impl PublishMachine {
@@ -215,6 +255,7 @@ impl PublishMachine {
             added: false,
             head_check: None,
             wrote_head: false,
+            listed_at: None,
             start: std::time::Instant::now(),
             state: State::Start { prev, seg },
         }
@@ -242,6 +283,7 @@ impl PublishMachine {
             added: false,
             head_check: None,
             wrote_head: false,
+            listed_at: None,
             start: std::time::Instant::now(),
             state,
         }
@@ -253,34 +295,56 @@ impl PublishMachine {
         self
     }
 
-    /// Whether this write's head PUT returned.
+    /// Whether this write created its head.
     pub(crate) fn wrote_head(&self) -> bool {
         self.wrote_head
     }
 
+    /// When the head listing that chose this write's generation started
+    /// (the backup's head read, `current_head_for_write`'s fetch). A slow
+    /// create is checked against it (04 step 8 D10).
+    pub(crate) fn listed_at(mut self, t: Option<MarkerStamp>) -> Self {
+        self.listed_at = t;
+        self
+    }
+
     fn run(&mut self, cx: &mut StepCx<'_>) -> Result<()> {
         let repo = &mut *cx.repo;
+        if self.listed_at.is_none() {
+            self.listed_at = Some(MarkerStamp::now(repo.host_env().clock.as_ref()));
+        }
         let state = std::mem::replace(&mut self.state, State::Failed);
         self.state = match state {
             State::Start { prev, seg } => self.start(repo, prev, seg)?,
             State::FoldPrefix(prep) => self.fold_prefix(repo, *prep)?,
             State::FoldBody(prep) => self.fold_body(repo, *prep)?,
             State::FoldGeneration(base) => {
+                self.listed_at = Some(MarkerStamp::now(repo.host_env().clock.as_ref()));
                 let generation = repo.next_head_gen(None)?;
                 State::FoldHead(base, generation)
             }
             State::FoldHead(base, generation) => fold_head(repo, *base, generation)?,
             State::Write(mut w) => match w.steps.pop_front() {
                 Some(kind) => {
-                    write_step(repo, &mut w, kind, self.head_check.as_ref())?;
-                    if kind == StepKind::PutHead {
-                        self.wrote_head = true;
+                    write_step(
+                        repo,
+                        &mut w,
+                        kind,
+                        self.head_check.as_ref(),
+                        self.listed_at.as_ref(),
+                    )?;
+                    match (kind, w.outcome) {
+                        (StepKind::PutHead, Some(HeadPut::Taken)) => self.lost(repo, *w),
+                        (StepKind::PutHead, _) => {
+                            self.wrote_head = true;
+                            State::Write(w)
+                        }
+                        _ => State::Write(w),
                     }
-                    State::Write(w)
                 }
                 None => State::Done(Some(self.finish(repo, *w))),
             },
-            State::Done(_) | State::Failed => {
+            State::Done(_) | State::Lost(..) | State::Failed => {
                 return Err(VykarError::Other(
                     "BUG: a finished index write was stepped".into(),
                 ));
@@ -397,10 +461,13 @@ impl PublishMachine {
             // is folded; a write never fails on it.
             warn!("cannot list index.d/ for the segments' ages ({e}); keeping them as segments");
         }
-        // Under the lock no named object is deleted, so a backup segment
-        // the head names and the listing lacks is damage: it reads young
-        // and stays named, so this client carries on while no cold client
-        // can load the chain. Not refused here (part 9 decides).
+        // A backup segment the head names and the listing lacks: a stale
+        // listing (the segment is there; its age is unknown, so young) or a
+        // lost object. A garbage collection deletes objects only after its
+        // caller created the latest head (04 step 8), so a named one is
+        // never collected; one absent is damage, and a write over it would
+        // publish a chain no cold client can load: refused. Re-checked with
+        // an EXISTS each, only when the listing lacks one.
         if let Some(ages) = repo.segment_ages() {
             let unlisted: Vec<String> = prep
                 .prev
@@ -409,13 +476,26 @@ impl PublishMachine {
                 .filter(|s| s.kind == SegmentKind::Backup && !ages.listed(&s.name))
                 .map(|s| index_store::object_key(&s.name))
                 .collect();
-            if !unlisted.is_empty() {
-                warn!(
-                    segments = ?unlisted,
-                    "the index head names segments the listing of index.d/ lacks; \
-                     keeping them as segments; the chain may not load elsewhere and is \
-                     not folded past them until `vykar check --repair` rewrites it"
-                );
+            for key in unlisted {
+                match repo.storage.exists(&key) {
+                    Ok(true) => debug!(
+                        key,
+                        "the listing of index.d/ lacks a segment the head names; it exists \
+                         (a stale listing): kept as a segment"
+                    ),
+                    Ok(false) => {
+                        return Err(VykarError::IndexObjectMissing {
+                            kind: "segment",
+                            key,
+                        });
+                    }
+                    Err(e) => warn!(
+                        key,
+                        error = %e,
+                        "the listing of index.d/ lacks a segment the head names and it \
+                         cannot be checked; kept as a segment"
+                    ),
+                }
             }
         }
         let k = repo.foldable_prefix(&prep.prev.segments);
@@ -560,7 +640,7 @@ impl PublishMachine {
         let dir = repo.cache_dir();
         let anchor = index_store::cache_anchor(dir.as_deref());
         let writer = TableFileWriter::new_beside(&anchor)?;
-        let (w, entries, kept, appended) = match mode {
+        let (w, entries, kept, appended, folded) = match mode {
             FoldMode::Full => {
                 if self.backup
                     && let Some(seg) = seg.as_ref()
@@ -575,7 +655,10 @@ impl PublishMachine {
                     }
                 }
                 let (w, entries) = repo.chunk_index.write_base_body(writer)?;
-                (w, entries, Vec::new(), None)
+                // A backup keeps its segment until the head is created: a
+                // taken generation hands it back for the retry.
+                let folded = if self.backup { seg } else { None };
+                (w, entries, Vec::new(), None, folded)
             }
             FoldMode::Partial {
                 k,
@@ -615,7 +698,7 @@ impl PublishMachine {
                     .skip(k)
                     .collect();
                 let appended = appended.zip(seg);
-                (w, entries, kept, appended)
+                (w, entries, kept, appended, None)
             }
         };
         let table = ChunkTable::install(w.finish()?, None, None)?;
@@ -632,6 +715,7 @@ impl PublishMachine {
             entries,
             kept,
             appended,
+            folded,
         });
         Ok(match next {
             Some(generation) => State::FoldHead(base, generation),
@@ -673,6 +757,7 @@ impl PublishMachine {
                     gc,
                     kept,
                     appended,
+                    ..
                 } = *fold;
                 debug!(
                     bytes,
@@ -742,6 +827,29 @@ impl PublishMachine {
         head
     }
 
+    /// The head create found the generation taken: undo as after an error
+    /// and keep a backup's own segment for its retry.
+    fn lost(&mut self, repo: &mut super::Repository, w: Writes) -> State {
+        let generation = w.head.generation;
+        self.on_error(repo);
+        tracing::info!(
+            generation,
+            "index head {generation} was created by another writer"
+        );
+        let seg = match w.finish {
+            _ if !self.backup => None,
+            Finish::Segment { seg, .. } => Some(seg),
+            Finish::Fold(fold) => {
+                let FoldFinish {
+                    appended, folded, ..
+                } = *fold;
+                appended.map(|(_, seg)| seg).or(folded)
+            }
+            Finish::Unchanged => None,
+        };
+        State::Lost(generation, seg)
+    }
+
     /// Undo what an error leaves behind: a fold's backup additions, and a
     /// publish's fold request.
     fn on_error(&mut self, repo: &mut super::Repository) {
@@ -790,6 +898,8 @@ impl Writes {
             record,
             segment,
             segment_written: None,
+            first_put: None,
+            outcome: None,
             finish,
         }
     }
@@ -935,6 +1045,7 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
         entries,
         kept,
         appended,
+        folded,
     } = base;
     let mut segments: Vec<SegmentRef> = kept.iter().map(|(r, _)| r.clone()).collect();
     let (segment, appended) = match appended {
@@ -985,6 +1096,7 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
         gc: index_store::IndexGcStats::default(),
         kept,
         appended,
+        folded,
     }));
     Ok(State::Write(Box::new(Writes::new(
         head,
@@ -996,30 +1108,80 @@ fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> R
     ))))
 }
 
-/// One storage step of a write.
+/// After a create that returned more than [`HEAD_FRESHNESS_LIMIT`] after the
+/// listing that chose `generation` (04 step 8 D10): one listing of
+/// `index.h/`. A generation more than `HEADS_KEPT` below the latest is one
+/// another writer created after that listing and the garbage collection
+/// deleted before this create re-made it: readers take the latest, so the
+/// write counts as taken. The re-made head is deleted again, best effort,
+/// and only when the key still holds `packed`, the bytes this write created
+/// (a GET and a comparison first): other bytes, or a failed GET, mean the
+/// key may be another writer's, which is left alone. No reader takes a head
+/// that far below the latest, and no writer builds on it.
+fn fresh_generation(
+    storage: &dyn vykar_storage::StorageBackend,
+    generation: u64,
+    packed: &[u8],
+) -> Result<HeadPut> {
+    let latest = index_store::list_head_generations(storage)?
+        .last()
+        .copied()
+        .unwrap_or(generation);
+    if generation + index_store::HEADS_KEPT >= latest {
+        return Ok(HeadPut::Created);
+    }
+    let key = index_store::head_key(generation);
+    match storage.get(&key) {
+        Ok(Some(stored)) if stored == packed => {
+            if let Err(e) = storage.delete(&key) {
+                debug!(key, error = %e, "could not delete a re-made old index head");
+            }
+        }
+        Ok(_) => debug!(
+            key,
+            "a re-made old index head holds other bytes now (or is gone); left alone"
+        ),
+        Err(e) => debug!(
+            key,
+            error = %e,
+            "cannot read a re-made old index head; left alone"
+        ),
+    }
+    Ok(HeadPut::Taken)
+}
+
+/// One storage step of a write. `listed_at`: see
+/// [`PublishMachine::listed_at`].
 fn write_step(
     repo: &mut super::Repository,
     w: &mut Writes,
     kind: StepKind,
     head_check: Option<&HeadCheck>,
+    listed_at: Option<&MarkerStamp>,
 ) -> Result<()> {
     let missing = || {
         VykarError::Other(format!(
             "BUG: index write step {kind:?} has nothing to write"
         ))
     };
+    let stamp = |repo: &super::Repository| MarkerStamp::now(repo.host_env().clock.as_ref());
     match kind {
         StepKind::PutBase => {
             let obj = w.base.take().ok_or_else(missing)?;
-            repo.storage.put(&obj.key(), &obj.bytes)
+            repo.storage.put(&obj.key(), &obj.bytes)?;
+            w.first_put.get_or_insert(stamp(repo));
+            Ok(())
         }
         StepKind::PutSweepRecord => {
             let rec = w.record.take().ok_or_else(missing)?;
-            repo.storage.put(&rec.key(), &rec.bytes)
+            repo.storage.put(&rec.key(), &rec.bytes)?;
+            w.first_put.get_or_insert(stamp(repo));
+            Ok(())
         }
         StepKind::PutSegment => {
             let obj = w.segment.take().ok_or_else(missing)?;
             repo.storage.put(&obj.key(), &obj.bytes)?;
+            w.first_put.get_or_insert(stamp(repo));
             if let Some(dir) = repo.cache_dir() {
                 table::write_cached_segment(&dir, &obj.name, &obj.bytes);
             }
@@ -1027,6 +1189,24 @@ fn write_step(
             Ok(())
         }
         StepKind::Fence => {
+            // The put-if-absent check (once per backend instance) runs
+            // before the fence, so the fence and the pack-age term stay the
+            // last checks before the head create. Undecided fails the write
+            // like a failed PUT; `Unsupported`, or a backend that offers no
+            // put-if-absent, falls back to a plain PUT, logged once per
+            // handle (never silently unconditional).
+            match repo.storage.conditional() {
+                Some(cond) => {
+                    if let vykar_storage::ConditionalSupport::Unsupported { reason } =
+                        cond.verify()?
+                    {
+                        index_store::note_fallback(&mut repo.head_fallback, Some(&reason));
+                    }
+                }
+                None => {
+                    index_store::note_fallback(&mut repo.head_fallback, None);
+                }
+            }
             repo.check_lock_fence()?;
             match head_check {
                 Some(check) => check.run(repo),
@@ -1034,20 +1214,49 @@ fn write_step(
             }
         }
         StepKind::PutHead => {
-            match w.packed_head.take() {
-                Some(packed) => repo
-                    .storage
-                    .put(&index_store::head_key(w.head.generation), &packed)?,
-                None => {
-                    index_store::put_head(repo.storage.as_ref(), &w.head, repo.crypto.as_ref())?
+            let generation = w.head.generation;
+            let packed = match w.packed_head.take() {
+                Some(packed) => packed,
+                None => index_store::pack_head(&w.head, repo.crypto.as_ref())?,
+            };
+            let created = index_store::create_head(
+                repo.storage.as_ref(),
+                generation,
+                &packed,
+                &mut repo.head_fallback,
+            );
+            let mut outcome = match created {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    w.packed_head = Some(packed);
+                    return Err(e);
                 }
+            };
+            let now = stamp(repo);
+            if outcome == HeadPut::Created
+                && listed_at.is_some_and(|t| t.until(&now) > HEAD_FRESHNESS_LIMIT)
+            {
+                outcome = fresh_generation(repo.storage.as_ref(), generation, &packed)?;
+            }
+            w.packed_head = Some(packed);
+            w.outcome = Some(outcome);
+            if outcome == HeadPut::Taken {
+                return Ok(());
+            }
+            repo.created_head = Some(generation);
+            if let Some(first) = w.first_put
+                && first.until(&now) > HEAD_FRESHNESS_LIMIT
+            {
+                // Under the lock no collector runs beside this write; without
+                // it, objects this old could have been collected (part 10).
+                warn!(
+                    generation,
+                    elapsed_secs = first.until(&now).as_secs(),
+                    "index head created long after its first object PUT"
+                );
             }
             if let Some(bytes) = w.segment_written {
-                debug!(
-                    bytes,
-                    generation = w.head.generation,
-                    "index segment written"
-                );
+                debug!(bytes, generation, "index segment written");
             }
             Ok(())
         }
@@ -1074,7 +1283,7 @@ fn write_step(
 }
 
 impl Machine for PublishMachine {
-    type Output = IndexHead;
+    type Output = Published;
 
     fn enabled(&self) -> Vec<StepKind> {
         match &self.state {
@@ -1084,7 +1293,7 @@ impl Machine for PublishMachine {
             State::Start { .. } | State::FoldBody(_) | State::FoldHead(..) => {
                 vec![StepKind::Local]
             }
-            State::Done(_) | State::Failed => Vec::new(),
+            State::Done(_) | State::Lost(..) | State::Failed => Vec::new(),
         }
     }
 
@@ -1101,10 +1310,50 @@ impl Machine for PublishMachine {
         result
     }
 
-    fn take_output(&mut self) -> Option<IndexHead> {
-        match &mut self.state {
-            State::Done(head) => head.take(),
-            _ => None,
+    fn take_output(&mut self) -> Option<Published> {
+        match std::mem::replace(&mut self.state, State::Failed) {
+            State::Done(Some(head)) => Some(Published::Head(head)),
+            State::Lost(generation, seg) => Some(Published::Taken { generation, seg }),
+            other => {
+                self.state = other;
+                None
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D10's clean-up of a re-made old head compares bytes first: the key
+    /// holding this write's bytes is deleted, one holding other bytes (another
+    /// writer's) is left alone; both count as taken. A generation within
+    /// `HEADS_KEPT` of the latest is created and nothing is read.
+    #[test]
+    fn a_remade_old_head_is_deleted_only_when_it_is_ours() {
+        use vykar_storage::StorageBackend;
+        let mine: &[u8] = b"head bytes of this write";
+        let latest = 2 + index_store::HEADS_KEPT + 1;
+        for (stored, deleted) in [(mine, true), (&b"another writer's head"[..], false)] {
+            let s = crate::testutil::MemoryBackend::new();
+            s.put(&index_store::head_key(2), stored).unwrap();
+            s.put(&index_store::head_key(latest), b"latest").unwrap();
+            assert_eq!(fresh_generation(&s, 2, mine).unwrap(), HeadPut::Taken);
+            assert_eq!(
+                s.get(&index_store::head_key(2)).unwrap().is_none(),
+                deleted,
+                "stored {stored:?}"
+            );
+        }
+        let s = crate::testutil::MemoryBackend::new();
+        s.put(&index_store::head_key(3), b"other").unwrap();
+        s.put(
+            &index_store::head_key(2 + index_store::HEADS_KEPT),
+            b"latest",
+        )
+        .unwrap();
+        assert_eq!(fresh_generation(&s, 3, mine).unwrap(), HeadPut::Created);
+        assert!(s.get(&index_store::head_key(3)).unwrap().is_some());
     }
 }

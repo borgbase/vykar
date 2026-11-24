@@ -217,6 +217,13 @@ fn classify_errors() {
         AllowedError::Injected,
     );
     allowed(
+        VykarError::Other(format!(
+            "{} 11 h 20 min since its first object upload; retry",
+            crate::repo::ages::SLOW_INDEX_WRITE_TEXT
+        )),
+        AllowedError::SlowIndexWrite,
+    );
+    allowed(
         VykarError::RestoreSourceUnreadable(Box::new(VykarError::Other(format!(
             "{}: Fail",
             crate::sim::INJECTED_MARKER
@@ -2581,8 +2588,8 @@ fn a_refreshed_marker_keeps_uploads_older_than_t_pack() {
 /// uploads for more than T_pack while its heartbeat refreshes the marker,
 /// so I8 lets it commit; its head PUT is delayed and the commit fails
 /// (its session, and with it its horizon, ends). b's compact deletes a's
-/// packs as orphans older than T_pack and keeps a's segment (younger than
-/// T_idx); the late head then lands and names that segment, so the index
+/// packs as orphans older than T_pack and keeps a's segment (written after
+/// the hold, younger than the 12 h `INDEX_OBJECT_GRACE`); the late head then lands and names that segment, so the index
 /// names absent packs. The driver's verdict on this store claims it as
 /// exactly `LateHeadThenCompact` (fixed by 04 step 8).
 #[test]
@@ -2659,14 +2666,12 @@ fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
 /// its marker goes stale), takes its commit lock and is held again at its
 /// head PUT, after the fence; another 6 h 1 min age its lock past the
 /// stale age and its packs past T_pack. b's compact reaps the lock and the
-/// marker and deletes a's packs as orphans; its index GC fails to delete
-/// a's segment (an injected delete fault), so a's head, published outside
-/// any lock, names a present segment whose entries name absent packs. The
-/// driver's verdict claims it as exactly `AgedLockReaped` (the head PUT)
-/// and `AgedLockPacksCollected` (fixed by 04 step 8). Without the fault
-/// the GC takes the segment (older than T_idx, named by no head), and the
-/// case is `AgedLockSegmentCollected`: the driver's seeds
-/// `aged-lock-packs-collected{,-old-packs}`.
+/// marker and deletes a's packs as orphans; its index GC keeps a's segment
+/// (written after the first jump, about 6 h old: younger than the 12 h
+/// `INDEX_OBJECT_GRACE`), so a's head, published outside any lock, names a
+/// present segment whose entries name absent packs. The driver's verdict
+/// claims it as exactly `AgedLockReaped` (the head PUT) and
+/// `AgedLockPacksCollected` (fixed by 04 step 8 on conditional stores).
 #[test]
 fn an_aged_lock_head_names_packs_compact_deleted() {
     use crate::sim::driver::{Action, Signature, TraceEntry, classify as classify_case};
@@ -2694,14 +2699,6 @@ fn an_aged_lock_head_names_packs_compact_deleted() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    sim.fault(
-        FaultRule::new(
-            OpMatch::AnyDelete,
-            KeyMatch::Prefix("index.d/".into()),
-            FaultAction::Fail,
-        )
-        .client(b),
-    );
     let (ga, sa) = hold_after_upload(&mut sim, a);
     let a_packs = sim.store().keys_written_by(a, "packs/");
     span(&sim, "upload");

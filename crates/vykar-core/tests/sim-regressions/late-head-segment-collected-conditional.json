@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-conditional",
-  "note": "Conditional twin of late-head-segment-collected (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the collector created the generation the late head targets before collecting (its claim), so the late create finds it taken and names nothing collected.",
+  "note": "Conditional twin of late-head-segment-collected (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the collector created the generation the late head targets before collecting (its claim), so the late create finds it taken and names nothing collected. Re-derived with the plain seed for phase F part 10b2 (the same decisions; see its note). Unchanged signatures.",
   "expect": [],
   "at": [
     [
@@ -131,6 +131,22 @@
     ],
     [
       {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
         "Step": {
           "client": 0,
           "pick": 0
@@ -236,22 +252,6 @@
         }
       },
       "fence"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 10860
-        }
-      },
-      "advance"
     ],
     [
       {
@@ -385,6 +385,8 @@
       1,
       0,
       0,
+      7,
+      7,
       0,
       0,
       0,
@@ -397,15 +399,13 @@
       0,
       0,
       0,
-      3,
-      6,
       0,
       1,
       0,
       0,
       0,
       0,
-      7,
+      1,
       0
     ],
     "policy": "First",

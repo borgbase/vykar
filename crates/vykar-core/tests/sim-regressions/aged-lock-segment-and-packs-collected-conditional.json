@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-and-packs-collected-conditional",
-  "note": "Conditional twin of aged-lock-segment-and-packs-collected (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the victim's create finds the reaper's generation taken (decisions after put-head drift: backoff and the re-read); its retry re-PUTs its segment after the reap (AgedLockReaped) and fails at its fence; its next fold names nothing collected.",
+  "note": "Conditional twin of aged-lock-segment-and-packs-collected (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the victim's create finds the reaper's generation taken (decisions after put-head drift: backoff and the re-read); its retry re-PUTs its segment after the reap (AgedLockReaped) and fails at its fence; its next fold names nothing collected. Since phase F part 10b2 it keeps the schedule the plain seed had before 10b2 (the plain seed now takes two 6 h 1 min jumps, after which the victim's head create refuses on both stores alike), so that the taken generation and the retry stay covered; the segment, about 6 h old at the compact, is younger than INDEX_OBJECT_GRACE (12 h) and is no longer collected. Unchanged signatures.",
   "expect": [
     "AgedLockReaped"
   ],

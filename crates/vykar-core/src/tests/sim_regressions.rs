@@ -68,10 +68,13 @@ fn fixed_by(s: Signature) -> &'static str {
             "part 10 (04 step 9 and the reused section; narrowed by step 7: needs a segment \
              older than T_pack)"
         }
+        Signature::AgedLockSegmentCollected => {
+            "04 step 8 on conditional backends (phase F part 9); on every store by the \
+             slow-index-write refusal (phase F part 10b2)"
+        }
         Signature::LateHeadWrite
         | Signature::LateHeadThenCompact
         | Signature::LateHeadSegmentCollected
-        | Signature::AgedLockSegmentCollected
         | Signature::AgedLockPacksCollected => {
             "04 step 8 on conditional backends (phase F part 9); the fallback keeps it"
         }

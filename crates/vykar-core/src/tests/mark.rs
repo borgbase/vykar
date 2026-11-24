@@ -771,6 +771,101 @@ fn report_refuses_a_newer_snapshot_format() {
     );
 }
 
+/// A local backend whose GET of `hidden` finds nothing, while its listing
+/// of `snapshots/` shows the key (added when storage does not hold it): a
+/// false "not found", or a snapshot deleted between the listing and its GET.
+struct Ghost {
+    inner: LocalBackend,
+    hidden: String,
+}
+
+impl InnerBackend for Ghost {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for Ghost;
+    except [get, list, list_sized, list_meta, server_ops];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if key == self.hidden {
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = self.inner.list(prefix)?;
+        if prefix == "snapshots/" && !keys.contains(&self.hidden) {
+            keys.push(self.hidden.clone());
+        }
+        Ok(keys)
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        Ok(self.with_ghost(prefix, self.inner.list_sized(prefix)?))
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        Ok(self.with_ghost(prefix, self.inner.list_meta(prefix)?))
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
+    }
+}
+
+impl Ghost {
+    fn open(fx: &Fx, hidden: &str) -> Repository {
+        Repository::open(
+            Box::new(Ghost {
+                inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
+                hidden: hidden.to_string(),
+            }),
+            fx.pass,
+            None,
+            OpenOptions::new().with_index(),
+        )
+        .unwrap()
+    }
+
+    fn with_ghost(
+        &self,
+        prefix: &str,
+        mut objects: Vec<vykar_storage::ListedObject>,
+    ) -> Vec<vykar_storage::ListedObject> {
+        if prefix == "snapshots/" && !objects.iter().any(|o| o.key == self.hidden) {
+            objects.push(vykar_storage::ListedObject {
+                key: self.hidden.clone(),
+                size: None,
+                mtime: None,
+            });
+        }
+        objects
+    }
+}
+
+/// Under the maintenance lock a listed snapshot whose GET finds nothing may
+/// be live (a reaped lock, an out-of-band delete, a false "not found"): the
+/// strict listing fails closed on it.
+#[test]
+fn the_strict_listing_fails_on_a_listed_snapshot_that_is_gone() {
+    for encrypted in [false, true] {
+        let fx = two_snapshots(encrypted);
+        let ghost = format!("snapshots/{}", "cd".repeat(32));
+        let err = load_snapshots_strict(&Ghost::open(&fx, &ghost), &CancelToken::new())
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains(&format!("{ghost} was listed but is gone")),
+            "encrypted={encrypted}: {err}"
+        );
+    }
+}
+
 /// A `RegularFile` chunk reference of snapshot `name`.
 fn a_file_chunk(fx: &Fx, name: &str) -> ChunkId {
     let mut repo = fx.open();
@@ -1763,6 +1858,46 @@ fn compact_refuses_a_listing_that_hides_a_marked_snapshot() {
     drop(repo);
     assert_mark_refused(&err, &format!("{hidden} exists but the listing"));
     assert_eq!(repo_files(&fx), before);
+}
+
+/// A live snapshot whose GET finds nothing (a false "not found" under the
+/// lock) does not get its chunks swept: compact refuses before it changes
+/// anything, so no entry is removed and no pack deleted, though every
+/// object is past the 12 h graces.
+#[test]
+fn compact_refuses_a_live_snapshot_whose_get_finds_nothing() {
+    for encrypted in [false, true] {
+        let fx = two_disjoint_snapshots(encrypted);
+        commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+        age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
+        let hidden = fx
+            .open()
+            .manifest()
+            .find_snapshot("s2")
+            .unwrap()
+            .id
+            .storage_key();
+        let before = repo_files(&fx);
+        let mut repo = Ghost::open(&fx, &hidden);
+        let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
+            .unwrap_err();
+        drop(repo);
+        assert_mark_refused(&err, &format!("{hidden} was listed but is gone"));
+        assert_eq!(repo_files(&fx), before, "encrypted={encrypted}");
+        compact(&fx, false).unwrap();
+        let dest = fx.tmp.path().join(format!("restore-{encrypted}"));
+        commands::restore::run(
+            &fx.config,
+            fx.pass,
+            "s2",
+            dest.to_str().unwrap(),
+            None,
+            false,
+            true,
+            &CancelToken::new(),
+        )
+        .unwrap();
+    }
 }
 
 /// Fails every `get` of one key with an I/O error.

@@ -1364,7 +1364,7 @@ fn garbage_collection_after_a_resumed_upgrade_keeps_the_latest_objects() {
         repo.storage.as_ref(),
         repo.crypto.as_ref(),
         &latest,
-        std::time::Duration::ZERO,
+        index_store::IndexGcGrace::both(std::time::Duration::ZERO),
     )
     .unwrap();
     assert!(stats.objects_deleted >= 1, "{stats:?}");

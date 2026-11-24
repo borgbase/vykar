@@ -593,8 +593,9 @@ pub struct Repository {
     head_fallback: Option<index_store::HeadFallback>,
     /// What the next index write records in the head's `sweep`; consumed by it.
     pending_sweep: Option<index_write::PendingSweep>,
-    /// Grace of `collect_index_garbage`: `INDEX_GC_GRACE`; tests lower it.
-    index_gc_grace: std::time::Duration,
+    /// Graces of `collect_index_garbage`: `IndexGcGrace::DEFAULT`; tests
+    /// lower them.
+    index_gc_grace: index_store::IndexGcGrace,
     /// The held lock's key mtime (the maintenance lock, or a backup's commit
     /// lock): "now" on the store's clock for the ages this lock holder
     /// judges. `None` outside a lock, or when the storage reports no mtime.

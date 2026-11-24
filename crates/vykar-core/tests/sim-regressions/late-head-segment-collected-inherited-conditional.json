@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-inherited-conditional",
-  "note": "Conditional twin of late-head-segment-collected-inherited (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the backup's fold created the generation first; compact's late create finds it taken and no later head inherits a collected name.",
+  "note": "Conditional twin of late-head-segment-collected-inherited (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the backup's fold created the generation first; compact's late create finds it taken and no later head inherits a collected name. Re-derived with the plain seed for phase F part 10b2 (the same decisions; see its note). Unchanged signatures.",
   "expect": [],
   "at": [
     [
@@ -50,14 +50,6 @@
     ],
     [
       {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
-    ],
-    [
-      {
         "Step": {
           "client": 0,
           "pick": 0
@@ -82,14 +74,6 @@
         }
       },
       "sync-index"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
     ],
     [
       {
@@ -155,6 +139,14 @@
     ],
     [
       {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
         "Release": {
           "parked": 0
         }
@@ -205,11 +197,9 @@
       0,
       0,
       0,
-      4,
       0,
       0,
       0,
-      3,
       0,
       0,
       0,
@@ -217,7 +207,8 @@
       0,
       0,
       7,
-      5
+      7,
+      2
     ],
     "policy": "First",
     "storage": "Conditional"

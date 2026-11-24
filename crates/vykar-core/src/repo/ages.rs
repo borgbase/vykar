@@ -12,8 +12,10 @@
 //! younger than [`RECOVERY_MAX_PACK_AGE`]; an index write whose head
 //! create returns more than [`HEAD_FRESHNESS_LIMIT`] after the listing that
 //! chose its generation checks that generation again (04 step 8); index
-//! garbage collection deletes unreferenced objects and old heads older than
-//! [`T_IDX`].
+//! garbage collection deletes old heads older than [`T_IDX`] and
+//! unreferenced `index.d/` objects older than [`T_PACK`]
+//! (`index_store::INDEX_OBJECT_GRACE`), and an index write slower than
+//! [`INDEX_WRITE_LIMIT`] from its first object PUT is refused.
 //!
 //! Segment age (04 step 7): a backup segment's age is the store's "now"
 //! minus the mtime of its `index.d/` key in one LIST_META ([`SegmentAges`]).
@@ -44,7 +46,8 @@ use super::lock::SESSION_STALE_SECS;
 
 /// Grace for packs that no index entry names, on the store's clock.
 pub(crate) const T_PACK: Duration = Duration::from_secs(12 * 3600);
-/// Grace for unreferenced `index.d/` objects and old heads.
+/// Grace for old heads below the kept generations (unreferenced
+/// `index.d/` objects keep [`T_PACK`]: `index_store::INDEX_OBJECT_GRACE`).
 pub(crate) const T_IDX: Duration = Duration::from_secs(3600);
 /// Margin M against request timeouts and clock resolution.
 pub(crate) const MARGIN: Duration = Duration::from_secs(10 * 60);
@@ -68,8 +71,8 @@ pub(crate) const RECOVERY_MAX_PACK_AGE: Duration = Duration::from_secs(T_PACK.as
 pub(crate) const PACK_AGE_LIMIT: Duration =
     Duration::from_secs(T_PACK.as_secs() - MARGIN.as_secs());
 
-// 04's relations: T_pack − M (the commit refusal, I8) and T_idx − M (segment
-// renewal) are positive and leave room; the journal window T_pack/2 outlasts
+// 04's relations: T_pack − M (the commit refusal, I8) and T_idx − M (the
+// head create's re-listing of index.h/) are positive and leave room; the journal window T_pack/2 outlasts
 // a marker's staleness by more than M.
 const _: () = assert!(T_PACK.as_secs() > 2 * MARGIN.as_secs());
 const _: () = assert!(T_IDX.as_secs() > MARGIN.as_secs());
@@ -77,6 +80,24 @@ const _: () = assert!(T_PACK.as_secs() / 2 > SESSION_STALE_SECS as u64 + MARGIN.
 const _: () = assert!(
     PACK_AGE_LIMIT.as_secs() > HEAD_LANDING_ALLOWANCE.as_secs() + RECOVERY_MAX_PACK_AGE.as_secs()
 );
+
+/// Longest time from the start of an index write's first `index.d/` PUT to
+/// the return of its head create (`index_store::INDEX_OBJECT_GRACE` − M):
+/// the write refuses to create its head when this minus
+/// [`HEAD_LANDING_ALLOWANCE`] (about 11 h 20 min) has passed, and fails
+/// before its snapshot when the create returned later than this. Measured
+/// suspend included, as markers measure elapsed time.
+pub(crate) const INDEX_WRITE_LIMIT: Duration =
+    Duration::from_secs(super::index_store::INDEX_OBJECT_GRACE.as_secs() - MARGIN.as_secs());
+
+const _: () = assert!(
+    super::index_store::INDEX_OBJECT_GRACE.as_secs()
+        > MARGIN.as_secs() + HEAD_LANDING_ALLOWANCE.as_secs()
+);
+
+/// The start of the error an index write refused by [`INDEX_WRITE_LIMIT`]
+/// fails with (the simulator classifies it by this text).
+pub(crate) const SLOW_INDEX_WRITE_TEXT: &str = "the index write took longer than";
 
 /// Longest time from the head listing that chose a write's generation to
 /// the return of its head create after which the generation is checked

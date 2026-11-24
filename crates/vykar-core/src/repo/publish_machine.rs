@@ -32,7 +32,9 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
-use super::ages::HEAD_FRESHNESS_LIMIT;
+use super::ages::{
+    HEAD_FRESHNESS_LIMIT, HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT, SLOW_INDEX_WRITE_TEXT,
+};
 use super::index_store::{self, HeadPut, PackedObject};
 use super::index_write::FoldRequest;
 use super::lock::{self, MarkerStamp, SessionMarker};
@@ -200,8 +202,11 @@ struct Writes {
     segment: Option<PackedObject>,
     /// The size of the segment PUT, logged once the head is written.
     segment_written: Option<u64>,
-    /// When the write's first object PUT returned (D11's slow-head log).
-    first_put: Option<MarkerStamp>,
+    /// Taken just before the request of the write's first object PUT (base,
+    /// sweep record or segment): the write's age against
+    /// [`INDEX_WRITE_LIMIT`] at its head create (`None`: a head-only
+    /// write, which PUTs no object).
+    objects_from: Option<MarkerStamp>,
     /// How the head create ended.
     outcome: Option<HeadPut>,
     finish: Finish,
@@ -898,7 +903,7 @@ impl Writes {
             record,
             segment,
             segment_written: None,
-            first_put: None,
+            objects_from: None,
             outcome: None,
             finish,
         }
@@ -1150,6 +1155,28 @@ fn fresh_generation(
     Ok(HeadPut::Taken)
 }
 
+/// An index write that took longer than `limit` from its first object
+/// upload (`index_store::INDEX_OBJECT_GRACE`).
+fn slow_index_write(limit: std::time::Duration) -> VykarError {
+    let mins = limit.as_secs() / 60;
+    VykarError::Other(format!(
+        "{SLOW_INDEX_WRITE_TEXT} {} h {} min since its first object upload; retry",
+        mins / 60,
+        mins % 60
+    ))
+}
+
+/// The error of a head create that returned more than `limit` after the
+/// write's first object upload: the refusal's text (the simulator matches
+/// its start), then what happened.
+fn slow_index_write_after_create(limit: std::time::Duration) -> VykarError {
+    VykarError::Other(format!(
+        "{}. The index head was written without its snapshot; the next run continues \
+         from it. Run `vykar check` if the repository fails to open",
+        slow_index_write(limit)
+    ))
+}
+
 /// One storage step of a write. `listed_at`: see
 /// [`PublishMachine::listed_at`].
 fn write_step(
@@ -1168,20 +1195,20 @@ fn write_step(
     match kind {
         StepKind::PutBase => {
             let obj = w.base.take().ok_or_else(missing)?;
+            w.objects_from.get_or_insert(stamp(repo));
             repo.storage.put(&obj.key(), &obj.bytes)?;
-            w.first_put.get_or_insert(stamp(repo));
             Ok(())
         }
         StepKind::PutSweepRecord => {
             let rec = w.record.take().ok_or_else(missing)?;
+            w.objects_from.get_or_insert(stamp(repo));
             repo.storage.put(&rec.key(), &rec.bytes)?;
-            w.first_put.get_or_insert(stamp(repo));
             Ok(())
         }
         StepKind::PutSegment => {
             let obj = w.segment.take().ok_or_else(missing)?;
+            w.objects_from.get_or_insert(stamp(repo));
             repo.storage.put(&obj.key(), &obj.bytes)?;
-            w.first_put.get_or_insert(stamp(repo));
             if let Some(dir) = repo.cache_dir() {
                 table::write_cached_segment(&dir, &obj.name, &obj.bytes);
             }
@@ -1215,6 +1242,16 @@ fn write_step(
         }
         StepKind::PutHead => {
             let generation = w.head.generation;
+            // Refused before the create when the write's objects may no
+            // longer outlive the landing of its head (`INDEX_OBJECT_GRACE`):
+            // the error cleanup runs and the caller retries with fresh
+            // objects.
+            let early = INDEX_WRITE_LIMIT.saturating_sub(HEAD_LANDING_ALLOWANCE);
+            if let Some(from) = w.objects_from.as_ref()
+                && from.until(&stamp(repo)) > early
+            {
+                return Err(slow_index_write(early));
+            }
             let packed = match w.packed_head.take() {
                 Some(packed) => packed,
                 None => index_store::pack_head(&w.head, repo.crypto.as_ref())?,
@@ -1244,16 +1281,18 @@ fn write_step(
                 return Ok(());
             }
             repo.created_head = Some(generation);
-            if let Some(first) = w.first_put
-                && first.until(&now) > HEAD_FRESHNESS_LIMIT
+            if let Some(from) = w.objects_from.as_ref()
+                && from.until(&now) > INDEX_WRITE_LIMIT
             {
-                // Under the lock no collector runs beside this write; without
-                // it, objects this old could have been collected (part 10).
-                warn!(
+                // The head is created, but a collector may have judged its
+                // objects old before it landed: no snapshot names it (`check`
+                // names a collected object).
+                tracing::error!(
                     generation,
-                    elapsed_secs = first.until(&now).as_secs(),
-                    "index head created long after its first object PUT"
+                    elapsed_secs = from.until(&now).as_secs(),
+                    "index head created after its objects' grace; the write fails"
                 );
+                return Err(slow_index_write_after_create(INDEX_WRITE_LIMIT));
             }
             if let Some(bytes) = w.segment_written {
                 debug!(bytes, generation, "index segment written");

@@ -360,8 +360,9 @@ fn backup_with_fold(c: &Client, name: &str) {
         .unwrap();
 }
 
-/// An unnamed `index.d/` object two hours old: older than the GC grace
-/// relative to anything just written, and named by no head.
+/// An unnamed `index.d/` object thirteen hours old: older than the
+/// objects' GC grace (12 h) relative to anything just written, and named by
+/// no head.
 fn plant_old_debris(server: &Server) -> PathBuf {
     let debris = server
         .data
@@ -373,7 +374,7 @@ fn plant_old_debris(server: &Server) -> PathBuf {
         .write(true)
         .open(&debris)
         .unwrap()
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .set_modified(std::time::SystemTime::now() - PAST_T_PACK)
         .unwrap();
     debris
 }

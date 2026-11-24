@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-after-conditional",
-  "note": "Conditional twin of late-head-segment-collected-after (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the fold created the generation first, so the late create finds it taken; the GC judged by a head nothing can replace.",
+  "note": "Conditional twin of late-head-segment-collected-after (the same case on \"storage\": \"Conditional\"). Closed on conditional stores by 04 step 8 (phase F part 9): the fold created the generation first, so the late create finds it taken; the GC judged by a head nothing can replace. Re-derived with the plain seed for phase F part 10b2 (the same decisions; see its note). Unchanged signatures.",
   "expect": [],
   "at": [
     [
@@ -113,6 +113,22 @@
     ],
     [
       {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
         "Step": {
           "client": 0,
           "pick": 0
@@ -191,14 +207,6 @@
         }
       },
       "fold-prefix +local +local"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 10860
-        }
-      },
-      "advance"
     ],
     [
       {
@@ -294,6 +302,8 @@
       0,
       0,
       0,
+      7,
+      7,
       0,
       0,
       0,
@@ -303,7 +313,6 @@
       0,
       0,
       0,
-      6,
       0,
       0,
       0,

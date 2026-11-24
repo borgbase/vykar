@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-inherited",
-  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's old segment). Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-inherited-conditional is the same case on a conditional store.",
+  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's old segment). Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-inherited-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the jumps of 61 s, 61 s and 6 h 1 min left compact's segment younger than the object grace, so the case now takes two 6 h 1 min jumps between the backup's head create and the release of compact's late head (the collection's \"now\" is the mtime of the key the late PUT overwrote, so they age the segment without touching the backup's own write); the 61 s jumps are dropped (MAX_ADVANCES). Unchanged signatures.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -52,14 +52,6 @@
     ],
     [
       {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
-    ],
-    [
-      {
         "Step": {
           "client": 0,
           "pick": 0
@@ -84,14 +76,6 @@
         }
       },
       "sync-index"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
     ],
     [
       {
@@ -157,6 +141,14 @@
     ],
     [
       {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
         "Release": {
           "parked": 0
         }
@@ -207,11 +199,9 @@
       0,
       0,
       0,
-      4,
       0,
       0,
       0,
-      3,
       0,
       0,
       0,
@@ -219,7 +209,8 @@
       0,
       0,
       7,
-      5
+      7,
+      2
     ],
     "policy": "First"
   }

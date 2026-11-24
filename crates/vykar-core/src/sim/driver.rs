@@ -645,15 +645,18 @@ pub enum Signature {
     /// H3-compact: a released write of `index.h/`, and the index names an
     /// absent pack. Since 04 step 5 compact deletes only orphan packs older
     /// than T_pack (12 h). A jump after the failed commit ages its segment
-    /// past T_idx too, so the compact's index GC takes it and the case shows
-    /// `LateHeadSegmentCollected` instead; the packs must age before the
+    /// past the object grace too (T_idx until phase F part 10b2, T_pack
+    /// since: `index_store::INDEX_OBJECT_GRACE`), so the compact's index GC
+    /// takes it and the case shows `LateHeadSegmentCollected` instead; the packs must age before the
     /// segment is written (jumps between the uploads and the commit lock,
     /// seed `late-head-then-compact-old-packs`). Since 04 step 7 (phase F
     /// part 8b) I8 narrows it further: a backup whose marker went
     /// unrefreshed commits only while its packs are younger than T_pack − M
     /// − 30 min at its fence, so the packs must age 40 to 60 min after the
-    /// fence while the segment stays younger than T_idx, which the driver's
-    /// jumps cannot make (that seed now shows its commit refusing). A
+    /// fence while the segment stays younger than the object grace, which
+    /// the driver's jumps could not make while that grace was T_idx (that
+    /// seed shows its commit refusing; with T_pack since part 10b2 the
+    /// window is open again in principle, not re-searched by a seed). A
     /// backup whose marker is refreshed throughout passes I8 at any age, so
     /// production still reaches it; the driver never refreshes markers (its
     /// clock moves only by jumps), and the scripted test
@@ -666,7 +669,8 @@ pub enum Signature {
     /// timed out names a segment of its failed commit; before the late
     /// write lands, a later publisher's `collect_index_garbage` (any
     /// publisher, not only compact) deletes that segment, which no head
-    /// named and which was older than `INDEX_GC_GRACE` after a jump of
+    /// named and which was older than the object grace
+    /// (`INDEX_OBJECT_GRACE`, 12 h since phase F part 10b2) after jumps of
     /// time. The released head then names an absent segment. Requires a
     /// released `index.h/` write at step h and a `HeadObjectAbsent` whose
     /// object had an applied delete before h and after that head PUT was
@@ -680,8 +684,8 @@ pub enum Signature {
     LateHeadSegmentCollected,
     /// 04 "Current issues" 3 with the second holder coming from the 6 h
     /// lock staleness: victim V wrote an `index.d/` segment S under its
-    /// lock; a jump of time ages the lock past the stale age (and S past
-    /// `INDEX_GC_GRACE`); another client reaps the lock and its index GC
+    /// lock; jumps of time age the lock past the stale age (and S past
+    /// `INDEX_OBJECT_GRACE`); another client reaps the lock and its index GC
     /// deletes S, which no head names yet (the limit
     /// `collect_index_garbage`'s doc names); V's head PUT, outside any
     /// lock, then names S. Requires all of: an aged reap of V's lock at
@@ -697,8 +701,13 @@ pub enum Signature {
     /// age, the segment collected at T_idx = 1 h). Closed on conditional
     /// stores by 04 step 8 (phase F part 9): the reaper's compact created
     /// the generation before collecting, so the victim's create finds it
-    /// taken (its retry's writes after the reap stay `AgedLockReaped`'s);
-    /// the fallback (`Plain`) keeps it.
+    /// taken (its retry's writes after the reap stay `AgedLockReaped`'s).
+    /// Closed on every store by phase F part 10b2: S is collected only once
+    /// 12 h old (`INDEX_OBJECT_GRACE`), and V's head create refuses when its
+    /// first object PUT started more than 11 h 20 min before
+    /// (`ages::INDEX_WRITE_LIMIT`; seed `aged-lock-segment-collected`).
+    /// A head PUT issued before that and released late is
+    /// `LateHeadSegmentCollected`'s.
     AgedLockSegmentCollected,
     /// The same aged reap with packs instead of a segment: victim V's lock
     /// and session marker age past their staleness in one jump of time;
@@ -716,16 +725,15 @@ pub enum Signature {
     /// part 8b) I8 narrows it: V's head must pass its fence before its
     /// packs are T_pack − M − 30 min old (11 h 20 min), so the last jump
     /// must come after the fence (a stall after it, the lost-lock hazard).
-    /// Since phase F part 8c no driver case reaches it: V writes every
-    /// index object before its fence, so the jump that ages its lock ages
-    /// them past T_idx too, and the compact's index GC collects them (no
-    /// head names them yet). V's head then names an absent segment, and a
-    /// later eligible fold of V's keeps that segment named (a segment its listing
-    /// lacks reads young; before 8c the fold carried its entries into a
-    /// base from V's cache and hid the loss): `AgedLockSegmentCollected`
-    /// (seeds `aged-lock-packs-collected{,-old-packs}`). More jumps would
-    /// not change that, so it is not `MAX_ADVANCES` (3) that keeps it out
-    /// of reach. The scripted test
+    /// From phase F part 8c to 10b2 no driver case reached it: V writes
+    /// every index object before its fence, so the jump that aged its lock
+    /// aged them past T_idx too, and the compact's index GC collected them
+    /// (no head names them yet); V's head then named an absent segment, and
+    /// a later eligible fold of V's kept that segment named (a segment its
+    /// listing lacks reads young): `AgedLockSegmentCollected`. Since 10b2
+    /// unreferenced index objects are kept 12 h (`INDEX_OBJECT_GRACE`), so a
+    /// segment about 6 h old at the compact stays and the case shows this
+    /// signature again (seed `aged-lock-packs-collected-old-packs`). The scripted test
     /// `an_aged_lock_head_names_packs_compact_deleted` (tests/sim.rs)
     /// shows it with the compact's `index.d/` deletes failing. In production
     /// it is reached whenever the compact's index GC does not take V's

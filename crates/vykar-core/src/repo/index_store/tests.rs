@@ -1120,12 +1120,21 @@ impl Aged {
         }
     }
 
-    /// Make `key` two hours old.
+    /// Make `key` thirteen hours old: past both graces.
     fn age(&self, key: &str) {
         self.mtimes.lock().unwrap().insert(
             key.to_string(),
-            self.now - std::time::Duration::from_secs(7200),
+            self.now - std::time::Duration::from_secs(13 * 3600),
         );
+    }
+
+    /// Make every key aged so far `age` old instead.
+    fn reage_all(&self, age: std::time::Duration) {
+        for mtime in self.mtimes.lock().unwrap().values_mut() {
+            if *mtime < self.now {
+                *mtime = self.now - age;
+            }
+        }
     }
 
     /// Give `key` the mtime `now + ahead` (a future mtime).
@@ -1243,7 +1252,7 @@ fn gc_garbage() -> Vec<String> {
     keys_of(&[1, 3, 200])
 }
 
-const GRACE: std::time::Duration = INDEX_GC_GRACE;
+const GRACE: IndexGcGrace = IndexGcGrace::DEFAULT;
 
 /// STORE-4: heads below latest − 16 that are old go, with the objects no
 /// kept head names that are old.
@@ -1263,6 +1272,34 @@ fn collect_index_garbage_keeps_recent_young_and_named() {
     // A second run finds nothing more.
     let again = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
     assert_eq!((again.heads_deleted, again.objects_deleted), (0, 0));
+}
+
+/// The split grace (10b2): an old head goes after `INDEX_GC_GRACE` (1 h),
+/// an unnamed object only after `INDEX_OBJECT_GRACE` (12 h). At two hours
+/// the fixture's old heads go and every object stays, the objects of the
+/// deleted heads included; at twelve hours those objects go too.
+#[test]
+fn gc_keeps_unnamed_objects_for_twelve_hours_and_heads_for_one() {
+    assert_eq!(GRACE.heads, crate::repo::ages::T_IDX);
+    assert_eq!(GRACE.objects, crate::repo::ages::T_PACK);
+    let storage = Aged::new();
+    let latest = gc_fixture(&storage);
+    let before = remaining(&storage);
+    storage.reage_all(std::time::Duration::from_secs(2 * 3600));
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, None);
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (2, 0));
+    assert_eq!(remaining(&storage), before);
+
+    storage.reage_all(INDEX_OBJECT_GRACE - std::time::Duration::from_secs(60));
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
+    assert_eq!(remaining(&storage), before);
+
+    storage.reage_all(INDEX_OBJECT_GRACE);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 3));
+    assert_eq!(remaining(&storage), remaining_after_gc());
 }
 
 /// 04's order (step 8): the objects are listed before the heads, so an

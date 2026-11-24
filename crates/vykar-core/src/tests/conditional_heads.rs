@@ -739,6 +739,111 @@ fn a_named_segment_the_store_lacks_refuses_the_fold() {
     assert_eq!(latest_head(&sim).generation, head.generation);
 }
 
+/// Phase F part 10b2: an index write whose first object PUT started more
+/// than `INDEX_WRITE_LIMIT` − `HEAD_LANDING_ALLOWANCE` (11 h 20 min) before
+/// its head create refuses the create (its objects may be collected before
+/// the head lands); a minute less still commits. A retry with fresh objects
+/// commits.
+#[test]
+fn an_index_write_older_than_the_object_grace_is_refused() {
+    use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT};
+    let edge = INDEX_WRITE_LIMIT - HEAD_LANDING_ALLOWANCE;
+    assert_eq!(edge, Duration::from_secs(11 * 3600 + 20 * 60));
+    let minute = Duration::from_secs(60);
+    for (stall, refused) in [(edge - minute, false), (edge + minute, true)] {
+        let mut sim = sim_of(StoreKind::Conditional);
+        let a = sim.client("a");
+        let mut ra = open(&sim, a, sim.host_env(a));
+        commit_whole(&mut ra, "a0", &[b"chunk a0"]);
+        let before = latest_head(&sim);
+        let mut m = session(&mut ra, "a1", &[b"chunk a1"]);
+        step_until(&mut ra, &mut m, at_put_head).unwrap();
+        sim.advance(stall);
+        let from = sim.store().step();
+        let result = step_until(&mut ra, &mut m, |_| false);
+        if !refused {
+            result.unwrap();
+            assert!(m.take_output().is_some());
+            assert_eq!(latest_head(&sim).generation, before.generation + 1);
+            continue;
+        }
+        let err = result.unwrap_err();
+        assert_eq!(
+            crate::sim::history::classify(&err),
+            ErrorClass::Allowed(AllowedError::SlowIndexWrite),
+            "{err}"
+        );
+        let creates: Vec<OpRecord> = ops_after(&sim, a, from)
+            .into_iter()
+            .filter(|r| {
+                r.key.starts_with("index.h/") && r.op != OpKind::Get && r.op != OpKind::List
+            })
+            .collect();
+        assert!(creates.is_empty(), "no head written: {creates:?}");
+        assert_eq!(latest_head(&sim), before);
+        let mut retry = open(&sim, a, sim.host_env(a));
+        commit_whole(&mut retry, "a2", &[b"chunk a2"]);
+        assert_eq!(latest_head(&sim).generation, before.generation + 1);
+    }
+}
+
+/// Phase F part 10b2: a head create that returns more than
+/// `INDEX_WRITE_LIMIT` (11 h 50 min) after the write's first object PUT
+/// started fails the backup before its snapshot: the head is created, but
+/// a collector may have judged its objects old before it landed.
+#[test]
+fn a_head_created_after_the_object_grace_fails_the_backup() {
+    let mut sim = sim_of(StoreKind::Conditional);
+    let a = sim.client("a");
+    sim.backup(a, "a0", &tree("a0")).expect_ok();
+    let before = latest_head(&sim);
+    let gate = sim.gate(GateRule::new(
+        a,
+        OpMatch::Kind(OpKind::PutIfAbsent),
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let run = sim.spawn(
+        a,
+        Call::Backup {
+            snapshot: "a1".into(),
+            tree: tree("a1"),
+        },
+    );
+    sim.expect_paused(gate, "a's head create");
+    sim.advance(crate::repo::ages::INDEX_WRITE_LIMIT + Duration::from_secs(60));
+    sim.resume(gate);
+    let run = sim.join(run);
+    assert_eq!(
+        run.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::SlowIndexWrite)),
+        "{}",
+        run.detail()
+    );
+    assert_eq!(latest_head(&sim).generation, before.generation + 1);
+    let recs = records(&sim, a, run.index);
+    assert!(
+        !recs.iter().any(|r| r.key.starts_with("snapshots/")
+            && r.op != OpKind::List
+            && r.op != OpKind::Get),
+        "no snapshot written: {recs:?}"
+    );
+    assert!(
+        run.detail()
+            .contains("written without its snapshot; the next run continues from it"),
+        "{}",
+        run.detail()
+    );
+    let report = sim.check_invariants(&[Invariant::HeadsImmutable, Invariant::IndexIntegrity]);
+    assert!(report.is_clean(), "{report}");
+    // The next run continues from the snapshot-less head.
+    sim.restore(a, "a0").expect_ok();
+    sim.backup(a, "a2", &tree("a2")).expect_ok();
+    assert_eq!(latest_head(&sim).generation, before.generation + 2);
+    sim.restore(a, "a2").expect_ok();
+    sim.check_invariants(&[Invariant::HeadsImmutable, Invariant::IndexIntegrity])
+        .assert_clean();
+}
+
 /// The index garbage collection runs only right after its caller created
 /// the latest head: a handle that wrote no head deletes no old unreferenced
 /// object; after its own head write it does.
@@ -748,7 +853,7 @@ fn gc_needs_the_callers_own_head() {
     let a = sim.client("a");
     let junk = format!("index.d/{}", "ab".repeat(32));
     sim.tamper_put(&junk, b"unreferenced");
-    sim.advance(crate::repo::ages::T_IDX + Duration::from_secs(60));
+    sim.advance(index_store::INDEX_OBJECT_GRACE + Duration::from_secs(60));
     let mut ra = open(&sim, a, sim.host_env(a));
     ra.maintain_segmented_index().unwrap();
     assert!(sim.store().object(&junk).is_some(), "no head of its own");

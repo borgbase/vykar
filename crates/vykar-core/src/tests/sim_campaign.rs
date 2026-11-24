@@ -59,18 +59,27 @@ struct CampaignReport {
 }
 
 /// The signatures 04 step 8 closes on a store that honours put-if-absent.
-const CLOSED_ON_CONDITIONAL: [Signature; 5] = [
+const CLOSED_ON_CONDITIONAL: [Signature; 4] = [
     Signature::LateHeadWrite,
     Signature::LateHeadThenCompact,
     Signature::LateHeadSegmentCollected,
-    Signature::AgedLockSegmentCollected,
     Signature::AgedLockPacksCollected,
 ];
 
-/// The campaign's rule: damage no signature explains, or, on the
-/// conditional store, damage of a shape 04 step 8 closed there.
+/// The signatures closed on every store. `AgedLockSegmentCollected` (phase
+/// F part 10b2: the 12 h object grace and the slow-index-write refusal)
+/// needs no exemption for a head PUT released late: the signature requires
+/// a non-released head PUT, and a released-late one is
+/// `LateHeadSegmentCollected`'s, which stays closed on the conditional
+/// store only.
+const CLOSED_EVERYWHERE: [Signature; 1] = [Signature::AgedLockSegmentCollected];
+
+/// The campaign's rule: damage no signature explains, damage of a shape
+/// closed on every store, or, on the conditional store, damage of a shape
+/// 04 step 8 closed there.
 fn unknown(o: &Outcome) -> bool {
     o.signatures.contains(&Signature::Unknown)
+        || CLOSED_EVERYWHERE.iter().any(|s| o.signatures.contains(s))
         || (o.trace.case.storage == StoreKind::Conditional
             && CLOSED_ON_CONDITIONAL
                 .iter()

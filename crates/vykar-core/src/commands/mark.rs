@@ -136,6 +136,12 @@ pub(crate) fn load_snapshots_strict(
                 VykarError::Other(format!("snapshot object {key}: {e}"))
             }
         };
+        // Under the maintenance lock nobody deletes a snapshot between the
+        // listing and this GET, so a listed key that is gone is a reaped lock,
+        // an out-of-band delete or a false "not found", and the snapshot may
+        // be live. Lock-free deletes (10d) may skip it only after a second
+        // listing of snapshots/, taken after the GETs, no longer shows it; a
+        // key still listed with a not-found keeps failing closed.
         let blob = repo
             .storage
             .get(key)

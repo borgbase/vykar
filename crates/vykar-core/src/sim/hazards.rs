@@ -873,7 +873,8 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
 /// a lost lock plus a late PUT; 04 step 8 (create-if-absent heads) fixes it.
 ///
 /// Since 04 step 5 the compact keeps orphan packs younger than T_pack. A
-/// plain wait of T_pack would also age a's segment past T_idx, and the
+/// plain wait of T_pack would also age a's segment past the object grace
+/// (T_idx then; T_pack, the same 12 h, since phase F part 10b2), and the
 /// compact's index GC would collect it (the loud shape again). The route
 /// is a store clock step of T_pack + 1 min between a's pack uploads and
 /// its segment PUT (an NTP correction on the server, as for H2 and H4):

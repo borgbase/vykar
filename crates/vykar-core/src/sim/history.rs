@@ -37,6 +37,10 @@ pub enum AllowedError {
     /// A reader whose planned chunk a concurrent compact removed
     /// (`ChunkRemovedDuringRead`, also inside `RestoreSourceUnreadable`).
     RemovedDuringRead,
+    /// An index write refused at its head create because its first object
+    /// upload started longer ago than its objects' grace allows
+    /// (`ages::INDEX_WRITE_LIMIT`; a time jump inside the write).
+    SlowIndexWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +68,9 @@ pub fn classify(err: &VykarError) -> ErrorClass {
         VykarError::Other(m) if m.contains(INDEX_CHANGED_TEXT) => Some(AllowedError::IndexChanged),
         VykarError::Other(m) if m.starts_with(crate::commands::compact::MARK_REFUSED) => {
             Some(AllowedError::MarkRefused)
+        }
+        VykarError::Other(m) if m.starts_with(crate::repo::ages::SLOW_INDEX_WRITE_TEXT) => {
+            Some(AllowedError::SlowIndexWrite)
         }
         _ => None,
     };

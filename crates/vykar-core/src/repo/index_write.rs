@@ -192,10 +192,11 @@ impl Repository {
         self.pending_sweep = Some(p);
     }
 
-    /// Set the grace of the index garbage collection (tests).
+    /// Set both graces of the index garbage collection, heads' and
+    /// objects' (tests).
     #[cfg(test)]
     pub(crate) fn set_index_gc_grace(&mut self, grace: std::time::Duration) {
-        self.index_gc_grace = grace;
+        self.index_gc_grace = index_store::IndexGcGrace::both(grace);
     }
 
     /// The next head's generation: `prev.generation + 1`; with no readable head

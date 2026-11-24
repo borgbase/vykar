@@ -54,9 +54,54 @@ pub(crate) const HEAD_PREFIX: &str = "index.h/";
 pub(crate) const HEAD_CONTEXT: &[u8] = b"index.h";
 pub(crate) const SWEEP_RECORD_CONTEXT: &[u8] = b"index.d/sweep";
 
-/// How long an unreferenced index object or an old head is kept, by the
+/// How long an old head (below the kept generations) is kept, by the
 /// storage's clock (04's T_idx).
 pub(crate) const INDEX_GC_GRACE: std::time::Duration = super::ages::T_IDX;
+
+/// How long an unreferenced `index.d/` object is kept, by the storage's
+/// clock: T_pack (12 h), not T_idx. A collector deletes an object O that no
+/// listed retained head names only once now − mtime(O) reaches this grace,
+/// "now" being the mtime of the head the collector created. A writer whose
+/// head names O creates it above that head's generation, so after the
+/// collector's listing: at least this grace after mtime(O), and mtime(O) is
+/// at or after the writer's stamp taken before O's PUT started. A writer
+/// refuses to create a head when its first object PUT started more than
+/// [`super::ages::INDEX_WRITE_LIMIT`] (this grace − M) minus the landing
+/// allowance before (about 11 h 20 min), and fails before its snapshot
+/// after a create that returned more than `INDEX_WRITE_LIMIT` after it, so
+/// no head it publishes names an object a collector judged old (M absorbs
+/// the rate difference of the two clocks).
+/// Objects a write did not PUT (kept segments, the predecessor's base) are
+/// named by the predecessor head, which the collector retains. Without the
+/// lock this is what keeps a slow writer's objects; under it, it only makes
+/// garbage stay longer: every fold in the last 12 h leaves its predecessor's
+/// base and folded segments, and each lost fold attempt its own base.
+pub(crate) const INDEX_OBJECT_GRACE: std::time::Duration = super::ages::T_PACK;
+
+/// The two graces of [`collect_index_garbage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndexGcGrace {
+    /// Old heads below the kept generations ([`INDEX_GC_GRACE`]).
+    pub heads: std::time::Duration,
+    /// Unreferenced `index.d/` objects ([`INDEX_OBJECT_GRACE`]).
+    pub objects: std::time::Duration,
+}
+
+impl IndexGcGrace {
+    pub(crate) const DEFAULT: Self = Self {
+        heads: INDEX_GC_GRACE,
+        objects: INDEX_OBJECT_GRACE,
+    };
+
+    /// Both graces `grace` (tests).
+    #[cfg(test)]
+    pub(crate) const fn both(grace: std::time::Duration) -> Self {
+        Self {
+            heads: grace,
+            objects: grace,
+        }
+    }
+}
 
 /// Heads kept below the latest regardless of age (04: latest − 16).
 pub(crate) const HEADS_KEPT: u64 = 16;
@@ -993,10 +1038,10 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// Delete old heads and old unreferenced `index.d/` objects, by 04's rule
 /// and the storage's clock:
 /// - heads: keep `latest`, every generation >= `latest.generation - HEADS_KEPT`,
-///   and every head younger than `grace`; delete the others;
+///   and every head younger than `grace.heads`; delete the others;
 /// - objects: keep every object a kept head names
-///   ([`IndexHead::named_objects`]) and every object younger than `grace`;
-///   delete the others.
+///   ([`IndexHead::named_objects`]) and every object younger than
+///   `grace.objects`; delete the others.
 ///
 /// "Now" is the listed mtime of `latest`, the head the caller created (the
 /// storage's clock, not the client's: 04 "Constants", the mtime of an object
@@ -1025,10 +1070,11 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// `index.d/` is listed before `index.h/` (04's order): a writer that read
 /// `latest` or later PUTs its new objects after that read, so an object the
 /// heads listing does not cover was PUT after the object listing (not
-/// listed, not deleted) or is younger than `grace` at "now" (the heads
-/// listing includes `latest`, so "now" is its mtime) — unless the
-/// writer's head lands more than `grace` after it read `latest`, which the
-/// lock excludes today. On a plaintext repository an index object's name is a
+/// listed, not deleted) or is younger than `grace.objects` at "now" (the
+/// heads listing includes `latest`, so "now" is its mtime) — unless the
+/// writer's head lands more than `grace.objects` after its first object
+/// PUT started, which the lock excludes and the writer itself refuses
+/// ([`INDEX_OBJECT_GRACE`]). On a plaintext repository an index object's name is a
 /// function of its content, so a writer can re-create an old unreferenced
 /// name the listing saw as old; harmless while the lock keeps collectors away
 /// from writers (recorded for the owner with 04 step 9: plaintext
@@ -1037,7 +1083,7 @@ pub(crate) fn collect_index_garbage(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     latest: &IndexHead,
-    grace: std::time::Duration,
+    grace: IndexGcGrace,
 ) -> Result<IndexGcStats> {
     let mut stats = IndexGcStats::default();
     // An append-only server refuses every delete below: skip the listings too.
@@ -1068,14 +1114,14 @@ pub(crate) fn collect_index_garbage(
         return Ok(stats);
     };
     // Age 0 when the mtime is missing or newer than "now".
-    let old = |mtime: Option<std::time::SystemTime>| {
+    let old = |mtime: Option<std::time::SystemTime>, grace: std::time::Duration| {
         mtime.is_some_and(|m| now.duration_since(m).unwrap_or_default() >= grace)
     };
 
     let floor = latest.generation.saturating_sub(HEADS_KEPT);
     let (doomed, kept): (Vec<_>, Vec<_>) =
         heads.iter().copied().partition(|&(generation, mtime)| {
-            generation != latest.generation && generation < floor && old(mtime)
+            generation != latest.generation && generation < floor && old(mtime, grace.heads)
         });
 
     // Read the kept heads before deleting anything.
@@ -1116,7 +1162,7 @@ pub(crate) fn collect_index_garbage(
 
     let garbage: Vec<String> = objects
         .iter()
-        .filter(|(name, mtime)| !keep.contains(name) && old(*mtime))
+        .filter(|(name, mtime)| !keep.contains(name) && old(*mtime, grace.objects))
         .map(|(name, _)| object_key(name))
         .collect();
     if garbage.is_empty() {

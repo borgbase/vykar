@@ -1,10 +1,7 @@
 {
   "name": "aged-lock-segment-collected-later-runs",
-  "note": "Second campaign of phase F part 2 (random-2011597032612029699): shape A (aged lock, compact's index GC takes the unpublished segment, the holder's head names it), with a later backup that started before the head PUT and fails on the missing segment after it. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-later-runs-conditional is the same case on a conditional store.",
-  "expect": [
-    "AgedLockReaped",
-    "AgedLockSegmentCollected"
-  ],
+  "note": "Second campaign of phase F part 2 (random-2011597032612029699): shape A (aged lock, compact's index GC takes the unpublished segment, the holder's head names it), with a later backup that started before the head PUT and fails on the missing segment after it. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-later-runs-conditional is the same case on a conditional store with the schedule of before 10b2 (see its note). Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): after the jumps of 61 s, 6 h 1 min and 61 s the segment is younger than the object grace, compact keeps it and only AgedLockReaped is left, so the case now takes two 6 h 1 min jumps after the fence (the 61 s jumps dropped). Compact collects the 12 h 2 min old segment; the holder's head create then refuses (AllowedError::SlowIndexWrite), the later backup commits, and the case is clean. AgedLockSegmentCollected is closed on every store by 10b2 for head writes that are not released late.",
+  "expect": [],
   "at": [
     [
       {
@@ -23,14 +20,6 @@
         }
       },
       "lock"
-    ],
-    [
-      {
-        "Advance": {
-          "secs": 61
-        }
-      },
-      "advance"
     ],
     [
       {
@@ -115,7 +104,7 @@
     [
       {
         "Advance": {
-          "secs": 61
+          "secs": 21660
         }
       },
       "advance"
@@ -145,7 +134,7 @@
           "pick": 0
         }
       },
-      "put-head +local"
+      "put-head"
     ]
   ],
   "case": {
@@ -183,7 +172,6 @@
     "choices": [
       0,
       0,
-      3,
       0,
       0,
       0,
@@ -193,8 +181,8 @@
       0,
       0,
       7,
-      3,
-      4,
+      7,
+      1,
       1,
       0
     ],

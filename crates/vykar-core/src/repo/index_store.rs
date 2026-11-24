@@ -998,14 +998,15 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 ///   ([`IndexHead::named_objects`]) and every object younger than `grace`;
 ///   delete the others.
 ///
-/// "Now" is the newest mtime in the two listings (the storage's clock, not
-/// the client's). A listed entry with an mtime in the future moves "now"
-/// forward and over-estimates every other age. That damage is bounded: the
-/// latest head and the [`HEADS_KEPT`] below it are kept whatever their age,
-/// and so is every object a kept head names; only an object no recent head
-/// names can go early (a concurrent writer's object not yet named by its
-/// head among them). An entry without an mtime counts as age 0; with no mtime
-/// at all nothing is deleted (`skipped = "no mtimes"`). A kept head other
+/// "Now" is the listed mtime of `latest`, the head the caller created (the
+/// storage's clock, not the client's: 04 "Constants", the mtime of an object
+/// this client has just written). Not the newest listed mtime: one entry
+/// with a future mtime (a stepped server clock) would move "now" forward
+/// and make every young unnamed object look old. When the heads listing
+/// lacks `latest` (a stale listing) nothing is deleted (`skipped = "own
+/// head not listed"`); when it lists `latest` without an mtime (a store
+/// without mtimes), neither (`skipped = "no mtimes"`). Another entry
+/// without an mtime counts as age 0. A kept head other
 /// than `latest` that cannot be read stops the object part (`skipped =
 /// "unreadable retained head"`); heads already deleted stay deleted. A head
 /// whose delete failed is still treated as not kept, so its objects may go:
@@ -1025,7 +1026,7 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// `latest` or later PUTs its new objects after that read, so an object the
 /// heads listing does not cover was PUT after the object listing (not
 /// listed, not deleted) or is younger than `grace` at "now" (the heads
-/// listing includes `latest`, so "now" is at least its mtime) — unless the
+/// listing includes `latest`, so "now" is its mtime) — unless the
 /// writer's head lands more than `grace` after it read `latest`, which the
 /// lock excludes today. On a plaintext repository an index object's name is a
 /// function of its content, so a writer can re-create an old unreferenced
@@ -1055,13 +1056,14 @@ pub(crate) fn collect_index_garbage(
         .into_iter()
         .filter_map(|o| Some((vykar_protocol::head_generation(&o.key)?, o.mtime)))
         .collect();
-    let Some(now) = heads
-        .iter()
-        .map(|h| h.1)
-        .chain(objects.iter().map(|o| o.1))
-        .flatten()
-        .max()
-    else {
+    // "Now" on the store's clock: the mtime of the head the caller created,
+    // listed after the objects. Not the newest listed mtime: one entry with
+    // a future mtime would make every young unnamed object look old.
+    let Some(own) = heads.iter().find(|h| h.0 == latest.generation) else {
+        stats.skipped = Some("own head not listed");
+        return Ok(stats);
+    };
+    let Some(now) = own.1 else {
         stats.skipped = Some("no mtimes");
         return Ok(stats);
     };

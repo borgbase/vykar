@@ -2029,7 +2029,9 @@ fn backup_with(
         .unwrap();
     let mut commit = pending.begin_commit(guard);
     let result = commit.drive(&no_events);
-    commit.finish(result, &mut None).unwrap();
+    commit
+        .finish(result, &mut None, &crate::repo::control::CancelToken::new())
+        .unwrap();
 }
 
 /// A backup whose commit folds (requested: the hard limit's stand-in)

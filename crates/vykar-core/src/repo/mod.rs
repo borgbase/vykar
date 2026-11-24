@@ -65,8 +65,10 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 use vykar_types::hash::HashAlgorithm;
 
+use self::control::CancelToken;
 use self::file_cache::FileCache;
 use self::manifest::Manifest;
+use vykar_types::snapshot_id::SnapshotId;
 
 /// The repository layout version, resolved once from the stored `config`.
 ///
@@ -548,6 +550,13 @@ pub struct Repository {
     index_dirty: bool,
     /// Whether the file cache has been modified since last persist.
     file_cache_dirty: bool,
+    /// The on-disk file cache as this handle loaded or last saved it; a
+    /// different file at save time means another process saved since.
+    file_cache_stamp: Option<file_cache::FileCacheStamp>,
+    /// Section keys this handle wrote into `file_cache` since its last save.
+    file_cache_written: std::collections::BTreeSet<String>,
+    /// Anchors of the sections this handle invalidated since its last save.
+    file_cache_dropped: std::collections::HashSet<SnapshotId>,
     /// Override for the cache directory root (from config `cache_dir`).
     cache_dir_override: Option<PathBuf>,
     /// Local tree-chunk cache; None without a cache dir.
@@ -605,6 +614,16 @@ pub struct Repository {
     relocation: relocate::RelocationCache,
 }
 
+/// What [`Repository::save_file_cache_cancellable`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileCacheSave {
+    /// Another process had saved since this handle loaded or saved: the
+    /// number of its sections taken over. None: a plain save.
+    pub(crate) merged: Option<usize>,
+    /// Whether the save held `filecache.lock`.
+    pub(crate) locked: bool,
+}
+
 impl Repository {
     /// Clock and identity of this client.
     pub fn host_env(&self) -> &HostEnv {
@@ -633,17 +652,134 @@ impl Repository {
 
     /// Save the file cache to local disk if it has been modified.
     /// Returns `Ok(())` if no save was needed or the save succeeded.
+    /// See `save_file_cache_cancellable`: the merge with another process's
+    /// save and the local lock.
     pub fn save_file_cache_if_dirty(&mut self) -> Result<()> {
+        self.save_file_cache_cancellable(&CancelToken::new())
+            .map(|_| ())
+    }
+
+    /// Record that this handle invalidated the sections anchored at `ids`:
+    /// a merged save does not take them back from another process's copy.
+    pub(crate) fn note_file_cache_dropped(&mut self, ids: impl IntoIterator<Item = SnapshotId>) {
+        self.file_cache_dropped.extend(ids);
+    }
+
+    /// Record that this handle wrote the section `key` (it replaces the
+    /// other process's copy in a merged save).
+    pub(crate) fn note_file_cache_written(&mut self, key: &str) {
+        self.file_cache_written.insert(key.to_string());
+    }
+
+    /// Save the file cache if dirty, merged with another process's save.
+    ///
+    /// Two processes on one host (a daemon and a CLI run) share the cache
+    /// directory. The save takes the local lock `filecache.lock` beside the
+    /// file ([`file_cache::FileCacheLock`]; polled for at most
+    /// [`file_cache::FILE_CACHE_LOCK_WAIT`] or until `cancel`, since it runs
+    /// after the commit point with the commit lock held; then it saves
+    /// without the lock, with one warning). When the file is the one this
+    /// handle loaded or last saved (its stamp), the save is a single atomic
+    /// write as before. When another process replaced it, the copies of the
+    /// sections this handle did not write are dropped as stale, the file is
+    /// re-read without the sections this handle wrote, and its sections are
+    /// taken over except those anchored at a snapshot this handle
+    /// invalidated. For a root both processes wrote, the last save wins;
+    /// every section stays consistent with its own anchor snapshot. A file
+    /// that does not read, decrypt or carry this binary's format byte is not
+    /// merged: the save writes everything this handle holds, as when the
+    /// file is its own. A file that fails later, mid-decode, contributes
+    /// nothing, and the copies of the sections this handle did not write are
+    /// already dropped then. A save without the lock keeps no stamp, so the
+    /// next save merges. On error `dirty` and what this handle wrote and
+    /// dropped are kept.
+    ///
+    /// Returns None when nothing was saved (not dirty, or no cache dir).
+    pub(crate) fn save_file_cache_cancellable(
+        &mut self,
+        cancel: &CancelToken,
+    ) -> Result<Option<FileCacheSave>> {
         if !self.file_cache_dirty {
-            return Ok(());
+            return Ok(None);
+        }
+        let Some(path) =
+            file_cache::FileCache::cache_path(&self.config.id, self.cache_dir_override.as_deref())
+        else {
+            self.file_cache_dirty = false;
+            return Ok(None);
+        };
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let lock = match file_cache::FileCacheLock::acquire(
+            dir,
+            self.host_env.clock.as_ref(),
+            cancel,
+            file_cache::FILE_CACHE_LOCK_WAIT,
+        ) {
+            Ok(lock) => Some(lock),
+            Err(file_cache::FileCacheLockError::TimedOut) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "another process held the file cache lock for {} s; saving the file \
+                     cache without it (a save running beside this one may drop this \
+                     run's sections or the other's, and the next backup of those \
+                     sources walks cold)",
+                    file_cache::FILE_CACHE_LOCK_WAIT.as_secs()
+                );
+                None
+            }
+            Err(file_cache::FileCacheLockError::Cancelled) => {
+                tracing::info!(
+                    "cancelled while waiting for the file cache lock; saving without it"
+                );
+                None
+            }
+            Err(file_cache::FileCacheLockError::Unavailable(e)) => {
+                tracing::debug!(dir = %dir.display(), "file cache lock unavailable ({e}); saving without it");
+                None
+            }
+        };
+        let on_disk = file_cache::FileCacheStamp::of(&path);
+        let mut merged = None;
+        if on_disk.is_some()
+            && on_disk != self.file_cache_stamp
+            && let Some(plaintext) =
+                file_cache::FileCache::read_mergeable(&path, self.crypto.as_ref())
+        {
+            // Drop the stale copies before the decode builds the other
+            // process's sections: the two are never held together.
+            self.file_cache.retain_sections_in(&self.file_cache_written);
+            let other =
+                file_cache::FileCache::decode_except(&path, &plaintext, &self.file_cache_written);
+            drop(plaintext);
+            let adopted = self
+                .file_cache
+                .adopt_sections(other, &self.file_cache_dropped);
+            tracing::info!(
+                adopted,
+                "file cache merged with the sections another process saved"
+            );
+            merged = Some(adopted);
         }
         self.file_cache.save(
             &self.config.id,
             self.crypto.as_ref(),
             self.cache_dir_override.as_deref(),
         )?;
+        // Under the lock no other save renamed over this one yet, so the file
+        // is this save's. Without it the file may already be another
+        // process's: no stamp, so the next save re-reads and merges.
+        let locked = lock.is_some();
+        self.file_cache_stamp = if locked {
+            file_cache::FileCacheStamp::of(&path)
+        } else {
+            None
+        };
+        self.file_cache_written.clear();
+        self.file_cache_dropped.clear();
         self.file_cache_dirty = false;
-        Ok(())
+        drop(lock);
+        Ok(Some(FileCacheSave { merged, locked }))
     }
 
     /// The repository layout format, resolved at open time.

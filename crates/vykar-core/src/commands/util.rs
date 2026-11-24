@@ -221,7 +221,25 @@ pub(crate) fn refuse_on_append_only_server(
 /// compact no horizon (no orphan pack is deleted), after that they are
 /// reaped like any stale marker (`break-lock --sessions` clears them at
 /// once). A failed listing refuses.
+///
+/// The session listing runs inside the fence (it is
+/// `list_live_sessions_under_lock` called first in the action): a failed
+/// listing returns through the fence's epilogue, which releases the lock.
 pub fn with_maintenance_lock<T>(
+    repo: &mut Repository,
+    action: impl FnOnce(&mut Repository) -> Result<T>,
+) -> Result<T> {
+    with_maintenance_lock_unlisted(repo, |repo| {
+        list_live_sessions_under_lock(repo)?;
+        action(repo)
+    })
+}
+
+/// [`with_maintenance_lock`] without the session listing: acquire, remove
+/// probe debris, fence, `lock_store_time`, run, release. The action lists
+/// sessions itself ([`list_live_sessions_under_lock`]) where the order
+/// matters: compact, after its pack listing (04 "Compact" 1).
+pub(crate) fn with_maintenance_lock_unlisted<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
@@ -230,17 +248,24 @@ pub fn with_maintenance_lock<T>(
     // An uncontended acquirer never probes the store's clock, so it removes
     // the old probes its acquisition listed (best effort).
     guard.remove_probe_debris(repo.storage.as_ref());
+    run_under_fence(repo, guard, action)
+}
 
+/// The stale-session reap and the live listing of [`with_maintenance_lock`],
+/// for an action already under the maintenance lock; sets
+/// `Repository::live_sessions`. "Now" is `Repository::lock_store_time`.
+/// Fails closed: without the listing compact would not know whose uploads
+/// to keep, so a failed listing refuses the maintenance.
+pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()> {
     // Clean up stale sessions; the ones kept are live. Backups may run
     // beside maintenance (04 step 7): compact keeps their uploads by age and
-    // by their marker's horizon. Fail closed: without the listing compact
-    // would not know whose uploads to keep.
+    // by their marker's horizon.
     let stale_threshold = lock::default_stale_session_duration();
     let live = match lock::cleanup_stale_sessions_keeping(
         repo.storage.as_ref(),
         stale_threshold,
-        &env,
-        guard.store_time(),
+        repo.host_env(),
+        repo.lock_store_time(),
     ) {
         Ok((cleaned, live)) => {
             if !cleaned.is_empty() {
@@ -253,7 +278,6 @@ pub fn with_maintenance_lock<T>(
             live
         }
         Err(e) => {
-            let _ = lock::release_lock(repo.storage.as_ref(), guard);
             return Err(VykarError::Other(format!(
                 "cannot clean up stale backup sessions (storage error: {e}); \
                  refusing maintenance to avoid data loss"
@@ -267,7 +291,7 @@ pub fn with_maintenance_lock<T>(
         );
     }
     repo.set_live_sessions(Some(live));
-    run_under_fence(repo, guard, action)
+    Ok(())
 }
 
 #[cfg(test)]

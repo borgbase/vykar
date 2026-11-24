@@ -472,7 +472,7 @@ pub(crate) fn run_scoped(
         commit.drive(&events)
     };
     commit
-        .finish(result, &mut progress)
+        .finish(result, &mut progress, shutdown)
         .map_err(|e| (FailureScope::Repository, e))
 }
 

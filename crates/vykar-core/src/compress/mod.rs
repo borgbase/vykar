@@ -362,19 +362,31 @@ pub fn decompress_metadata(data: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Returns the value and the decompressed size in bytes.
 pub fn decode_metadata_msgpack<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(T, u64)> {
-    presize::with_input_budget(data.len(), || decode_metadata_msgpack_inner(data))
+    decode_metadata_msgpack_seed(data, std::marker::PhantomData::<T>)
 }
 
-fn decode_metadata_msgpack_inner<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(T, u64)> {
+/// [`decode_metadata_msgpack`] through a [`serde::de::DeserializeSeed`], for
+/// a decode that needs state (e.g. which parts of the value to skip).
+pub(crate) fn decode_metadata_msgpack_seed<T, S>(data: &[u8], seed: S) -> Result<(T, u64)>
+where
+    S: for<'de> serde::de::DeserializeSeed<'de, Value = T>,
+{
+    presize::with_input_budget(data.len(), || decode_metadata_msgpack_inner(data, seed))
+}
+
+fn decode_metadata_msgpack_inner<T, S>(data: &[u8], seed: S) -> Result<(T, u64)>
+where
+    S: for<'de> serde::de::DeserializeSeed<'de, Value = T>,
+{
     if data.first() != Some(&TAG_ZSTD) {
         let raw = decompress_metadata(data)?;
-        let value = rmp_serde::from_slice(&raw)?;
+        let value = seed.deserialize(&mut rmp_serde::Deserializer::from_read_ref(&raw))?;
         return Ok((value, raw.len() as u64));
     }
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&data[1..]))
         .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
     let mut reader = MsgpackStreamReader::new(decoder.take(MAX_METADATA_DECOMPRESS_SIZE + 1));
-    let value = rmp_serde::from_read(&mut reader)?;
+    let value = seed.deserialize(&mut rmp_serde::Deserializer::new(&mut reader))?;
     let total = reader
         .drain()
         .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;

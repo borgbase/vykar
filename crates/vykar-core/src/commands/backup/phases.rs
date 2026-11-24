@@ -165,12 +165,13 @@ pub(super) fn phase1_upload(
             repo.manifest().snapshots.iter().map(|s| s.id).collect();
         let invalidated = repo
             .file_cache_mut()
-            .invalidate_missing_snapshots(&|id| snapshot_ids.contains(id));
-        if invalidated > 0 {
+            .invalidate_missing_snapshots_collect(&|id| snapshot_ids.contains(id));
+        if !invalidated.is_empty() {
             info!(
-                invalidated,
+                invalidated = invalidated.len(),
                 "invalidated file cache sections for deleted snapshots"
             );
+            repo.note_file_cache_dropped(invalidated);
             repo.mark_file_cache_dirty();
         }
     }
@@ -603,10 +604,13 @@ impl CommitInProgress {
     /// End Phase 2 once the machine ended with `result`: the post-commit
     /// work, deregistration and lock release on success; on failure,
     /// deregistration, the lock release, then `flush_on_abort`.
+    /// `shutdown` only shortens the post-commit wait for the local
+    /// file-cache lock.
     pub(crate) fn finish(
         self,
         result: Result<Committed>,
         progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+        shutdown: &CancelToken,
     ) -> Result<BackupOutcome> {
         let Self {
             mut session,
@@ -631,26 +635,32 @@ impl CommitInProgress {
         let ok = result.is_ok();
         let result = result.map(|committed| {
             let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
-            repo.finish_backup_commit(committed, &mut report.new_file_cache, &events, || {
-                let guard = session.guard.take();
-                let storage = Arc::clone(&repo_storage);
-                let session_id = session.id.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("session-cleanup".into())
-                    .spawn(move || {
-                        drop(guard);
-                        // All entries are in the persisted index now. Best-effort —
-                        // a stale journal is harmless.
-                        crate::repo::session_journal::clear_pending_index(
-                            storage.as_ref(),
-                            &session_id,
-                        );
-                    });
-                match spawned {
-                    Ok(handle) => cleanup = Some(handle),
-                    Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
-                }
-            });
+            repo.finish_backup_commit(
+                committed,
+                &mut report.new_file_cache,
+                &events,
+                shutdown,
+                || {
+                    let guard = session.guard.take();
+                    let storage = Arc::clone(&repo_storage);
+                    let session_id = session.id.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("session-cleanup".into())
+                        .spawn(move || {
+                            drop(guard);
+                            // All entries are in the persisted index now. Best-effort —
+                            // a stale journal is harmless.
+                            crate::repo::session_journal::clear_pending_index(
+                                storage.as_ref(),
+                                &session_id,
+                            );
+                        });
+                    match spawned {
+                        Ok(handle) => cleanup = Some(handle),
+                        Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
+                    }
+                },
+            );
         });
         let journal_cleared = cleanup.is_some();
         if let Some(handle) = cleanup.take() {

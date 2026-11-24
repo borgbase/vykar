@@ -355,7 +355,9 @@ fn backup_with_fold(c: &Client, name: &str) {
         .unwrap();
     let mut commit = pending.begin_commit(guard);
     let result = commit.drive(&no_events);
-    commit.finish(result, &mut None).unwrap();
+    commit
+        .finish(result, &mut None, &crate::repo::control::CancelToken::new())
+        .unwrap();
 }
 
 /// An unnamed `index.d/` object two hours old: older than the GC grace

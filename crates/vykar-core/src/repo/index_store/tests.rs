@@ -1127,6 +1127,14 @@ impl Aged {
             self.now - std::time::Duration::from_secs(7200),
         );
     }
+
+    /// Give `key` the mtime `now + ahead` (a future mtime).
+    fn ahead(&self, key: &str, ahead: std::time::Duration) {
+        self.mtimes
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), self.now + ahead);
+    }
 }
 
 impl InnerBackend for Aged {
@@ -1309,6 +1317,40 @@ fn collect_index_garbage_without_mtimes_deletes_nothing() {
     assert_eq!(stats.skipped, Some("no mtimes"));
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
     assert_eq!(list_head_generations(&mem).unwrap().len(), 20);
+}
+
+/// "Now" is the mtime of the head the caller created, not the newest listed
+/// mtime: an unnamed object with a future mtime neither moves "now" (the
+/// young object 201 stays) nor is old itself; the old object 200 goes.
+#[test]
+fn gc_now_is_the_own_heads_mtime() {
+    let storage = Aged::new();
+    let latest = gc_fixture(&storage);
+    storage.put(&object_key(&gc_name(202)), b"x").unwrap();
+    storage.ahead(
+        &object_key(&gc_name(202)),
+        std::time::Duration::from_secs(10 * 3600),
+    );
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, None);
+    assert_eq!(stats.objects_deleted, 3, "{stats:?}");
+    assert!(!storage.exists(&object_key(&gc_name(200))).unwrap());
+    assert!(storage.exists(&object_key(&gc_name(201))).unwrap());
+    assert!(storage.exists(&object_key(&gc_name(202))).unwrap());
+}
+
+/// A heads listing that lacks the caller's own head (a stale listing)
+/// deletes nothing.
+#[test]
+fn gc_skips_without_the_own_head() {
+    let storage = Aged::new();
+    gc_fixture(&storage);
+    let before = remaining(&storage);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &gc_head(21), GRACE).unwrap();
+    assert_eq!(stats.skipped, Some("own head not listed"));
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
+    assert_eq!(remaining(&storage), before);
+    assert_eq!(list_head_generations(&storage).unwrap().len(), 20);
 }
 
 /// STORE-6: a kept head that does not decode stops the object part; the

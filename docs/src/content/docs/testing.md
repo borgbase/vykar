@@ -72,7 +72,7 @@ The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `s
 | `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
 | `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
 | `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
-| `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` | Manual msgpack marker parsing, allocation cap, legacy fallback |
+| `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext`, `FileCache::decode_from_plaintext_skipping` | Manual msgpack marker parsing, allocation cap, legacy fallback |
 | `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring for chunk, index, head, base and segment objects, tag authentication |
 | `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
 | `fuzz_index_base_v2` | `validate_base_body`, `BaseWriter` | Fixed-width base body: counts against the length, sort order, pack slots, unreferenced packs; re-encode identity |

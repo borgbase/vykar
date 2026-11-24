@@ -64,7 +64,7 @@ fn flush_reads(reads: &mut Vec<String>, lines: &mut Vec<String>) {
 /// `locks/` reads right before its first `locks/` write; phase 1 uploads
 /// from worker threads), without `sessions/*.index` writes (the final
 /// journal PUT runs in the background until the commit's flush joins it).
-pub(super) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRecord> {
+pub(crate) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRecord> {
     let mine: Vec<OpRecord> = sim
         .store()
         .log()
@@ -276,11 +276,11 @@ fn compact_after_delete_writes_a_record_and_a_segment() {
             "ListMeta index.d/ ok",
             "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
+            "reads packs/",
             "Put index.d/ ok x2",
             "Exists locks/ ok",
             "Put index.h/ ok",
             "Exists locks/ ok",
-            "reads packs/",
             "Delete packs/ ok x2",
             "Get index.h/ ok x4",
             "List index.h/ ok",
@@ -322,6 +322,7 @@ fn compact_with_nothing_to_remove_writes_a_head_only() {
             "ListMeta index.d/ ok",
             "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
+            "reads packs/",
             "Put index.d/ ok",
             "Exists locks/ ok",
             "Put index.h/ ok",
@@ -330,7 +331,6 @@ fn compact_with_nothing_to_remove_writes_a_head_only() {
             "List packmaps/ ok",
             "ListMeta index.d/ ok",
             "ListMeta index.h/ ok",
-            "reads packs/",
             "Delete locks/ ok",
         ],
     );

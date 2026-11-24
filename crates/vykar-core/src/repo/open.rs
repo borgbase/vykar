@@ -69,6 +69,10 @@ fn storage_label(init_opts: Option<&InitOptions>) -> String {
         .unwrap_or_else(|| "the configured server".to_string())
 }
 
+/// The file cache loading beside the open, and the stamp of the file it read.
+type FileCacheLoad =
+    std::thread::JoinHandle<(FileCache, Option<super::file_cache::FileCacheStamp>)>;
+
 impl Repository {
     /// Initialize a new repository.
     pub fn init(
@@ -286,6 +290,9 @@ impl Repository {
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,
+            file_cache_stamp: None,
+            file_cache_written: Default::default(),
+            file_cache_dropped: Default::default(),
             cache_dir_override: cache_dir,
             tree_cache,
             host_env: HostEnv::system(),
@@ -338,9 +345,11 @@ impl Repository {
             repo.sync_index(head, true)
         });
         if let Some(handle) = file_cache_load {
-            repo.file_cache = handle
+            let (cache, stamp) = handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            repo.file_cache = cache;
+            repo.file_cache_stamp = stamp;
         }
         if let Some(synced) = synced {
             let start = std::time::Instant::now();
@@ -367,7 +376,7 @@ impl Repository {
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
         opts: &OpenOptions,
-    ) -> Result<(Self, Option<std::thread::JoinHandle<FileCache>>)> {
+    ) -> Result<(Self, Option<FileCacheLoad>)> {
         // Read config
         let config_data = storage
             .get("config")?
@@ -444,7 +453,9 @@ impl Repository {
             let cache_dir = cache_dir.clone();
             let spawned = std::thread::Builder::new()
                 .name("file-cache-load".into())
-                .spawn(move || FileCache::load(&repo_id, crypto.as_ref(), cache_dir.as_deref()));
+                .spawn(move || {
+                    FileCache::load_stamped(&repo_id, crypto.as_ref(), cache_dir.as_deref())
+                });
             match spawned {
                 Ok(handle) => Some(handle),
                 Err(e) => {
@@ -512,6 +523,9 @@ impl Repository {
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,
+            file_cache_stamp: None,
+            file_cache_written: Default::default(),
+            file_cache_dropped: Default::default(),
             cache_dir_override: cache_dir,
             tree_cache,
             host_env: opts.host_env.for_new_run(),

@@ -1428,7 +1428,7 @@ impl<'c> Driver<'c> {
         self.label(i, "finish");
         let Running { run, commit } = *r;
         let outcome = commit
-            .finish(result, &mut None)
+            .finish(result, &mut None, &crate::repo::control::CancelToken::new())
             .map(|o| (Vec::new(), format!("partial: {}", o.is_partial)));
         self.end_run(i, run, outcome);
         "finish".into()

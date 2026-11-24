@@ -1074,8 +1074,11 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact List snapshots/",
     "compact List index.h/",
     "compact Get index.h/",
-    // (the maintenance lock is taken in the decision before) the session
-    // cleanup, whose listing also gives the live sessions
+    // (the maintenance lock is taken in the decision before) the pack
+    // listing first (04 "Compact" 1; the first shard, the rest in the same
+    // decision), then the session cleanup, whose listing also gives the
+    // live sessions
+    "compact ListMeta packs/",
     "compact ListMeta sessions/",
     // index load under the lock; the segments' ages (04 step 7); marks
     "compact List index.h/",
@@ -1090,8 +1093,6 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact Put index.d/",
     "compact Exists locks/",
     "compact Put index.h/",
-    // pack listing (the first shard; the rest in the same decision)
-    "compact ListMeta packs/",
     // the repack batch: fence, head re-read, segment, fence, head, deletes
     "compact Exists locks/",
     "compact List index.h/",

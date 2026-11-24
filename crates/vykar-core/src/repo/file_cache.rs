@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,6 +8,8 @@ use tracing::{debug, info, warn};
 use crate::cache_paths::repo_cache_dir;
 use crate::compress;
 use crate::platform::fs::path_starts_with;
+use crate::repo::control::CancelToken;
+use crate::repo::host_env::Clock;
 use crate::snapshot::item::ChunkRef;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
@@ -42,6 +44,108 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     vykar_common::fs::fdatasync_file(tmp.as_file())?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Identity of the on-disk file cache as this process read or wrote it:
+/// enough to tell whether another process replaced it since.
+/// [`atomic_write`]'s rename gives every save a new inode on Unix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileCacheStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// (dev, ino) on Unix; None elsewhere.
+    inode: Option<(u64, u64)>,
+}
+
+impl FileCacheStamp {
+    /// The stamp of the file at `path` now; None when it is absent or
+    /// cannot be stat'ed.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            Some((meta.dev(), meta.ino()))
+        };
+        #[cfg(not(unix))]
+        let inode = None;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        })
+    }
+}
+
+/// How long a file-cache save waits for another process's save on the same
+/// cache directory before it saves without the lock. The save runs after the
+/// commit point, with the repository's commit lock still held, so it must
+/// never block for long.
+pub(crate) const FILE_CACHE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Interval of the polls of [`FileCacheLock::acquire`].
+const FILE_CACHE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The local advisory lock that serialises the file-cache saves of the
+/// processes sharing one cache directory: an OS file lock on
+/// `<cache dir>/filecache.lock`, released on drop (and by the OS when the
+/// process dies). The lock file is never deleted: deleting a lock file
+/// others may hold open defeats it.
+#[derive(Debug)]
+pub(crate) struct FileCacheLock {
+    _file: std::fs::File,
+}
+
+/// Why [`FileCacheLock::acquire`] returned without the lock.
+#[derive(Debug)]
+pub(crate) enum FileCacheLockError {
+    /// Another process held it for the whole wait.
+    TimedOut,
+    /// The caller's token was cancelled while waiting.
+    Cancelled,
+    /// The lock file cannot be opened or locked here (e.g. a filesystem
+    /// without locks).
+    Unavailable(std::io::Error),
+}
+
+impl FileCacheLock {
+    /// Name of the lock file in the repository's cache directory.
+    pub(crate) const FILE_NAME: &'static str = "filecache.lock";
+
+    /// Take the lock in `dir`, polling a non-blocking attempt every 100 ms
+    /// for at most `max_wait` on `clock`; stops early when `cancel` is
+    /// cancelled.
+    pub(crate) fn acquire(
+        dir: &Path,
+        clock: &dyn Clock,
+        cancel: &CancelToken,
+        max_wait: std::time::Duration,
+    ) -> std::result::Result<Self, FileCacheLockError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(Self::FILE_NAME))
+            .map_err(FileCacheLockError::Unavailable)?;
+        let start = clock.monotonic();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(FileCacheLockError::Unavailable(e));
+                }
+            }
+            if cancel.is_cancelled() {
+                return Err(FileCacheLockError::Cancelled);
+            }
+            let waited = clock.elapsed(start);
+            if waited >= max_wait {
+                return Err(FileCacheLockError::TimedOut);
+            }
+            clock.sleep(FILE_CACHE_LOCK_POLL.min(max_wait - waited));
+        }
+    }
 }
 
 use super::format::{
@@ -403,6 +507,108 @@ pub struct FileCache {
     retained_hits: BTreeMap<String, RetainedHits>,
 }
 
+/// Deserializes a [`FileCache`] like its derived `Deserialize`, but consumes
+/// the value of every section whose key is in `skip` as
+/// [`serde::de::IgnoredAny`], so those sections are never built (the merged
+/// save of `Repository::save_file_cache_if_dirty`).
+struct CacheExcept<'a> {
+    skip: &'a BTreeSet<String>,
+}
+
+/// The `sections` map of [`CacheExcept`].
+struct SectionsExcept<'a> {
+    skip: &'a BTreeSet<String>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for CacheExcept<'_> {
+    type Value = FileCache;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<FileCache, D::Error> {
+        deserializer.deserialize_struct("FileCache", &["sections"], self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CacheExcept<'_> {
+    type Value = FileCache;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("struct FileCache")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<FileCache, A::Error> {
+        let sections = seq
+            .next_element_seed(SectionsExcept { skip: self.skip })?
+            .ok_or_else(|| serde::de::Error::invalid_length(0, &"struct FileCache"))?;
+        Ok(FileCache {
+            sections,
+            ..FileCache::new()
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<FileCache, A::Error> {
+        let mut sections = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "sections" {
+                if sections.is_some() {
+                    return Err(serde::de::Error::duplicate_field("sections"));
+                }
+                sections = Some(map.next_value_seed(SectionsExcept { skip: self.skip })?);
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        let sections = sections.ok_or_else(|| serde::de::Error::missing_field("sections"))?;
+        Ok(FileCache {
+            sections,
+            ..FileCache::new()
+        })
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for SectionsExcept<'_> {
+    type Value = BTreeMap<String, CacheSection>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SectionsExcept<'_> {
+    type Value = BTreeMap<String, CacheSection>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a map of file cache sections")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut sections = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if self.skip.contains(&key) {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            } else {
+                let section = map.next_value::<CacheSection>()?;
+                sections.insert(key, section);
+            }
+        }
+        Ok(sections)
+    }
+}
+
 /// Structured outcome of decoding an on-disk cache blob. `load` matches on
 /// this so a rejected-to-empty result does not masquerade as a legitimately
 /// empty decode in the logs.
@@ -757,10 +963,64 @@ impl FileCache {
     /// Remove sections whose anchor snapshot no longer exists.
     /// Returns the number of sections invalidated.
     pub fn invalidate_missing_snapshots(&mut self, exists: &dyn Fn(&SnapshotId) -> bool) -> usize {
-        let before = self.sections.len();
-        self.sections
-            .retain(|_label, section| exists(&section.anchor_snapshot_id));
-        before - self.sections.len()
+        self.invalidate_missing_snapshots_collect(exists).len()
+    }
+
+    /// [`Self::invalidate_missing_snapshots`], returning the anchors of the
+    /// removed sections (what a merged save must not take back from another
+    /// process's copy, see `Repository::save_file_cache_if_dirty`).
+    pub(crate) fn invalidate_missing_snapshots_collect(
+        &mut self,
+        exists: &dyn Fn(&SnapshotId) -> bool,
+    ) -> Vec<SnapshotId> {
+        let mut removed = Vec::new();
+        self.sections.retain(|_label, section| {
+            let keep = exists(&section.anchor_snapshot_id);
+            if !keep {
+                removed.push(section.anchor_snapshot_id);
+            }
+            keep
+        });
+        removed
+    }
+
+    /// Keep only the sections whose key is in `keys`: before a merged save,
+    /// the copies of the sections this process did not write are stale (the
+    /// disk holds the other process's current ones).
+    pub(crate) fn retain_sections_in(&mut self, keys: &BTreeSet<String>) {
+        self.sections.retain(|key, _| keys.contains(key));
+    }
+
+    /// Take over the sections of `other` (another process's saved copy,
+    /// decoded without the sections this process wrote), except those
+    /// anchored at a snapshot this process invalidated. Returns how many
+    /// were taken.
+    pub(crate) fn adopt_sections(
+        &mut self,
+        other: FileCache,
+        dropped: &HashSet<SnapshotId>,
+    ) -> usize {
+        let mut adopted = 0;
+        for (key, section) in other.sections {
+            if dropped.contains(&section.anchor_snapshot_id) {
+                continue;
+            }
+            self.sections.insert(key, section);
+            adopted += 1;
+        }
+        adopted
+    }
+
+    /// The section keys, in order (tests).
+    #[cfg(test)]
+    pub(crate) fn section_keys(&self) -> Vec<String> {
+        self.sections.keys().cloned().collect()
+    }
+
+    /// The anchor of the section for `root` (tests).
+    #[cfg(test)]
+    pub(crate) fn section_anchor(&self, root: &str) -> Option<SnapshotId> {
+        self.sections.get(root).map(|s| s.anchor_snapshot_id)
     }
 
     /// Return a human-readable reason why sections are missing for some roots.
@@ -814,6 +1074,16 @@ impl FileCache {
         })
     }
 
+    /// [`Self::decode_from_plaintext`] without building the sections named in
+    /// `skip` (the decode of a merged save); exposed for the fuzz target.
+    #[doc(hidden)]
+    pub fn decode_from_plaintext_skipping(plaintext: &[u8], skip: &BTreeSet<String>) -> Self {
+        match Self::decode_from_plaintext_outcome_except(plaintext, Some(skip)) {
+            CacheDecode::Loaded(cache) => cache,
+            CacheDecode::Rejected { .. } | CacheDecode::Malformed { .. } => Self::new(),
+        }
+    }
+
     /// Structured decode: lets callers distinguish "decoded fine" from
     /// "rejected to empty" from "malformed input", so log sites aren't
     /// forced to claim every empty cache was legitimately empty.
@@ -829,6 +1099,15 @@ impl FileCache {
     /// catches msgpack containers whose inflated length headers rmp_serde
     /// happened to fill with garbage.
     fn decode_from_plaintext_outcome(plaintext: &[u8]) -> CacheDecode {
+        Self::decode_from_plaintext_outcome_except(plaintext, None)
+    }
+
+    /// [`Self::decode_from_plaintext_outcome`]; with `skip`, the sections
+    /// named in it are consumed without being built (`CacheExcept`).
+    fn decode_from_plaintext_outcome_except(
+        plaintext: &[u8],
+        skip: Option<&BTreeSet<String>>,
+    ) -> CacheDecode {
         let Some((&first, rest)) = plaintext.split_first() else {
             return CacheDecode::Malformed {
                 error: "empty plaintext".into(),
@@ -846,7 +1125,11 @@ impl FileCache {
         }
         // Decode straight out of the zstd stream: the decompressed msgpack
         // (larger than the cache itself) is never materialized.
-        match compress::decode_metadata_msgpack::<FileCache>(rest) {
+        let decoded = match skip {
+            None => compress::decode_metadata_msgpack::<FileCache>(rest),
+            Some(skip) => compress::decode_metadata_msgpack_seed(rest, CacheExcept { skip }),
+        };
+        match decoded {
             Ok((cache, raw_len)) => {
                 let max_entries =
                     usize::try_from(raw_len).unwrap_or(usize::MAX) / Self::MIN_BYTES_PER_ENTRY;
@@ -864,7 +1147,7 @@ impl FileCache {
     }
 
     /// Return the local filesystem path for the cache file.
-    fn cache_path(repo_id: &[u8], cache_dir_override: Option<&Path>) -> Option<PathBuf> {
+    pub(crate) fn cache_path(repo_id: &[u8], cache_dir_override: Option<&Path>) -> Option<PathBuf> {
         repo_cache_dir(repo_id, cache_dir_override).map(|d| d.join("filecache"))
     }
 
@@ -875,31 +1158,89 @@ impl FileCache {
         crypto: &dyn CryptoEngine,
         cache_dir_override: Option<&Path>,
     ) -> Self {
+        Self::load_stamped(repo_id, crypto, cache_dir_override).0
+    }
+
+    /// [`Self::load`], with the stamp of the file as loaded (None: no file).
+    /// The file is stat'ed **before** it is read: a replacement between the
+    /// two makes the stamp older than the content, so the next save merges
+    /// needlessly, never loses.
+    pub(crate) fn load_stamped(
+        repo_id: &[u8],
+        crypto: &dyn CryptoEngine,
+        cache_dir_override: Option<&Path>,
+    ) -> (Self, Option<FileCacheStamp>) {
         let Some(path) = Self::cache_path(repo_id, cache_dir_override) else {
-            return Self::new();
+            return (Self::new(), None);
         };
-        let plaintext = {
-            let data = match std::fs::read(&path) {
-                Ok(d) => d,
-                Err(_) => {
-                    debug!(path = %path.display(), "file cache: no cache file on disk, starting fresh");
-                    return Self::new();
-                }
-            };
-            match unpack_object_expect_with_context(
-                &data,
-                ObjectType::FileCache,
-                b"filecache",
-                crypto,
-            ) {
-                Ok(pt) => pt,
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "file cache: failed to decrypt (stale or corrupt cache file?), starting fresh");
-                    return Self::new();
-                }
+        let stamp = FileCacheStamp::of(&path);
+        let Some(plaintext) = Self::read_plaintext(&path, crypto) else {
+            return (Self::new(), stamp);
+        };
+        (Self::decode_logged(&path, &plaintext), stamp)
+    }
+
+    /// The plaintext of the cache at `path` as another process saved it
+    /// (still compressed), when it reads, decrypts and carries this binary's
+    /// format byte; None (logged) otherwise. A merged save checks this
+    /// before it drops anything, so a file it cannot merge (another
+    /// binary's format, garbage) leaves this process's copy whole.
+    pub(crate) fn read_mergeable(path: &Path, crypto: &dyn CryptoEngine) -> Option<Vec<u8>> {
+        let plaintext = Self::read_plaintext(path, crypto)?;
+        match plaintext.first() {
+            Some(&FORMAT_VERSION_BYTE) => Some(plaintext),
+            first => {
+                warn!(
+                    path = %path.display(),
+                    format_byte = ?first,
+                    "file cache on disk has another format; not merged"
+                );
+                None
+            }
+        }
+    }
+
+    /// The plaintext [`Self::read_mergeable`] returned for `path`, decoded
+    /// without the sections named in `skip` (never built: the caller is about
+    /// to replace them). Empty when the decode fails.
+    pub(crate) fn decode_except(path: &Path, plaintext: &[u8], skip: &BTreeSet<String>) -> Self {
+        match Self::decode_from_plaintext_outcome_except(plaintext, Some(skip)) {
+            CacheDecode::Loaded(cache) => cache,
+            CacheDecode::Rejected { reason } => {
+                info!(path = %path.display(), reason, "file cache on disk rejected; not merged");
+                Self::new()
+            }
+            CacheDecode::Malformed { error } => {
+                warn!(path = %path.display(), error, "file cache on disk cannot be decoded; not merged");
+                Self::new()
+            }
+        }
+    }
+
+    /// The decrypted plaintext of the cache file; None (logged) when it is
+    /// absent or does not decrypt.
+    fn read_plaintext(path: &Path, crypto: &dyn CryptoEngine) -> Option<Vec<u8>> {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                debug!(path = %path.display(), "file cache: no cache file on disk, starting fresh");
+                return None;
             }
         };
-        match Self::decode_from_plaintext_outcome(&plaintext) {
+        match unpack_object_expect_with_context(&data, ObjectType::FileCache, b"filecache", crypto)
+        {
+            Ok(pt) => Some(pt),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "file cache: failed to decrypt (stale or corrupt cache file?), starting fresh");
+                None
+            }
+        }
+    }
+
+    /// Decode `plaintext` read from `path`, logging the outcome as
+    /// [`Self::load`] does.
+    fn decode_logged(path: &Path, plaintext: &[u8]) -> Self {
+        match Self::decode_from_plaintext_outcome(plaintext) {
             CacheDecode::Loaded(cache) => {
                 let total_entries: usize = cache.sections.values().map(|s| s.entries.len()).sum();
                 info!(
@@ -1226,6 +1567,71 @@ mod tests {
     /// Helper to build a Vec<String> from path literals.
     fn roots(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// Sections /a, /b, /c, each with one entry and its own anchor.
+    fn three_sections() -> FileCache {
+        let mut cache = FileCache::new();
+        for (i, root) in ["/a", "/b", "/c"].into_iter().enumerate() {
+            let mut write = FileCache::new();
+            write.begin_sections(&roots(&[root]), &[0]);
+            write.insert(&format!("{root}/f"), 1, 1, 1, 1, 1, sample_chunk_refs());
+            write.finalize_sections(SnapshotId::from_bytes([i as u8 + 1; 32]));
+            for (key, section) in write.take_active_sections() {
+                cache.merge_section(&key, section);
+            }
+        }
+        cache
+    }
+
+    fn decoded_except(plaintext: &[u8], skip: &[&str]) -> FileCache {
+        let skip: BTreeSet<String> = skip.iter().map(|s| s.to_string()).collect();
+        match FileCache::decode_from_plaintext_outcome_except(plaintext, Some(&skip)) {
+            CacheDecode::Loaded(cache) => cache,
+            _ => panic!("not loaded"),
+        }
+    }
+
+    #[test]
+    fn decode_except_skips_named_sections() {
+        let plaintext = encode_plaintext_v2(&three_sections());
+        let cache = decoded_except(&plaintext, &["/b"]);
+        assert_eq!(
+            cache.section_keys(),
+            vec!["/a".to_string(), "/c".to_string()]
+        );
+        assert_eq!(cache.section_len("/a"), 1);
+        assert_eq!(
+            cache.section_anchor("/c"),
+            Some(SnapshotId::from_bytes([3; 32]))
+        );
+        // Skipping nothing decodes what the derived decode does.
+        let all = decoded_except(&plaintext, &[]);
+        let derived = FileCache::decode_from_plaintext(&plaintext).unwrap();
+        assert_eq!(all.section_keys(), derived.section_keys());
+        assert_eq!(all.len(), derived.len());
+
+        // The map form of the struct (field names) decodes too.
+        let mut named = vec![FORMAT_VERSION_BYTE];
+        crate::compress::compress_stream_zstd(&mut named, 3, |enc| {
+            three_sections().serialize(&mut rmp_serde::Serializer::new(enc).with_struct_map())?;
+            Ok(())
+        })
+        .unwrap();
+        let cache = decoded_except(&named, &["/a", "/c"]);
+        assert_eq!(cache.section_keys(), vec!["/b".to_string()]);
+
+        // A malformed or absent file is not mergeable; a stream that fails
+        // mid-decode contributes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("filecache");
+        std::fs::write(&path, b"not a file cache").unwrap();
+        let crypto =
+            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        assert!(FileCache::read_mergeable(&path, &crypto).is_none());
+        assert!(FileCache::read_mergeable(&dir.path().join("absent"), &crypto).is_none());
+        let truncated = &plaintext[..plaintext.len() / 2];
+        assert!(FileCache::decode_except(&path, truncated, &BTreeSet::new()).is_empty());
     }
 
     #[test]

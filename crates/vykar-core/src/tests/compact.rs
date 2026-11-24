@@ -1731,3 +1731,142 @@ fn orphans_inside_a_live_horizon_are_kept() {
         }
     }
 }
+
+/// 04 "Compact" 1: compact lists the packs first, then the sessions, then
+/// reads the head, then lists the snapshots (the mark).
+#[test]
+fn compact_lists_packs_before_sessions_and_head() {
+    use crate::sim::Sim;
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "t0", &crate::sim::SourceTree::seeded("t0", 2, 16 * 1024))
+        .expect_ok();
+    let r = sim.compact(c);
+    r.expect_ok();
+    let recs = crate::tests::commit_op_order::run_records(&sim, &r, false);
+    let lock = recs
+        .iter()
+        .position(|r| r.op.is_write() && r.key.starts_with("locks/"))
+        .expect("the maintenance lock");
+    let first = |prefix: &str| {
+        recs.iter()
+            .enumerate()
+            .skip(lock + 1)
+            .find(|(_, r)| r.key.starts_with(prefix))
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| panic!("no {prefix} op under the lock"))
+    };
+    let order = ["packs/", "sessions/", "index.h/", "snapshots/"].map(first);
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "first ops under the lock at {order:?} (packs/, sessions/, index.h/, snapshots/)"
+    );
+}
+
+/// The pack listing precedes the mark: a pack PUT during the mark is not
+/// analysed by this run, however old its mtime, while an old orphan listed
+/// before goes.
+#[test]
+fn a_pack_uploaded_during_the_mark_is_not_analysed() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
+    use vykar_types::pack_id::PackId;
+
+    /// Puts `late` (with an old mtime) at the first `snapshots/` listing
+    /// once armed.
+    struct PutDuringMark {
+        inner: Arc<crate::testutil::MemoryBackend>,
+        armed: AtomicBool,
+        late: String,
+        old: std::time::SystemTime,
+    }
+
+    impl InnerBackend for PutDuringMark {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            self.inner.as_ref()
+        }
+    }
+
+    delegate_storage_backend! {
+        for PutDuringMark;
+        except [list, list_sized, list_meta, server_ops];
+
+        fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
+            self.during_mark(prefix)?;
+            self.inner.list(prefix)
+        }
+
+        fn list_sized(
+            &self,
+            prefix: &str,
+        ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+            self.during_mark(prefix)?;
+            self.inner.list_sized(prefix)
+        }
+
+        fn list_meta(
+            &self,
+            prefix: &str,
+        ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+            self.during_mark(prefix)?;
+            self.inner.list_meta(prefix)
+        }
+
+        fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+            None
+        }
+    }
+
+    impl PutDuringMark {
+        fn during_mark(&self, prefix: &str) -> vykar_types::error::Result<()> {
+            if prefix.starts_with("snapshots/") && self.armed.swap(false, Ordering::SeqCst) {
+                self.inner
+                    .put(&self.late, b"a pack uploaded during the mark")?;
+                self.inner.set_mtime(&self.late, self.old);
+            }
+            Ok(())
+        }
+    }
+
+    crate::testutil::init_test_environment();
+    let mem = Arc::new(crate::testutil::MemoryBackend::with_mtimes());
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(13 * 3600);
+    let early = PackId::from_bytes([0x11; 32]).storage_key();
+    let late = PackId::from_bytes([0x22; 32]).storage_key();
+    let wrapped = Arc::new(PutDuringMark {
+        inner: Arc::clone(&mem),
+        armed: AtomicBool::new(false),
+        late: late.clone(),
+        old,
+    });
+    let storage: Arc<dyn StorageBackend> = wrapped.clone();
+    let mut repo = crate::repo::Repository::init(
+        Box::new(storage),
+        crate::repo::EncryptionMode::None,
+        crate::repo::ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    mem.put(&early, b"an orphan pack listed before the mark")
+        .unwrap();
+    mem.set_mtime(&early, old);
+    wrapped.armed.store(true, Ordering::SeqCst);
+
+    let stats =
+        crate::commands::compact::run_on_repo(&mut repo, 0.1, None, false, &CancelToken::new())
+            .unwrap();
+    assert!(
+        !wrapped.armed.load(Ordering::SeqCst),
+        "the mark listed snapshots"
+    );
+    assert_eq!(stats.packs_orphan, 1, "{stats:?}");
+    assert_eq!(stats.packs_deleted_empty, 1, "{stats:?}");
+    assert!(!mem.exists(&early).unwrap(), "the listed old orphan goes");
+    assert!(
+        mem.exists(&late).unwrap(),
+        "the pack PUT during the mark stays"
+    );
+}

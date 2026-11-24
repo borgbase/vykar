@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::mark;
-use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
+use super::util::{
+    list_live_sessions_under_lock, open_repo, refuse_on_append_only_server, with_maintenance_lock,
+    with_maintenance_lock_unlisted,
+};
 use crate::config::VykarConfig;
 use crate::index::head::{SegmentKind, SegmentRef};
 use crate::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
@@ -296,6 +299,39 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
 /// The chunk index is loaded under the maintenance lock, so any index loaded
 /// at open is replaced. On an append-only server a non-dry run is refused
 /// before the lock.
+///
+/// Under the maintenance lock it lists in 04's order ("Compact" 1): the
+/// packs first, then the sessions (reap and live listing, the horizons),
+/// then the head (and, in the mark, the ages of `index.d/` objects). Why
+/// this order is correct **under the lock**: let P be a pack the listing
+/// shows as an old orphan that a head H' compact's head read does not see
+/// will name. If P's session S is in the session listing, P lies after S's
+/// horizon (or is a recovered journal pack S's pull-back covers) and is
+/// kept. If S is not in it, either S registered after the session listing,
+/// so it PUT P after the pack listing, which then does not show P (a
+/// recovered journal pack adopted after the listing is younger than
+/// T_pack/2 in it and kept by age); or S deregistered before it, which S
+/// does only after its snapshot PUT, after H', which then precedes the
+/// head read: a contradiction. A pack H' names through a reused chunk was
+/// named by the head S loaded; if this run's head no longer names it, a
+/// sweep or repack removed it and S's commit re-checks
+/// (`StaleChunksDuringCommit`). The older order (sessions, head, packs)
+/// was correct only through the registration probe against the lock.
+/// One consequence under the lock (D-a2 accepts it): on a plaintext
+/// repository a live backup's re-PUT, during the mark, of a pack whose
+/// bytes, hence key, equal those of a pack the listing showed as an old
+/// orphan no longer renews the mtime this run judges by, so compact deletes
+/// the pack and that backup's commit fails with the typed "missing from
+/// storage" error.
+///
+/// This claims correctness under the lock only. A lock-free compact (04
+/// step 9, a later part) additionally needs: object names a writer cannot
+/// re-create after the listing saw them (encrypted repositories; a
+/// plaintext pack or index object is named by its content and can be
+/// re-uploaded under a listed key); listings that show every object PUT
+/// before them (list-after-write consistency); and a session whose marker
+/// was reaped while it still commits left to the post-PUT pack-age check
+/// (I8).
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
     threshold: f64,
@@ -308,16 +344,50 @@ pub(crate) fn run_on_repo(
     }
     let concurrency = repo.storage.profile().request_width;
 
-    with_maintenance_lock(repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
-        compact_repo(
+    with_maintenance_lock_unlisted(repo, |repo| {
+        let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
+        list_live_sessions_under_lock(repo)?; // 2. sessions
+        repo.load_chunk_index_under_lock()?; // 3. head
+        compact_repo_listed(
             repo,
+            listing,
             threshold,
             max_repack_size,
             dry_run,
             concurrency,
             shutdown,
         )
+    })
+}
+
+/// What compact's pack listing returned, taken before the session listing
+/// and the head read (04 "Compact" 1). The analysis, the repack and the
+/// orphan decisions use it; a pack PUT after it is not considered by this
+/// run.
+pub(crate) struct PackListing {
+    discovered: Vec<ListedPack>,
+    temp_files_removed: u64,
+}
+
+/// Sweep stale temp files (not in a dry run), then list the packs: one
+/// listing on a vykar-server, else 256 per-shard listings in parallel.
+/// The sweep runs before the session listing and the mark, so a compact that
+/// then refuses ("nothing was changed") has already removed the temp files
+/// older than `STALE_TEMP_FILE_AGE`: upload debris only, never an object.
+fn take_pack_listing(repo: &Repository, dry_run: bool, concurrency: usize) -> Result<PackListing> {
+    // Sweep upload debris once, from the root, before listing shards. Temp
+    // files younger than this may belong to a live upload.
+    let mut temp_files_removed = 0;
+    if !dry_run {
+        match repo.storage.remove_stale_temp_files(STALE_TEMP_FILE_AGE) {
+            Ok(n) => temp_files_removed = n as u64,
+            Err(e) => tracing::warn!("compact: failed to sweep stale temp files: {e}"),
+        }
+    }
+    let discovered = list_packs(repo.storage.as_ref(), concurrency)?;
+    Ok(PackListing {
+        discovered,
+        temp_files_removed,
     })
 }
 
@@ -334,8 +404,34 @@ pub(crate) fn run_on_repo(
 /// Nothing is deleted or repacked without a completed mark of the same run,
 /// against the head loaded under the same lock. A dry run writes nothing
 /// and leaves the handle's index as it was loaded.
+///
+/// It lists the packs itself, after its caller loaded the head: callers
+/// get head, then packs. Production goes through `run_on_repo`, which
+/// lists in 04's order.
 pub fn compact_repo(
     repo: &mut Repository,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    concurrency: usize,
+    shutdown: &CancelToken,
+) -> Result<CompactStats> {
+    let listing = take_pack_listing(repo, dry_run, concurrency)?;
+    compact_repo_listed(
+        repo,
+        listing,
+        threshold,
+        max_repack_size,
+        dry_run,
+        concurrency,
+        shutdown,
+    )
+}
+
+/// [`compact_repo`] over a pack listing its caller took.
+fn compact_repo_listed(
+    repo: &mut Repository,
+    listing: PackListing,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
@@ -345,6 +441,7 @@ pub fn compact_repo(
     let swept = mark_and_sweep(repo, dry_run, shutdown)?;
     let mut stats = compact_after_mark(
         repo,
+        listing,
         threshold,
         max_repack_size,
         dry_run,
@@ -371,8 +468,10 @@ pub(crate) fn compact_repo_without_mark(
     concurrency: usize,
     shutdown: &CancelToken,
 ) -> Result<CompactStats> {
+    let listing = take_pack_listing(repo, dry_run, concurrency)?;
     compact_after_mark(
         repo,
+        listing,
         threshold,
         max_repack_size,
         dry_run,
@@ -384,6 +483,7 @@ pub(crate) fn compact_repo_without_mark(
 /// Everything [`compact_repo`] does after the mark-and-sweep.
 fn compact_after_mark(
     repo: &mut Repository,
+    listing: PackListing,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
@@ -392,6 +492,7 @@ fn compact_after_mark(
 ) -> Result<CompactStats> {
     let run = compact_packs(
         repo,
+        listing,
         threshold,
         max_repack_size,
         dry_run,
@@ -459,7 +560,8 @@ struct Swept {
 /// Strict listing, the guards on it, the tree-chunk set, then `mark_live`
 /// with `CacheFirst`, counts and `MissingRefs::Abort`. Read-only. Any error
 /// is framed as [`MARK_REFUSED`], unless [`mark::passes_through`] (cancel,
-/// newer vykar).
+/// newer vykar). "Nothing was changed" means no object: the stale temp-file
+/// sweep of `take_pack_listing` ran before.
 fn plan_sweep(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPlan> {
     plan_sweep_inner(repo, shutdown).map_err(|e| {
         if mark::passes_through(&e) {
@@ -736,13 +838,21 @@ struct PackRun {
 
 fn compact_packs(
     repo: &mut Repository,
+    listing: PackListing,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
 ) -> Result<PackRun> {
-    let mut stats = CompactStats::default();
+    let PackListing {
+        discovered,
+        temp_files_removed,
+    } = listing;
+    let mut stats = CompactStats {
+        temp_files_removed,
+        ..CompactStats::default()
+    };
     let mut deleted: HashSet<PackId> = HashSet::new();
     // Packs this run wrote. A repack's output can have the ID of a pack the
     // listing showed as an orphan (the same blobs repacked by an earlier,
@@ -776,18 +886,8 @@ fn compact_packs(
         })
         .collect();
 
-    // Sweep upload debris once, from the root, before listing shards. Temp
-    // files younger than this may belong to a live upload.
-    if !dry_run {
-        match repo.storage.remove_stale_temp_files(STALE_TEMP_FILE_AGE) {
-            Ok(n) => stats.temp_files_removed = n as u64,
-            Err(e) => tracing::warn!("compact: failed to sweep stale temp files: {e}"),
-        }
-    }
-
-    // Discover all packs: one listing on a vykar-server, else 256 per-shard
-    // listings in parallel.
-    let discovered = list_packs(repo.storage.as_ref(), concurrency)?;
+    // The packs as listed before the session listing and the head read
+    // (`take_pack_listing`).
     let listed: HashSet<PackId> = discovered.iter().map(|p| p.pack_id).collect();
 
     // For each discovered pack, compute live/dead space from its size and the

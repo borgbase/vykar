@@ -5,7 +5,7 @@ use super::Repository;
 #[cfg(test)]
 use super::commit_machine::BackupCommit;
 use super::commit_machine::Committed;
-use super::control::{CommitEvent, EventSink};
+use super::control::{CancelToken, CommitEvent, EventSink};
 use super::file_cache;
 use super::index_store::{self, CacheLocation, SyncedIndex};
 use super::machine::log_stage_elapsed;
@@ -221,6 +221,7 @@ impl Repository {
         committed: Committed,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
+        cancel: &CancelToken,
         on_commit_point: impl FnOnce(),
     ) {
         // A journal PUT landing after the caller deleted the journal would
@@ -239,7 +240,7 @@ impl Repository {
         // the cache is pruned against `snapshots/` on every open.
         self.persist_snapshot_cache_from_manifest();
 
-        self.commit_finalize(new_file_cache, events);
+        self.commit_finalize(new_file_cache, events, cancel);
     }
 
     /// Commit the active session as `entry` with no lock and no fence: the
@@ -255,7 +256,13 @@ impl Repository {
     ) -> Result<()> {
         let mut m = BackupCommit::new(self, entry, packed, None);
         let committed = drive_blocking(&mut m, &mut StepCx { repo: self, events })?;
-        self.finish_backup_commit(committed, new_file_cache, events, || {});
+        self.finish_backup_commit(
+            committed,
+            new_file_cache,
+            events,
+            &CancelToken::new(),
+            || {},
+        );
         Ok(())
     }
 
@@ -263,10 +270,12 @@ impl Repository {
     /// it statically forbids `?` from escaping a path that runs after the
     /// snapshot has already been durably committed. All internal failures
     /// must be reported via `post_commit_warning`.
+    /// `cancel` only shortens the wait for the local file-cache lock.
     fn commit_finalize(
         &mut self,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
+        cancel: &CancelToken,
     ) {
         // Merge active sections if any were produced (filesystem backup).
         // Dump-only runs produce no active sections and skip this block.
@@ -274,6 +283,7 @@ impl Repository {
         if !sections.is_empty() {
             for (key, section) in sections {
                 self.file_cache.merge_section(&key, section);
+                self.note_file_cache_written(&key);
             }
             self.file_cache_dirty = true;
         }
@@ -282,7 +292,7 @@ impl Repository {
         // invalidation that set the dirty flag (e.g., stale sections removed
         // at backup start).
         let ctx = (std::time::Instant::now(), "save file cache");
-        if let Err(e) = self.save_file_cache_if_dirty() {
+        if let Err(e) = self.save_file_cache_cancellable(cancel) {
             post_commit_warning(
                 events,
                 format!(

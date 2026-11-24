@@ -447,6 +447,121 @@ fn campaign() {
     );
 }
 
+/// The campaign's random cases narrowed to the shape of its stale-session
+/// unknowns (phase F part 10d fix round 3): time jumps, a gate-stepped
+/// compact (one command made `Compact` when the case has none), the
+/// encrypted template on the conditional store, on the store whose plain PUT
+/// overwrites, or on that store with client b in lock mode (as
+/// [`campaign_cases`]: a handle without put-if-absent on vykar-server's
+/// write-once heads is not a deployment), any hosts.
+fn stale_session_cases() -> impl proptest::strategy::Strategy<Value = Case> {
+    use proptest::prelude::*;
+    (super::sim_explore::general(), 0u8..3).prop_map(|(mut c, kind)| {
+        if !c.clients.iter().flatten().any(|x| *x == Command::Compact)
+            && let Some(last) = c.clients.last_mut().and_then(|x| x.last_mut())
+        {
+            *last = Command::Compact;
+        }
+        Case {
+            advances: true,
+            maintenance: Maintenance::Stepped,
+            template: TemplateKind::Encrypted,
+            storage: if kind == 0 {
+                StoreKind::Conditional
+            } else {
+                StoreKind::ConditionalOverwrite
+            },
+            lock_clients: if kind == 2 { vec![1] } else { vec![] },
+            ..c
+        }
+    })
+}
+
+/// `VYKAR_SIM_FOCUS_CASES=<n>`: run about n cases of
+/// [`stale_session_cases`] on all workers (`VYKAR_SIM_JOBS`), unshrunk,
+/// and print the signatures seen; each case the campaign would fail is
+/// written to `VYKAR_SIM_TRACE_DIR` and fails the run at the end. A no-op
+/// otherwise.
+#[test]
+fn stale_session_search() {
+    let Some(total) = std::env::var("VYKAR_SIM_FOCUS_CASES").ok().map(|s| {
+        s.parse::<usize>()
+            .expect("VYKAR_SIM_FOCUS_CASES is a number")
+    }) else {
+        return;
+    };
+    let jobs = std::env::var("VYKAR_SIM_JOBS")
+        .ok()
+        .map(|s| s.parse::<usize>().expect("VYKAR_SIM_JOBS is a number"))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .max(1);
+    let trace_dir = std::env::var_os("VYKAR_SIM_TRACE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("vykar-sim"));
+    std::fs::create_dir_all(&trace_dir).expect("create the trace directory");
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let per_round = 50usize;
+    let rounds = total.div_ceil(per_round);
+    let next = AtomicUsize::new(0);
+    let report = Mutex::new(CampaignReport::default());
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        for j in 0..jobs {
+            let (next, report, trace_dir) = (&next, &report, &trace_dir);
+            s.spawn(move || {
+                let templates = Templates::new();
+                loop {
+                    let round = next.fetch_add(1, Ordering::Relaxed);
+                    if round >= rounds {
+                        return;
+                    }
+                    let seed = base ^ (round as u64).rotate_left(40);
+                    let n = Cell::new(0usize);
+                    let result =
+                        runner_with(per_round as u32, seed).run(&stale_session_cases(), |case| {
+                            write_current(trace_dir, j, &case);
+                            let o = templates.run(&case);
+                            n.set(n.get() + 1);
+                            let mut r = lock(report);
+                            r.random_cases += 1;
+                            for sig in &o.signatures {
+                                *r.signatures.entry(*sig).or_insert(0) += 1;
+                            }
+                            if unknown(&o) {
+                                let path = o
+                                    .trace
+                                    .write_in(trace_dir, &format!("focus-{seed}-{}", n.get()))
+                                    .expect("write a failing trace");
+                                eprintln!("stale_session_search: failure {}", path.display());
+                                r.failures.push(path);
+                            }
+                            Ok(())
+                        });
+                    if let Err(e) = result {
+                        panic!("stale_session_search worker {j}: {e}");
+                    }
+                    let _ = std::fs::remove_file(current_path(trace_dir, j));
+                }
+            });
+        }
+    });
+    let r = lock(&report);
+    eprintln!(
+        "stale_session_search: {} cases on {jobs} workers in {:?}, base seed {base}",
+        r.random_cases,
+        start.elapsed()
+    );
+    eprintln!("stale_session_search: signatures {:?}", r.signatures);
+    assert!(
+        r.failures.is_empty(),
+        "{} failing cases: {:?}",
+        r.failures.len(),
+        r.failures
+    );
+}
+
 /// What the campaign failed to cover: a family with no completed scenario,
 /// no completed K >= 2 search.
 fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts) -> Vec<String> {

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use vykar_types::error::Result;
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::{open_repo, refuse_on_append_only_server, with_maintenance_lock};
+use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_exclusion};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 
@@ -36,7 +36,8 @@ pub fn run(
     run_on_repo(&mut repo, snapshot_names, dry_run, shutdown)
 }
 
-/// [`run`] on an already opened repository, under the maintenance lock. A
+/// [`run`] on an already opened repository, under the maintenance lock or,
+/// lock-free, a registered session (`with_snapshot_removal_exclusion`). A
 /// dry run only resolves the names.
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
@@ -52,7 +53,7 @@ pub(crate) fn run_on_repo(
         .filter(|name| seen.insert(*name))
         .collect();
 
-    with_maintenance_lock(repo, |repo| {
+    with_snapshot_removal_exclusion(repo, |repo| {
         let targets = prepare_removal_targets(repo, &unique_names)?;
         let names: Vec<String> = if dry_run {
             targets.into_iter().map(|t| t.snapshot_name).collect()

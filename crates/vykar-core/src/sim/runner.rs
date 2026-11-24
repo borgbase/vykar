@@ -158,6 +158,13 @@ pub enum Call {
         tree: SourceTree,
         shutdown: CancelToken,
     },
+    /// [`Call::Backup`] of the source directory snapshot `of` was taken
+    /// from, untouched since: equal items (path, mtime, ctime), hence equal
+    /// tree chunks, so the backup adds no chunk (a reuse-only commit).
+    BackupSameSource {
+        snapshot: String,
+        of: String,
+    },
     Delete {
         names: Vec<String>,
     },
@@ -264,6 +271,9 @@ pub struct Sim {
     time: Arc<SimTime>,
     hosts: SimHosts,
     skews: BTreeMap<ClientId, chrono::Duration>,
+    /// `compact.threshold` of a client whose config sets one
+    /// ([`Sim::set_compact_threshold`]).
+    compact_thresholds: BTreeMap<ClientId, f64>,
     /// The index of the next run; reserved when the run starts.
     next_run: usize,
     in_flight: BTreeMap<ClientId, InFlight>,
@@ -354,9 +364,18 @@ impl Sim {
             time,
             hosts,
             skews: BTreeMap::new(),
+            compact_thresholds: BTreeMap::new(),
             next_run: 0,
             in_flight: BTreeMap::new(),
         }
+    }
+
+    /// `c`'s config sets `compact.threshold` to `threshold` (percent of
+    /// unused space from which a pack is repacked; 100 repacks only packs
+    /// with no live entry): two machines that compact with different
+    /// thresholds.
+    pub fn set_compact_threshold(&mut self, c: ClientId, threshold: f64) {
+        self.compact_thresholds.insert(c, threshold);
     }
 
     pub fn store(&self) -> &SimStore {
@@ -573,6 +592,30 @@ impl Sim {
         };
         self.run_inline(c, op, |store, cfg, _, _, env| {
             custom_body(store, c, cfg, env, f)
+        })
+    }
+
+    /// [`Self::custom`] in a lock-free maintenance session
+    /// (`util::with_maintenance_session` with `flags`) instead of the lock:
+    /// what a lock-free maintenance writer may do, for scripted tests of
+    /// what the checker judges in lock-free runs. The run is
+    /// `RunRecord::lock_free`.
+    #[cfg(test)]
+    pub(crate) fn custom_lock_free(
+        &mut self,
+        c: ClientId,
+        label: &str,
+        flags: crate::repo::lock::MarkerFlags,
+        f: impl FnOnce(&mut Repository) -> Result<()>,
+    ) -> RunRecord {
+        self.assert_inline_ok(c);
+        let op = ClientOp::Custom {
+            label: label.to_string(),
+        };
+        self.run_inline(c, op, |store, cfg, _, _, env| {
+            let mut repo = open_for(store, c, &cfg, env)?;
+            util::with_maintenance_session(&mut repo, flags, |repo, _| f(repo))?;
+            Ok((Vec::new(), String::new()))
         })
     }
 
@@ -849,6 +892,9 @@ impl Sim {
             ..Default::default()
         };
         cfg.limits.threads = 2;
+        if let Some(&threshold) = self.compact_thresholds.get(&c) {
+            cfg.compact.threshold = threshold;
+        }
         cfg
     }
 
@@ -864,6 +910,21 @@ impl Sim {
                 tree,
                 shutdown,
             } => self.prepare_backup(c, snapshot, tree, shutdown),
+            Call::BackupSameSource { snapshot, of } => {
+                let tree = self
+                    .history
+                    .trees
+                    .get(&of)
+                    .unwrap_or_else(|| panic!("no source of snapshot {of}"))
+                    .clone();
+                assert!(
+                    !self.history.trees.contains_key(&snapshot),
+                    "snapshot name {snapshot} reused"
+                );
+                self.history.trees.insert(snapshot.clone(), tree);
+                let src = self.root.path().join("sources").join(&of);
+                self.backup_body(c, snapshot, src, CancelToken::new())
+            }
             Call::Delete { names } => {
                 let op = ClientOp::Delete {
                     names: names.clone(),
@@ -930,7 +991,8 @@ impl Sim {
                             Vec::new(),
                             format!(
                                 "packs {} repacked {} deleted_empty {} orphan {} young {} \
-                                 unknown_age {} corrupt {} unreferenced {} live {} kept-young {}",
+                                 unknown_age {} corrupt {} unreferenced {} live {} kept-young {} \
+                                 sweep-skipped {:?} abandoned {} held {}",
                                 s.packs_total,
                                 s.packs_repacked,
                                 s.packs_deleted_empty,
@@ -940,7 +1002,10 @@ impl Sim {
                                 s.packs_corrupt,
                                 s.chunks_unreferenced,
                                 s.packs_orphan_live,
-                                s.chunks_unreferenced_young
+                                s.chunks_unreferenced_young,
+                                s.sweep_skipped,
+                                s.packs_abandoned,
+                                s.packs_repack_held
                             ),
                         ))
                     },
@@ -1080,6 +1145,17 @@ impl Sim {
         shutdown: CancelToken,
     ) -> (ClientOp, Body) {
         let src = self.prepare_backup_source(&snapshot, tree);
+        self.backup_body(c, snapshot, src, shutdown)
+    }
+
+    /// The op and the body of a backup of `src` as `snapshot`.
+    fn backup_body(
+        &mut self,
+        c: ClientId,
+        snapshot: String,
+        src: PathBuf,
+        shutdown: CancelToken,
+    ) -> (ClientOp, Body) {
         let op = ClientOp::Backup {
             snapshot: snapshot.clone(),
         };
@@ -1245,10 +1321,17 @@ impl Sim {
         // A backup commits lock-free once it decided to (an encrypted
         // repository, a passed put-if-absent check and a continuous marker
         // record: `PendingCommit::commit_mode`), which its commit mark
-        // shows; maintenance takes the lock in every mode (phase F part
-        // 10c).
-        let lock_free =
-            matches!(op, ClientOp::Backup { .. }) && self.store.committed_lock_free_in_run(index);
+        // shows. Maintenance (compact, prune, delete, a lock-free custom
+        // run) runs lock-free in a registered session (phase F part 10d),
+        // which its marker shows: under the lock it registers none.
+        let lock_free = match op {
+            ClientOp::Backup { .. } => self.store.committed_lock_free_in_run(index),
+            ClientOp::Compact
+            | ClientOp::Prune
+            | ClientOp::Delete { .. }
+            | ClientOp::Custom { .. } => self.store.registered_in_run(index),
+            _ => false,
+        };
         let record = RunRecord {
             index,
             client: c,

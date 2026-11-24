@@ -347,11 +347,11 @@ pub(crate) fn yield_to_lock_free_writers(
 ) -> Result<(Vec<String>, Vec<LiveSession>)> {
     // A backup (`own`) reaps stale markers but leaves orphan journals to
     // maintenance, as before its lock listed sessions.
-    let (cleaned, live) = reap_sessions(
+    let (cleaned, live, _) = reap_sessions(
         storage,
         default_stale_session_duration(),
         env,
-        now,
+        ReapNow::Known(now),
         own.is_none(),
     )?;
     let holder = |key: String, entry: Option<&SessionEntry>| {
@@ -1019,7 +1019,22 @@ pub fn register_session(
     session_id: &str,
     env: &HostEnv,
 ) -> Result<Registration> {
-    register_session_inner(storage, session_id, 3, 2000, env)
+    register_session_inner(storage, session_id, 3, 2000, env, MarkerFlags::default())
+}
+
+/// [`register_session`] whose registration key already carries `flags`
+/// (a lock-free maintenance session, 04 step 9: a compact that may create
+/// index heads without the lock registers with `writes_heads`, so the
+/// flag is written before its registration probe lists `locks/`, the
+/// lock-free writer's half of the marker handshake). Every later key of
+/// the session carries the same flags.
+pub(crate) fn register_session_with(
+    storage: &dyn StorageBackend,
+    session_id: &str,
+    env: &HostEnv,
+    flags: MarkerFlags,
+) -> Result<Registration> {
+    register_session_inner(storage, session_id, 3, 2000, env, flags)
 }
 
 pub(crate) fn register_session_inner(
@@ -1028,10 +1043,15 @@ pub(crate) fn register_session_inner(
     max_attempts: usize,
     base_delay_ms: u64,
     env: &HostEnv,
+    flags: MarkerFlags,
 ) -> Result<Registration> {
     let key = session_marker_key(session_id);
     let now = env.now_utc();
-    let entry = SessionEntry::new(env, now, now);
+    let entry = SessionEntry {
+        committing: flags.committing,
+        writes_heads: flags.writes_heads,
+        ..SessionEntry::new(env, now, now)
+    };
     let data = serde_json::to_vec(&entry)
         .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
     if let Err(e) = storage.put(&key, &data) {
@@ -1249,7 +1269,10 @@ impl SessionMarker {
             entry: registration.entry.clone(),
             started: registration.written,
             state: std::sync::Mutex::new(MarkerState {
-                flags: MarkerFlags::default(),
+                flags: MarkerFlags {
+                    committing: registration.entry.committing,
+                    writes_heads: registration.entry.writes_heads,
+                },
                 current: 0,
                 current_written: registration.written,
                 attempted: 0,
@@ -1759,6 +1782,9 @@ impl HeartbeatSchedule {
     }
 }
 
+/// The name of every session's heartbeat thread.
+pub(crate) const HEARTBEAT_THREAD_NAME: &str = "session-refresh";
+
 /// RAII guard that deregisters a session on drop and periodically refreshes
 /// the session marker so maintenance doesn't treat it as stale.
 pub struct SessionGuard {
@@ -1813,7 +1839,7 @@ impl SessionGuard {
         env: HostEnv,
     ) -> Result<JoinHandle<()>> {
         std::thread::Builder::new()
-            .name("session-refresh".into())
+            .name(HEARTBEAT_THREAD_NAME.into())
             .spawn(move || {
                 let session_id = marker.session_id();
                 let mut schedule = HeartbeatSchedule::new();
@@ -1942,25 +1968,70 @@ pub(crate) fn cleanup_stale_sessions_keeping(
     env: &HostEnv,
     now: Option<StoreNow>,
 ) -> Result<(Vec<String>, Vec<LiveSession>)> {
-    reap_sessions(storage, max_age, env, now, true)
+    reap_sessions(storage, max_age, env, ReapNow::Known(now), true)
+        .map(|(cleaned, kept, _)| (cleaned, kept))
+}
+
+/// Where [`reap_sessions`] reads "now" on the store's clock.
+pub(crate) enum ReapNow<'a> {
+    /// Read already by the caller (a held lock's key mtime; `None`:
+    /// unknown).
+    Known(Option<StoreNow>),
+    /// The caller's own registered session (a lock-free maintenance run,
+    /// 04 step 9): "now" is the mtime of its newest key in this listing,
+    /// written before the listing; the session itself is neither reaped
+    /// nor returned as live.
+    OwnSession(&'a str),
+}
+
+/// The stale-session reap and live listing of a lock-free maintenance run
+/// (04 step 9, compact's sessions #1): [`cleanup_stale_sessions_keeping`]
+/// from one listing of `sessions/`, "now" being the mtime of `own`'s
+/// newest key in it ([`ReapNow::OwnSession`]). Returns the cleaned
+/// sessions, the live ones other than `own`, and that "now" (`None`
+/// when the listing reports no mtime for it).
+pub(crate) fn reap_sessions_registered(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    own: &str,
+) -> Result<(Vec<String>, Vec<LiveSession>, Option<StoreNow>)> {
+    reap_sessions(
+        storage,
+        default_stale_session_duration(),
+        env,
+        ReapNow::OwnSession(own),
+        true,
+    )
 }
 
 /// [`cleanup_stale_sessions_keeping`]; `delete_orphan_journals`: whether its
 /// second pass runs (a backup's commit-lock yield skips it, so a crashed
 /// session's journal keeps its grace until the next maintenance, as before
-/// backups listed sessions at their lock).
+/// backups listed sessions at their lock). Also returns the "now" it judged
+/// ages by.
 fn reap_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
     env: &HostEnv,
-    now: Option<StoreNow>,
+    now: ReapNow<'_>,
     delete_orphan_journals: bool,
-) -> Result<(Vec<String>, Vec<LiveSession>)> {
+) -> Result<(Vec<String>, Vec<LiveSession>, Option<StoreNow>)> {
     let local_now = env.now_utc();
     let listing = storage.list_meta(SESSIONS_PREFIX)?;
     let mtimes: std::collections::HashMap<&str, Option<std::time::SystemTime>> =
         listing.iter().map(|o| (o.key.as_str(), o.mtime)).collect();
     let keys: Vec<String> = listing.iter().map(|o| o.key.clone()).collect();
+    let (now, own) = match now {
+        ReapNow::Known(now) => (now, None),
+        ReapNow::OwnSession(own) => {
+            let newest = group_session_markers(&keys)
+                .get(own)
+                .and_then(|m| m.last())
+                .map(|&(_, key)| key.to_string());
+            let now = newest.and_then(|key| StoreNow::of_written(&listing, &key));
+            (now, Some(own))
+        }
+    };
     let mut cleaned = Vec::new();
     let mut kept = Vec::new();
     // Track which session IDs survived the first pass (not deleted).
@@ -1971,6 +2042,10 @@ fn reap_sessions(
 
     // First pass: the .json session markers, per session.
     for (session_id, markers) in group_session_markers(&keys) {
+        if Some(session_id) == own {
+            surviving_markers.insert(session_id.to_string());
+            continue;
+        }
         let Some(&(_, newest)) = markers.last() else {
             continue;
         };
@@ -2071,7 +2146,57 @@ fn reap_sessions(
         }
     }
 
-    Ok((cleaned, kept))
+    Ok((cleaned, kept, now))
+}
+
+/// Sessions #2 of a lock-free compact (04 step 9, O3): one listing of
+/// `sessions/` and a GET of each other session's newest key. Returns the
+/// IDs of the sessions that are committing: their newest key carries
+/// `committing`, or is malformed, or is gone on GET twice (fail closed: a
+/// gone newest key can be a rotation the listing half-saw). A key gone on
+/// GET is listed again once; a session with no key left then has
+/// deregistered, which a backup does only after its snapshot PUT. Reaps
+/// nothing. `own` is the caller's session.
+pub(crate) fn committing_sessions(storage: &dyn StorageBackend, own: &str) -> Result<Vec<String>> {
+    let keys = storage.list(SESSIONS_PREFIX)?;
+    let mut committing = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    for (session_id, markers) in group_session_markers(&keys) {
+        if session_id == own {
+            continue;
+        }
+        let Some(&(_, newest)) = markers.last() else {
+            continue;
+        };
+        match storage.get(newest)? {
+            None => unread.push(session_id.to_string()),
+            Some(data) => match serde_json::from_slice::<SessionEntry>(&data) {
+                Ok(entry) if !entry.committing => {}
+                _ => committing.push(session_id.to_string()),
+            },
+        }
+    }
+    if !unread.is_empty() {
+        let keys = storage.list(SESSIONS_PREFIX)?;
+        let sessions = group_session_markers(&keys);
+        for id in unread {
+            let Some(&(_, newest)) = sessions.get(id.as_str()).and_then(|m| m.last()) else {
+                debug!(
+                    session_id = id,
+                    "session deregistered during compact's second session listing"
+                );
+                continue;
+            };
+            let entry = storage
+                .get(newest)?
+                .and_then(|data| serde_json::from_slice::<SessionEntry>(&data).ok());
+            if entry.is_none_or(|e| e.committing) {
+                committing.push(id);
+            }
+        }
+    }
+    committing.sort();
+    Ok(committing)
 }
 
 /// List all sessions with their parsed marker, one per session, in

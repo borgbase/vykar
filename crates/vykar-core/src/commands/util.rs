@@ -206,7 +206,9 @@ pub(crate) fn refuse_on_append_only_server(
     Ok(())
 }
 
-/// Execute a maintenance operation while holding an advisory lock.
+/// Execute a maintenance operation while holding an advisory lock (lock
+/// mode; in lock-free mode compact, prune and delete register a session
+/// instead, `with_maintenance_session`).
 ///
 /// Acquires the lock, cleans up stale sessions (no marker written for 45 min
 /// by the store's clock), lists the sessions that remain live (for compact's
@@ -263,8 +265,9 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()>
     //
     // On an encrypted repository the same listing is the lock holder's half
     // of the marker handshake (04 step 9): a live session that may write
-    // heads without the lock (a lock-free backup committing) makes this
-    // holder yield with `Locked` naming it, before any write; the user
+    // heads without the lock (a lock-free backup committing, or a lock-free
+    // compact, whose marker carries `writes_heads` for its whole run) makes
+    // this holder yield with `Locked` naming it, before any write; the user
     // retries. A plaintext repository has no lock-free writers.
     let stale_threshold = lock::default_stale_session_duration();
     let listed = if repo.config.encryption == crate::repo::EncryptionMode::None {
@@ -307,6 +310,179 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()>
             "backup sessions are live; maintenance runs beside them"
         );
     }
+    repo.set_live_sessions(Some(live));
+    Ok(())
+}
+
+/// The registered session of a lock-free maintenance run (04 step 9): its
+/// heartbeat runs until the run ends, then it deregisters.
+pub(crate) struct MaintenanceSession {
+    guard: lock::SessionGuard,
+}
+
+impl MaintenanceSession {
+    pub(crate) fn id(&self) -> &str {
+        self.guard.session_id()
+    }
+
+    /// The session's marker record (its heartbeat's view of the marker).
+    pub(crate) fn marker(&self) -> Arc<lock::SessionMarker> {
+        self.guard.marker()
+    }
+}
+
+/// The fence of a lock-free maintenance run (04 step 9), installed as the
+/// handle's lock fence for the whole run: the run's marker exists now and
+/// its record is [continuous](lock::MarkerReport::continuous), the
+/// predicate a lock-free backup checks before its snapshot PUT. It runs
+/// before every head create of the run (the publish machine's fence step:
+/// the sweep head, each repack batch's create and each create after a
+/// rebase, the fold), before each batch of pack deletes, before the index
+/// garbage collection and before each snapshot delete. A failed check ends
+/// the run with `MarkerLostDuringCommit`; what it wrote so far is
+/// unreferenced debris (repack outputs are orphans for a later compact).
+///
+/// Why: once its marker is reaped (a stall over the session staleness, a
+/// suspended laptop) nothing protects what the run decided before. Another
+/// compact takes its repack outputs for old orphans and deletes them, and a
+/// lock holder no longer yields to it, so a lock-path backup commits a
+/// reuse-only snapshot (no head) that this run's sweep, planned from an
+/// older mark, would then strip. The check narrows both to a stall between
+/// the check and the write it guards. A reap needs the marker unrefreshed
+/// for the session staleness (45 min), and such a gap breaks the record's
+/// continuity (`MARKER_GAP_LIMIT`, 30 min) whether or not the key is
+/// still there: the check also catches a reaper that listed the key stale
+/// and deletes it only after a late refresh.
+fn maintenance_marker_fence(
+    marker: Arc<lock::SessionMarker>,
+    storage: Arc<dyn StorageBackend>,
+    clock: Arc<dyn crate::repo::host_env::Clock>,
+) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+    Arc::new(move || {
+        let present = marker.probe(storage.as_ref())?;
+        let report = marker.report(clock.as_ref());
+        if present && report.continuous() {
+            return Ok(());
+        }
+        if !present {
+            marker.note_missing();
+        }
+        tracing::warn!(
+            session_id = marker.session_id(),
+            present,
+            ?report,
+            "this maintenance run's session marker was reaped, or went unrefreshed for a \
+             while (machine suspended?): another client may have taken the run for ended; \
+             nothing more is written"
+        );
+        Err(VykarError::MarkerLostDuringCommit)
+    })
+}
+
+/// Lock-free maintenance (04 step 9): register a session marker carrying
+/// `flags`, adopt it with a heartbeat, run `action`, deregister. No lock is
+/// taken; the handle's lock fence is the marker check
+/// ([`maintenance_marker_fence`]) for the whole run.
+///
+/// The registration probe keeps the lock holders out: the marker is written
+/// before the probe lists `locks/` (a live lock fails `Locked` after the
+/// probe's retries, as a backup's registration does), and every lock holder
+/// lists `sessions/` after its lock is confirmed, so `check --repair` and
+/// `upgrade` refuse beside this session (`refuse_live_sessions`) and a
+/// lock-mode writer yields to a marker that may write heads
+/// (`writes_heads`: a compact). On error `flush_on_abort` runs, as under
+/// the lock. Clears the store time, live sessions and segment ages at the
+/// end (`Repository::clear_lock_fence`).
+pub(crate) fn with_maintenance_session<T>(
+    repo: &mut Repository,
+    flags: lock::MarkerFlags,
+    action: impl FnOnce(&mut Repository, &MaintenanceSession) -> Result<T>,
+) -> Result<T> {
+    let env = repo.host_env().clone();
+    let id = format!("{:032x}", rand::random::<u128>());
+    let registration = lock::register_session_with(repo.storage.as_ref(), &id, &env, flags)?;
+    let guard =
+        match lock::SessionGuard::adopt(Arc::clone(&repo.storage), registration, env.clone()) {
+            Ok(g) => g,
+            Err(e) => {
+                lock::deregister_session(repo.storage.as_ref(), &id, &env);
+                return Err(e);
+            }
+        };
+    tracing::debug!(session_id = id, ?flags, "maintenance session registered");
+    let session = MaintenanceSession { guard };
+    repo.set_lock_fence(maintenance_marker_fence(
+        session.marker(),
+        Arc::clone(&repo.storage),
+        Arc::clone(&repo.host_env().clock),
+    ));
+    let result = action(repo, &session);
+    if result.is_err() {
+        repo.flush_on_abort();
+    }
+    repo.clear_lock_fence();
+    drop(session);
+    result
+}
+
+/// The exclusion of a command that deletes only snapshot objects and
+/// writes no index (prune, delete): the maintenance lock in lock mode; in
+/// lock-free mode (04 step 9) a registered session without flags
+/// ([`with_maintenance_session`]), which keeps `check --repair` and
+/// `upgrade` out and lists no sessions (these commands write no head and
+/// judge no age). Snapshot deletes need no exclusion from writers: a
+/// concurrent compact's mark skips a snapshot deleted after its listing
+/// (`mark::load_snapshots_strict`), and a backup that reused chunks of a
+/// deleted snapshot is protected by its commit (the young-segment rule and
+/// compact's handling of committing sessions) or fails
+/// `StaleChunksDuringCommit`.
+pub(crate) fn with_snapshot_removal_exclusion<T>(
+    repo: &mut Repository,
+    action: impl FnOnce(&mut Repository) -> Result<T>,
+) -> Result<T> {
+    match repo.commit_mode()? {
+        crate::repo::CommitMode::Lock => with_maintenance_lock(repo, action),
+        crate::repo::CommitMode::LockFree => {
+            with_maintenance_session(repo, lock::MarkerFlags::default(), |repo, _| action(repo))
+        }
+    }
+}
+
+/// Sessions #1 of a lock-free maintenance run (04 step 9): one listing of
+/// `sessions/`; "now" on the store's clock is the mtime of `own`'s newest
+/// key in it (written after registration and before this listing, so it
+/// precedes compact's head read, as 8b's I8 argument needs); stale sessions
+/// are reaped with that "now"; `Repository::live_sessions` are the others
+/// and `Repository::lock_store_time` is that "now". Fails closed as
+/// [`list_live_sessions_under_lock`].
+pub(crate) fn list_live_sessions_registered(
+    repo: &mut Repository,
+    own: &MaintenanceSession,
+) -> Result<()> {
+    let (cleaned, live, now) =
+        match lock::reap_sessions_registered(repo.storage.as_ref(), repo.host_env(), own.id()) {
+            Ok(listed) => listed,
+            Err(e) => {
+                return Err(VykarError::Other(format!(
+                    "cannot clean up stale backup sessions (storage error: {e}); \
+                     refusing maintenance to avoid data loss"
+                )));
+            }
+        };
+    if !cleaned.is_empty() {
+        info!(
+            count = cleaned.len(),
+            sessions = ?cleaned,
+            "cleaned up stale backup sessions"
+        );
+    }
+    if !live.is_empty() {
+        info!(
+            count = live.len(),
+            "backup sessions are live; maintenance runs beside them"
+        );
+    }
+    repo.set_lock_store_time(now);
     repo.set_live_sessions(Some(live));
     Ok(())
 }

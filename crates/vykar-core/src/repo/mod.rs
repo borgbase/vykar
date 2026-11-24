@@ -24,7 +24,7 @@ mod chunks;
 mod commit;
 pub(crate) use commit::needs_recheck;
 mod commit_machine;
-pub(crate) use commit_machine::{BackupCommit, Committed};
+pub(crate) use commit_machine::{BackupCommit, Committed, HEAD_CREATE_ATTEMPTS, retry_delay};
 pub(crate) mod index_rebuild;
 pub(crate) mod index_store;
 pub(crate) mod index_write;

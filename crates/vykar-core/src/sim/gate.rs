@@ -20,6 +20,10 @@ pub struct GateRule {
     /// Applied after `op` and `key`, to the same key (any key of a
     /// `BatchDelete`); `None` matches everything.
     pub filter: Option<fn(OpKind, &str) -> bool>,
+    /// Operations of threads with this name do not count (a lock-free
+    /// stepped compact's heartbeat, `session-refresh`, beside its gated
+    /// main thread).
+    pub skip_thread: Option<&'static str>,
 }
 
 impl GateRule {
@@ -31,7 +35,14 @@ impl GateRule {
             key,
             nth: 1,
             filter: None,
+            skip_thread: None,
         }
+    }
+
+    /// Do not count operations of threads named `name`.
+    pub fn not_on_thread(mut self, name: &'static str) -> Self {
+        self.skip_thread = Some(name);
+        self
     }
 
     pub fn nth(mut self, n: u32) -> Self {
@@ -47,6 +58,12 @@ impl GateRule {
 
     /// Whether `op` on `keys` counts against this gate (its client aside).
     pub(crate) fn matches(&self, op: OpKind, keys: &[&str]) -> bool {
+        if self
+            .skip_thread
+            .is_some_and(|t| std::thread::current().name() == Some(t))
+        {
+            return false;
+        }
         self.op.matches(op)
             && keys
                 .iter()

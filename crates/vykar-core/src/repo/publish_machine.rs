@@ -4,7 +4,8 @@
 //! module doc, one storage PUT per step:
 //!
 //! - head only (a sweep pending, nothing else to write): [record] → fence →
-//!   head;
+//!   head; a forced head (a lock-free backup that added no chunk,
+//!   [`PublishMachine::force_head`]): fence → head → old heads deleted;
 //! - segment: [record] → segment → fence → head;
 //! - fold: [list heads] → [base] → [record] → fence → head → garbage
 //!   collection;
@@ -82,6 +83,8 @@ pub(crate) struct PublishMachine {
     head_check: Option<HeadCheck>,
     /// This write created its head.
     wrote_head: bool,
+    /// Write a head even when nothing changed (`Self::force_head`).
+    force_head: bool,
     /// Just before the head listing that chose this write's generation
     /// (suspend included, [`MarkerStamp::until`]); the machine's first step
     /// when the caller gave none.
@@ -260,6 +263,7 @@ impl PublishMachine {
             added: false,
             head_check: None,
             wrote_head: false,
+            force_head: false,
             listed_at: None,
             start: std::time::Instant::now(),
             state: State::Start { prev, seg },
@@ -288,10 +292,24 @@ impl PublishMachine {
             added: false,
             head_check: None,
             wrote_head: false,
+            force_head: false,
             listed_at: None,
             start: std::time::Instant::now(),
             state,
         }
+    }
+
+    /// Write a head when there is nothing else to write: the predecessor's
+    /// state (base, segments, sweep) at generation + 1, created with
+    /// put-if-absent, then the head part of the garbage collection
+    /// ([`index_store::collect_old_heads`]). A lock-free backup that added
+    /// no chunk but reused some (04 step 9, Q2): without a head of its own
+    /// nothing would conflict with a concurrent sweep that removes a chunk
+    /// it reused, since compact's second session listing alone does not
+    /// cover a backup whose head read followed compact's.
+    pub(crate) fn force_head(mut self) -> Self {
+        self.force_head = true;
+        self
     }
 
     /// Apply `check` at the fence before the head PUT (backups only).
@@ -610,9 +628,10 @@ impl PublishMachine {
     }
 
     /// An empty change: nothing to write, or a head only when a sweep is
-    /// pending (the same state, a new generation and the sweep).
+    /// pending or the head is forced (the same state, a new generation and
+    /// the sweep).
     fn unchanged(&mut self, repo: &mut super::Repository, prev: IndexHead) -> Result<State> {
-        if repo.pending_sweep.is_none() {
+        if repo.pending_sweep.is_none() && !self.force_head {
             debug!("index unchanged, nothing to write");
             return Ok(State::Done(Some(self.bookkeeping(repo, prev, true))));
         }
@@ -620,14 +639,11 @@ impl PublishMachine {
         let (sweep, record) = repo.next_sweep(Some(&prev), head.generation, false)?;
         head.sweep = sweep;
         head.validate()?;
-        Ok(State::Write(Box::new(Writes::new(
-            head,
-            None,
-            None,
-            record,
-            None,
-            Finish::Unchanged,
-        ))))
+        let mut writes = Writes::new(head, None, None, record, None, Finish::Unchanged);
+        if self.force_head {
+            writes.steps.push_back(StepKind::CollectGarbage);
+        }
+        Ok(State::Write(Box::new(writes)))
     }
 
     /// Fold: the base body written into a local table. A full fold first
@@ -1311,16 +1327,38 @@ fn write_step(
             Ok(())
         }
         StepKind::CollectGarbage => {
-            let gc = index_store::collect_index_garbage(
-                repo.storage.as_ref(),
-                repo.crypto.as_ref(),
-                &w.head,
-                repo.index_gc_grace,
-            )
+            // A lock-free maintenance run's marker check (04 step 9) guards
+            // its deletes: when it fails the collection is skipped (the
+            // head has landed; the run's next check ends it). A lock-free
+            // backup's handle has no fence; under the lock nothing changes.
+            if repo.is_lock_free()
+                && let Err(e) = repo.check_lock_fence()
+            {
+                warn!("index garbage collection skipped: {e}");
+                return Ok(());
+            }
+            // A fold collects heads and objects; a forced head only heads
+            // (`PublishMachine::force_head`).
+            let gc = match &w.finish {
+                Finish::Fold(_) => index_store::collect_index_garbage(
+                    repo.storage.as_ref(),
+                    repo.crypto.as_ref(),
+                    &w.head,
+                    repo.index_gc_grace,
+                ),
+                _ => index_store::collect_old_heads(
+                    repo.storage.as_ref(),
+                    &w.head,
+                    repo.index_gc_grace.heads,
+                ),
+            }
             .unwrap_or_else(|e| {
                 warn!("failed to delete old index objects: {e}");
                 Default::default()
             });
+            if gc.heads_deleted > 0 {
+                debug!(heads_deleted = gc.heads_deleted, "old index heads deleted");
+            }
             if let Finish::Fold(fold) = &mut w.finish {
                 fold.gc = gc;
             }

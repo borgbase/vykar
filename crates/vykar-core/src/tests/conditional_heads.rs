@@ -861,14 +861,16 @@ fn gc_needs_the_callers_own_head() {
     sim.tamper_put(&junk, b"unreferenced");
     sim.advance(index_store::INDEX_OBJECT_GRACE + Duration::from_secs(60));
     let mut ra = open(&sim, a, sim.host_env(a));
-    ra.maintain_segmented_index().unwrap();
+    ra.maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
+        .unwrap();
     assert!(sim.store().object(&junk).is_some(), "no head of its own");
     ra.begin_write_session(&WriteSessionOptions::default())
         .unwrap();
     ra.store_chunk(b"chunk of a", Compression::None, PackType::Data)
         .unwrap();
     ra.save_state().unwrap();
-    ra.maintain_segmented_index().unwrap();
+    ra.maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
+        .unwrap();
     assert!(
         sim.store().object(&junk).is_none(),
         "collected after its head"

@@ -19,7 +19,10 @@
 //!    the session's marker is gone is `StaleChunksDuringCommit`: compact
 //!    deleted the packs of a reaped session.
 //!    The publish's fence before the head PUT also runs the commit rule's
-//!    pack-age term ([`HeadCheck`]).
+//!    pack-age term ([`HeadCheck`]). A commit that adds no chunk writes no
+//!    index under the lock; lock-free (04 step 9) it creates a head anyway,
+//!    the head read's state at generation + 1 ([`PublishMachine::force_head`]),
+//!    so a concurrent sweep conflicts with it.
 //!    4b. If another writer created the head's generation (04 step 8): back
 //!    off, then repeat from 2 with the additions kept (at most
 //!    [`HEAD_CREATE_ATTEMPTS`] attempts). The sync re-checks reused chunks
@@ -124,6 +127,9 @@ pub(crate) struct BackupCommit {
     /// Lock-free (04 step 9): no lock fence; the marker must still be
     /// there before the snapshot PUT.
     lock_free: bool,
+    /// This attempt's index write is a head only (lock-free, no chunk
+    /// added).
+    head_only: bool,
     state: CommitState,
 }
 
@@ -264,6 +270,7 @@ impl BackupCommit {
             retry: None,
             delta: None,
             listed_at: None,
+            head_only: false,
             state: CommitState::Flush,
         }
     }
@@ -390,19 +397,26 @@ impl BackupCommit {
         if self.attempt >= HEAD_CREATE_ATTEMPTS {
             return Err(head_contention_error(generation, self.attempt));
         }
-        let (Some(seg), Some(kept)) = (seg, self.retry.take()) else {
+        // A head-only write (a lock-free commit that added no chunk) hands
+        // back no segment: the delta is what `RetryDelta` kept.
+        let Some(kept) = self.retry.take() else {
+            return Err(VykarError::Other(
+                "BUG: a backup's taken index write kept no retry delta".into(),
+            ));
+        };
+        if seg.is_none() && !self.head_only {
             return Err(VykarError::Other(
                 "BUG: a backup's taken index write returned no segment".into(),
             ));
-        };
+        }
         tracing::info!(
             attempt = self.attempt,
             generation,
             "index head taken by another writer; rebasing the commit"
         );
         let mut new_entries: Vec<NewChunkEntry> = seg
-            .additions
             .iter()
+            .flat_map(|seg| seg.additions.iter())
             .map(|(id, loc)| NewChunkEntry {
                 chunk_id: *id,
                 stored_size: loc.stored_size,
@@ -764,11 +778,30 @@ impl BackupCommit {
         let repo = &mut *cx.repo;
         let head = synced.head.clone();
         repo.install_synced_index(synced);
+        let check = self.marker.as_ref().map(|marker| HeadCheck {
+            session_id: self.session_id.clone(),
+            marker: Arc::clone(marker),
+        });
+        self.head_only = additions.is_empty();
         if additions.is_empty() {
-            debug!("backup added no chunks; no index write");
-            self.retry = None;
-            self.close_stage();
-            return Ok(after_index(repo));
+            if !self.lock_free {
+                debug!("backup added no chunks; no index write");
+                self.retry = None;
+                self.close_stage();
+                return Ok(after_index(repo));
+            }
+            // Lock-free (04 step 9, Q2): a head anyway, the head read's
+            // state at its generation + 1. Without it a reuse-only commit
+            // conflicts with nothing a concurrent sweep writes, and a sweep
+            // whose second session listing preceded this commit's mark could
+            // remove a chunk it reused.
+            debug!("backup added no chunks; writing a head only (lock-free)");
+            return Ok(CommitState::Publish(Box::new(
+                PublishMachine::publish(repo, Some(head), None, true)
+                    .force_head()
+                    .with_head_check(check)
+                    .listed_at(self.listed_at),
+            )));
         }
         let seg = SegmentBody {
             kind: SegmentKind::Backup,
@@ -777,10 +810,6 @@ impl BackupCommit {
             relocations: Vec::new(),
             pack_trailers,
         };
-        let check = self.marker.as_ref().map(|marker| HeadCheck {
-            session_id: self.session_id.clone(),
-            marker: Arc::clone(marker),
-        });
         Ok(CommitState::Publish(Box::new(
             PublishMachine::publish(repo, Some(head), Some(seg), true)
                 .with_head_check(check)

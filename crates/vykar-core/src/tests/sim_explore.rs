@@ -126,9 +126,10 @@ fn storage() -> impl Strategy<Value = StoreKind> {
 
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
 /// faults of any class and kind, a crash or not, any hosts, time jumps;
-/// compact whole or gate-stepped (no jump inside a stepped compact, see
-/// `Maintenance`; shrinking prefers whole); the fallback or the
-/// conditional store.
+/// compact whole or gate-stepped (no jump inside a stepped compact under
+/// the lock, see `Maintenance`; a lock-free one, on the encrypted
+/// template of [`campaign_cases`], is offered jumps; shrinking prefers
+/// whole); the fallback or the conditional store.
 pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
         .prop_flat_map(|n| {

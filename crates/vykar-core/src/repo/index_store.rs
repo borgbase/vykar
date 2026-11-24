@@ -1138,11 +1138,7 @@ pub(crate) fn collect_index_garbage(
         mtime.is_some_and(|m| now.duration_since(m).unwrap_or_default() >= grace)
     };
 
-    let floor = latest.generation.saturating_sub(HEADS_KEPT);
-    let (doomed, kept): (Vec<_>, Vec<_>) =
-        heads.iter().copied().partition(|&(generation, mtime)| {
-            generation != latest.generation && generation < floor && old(mtime, grace.heads)
-        });
+    let (doomed, kept) = partition_heads(&heads, latest.generation, now, grace.heads);
 
     // Read the kept heads before deleting anything.
     let mut keep: std::collections::HashSet<ObjectName> = latest.named_objects().collect();
@@ -1204,6 +1200,69 @@ pub(crate) fn collect_index_garbage(
         match storage.delete(key) {
             Ok(()) => stats.objects_deleted += 1,
             Err(e) => log_failed_delete("index object", key, &e),
+        }
+    }
+    Ok(stats)
+}
+
+/// `heads` split into those a collection deletes (not `latest`, more than
+/// [`HEADS_KEPT`] below it, and at least `grace` old at `now`; a missing
+/// or future mtime is age 0) and those it keeps.
+#[allow(clippy::type_complexity)]
+fn partition_heads(
+    heads: &[(u64, Option<std::time::SystemTime>)],
+    latest: u64,
+    now: std::time::SystemTime,
+    grace: std::time::Duration,
+) -> (
+    Vec<(u64, Option<std::time::SystemTime>)>,
+    Vec<(u64, Option<std::time::SystemTime>)>,
+) {
+    let floor = latest.saturating_sub(HEADS_KEPT);
+    heads.iter().copied().partition(|&(generation, mtime)| {
+        generation != latest
+            && generation < floor
+            && mtime.is_some_and(|m| now.duration_since(m).unwrap_or_default() >= grace)
+    })
+}
+
+/// The head part of [`collect_index_garbage`] alone: one listing of
+/// `index.h/`, then the deletes of the heads it would delete; no object is
+/// listed, read or deleted. For the head a lock-free backup that added no
+/// chunk creates (04 step 9, U9): such heads add no segment and trigger no
+/// fold, so without this `index.h/` would grow by one key per unchanged
+/// backup until the next fold or compact. Same precondition, "now" and
+/// skips as [`collect_index_garbage`]; the objects old heads named are
+/// collected by the next full collection, after their 12 h grace.
+pub(crate) fn collect_old_heads(
+    storage: &dyn StorageBackend,
+    latest: &IndexHead,
+    grace: std::time::Duration,
+) -> Result<IndexGcStats> {
+    let mut stats = IndexGcStats::default();
+    if storage.server_ops().is_some_and(|s| s.append_only()) {
+        stats.skipped = Some("append-only server");
+        return Ok(stats);
+    }
+    let heads: Vec<(u64, Option<std::time::SystemTime>)> = storage
+        .list_meta(HEAD_PREFIX)?
+        .into_iter()
+        .filter_map(|o| Some((vykar_protocol::head_generation(&o.key)?, o.mtime)))
+        .collect();
+    let Some(own) = heads.iter().find(|h| h.0 == latest.generation) else {
+        stats.skipped = Some("own head not listed");
+        return Ok(stats);
+    };
+    let Some(now) = own.1 else {
+        stats.skipped = Some("no mtimes");
+        return Ok(stats);
+    };
+    let (doomed, _) = partition_heads(&heads, latest.generation, now, grace);
+    for &(generation, _) in &doomed {
+        let key = head_key(generation);
+        match storage.delete(&key) {
+            Ok(()) => stats.heads_deleted += 1,
+            Err(e) => log_failed_delete("index head", &key, &e),
         }
     }
     Ok(stats)

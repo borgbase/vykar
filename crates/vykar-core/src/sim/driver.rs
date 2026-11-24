@@ -23,10 +23,13 @@
 //! before 04 step 7) or one decision per protocol-key operation
 //! (`Stepped`: gate-stepped on its own thread; the commit machines are
 //! steppable, compact is not a machine; see [`is_maintenance_step`]). No
-//! time jump is offered while a stepped compact is in flight: it holds the
-//! maintenance lock for its whole run, and a jump inside it would make it
-//! the victim of an aged-lock reap (H4's family), which no signature
-//! describes. Jumps before and after it, and crashes, are offered.
+//! time jump is offered while a stepped compact under the lock is in
+//! flight: it holds the maintenance lock for its whole run, and a jump
+//! inside it would make it the victim of an aged-lock reap (H4's family),
+//! which no signature describes. A lock-free stepped compact (phase F part
+//! 10d: it registers a session marker instead, its heartbeat running
+//! beside its gated main thread) is offered jumps inside it too. Jumps
+//! before and after it, and crashes, are offered.
 //! Delete is one decision. Both run their index writes through the same
 //! publish machine, driven to the end inside the command.
 //!
@@ -256,7 +259,12 @@ impl TemplateKind {
 /// (`crash_inside_a_stepped_compact`). 04 step 8 (phase F part 9) makes
 /// maintenance heads put-if-absent; jumps inside a stepped compact on a
 /// conditional store are its separable step 3.12, not built (part 9's
-/// report).
+/// report). Phase F part 10d: a lock-free stepped compact (encrypted
+/// template, a handle whose put-if-absent check passed) holds no lock, so
+/// jumps are offered inside it (`MaintRun::session`); its marker's
+/// heartbeat keeps it live across them, and a jump inside it only makes
+/// its "now" (its marker key's mtime, read at its session listing) older,
+/// which errs young.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Maintenance {
     /// One decision for the whole command (every seed recorded before 04
@@ -276,9 +284,18 @@ impl Maintenance {
     }
 }
 
+/// The name of a session's heartbeat thread: a lock-free stepped compact's
+/// heartbeat runs beside its gated main thread, its operations are not
+/// steps.
+const HEARTBEAT_THREAD: &str = crate::repo::lock::HEARTBEAT_THREAD_NAME;
+
 /// Most step operations one stepped compact makes; one more is a harness
-/// bug (at least twice the largest count the determinism test measures).
-pub const MAX_MAINTENANCE_STEPS: usize = 96;
+/// bug (at least twice the largest count the determinism test measures:
+/// 47 for a lock-free compact in phase F part 10d, which registers, lists
+/// sessions twice and deregisters; each of its re-marks, at most two more,
+/// adds a session listing with its GETs, a snapshot listing with its GETs
+/// and a head read, so the bound leaves room for both).
+pub const MAX_MAINTENANCE_STEPS: usize = 192;
 
 /// The shard listing `list_packs` issues first on a backend without a
 /// tree listing (the simulator's store): the step "before compact lists
@@ -634,7 +651,31 @@ pub enum Signature {
     /// the victim's head PUT and the compact (seed
     /// `aged-session-reaped-swept-packs-old-segment`). Left by part 9 (04
     /// step 8): the sweep cannot mark a snapshot not yet written; part 10
-    /// (04 step 9 and 05's `reused` section).
+    /// (04 step 9 and 05's `reused` section). Since phase F part 10d's fix
+    /// round also a lock-free compact's residual: it checks its marker
+    /// before every head create and batch of deletes, so what remains is a
+    /// reap by age while a head create is in flight after that check. The
+    /// signature claims the compact's repack outputs another client deleted
+    /// after the reap (`IndexNamesAbsentPack`) and the restores that need
+    /// them, and the violations of a snapshot a lock-path run committed
+    /// between the reap and that create (with a later compact's refusal to
+    /// mark it); nothing else. That claim cannot tell a reap after the
+    /// compact's marker check from a compact that never checked: with the
+    /// fence in place the two look alike, so the scripted tests in which the
+    /// compact stops at its marker check guard the fence, not campaigns.
+    /// Since part 10d's fix rounds 2 and 3 also a backup whose session a
+    /// compact (in either mode) found stale by age at its listing, judged as
+    /// production judges it (the newest key against the compact's own "now"),
+    /// whichever run deleted the stale keys: the victim then wrote its next
+    /// key (its commit mark) and the compact deleted its old uploads as
+    /// orphans while that key was present (invariant 10; seeds
+    /// `aged-session-reaped-mark-after-listing-lockfree`,
+    /// `mixed-aged-session-reaped-before-listing`). The victim's record has
+    /// a gap and its packs are past `PACK_AGE_LIMIT`, so its commit refuses
+    /// before a head. Claims those pack deletes, of packs past
+    /// `PACK_AGE_LIMIT` at the compact's "now", by the listing run, while
+    /// the victim wrote no snapshot and every key of it present was written
+    /// after the listing; nothing else.
     AgedSessionReaped,
     /// A protected write by a client whose lock another client reaped by
     /// age (not written for more than the 6 h stale age: the driver's time
@@ -803,7 +844,13 @@ pub enum Signature {
     /// `HeadOverwritten` at the release and the `HeadSkipsPredecessor` of
     /// the generation after the one it replaced (seed
     /// `mixed-late-lock-head-replaces-compact-head`: a compact had built
-    /// on the head the late PUT replaced and published the next one).
+    /// on the head the late PUT replaced and published the next one), the
+    /// skip only beside that overwrite and only when the next head was
+    /// built on the replaced one before the release (phase F part 10d).
+    /// Also (phase F part 10d) the `HeadOverwritten` of a lock client's
+    /// plain head PUT over such a late head, when the late write's run
+    /// failed without a snapshot (seed `mixed-late-lock-head-replaced`):
+    /// a lock holder that read the head before the late one landed.
     LateIndexWrite,
     /// Mixed modes (phase F part 10c) on the store whose plain PUT replaces
     /// heads (`StoreKind::ConditionalOverwrite`: local, SFTP, S3): a
@@ -1014,6 +1061,53 @@ struct MaintRun {
     spawned: Spawned,
     gates: Vec<GateId>,
     next: usize,
+    /// A lock-free compact's session (04 step 9), from its registration
+    /// key's PUT (its first step op): such a compact holds no lock, so time
+    /// jumps are offered inside it.
+    session: Option<String>,
+    /// Its heartbeat thread runs: registered and adopted, not yet ended.
+    /// Adopted is known from the first step op after a passed registration
+    /// probe, the listing of the first pack shard (a lock-free compact lists
+    /// `packs/` right after it registers; the probe's own step ops, a
+    /// listing of `sessions/` for a lock's age, come before). Any delete of
+    /// its own key (a failed registration, or the deregistration, which
+    /// stops the heartbeat before its first delete) ends it.
+    heartbeat: bool,
+    /// A delete of its own marker key was held: no heartbeat from here on.
+    ended: bool,
+    /// The registration probe passed and the session was adopted.
+    adopted: bool,
+}
+
+impl MaintRun {
+    /// Track the run's session from the step op it is held at.
+    fn observe(&mut self, held: &super::gate::Paused) {
+        let own_key = |id: &str| {
+            held.key
+                .strip_prefix("sessions/")
+                .is_some_and(|rest| rest.starts_with(id))
+        };
+        let registration = self.session.is_none()
+            && held.op.is_write()
+            && held.key.starts_with("sessions/")
+            && held.key.ends_with(".json");
+        if registration {
+            self.session = crate::repo::lock::parse_session_marker_key(&held.key)
+                .map(|(id, _)| id.to_string());
+            self.heartbeat = false;
+            return;
+        }
+        if let Some(id) = self.session.as_deref()
+            && held.op.is_delete()
+            && own_key(id)
+        {
+            self.ended = true;
+        }
+        if self.session.is_some() && held.op == OpKind::ListMeta && held.key == FIRST_PACK_SHARD {
+            self.adopted = true;
+        }
+        self.heartbeat = self.adopted && !self.ended;
+    }
 }
 
 struct LockWait {
@@ -1056,9 +1150,14 @@ impl Actor {
     }
 
     /// Its session is registered and its heartbeat runs. A stepped compact
-    /// registers no session.
+    /// under the lock registers no session; a lock-free one does
+    /// (`MaintRun::heartbeat`).
     fn heartbeat(&self) -> bool {
-        !matches!(self.phase, Phase::Idle | Phase::Maint(_))
+        match &self.phase {
+            Phase::Idle => false,
+            Phase::Maint(m) => m.heartbeat,
+            _ => true,
+        }
     }
 }
 
@@ -1192,11 +1291,12 @@ impl<'c> Driver<'c> {
             }
         }
         out.extend(parked);
-        // No jump inside a stepped compact (see `Maintenance`).
+        // No jump inside a stepped compact under the lock (see
+        // `Maintenance`); a lock-free one holds no lock.
         let in_maint = self
             .actors
             .iter()
-            .any(|a| matches!(a.phase, Phase::Maint(_)));
+            .any(|a| matches!(&a.phase, Phase::Maint(m) if m.session.is_none()));
         if self.case.advances && self.advances < MAX_ADVANCES && !in_maint {
             out.extend(ADVANCES.iter().map(|&secs| Action::Advance { secs }));
         }
@@ -1340,6 +1440,7 @@ impl<'c> Driver<'c> {
                 self.sim.gate(
                     GateRule::new(c, OpMatch::Any, KeyMatch::Any)
                         .filter(is_maintenance_step)
+                        .not_on_thread(HEARTBEAT_THREAD)
                         .nth(n),
                 )
             })
@@ -1350,6 +1451,10 @@ impl<'c> Driver<'c> {
             spawned,
             gates,
             next: 0,
+            session: None,
+            heartbeat: false,
+            ended: false,
+            adopted: false,
         });
         self.await_maint(i, m);
         "compact start".into()
@@ -1377,7 +1482,7 @@ impl<'c> Driver<'c> {
     /// Wait for `m` to be held at `gates[next]` (phase `Maint`) or to
     /// end (joined and recorded; phase `Idle`). Asserts that every held op
     /// comes from the run's own thread and that no gate was missed.
-    fn await_maint(&mut self, i: usize, m: Box<MaintRun>) {
+    fn await_maint(&mut self, i: usize, mut m: Box<MaintRun>) {
         assert!(
             m.next < m.gates.len(),
             "harness: a stepped compact made more than {MAX_MAINTENANCE_STEPS} step ops:
@@ -1408,6 +1513,7 @@ impl<'c> Driver<'c> {
 {}",
                     self.trace_text()
                 );
+                m.observe(&p);
                 self.actors[i].phase = Phase::Maint(m);
             }
             None => self.end_maint(*m),
@@ -1421,6 +1527,7 @@ impl<'c> Driver<'c> {
             spawned,
             gates,
             next,
+            ..
         } = m;
         for g in &gates[next..] {
             if let Err(e) = self.sim.store().resume_gate(*g) {
@@ -1904,6 +2011,51 @@ fn late_create_replaced(ev: &Evidence, created: &OpRecord, over: &OpRecord) -> b
         && failed_without_snapshot
 }
 
+/// Whether `over`, a plain head PUT, replaced `late`, a lock client's plain
+/// head PUT released after its run returned, on the store whose plain PUT
+/// replaces heads: `late`'s run did not succeed and wrote no snapshot (so
+/// no committed snapshot depended on that head), and `over` is a lock
+/// client's plain PUT by a lock holder whose last read of `index.h/`
+/// before it came before the late one landed (seed
+/// `mixed-late-lock-head-replaced`): it chose the generation without
+/// seeing the late head.
+fn late_lock_head_replaced(ev: &Evidence, late: &OpRecord, over: &OpRecord) -> bool {
+    let read_before_landing = ev
+        .log
+        .iter()
+        .filter(|r| {
+            r.client == over.client
+                && r.run == over.run
+                && r.step < over.step
+                && !r.op.is_mutation()
+                && r.key.starts_with("index.h/")
+        })
+        .map(|r| r.step)
+        .max()
+        .is_some_and(|read| read < late.step);
+    let failed_without_snapshot = late
+        .run
+        .and_then(|i| ev.runs.iter().find(|x| x.index == i))
+        .is_some_and(|run| {
+            run.last_step < late.step
+                && !run.is_ok()
+                && !ev.log.iter().any(|r| {
+                    r.run == Some(run.index)
+                        && r.op.is_write()
+                        && r.applied()
+                        && r.key.starts_with("snapshots/")
+                })
+        });
+    ev.kind == StoreKind::ConditionalOverwrite
+        && over.op == OpKind::Put
+        && ev.lock_clients.contains(&over.client)
+        && late.op == OpKind::Put
+        && ev.lock_clients.contains(&late.client)
+        && matches!(late.outcome, OpOutcome::Released(_))
+        && failed_without_snapshot
+        && read_before_landing
+}
+
 /// What [`classify_evidence`] reads of a simulation: its store log, its
 /// runs, and the store facts a signature depends on.
 #[derive(Clone, Debug)]
@@ -2215,11 +2367,18 @@ pub(crate) fn classify_evidence(
             .iter()
             .rfind(|r| r.step < step && r.key == rec.key && r.op.is_write() && r.applied());
         let replaced = replaced_write.map(|r| (r.client, r.run));
-        let aged_marker = replaced.is_some_and(|(c, run)| {
-            marker_reaps
-                .iter()
-                .any(|&(s, w, r, aged)| aged && s < step && w == c && r == run)
-        });
+        // A late overwrite is R5's only as a lock client's plain PUT on the
+        // store whose plain PUT replaces heads (the only writer that lands
+        // over a lock-free head without a create).
+        let lock_client_put = ev.kind == StoreKind::ConditionalOverwrite
+            && rec.op == OpKind::Put
+            && ev.lock_clients.contains(&rec.client);
+        let aged_marker = (!late || lock_client_put)
+            && replaced.is_some_and(|(c, run)| {
+                marker_reaps
+                    .iter()
+                    .any(|&(s, w, r, aged)| aged && s < step && w == c && r == run)
+            });
         let sig = if aged_lock {
             Signature::AgedLockReaped
         } else if aged_marker {
@@ -2230,10 +2389,112 @@ pub(crate) fn classify_evidence(
             if !late && replaced_write.is_some_and(|w| late_create_replaced(ev, w, rec)) {
                 claims.claim_index(Signature::LateHeadCreateReplaced, i);
             }
+            // A failed lock-mode run's late plain head PUT, replaced by a
+            // lock holder that read the head before it landed (H3's
+            // mechanism on the mixed store, its damage none): the late
+            // write's trace, `LateIndexWrite`'s.
+            if !late && replaced_write.is_some_and(|w| late_lock_head_replaced(ev, w, rec)) {
+                claims.claim_index(Signature::LateIndexWrite, i);
+            }
             continue;
         };
         claims.cascade(sig, step);
         claims.skipped = true;
+    }
+
+    // F1's residual (phase F part 10d): a lock-free compact checks its marker
+    // before each head create and each batch of deletes, so what is left is
+    // a stall over the session staleness between that check and the head
+    // create it guards, the marker reaped meanwhile. The late create lands
+    // and names (a) the compact's own repack outputs another client deleted
+    // as old orphans after the reap, or (b) a sweep planned before a
+    // lock-path run (which did not yield to the reaped marker) committed a
+    // snapshot without a head. Claimed: absent outputs and the restores that
+    // need them, and that snapshot's violations (and the later compact that
+    // cannot mark it); nothing else.
+    // Ages on the store's clock of each record (`OpRecord::at`), which the
+    // trace clock equals in a driver run and which a scripted run has too.
+    let mut aged_marker_reaps: Vec<(u64, ClientId, Option<usize>)> = Vec::new();
+    {
+        let mut written: BTreeMap<&str, (ClientId, Option<usize>, DateTime<Utc>)> = BTreeMap::new();
+        for r in log {
+            if r.op.is_write()
+                && r.applied()
+                && r.key.starts_with("sessions/")
+                && r.key.ends_with(".json")
+            {
+                written.insert(&r.key, (r.client, r.run, r.at));
+            }
+            for k in r.deleted_keys() {
+                if let Some(&(w, run, at)) = written.get(k)
+                    && w != r.client
+                    && (r.at - at).num_seconds() > STALE_SESSION_SECS
+                {
+                    aged_marker_reaps.push((r.step, w, run));
+                }
+            }
+        }
+    }
+    for &(reap_step, w, run) in &aged_marker_reaps {
+        let Some(victim) = run
+            .and_then(|i| runs.iter().find(|x| x.index == i))
+            .filter(|x| x.lock_free && matches!(x.op, ClientOp::Compact))
+        else {
+            continue;
+        };
+        let mine = |r: &OpRecord| r.client == w && r.run == Some(victim.index);
+        let Some(h) = log
+            .iter()
+            .find(|r| {
+                r.step > reap_step
+                    && mine(r)
+                    && r.op == OpKind::PutIfAbsent
+                    && r.applied()
+                    && r.key.starts_with("index.h/")
+            })
+            .map(|r| r.step)
+        else {
+            continue;
+        };
+        let outputs: BTreeSet<&str> = log
+            .iter()
+            .filter(|r| mine(r) && r.op.is_write() && r.applied() && r.key.starts_with("packs/"))
+            .map(|r| r.key.as_str())
+            .collect();
+        let deleted: BTreeSet<&str> = log
+            .iter()
+            .filter(|r| r.step > reap_step && r.step < h && r.client != w)
+            .flat_map(|r| r.deleted_keys())
+            .filter(|k| outputs.contains(k))
+            .collect();
+        let snaps: BTreeSet<&str> = runs
+            .iter()
+            .filter(|x| !x.lock_free && x.client != w)
+            .filter(|x| {
+                log.iter().any(|r| {
+                    r.run == Some(x.index)
+                        && r.step > reap_step
+                        && r.step < h
+                        && r.op.is_write()
+                        && r.applied()
+                        && r.key.starts_with("snapshots/")
+                })
+            })
+            .filter_map(|x| match &x.op {
+                ClientOp::Backup { snapshot } => Some(snapshot.as_str()),
+                _ => None,
+            })
+            .collect();
+        claims.claim(Signature::AgedSessionReaped, |v| match v.kind {
+            ViolationKind::IndexNamesAbsentPack => deleted.contains(v.subject.as_str()),
+            ViolationKind::WedgedCompact => snaps
+                .iter()
+                .any(|s| v.detail.contains(&format!("snapshot '{s} ("))),
+            _ if v.invariant == Invariant::CommittedSnapshotsRestore => {
+                snaps.contains(v.subject.as_str()) || deleted.iter().any(|p| v.detail.contains(p))
+            }
+            _ => false,
+        });
     }
 
     // Session markers deleted by another client while their writer's run
@@ -2280,6 +2541,121 @@ pub(crate) fn classify_evidence(
             });
         }
     }
+
+    // A backup's pack deleted by a run that found the backup's session stale
+    // by age (phase F part 10d, fix rounds 2 and 3). The deleting run R
+    // judged sessions as production does: at its last `sessions/` listing
+    // with mtimes L before the delete (a plain listing, such as the sweep's
+    // look for committing sessions, judges no age), the victim's newest
+    // marker key was older than the session staleness at R's "now"
+    // (`lock::reap_sessions` judges a session by its newest key, against
+    // the mtime of R's own newest marker key lock-free or of its lock key
+    // under the lock, both written before L), so no horizon held the
+    // victim's packs, and they were orphans past `PACK_AGE_LIMIT`. Who deleted the victim's stale keys does not matter:
+    // R itself (seed `aged-session-reaped-mark-after-listing-lockfree`), or
+    // an earlier run, such as a lock-mode backup's commit-lock yield (seed
+    // `mixed-aged-session-reaped-before-listing`). The victim then wrote a
+    // key after L (its commit mark, or a refresh after a stall), present at
+    // the delete: invariant 10's `LiveSessionPackDeleted`. Its record has a
+    // gap over `MARKER_GAP_LIMIT` and its elapsed time is past
+    // `PACK_AGE_LIMIT`, so every commit check refuses it (I8) before a head.
+    // Claimed: those deletes, by a run in either mode, of a backup run that
+    // wrote no snapshot, while every marker key of the victim present at the
+    // delete was written after L; nothing else.
+    let is_marker = |k: &str| k.starts_with("sessions/") && k.ends_with(".json");
+    let pack_age_limit = chrono::Duration::from_std(crate::repo::ages::PACK_AGE_LIMIT)
+        .expect("PACK_AGE_LIMIT fits a chrono duration");
+    let stale_at_listing = |v: &Violation| -> bool {
+        if v.kind != ViolationKind::LiveSessionPackDeleted {
+            return false;
+        }
+        let mut words = v.subject.splitn(3, ' ');
+        let (Some("run"), Some(victim), Some(pack)) = (words.next(), words.next(), words.next())
+        else {
+            return false;
+        };
+        let Ok(victim) = victim.parse::<usize>() else {
+            return false;
+        };
+        let Some(at) = v.step else { return false };
+        let Some(deleter) = log
+            .iter()
+            .find(|r| r.step == at && r.deleted_keys().contains(&pack))
+            .and_then(|r| r.run)
+        else {
+            return false;
+        };
+        if !runs
+            .iter()
+            .any(|x| x.index == victim && matches!(x.op, ClientOp::Backup { .. }))
+        {
+            return false;
+        }
+        let mine = |r: &&OpRecord, run: usize| r.run == Some(run) && r.op.is_write() && r.applied();
+        if log
+            .iter()
+            .any(|r| mine(&r, victim) && r.key.starts_with("snapshots/"))
+        {
+            return false;
+        }
+        let Some(listing) = log.iter().rfind(|r| {
+            r.step < at
+                && r.run == Some(deleter)
+                && r.op == OpKind::ListMeta
+                && r.key == "sessions/"
+                && r.outcome == OpOutcome::Ok
+        }) else {
+            return false;
+        };
+        let before = |r: &&OpRecord| r.step < listing.step;
+        // The deleter's "now": its newest marker key lock-free, else the
+        // lock key it acquired.
+        let now = log
+            .iter()
+            .filter(before)
+            .rfind(|r| mine(r, deleter) && is_marker(&r.key))
+            .or_else(|| {
+                log.iter().filter(before).find(|r| {
+                    mine(r, deleter) && r.key.starts_with("locks/") && r.key.ends_with(".json")
+                })
+            })
+            .map(|r| r.at);
+        let Some(now) = now else { return false };
+        // The victim's newest marker key before the listing, stale there.
+        let Some(newest) = log
+            .iter()
+            .filter(before)
+            .rfind(|r| mine(r, victim) && is_marker(&r.key))
+        else {
+            return false;
+        };
+        if (now - newest.at).num_seconds() <= STALE_SESSION_SECS {
+            return false;
+        }
+        // The pack was past the pack-age limit at that "now".
+        let Some(put) = log
+            .iter()
+            .rfind(|r| r.step < at && r.op.is_write() && r.applied() && r.key == pack)
+        else {
+            return false;
+        };
+        if now - put.at < pack_age_limit {
+            return false;
+        }
+        // Every marker key of the victim present at the delete was written
+        // after the listing.
+        let mut present: BTreeMap<&str, u64> = BTreeMap::new();
+        for r in log.iter().filter(|r| r.step < at && r.applied()) {
+            if mine(&r, victim) && is_marker(&r.key) {
+                present.insert(&r.key, r.step);
+            }
+            for k in r.deleted_keys() {
+                present.remove(k);
+            }
+        }
+        present.values().all(|&w| w > listing.step)
+    };
+    claims.claim(Signature::AgedSessionReaped, stale_at_listing);
 
     // A released head write cascades from its step when it left a
     // committed snapshot without index coverage, or the index naming an
@@ -2452,30 +2828,43 @@ pub(crate) fn classify_evidence(
             })
             .map(|r| (r.step, vykar_protocol::head_generation(&r.key)))
             .collect();
-        let late_lock_head: Vec<usize> = report
-            .violations
-            .iter()
-            .enumerate()
-            .filter(|(i, v)| {
-                !claims.claimed[*i]
-                    && match v.kind {
-                        ViolationKind::HeadOverwritten => {
-                            late_lock_heads.iter().any(|(s, _)| v.step == Some(*s))
-                        }
-                        ViolationKind::HeadSkipsPredecessor => {
-                            vykar_protocol::head_generation(&v.subject).is_some_and(|next| {
-                                late_lock_heads
-                                    .iter()
-                                    .any(|(_, g)| g.is_some() && *g == next.checked_sub(1))
-                            })
-                        }
-                        _ => false,
-                    }
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in late_lock_head {
-            claims.claim_index(Signature::LateIndexWrite, i);
+        let head_gen = |r: &OpRecord| vykar_protocol::head_generation(&r.key);
+        for &(s, g) in &late_lock_heads {
+            // The overwrite at the release itself; the next generation's
+            // skip only beside it, and only when that head was built on
+            // the replaced one: written, or its writer's GET of generation g
+            // made, before the release.
+            let Some(over) = report.violations.iter().enumerate().position(|(i, v)| {
+                !claims.claimed[i] && v.kind == ViolationKind::HeadOverwritten && v.step == Some(s)
+            }) else {
+                continue;
+            };
+            claims.claim_index(Signature::LateIndexWrite, over);
+            let Some(g) = g else { continue };
+            let next = log
+                .iter()
+                .find(|r| r.op.is_write() && r.applied() && head_gen(r) == Some(g + 1));
+            let built_before = next.is_some_and(|w| {
+                w.step < s
+                    || log.iter().any(|r| {
+                        r.step < s
+                            && r.client == w.client
+                            && r.run == w.run
+                            && r.op == OpKind::Get
+                            && head_gen(r) == Some(g)
+                    })
+            });
+            if !built_before {
+                continue;
+            }
+            let skip = report.violations.iter().enumerate().position(|(i, v)| {
+                !claims.claimed[i]
+                    && v.kind == ViolationKind::HeadSkipsPredecessor
+                    && vykar_protocol::head_generation(&v.subject) == Some(g + 1)
+            });
+            if let Some(i) = skip {
+                claims.claim_index(Signature::LateIndexWrite, i);
+            }
         }
     }
 

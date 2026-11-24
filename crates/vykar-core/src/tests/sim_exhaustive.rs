@@ -109,6 +109,27 @@ pub(super) fn commit_vs_compact(hosts: HostPlan) -> Case {
     )
 }
 
+/// a: a backup, then delete c0; b: compact. Distinct hosts (phase F part
+/// 10d: a delete that lands during a compact's mark).
+pub(super) fn delete_during_compact() -> Case {
+    base(
+        HostPlan::Distinct,
+        vec![
+            vec![backup(), Command::DeleteControl],
+            vec![Command::Compact],
+        ],
+    )
+}
+
+/// a: a backup sharing c0's file, then a compact; b: a compact. Distinct
+/// hosts (phase F part 10d: two compacts at once).
+pub(super) fn two_compacts() -> Case {
+    base(
+        HostPlan::Distinct,
+        vec![vec![backup(), Command::Compact], vec![Command::Compact]],
+    )
+}
+
 /// a and b: one backup each; c: delete c0, then compact. Distinct hosts.
 pub(super) fn three_clients() -> Case {
     base(
@@ -220,6 +241,22 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         c.faults = vec![f];
         out.push((label, c, 1));
     }
+    // Phase F part 10d's lock-free maintenance bases, on the lock-free
+    // family only (every client lock-free; in the other families they add
+    // nothing the compact bases above do not): a delete during a stepped
+    // compact, and two compacts, each at K = 1 with time jumps (inside the
+    // stepped compact too: it holds no lock) and at K = 2.
+    let mut lock_free_only: Vec<(String, Case, u32)> = Vec::new();
+    for (name, c) in [
+        ("delete-during-compact", delete_during_compact()),
+        ("two-compacts", two_compacts()),
+    ] {
+        let c = encrypted(conditional(stepped(c)));
+        let mut jumps = c.clone();
+        jumps.advances = true;
+        lock_free_only.push((format!("{name}-stepped-advances-k1-lockfree"), jumps, 1));
+        lock_free_only.push((format!("{name}-stepped-k2-lockfree"), c, 2));
+    }
     // Every scenario on the conditional store too (04 step 8, N6): local,
     // OpenSSH SFTP, AWS S3 and vykar-server all offer put-if-absent. Every
     // scenario lock-free too (phase F part 10c: the encrypted template on
@@ -233,15 +270,21 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
             1,
             (format!("{name}-conditional"), conditional(c.clone()), k),
         ));
-        all.push((
-            k,
-            2,
-            (
-                format!("{name}-lockfree"),
-                encrypted(conditional(c.clone())),
+        // A fault on a lock key never fires in the lock-free family: since
+        // phase F part 10d no client there takes the lock (backups and
+        // maintenance alike), so such a scenario repeats its no-fault twin.
+        let lock_fault = c.faults.iter().any(|f| f.class == KeyClass::Lock);
+        if !lock_fault {
+            all.push((
                 k,
-            ),
-        ));
+                2,
+                (
+                    format!("{name}-lockfree"),
+                    encrypted(conditional(c.clone())),
+                    k,
+                ),
+            ));
+        }
         if name.starts_with("pair") || name.starts_with("three") {
             all.push((
                 k,
@@ -254,6 +297,9 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
             ));
         }
         all.push((k, 0, (name, c, k)));
+    }
+    for (name, c, k) in lock_free_only {
+        all.push((k, 2, (name, c, k)));
     }
     // Within one (K, family) the cheapest first; stable, so the build order
     // stays among equals.
@@ -313,6 +359,8 @@ fn scenario_cost(name: &str) -> (bool, usize) {
         "pair-hostname",
         "compact-distinct",
         "compact-hostname",
+        "delete-during-compact",
+        "two-compacts",
         "three-clients",
     ]
     .iter()
@@ -397,10 +445,14 @@ fn lock_pair_on_a_conditional_store_is_clean() {
 /// [`assert_clean`], and some schedule has a run that committed lock-free
 /// (the case reaches the path it is about).
 fn assert_clean_lock_free(name: &str, c: &Case) {
-    let t = Template::of_kind(c.template);
+    assert_clean_lock_free_on(&Template::of_kind(c.template), name, c);
+}
+
+/// [`assert_clean_lock_free`] on template `t`.
+fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
     let mut lock_free = 0usize;
     let e = explore(
-        &t,
+        t,
         c,
         Bound {
             preemptions: PRECOMMIT_K,
@@ -421,7 +473,7 @@ fn assert_clean_lock_free(name: &str, c: &Case) {
     if let Some((sig, (_, case))) = e.signatures.iter().next() {
         panic!(
             "{name}: a schedule shows {sig:?}:\n{}",
-            kept_trace(&t, name, case)
+            kept_trace(t, name, case)
         );
     }
     assert!(e.search.complete, "{name}: the search did not complete");
@@ -446,21 +498,125 @@ fn lock_free_pair_is_clean() {
     );
 }
 
-/// A lock-free backup against delete + compact under the maintenance lock
-/// (phase F part 10c), whole and stepped: every schedule is clean. Compact
-/// yields (`Locked`) at its session listing to a backup that has marked
-/// its commit; a commit that marks after compact took the lock waits at its
-/// probe; one that commits before compact's listing is swept from by the
-/// rules of 04 step 7, as under the lock.
+/// A lock-free backup against a lock-mode delete + compact (client b's
+/// handle offers no put-if-absent, so it takes the maintenance lock: phase
+/// F part 10c's shape, now the mixed case), whole and stepped: every
+/// schedule is clean. Compact yields (`Locked`) at its session listing to
+/// a backup that has marked its commit; a commit that marks after compact
+/// took the lock waits at its probe; one that commits before compact's
+/// listing is swept from by the rules of 04 step 7, as under the lock.
 #[test]
 fn lock_free_backup_against_a_locked_compact_is_clean() {
     assert_clean_lock_free(
-        "lock-free-compact-distinct",
-        &encrypted(conditional(commit_vs_compact(HostPlan::Distinct))),
+        "lock-free-backup-locked-compact-distinct",
+        &encrypted(mixed(commit_vs_compact(HostPlan::Distinct), vec![1])),
     );
     assert_clean_lock_free(
-        "lock-free-compact-distinct-stepped",
-        &encrypted(conditional(stepped(commit_vs_compact(HostPlan::Distinct)))),
+        "lock-free-backup-locked-compact-distinct-stepped",
+        &encrypted(mixed(
+            stepped(commit_vs_compact(HostPlan::Distinct)),
+            vec![1],
+        )),
+    );
+}
+
+/// A lock-free backup against a lock-free delete + compact (phase F part
+/// 10d: both clients' handles pass the put-if-absent check), whole and
+/// gate-stepped, on the aged and the young template: every schedule is
+/// clean. The compact registers a `writes_heads` marker instead of the
+/// lock; its second session listing skips the sweep beside a committing
+/// backup; a backup that commits during its mark moves the head, and the
+/// compact marks again or its sweep head's create is taken; the backup's
+/// reuse re-check fails it `StaleChunksDuringCommit` when it read the sweep.
+#[test]
+fn lock_free_backup_against_lock_free_compact_is_clean() {
+    let cvc = || encrypted(conditional(commit_vs_compact(HostPlan::Distinct)));
+    assert_clean_lock_free("lock-free-compact-distinct", &cvc());
+    assert_clean_lock_free("lock-free-compact-distinct-stepped", &stepped(cvc()));
+}
+
+/// [`lock_free_backup_against_lock_free_compact_is_clean`] on the young
+/// template (c0's segment younger than T_pack: its chunks stay unswept).
+#[test]
+fn lock_free_backup_against_lock_free_compact_young_is_clean() {
+    let cvc = || encrypted(conditional(commit_vs_compact(HostPlan::Distinct)));
+    assert_clean_lock_free_on(
+        &Template::encrypted_young(),
+        "lock-free-compact-young",
+        &cvc(),
+    );
+    assert_clean_lock_free_on(
+        &Template::encrypted_young(),
+        "lock-free-compact-young-stepped",
+        &stepped(cvc()),
+    );
+}
+
+/// The stepped lock-free compact with time jumps offered inside it (phase
+/// F part 10d: it holds no lock, so a jump cannot age one), on the aged
+/// template: every schedule is clean (a jump past a marker's staleness
+/// inside the compact reaps nothing live: the driver's backups refresh).
+#[test]
+fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean() {
+    let mut c = stepped(encrypted(conditional(commit_vs_compact(
+        HostPlan::Distinct,
+    ))));
+    c.advances = true;
+    assert_clean_lock_free("lock-free-compact-stepped-advances", &c);
+}
+
+/// [`lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean`]
+/// on the young template.
+#[test]
+fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clean() {
+    let mut c = stepped(encrypted(conditional(commit_vs_compact(
+        HostPlan::Distinct,
+    ))));
+    c.advances = true;
+    assert_clean_lock_free_on(
+        &Template::encrypted_young(),
+        "lock-free-compact-young-stepped-advances",
+        &c,
+    );
+}
+
+/// The stepped lock-free compact with one crash offered (either client, at
+/// any decision), aged and young templates: every schedule is clean.
+#[test]
+fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() {
+    let mut c = stepped(encrypted(conditional(commit_vs_compact(
+        HostPlan::Distinct,
+    ))));
+    c.crash = true;
+    assert_clean_lock_free("lock-free-compact-stepped-crash", &c);
+    assert_clean_lock_free_on(
+        &Template::encrypted_young(),
+        "lock-free-compact-young-stepped-crash",
+        &c,
+    );
+}
+
+/// a: a backup, then a lock-free delete of c0; b: a stepped lock-free
+/// compact. The delete can land between the compact's snapshot listing and
+/// its GET of c0 (the mark skips it once a second listing no longer shows
+/// it) or anywhere else: every schedule is clean.
+#[test]
+fn lock_free_delete_during_compact_is_clean() {
+    assert_clean_lock_free(
+        "lock-free-delete-during-compact",
+        &stepped(encrypted(conditional(delete_during_compact()))),
+    );
+}
+
+/// a: a backup sharing c0's file, then a compact; b: a stepped compact;
+/// both lock-free: their sweeps meet at a head generation (one marks
+/// again), their repacks rebase over each other's heads, and an orphan or
+/// source one deleted is gone for the other. Every schedule is clean.
+#[test]
+fn two_lock_free_compacts_are_clean() {
+    assert_clean_lock_free(
+        "two-lock-free-compacts",
+        &stepped(encrypted(conditional(two_compacts()))),
     );
 }
 
@@ -1120,21 +1276,8 @@ fn measure_part_10_searches() {
     let start = Instant::now();
     let young = Template::encrypted_young();
     eprintln!("encrypted young template built in {:?}", start.elapsed());
-    let shared = Command::Backup {
-        shared: true,
-        fold: false,
-    };
-    let delete_during_compact = base(
-        HostPlan::Distinct,
-        vec![
-            vec![backup(), Command::DeleteControl],
-            vec![Command::Compact],
-        ],
-    );
-    let two_compacts = base(
-        HostPlan::Distinct,
-        vec![vec![shared, Command::Compact], vec![Command::Compact]],
-    );
+    let delete_during_compact = delete_during_compact();
+    let two_compacts = two_compacts();
     let advances = |mut c: Case| {
         c.advances = true;
         c

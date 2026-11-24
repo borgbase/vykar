@@ -166,6 +166,19 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         conditional: OnConditional::OwnKind,
     },
     KnownHazard {
+        id: "H-committing-reaped",
+        summary: "a lock-free backup that reused chunks of a deleted snapshot stalls 46 min \
+                  after its marker probe, before its snapshot PUT (its heartbeat failing): a \
+                  lock-free compact reaps its committing marker, finds no session \
+                  committing, sweeps the reused chunks and deletes their packs; the late \
+                  snapshot PUT commits a snapshot that does not restore (invariant 1)",
+        fixed_by: "not planned: the marker's documented limit (R1 of phase F part 10, \
+                   AgedSessionReaped); the post-head marker probe narrows it to a stall \
+                   after that probe",
+        run: h_committing_reaped,
+        conditional: OnConditional::OwnKind,
+    },
+    KnownHazard {
         id: "H-mixed-late-create",
         summary: "mixed modes on a store whose plain PUT replaces heads (local, SFTP, S3): \
                   a lock-free backup's head create times out and the backup fails and \
@@ -696,6 +709,82 @@ pub fn h_mixed_aged_lock() -> HazardOutcome {
         .any(|v| v.kind == ViolationKind::HeadOverwritten);
     let evidence = format!("l1: {}; {report}", rl.detail());
     if overwritten {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
+    }
+}
+
+/// H-committing-reaped (phase F part 10d, R1): on an encrypted repository
+/// over `StoreKind::Conditional`, snapshot "old" is deleted and its segment
+/// ages past T_pack; lock-free backup b of the same source again adds no
+/// chunk (it reuses all of "old"'s), creates its head and is held after its
+/// marker probe, at its snapshot PUT. Its heartbeat's next refresh fails
+/// and 46 min pass, so its committing marker is stale on the store's clock:
+/// a lock-free compact reaps it, its second session listing finds no
+/// session committing, its mark (of "keep" only) finds "old"'s chunks
+/// unreferenced, and it sweeps them and deletes their packs. b's snapshot
+/// PUT then commits a snapshot that does not restore.
+pub fn h_committing_reaped() -> HazardOutcome {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::Conditional,
+        encrypted: true,
+        ..SimConfig::default()
+    });
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    for name in ["old", "keep"] {
+        let run = sim.backup(a, name, &SourceTree::seeded(name, 3, FILE_SIZE));
+        if !run.is_ok() {
+            return broken(format!("{name}: {}", run.detail()));
+        }
+    }
+    if !sim.delete(a, &["old"]).is_ok() {
+        return broken(String::from("the delete of old failed"));
+    }
+    sim.advance(std::time::Duration::from_secs(12 * 3600 + 60));
+    let gate = sim.gate(GateRule::new(
+        b,
+        OpMatch::Kind(super::fault::OpKind::Put),
+        KeyMatch::Prefix("snapshots/".into()),
+    ));
+    let rb = sim.spawn(
+        b,
+        Call::BackupSameSource {
+            snapshot: "again".into(),
+            of: "old".into(),
+        },
+    );
+    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
+        let rb = sim.join(rb);
+        return broken(format!("b never reached its snapshot PUT: {}", rb.detail()));
+    }
+    sim.fault(
+        FaultRule::new(
+            OpMatch::Kind(super::fault::OpKind::Put),
+            KeyMatch::Prefix("sessions/".into()),
+            FaultAction::Fail,
+        )
+        .client(b),
+    );
+    sim.advance(std::time::Duration::from_secs(46 * 60));
+    let rc = sim.compact(a);
+    if !rc.is_ok() || !rc.lock_free {
+        return broken(format!("the compact should run lock-free: {}", rc.detail()));
+    }
+    sim.resume(gate);
+    let rb = sim.join(rb);
+    if !rb.is_ok() || !rb.lock_free {
+        return broken(format!("b should commit lock-free: {}", rb.detail()));
+    }
+    let report = sim.check_invariants(Invariant::STEP8);
+    let lost = report
+        .violations
+        .iter()
+        .any(|v| v.invariant == Invariant::CommittedSnapshotsRestore && v.subject == "again");
+    let evidence = format!("compact: {}; {report}", rc.detail());
+    if lost {
         HazardOutcome::Reproduced { evidence }
     } else if report.is_clean() {
         HazardOutcome::NotReproduced { evidence }

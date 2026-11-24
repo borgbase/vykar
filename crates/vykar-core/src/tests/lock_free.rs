@@ -224,13 +224,15 @@ fn a_lock_holder_yields_to_a_committing_backup() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// A compact (under the maintenance lock in 10c) that meets a committing
-/// lock-free backup at its session listing fails `Locked` naming the
-/// committing host, before any write.
+/// A lock-mode compact (its storage handle offers no put-if-absent, so it
+/// takes the maintenance lock) that meets a committing lock-free backup at
+/// its session listing fails `Locked` naming the committing host, before
+/// any write.
 #[test]
 fn a_locked_compact_fails_locked_beside_a_committing_backup() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (f, c) = (sim.client("f"), sim.client("c"));
+    sim.set_lock_client(c);
     let f_snap = sim.gate(snapshot_put(f));
     let rf = sim.spawn(f, backup_call("f1"));
     sim.expect_paused(f_snap, "f before its snapshot PUT");
@@ -256,6 +258,7 @@ fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
     let (f, l, c) = (sim.client("f"), sim.client("l"), sim.client("c"));
     sim.set_lock_client(l);
+    sim.set_lock_client(c);
     let f_head = sim.gate(GateRule::new(
         f,
         OpMatch::Kind(OpKind::PutIfAbsent),
@@ -439,6 +442,9 @@ fn a_lock_holder_lists_sessions_after_its_lock_is_confirmed() {
 fn maintenance_lists_sessions_after_its_lock_is_confirmed() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
+    // Lock mode: on this store a client with put-if-absent runs its
+    // maintenance lock-free (phase F part 10d).
+    sim.set_lock_client(a);
     for name in ["a1", "a2"] {
         sim.backup(a, name, &tree(name)).expect_ok();
     }

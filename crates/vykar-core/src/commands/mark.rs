@@ -11,7 +11,8 @@
 //! The mark ([`mark_live`]) sets one bit per referenced index position
 //! ([`IndexPositions`]) and can count references with snapshot multiplicity,
 //! for the sweep record's referenced bytes. It fails closed: a key under
-//! `snapshots/` that is not a snapshot ID, a listed object that is gone, a
+//! `snapshots/` that is not a snapshot ID, a listed object that is gone
+//! and still listed by a second listing, a
 //! snapshot object that cannot be read, decrypted or decoded, a foreign
 //! envelope, a newer format, a tree pointer missing from the index, a tree
 //! chunk that cannot be read or does not decode on its own, and (with
@@ -98,10 +99,15 @@ impl LiveSnapshot {
 
 /// Every object under `snapshots/` on storage, fetched, authenticated and
 /// decoded, sorted by (time, id). Fails closed: a key that is not a snapshot
-/// ID, a listed object that is gone, any read, decrypt or decode failure, a
-/// foreign envelope and a format version newer than this build all fail the
-/// call. Reads storage only; the local snapshot list is neither read nor
-/// written. Objects are fetched at the backend's request width.
+/// ID, a listed object that is gone and still listed, any read, decrypt or
+/// decode failure, a foreign envelope and a format version newer than this
+/// build all fail the call. A listed object whose GET finds nothing is
+/// skipped only when a second listing of `snapshots/`, taken after every
+/// GET, no longer shows it: a concurrent `delete` or `prune` removed it
+/// (they run without the lock beside compact, 04 step 9), and a deleted
+/// snapshot needs no marking. Reads storage only; the local snapshot list
+/// is neither read nor written. Objects are fetched at the backend's
+/// request width.
 pub(crate) fn load_snapshots_strict(
     repo: &Repository,
     shutdown: &CancelToken,
@@ -126,6 +132,7 @@ pub(crate) fn load_snapshots_strict(
     }
 
     let loaded: Mutex<Vec<LiveSnapshot>> = Mutex::new(Vec::with_capacity(listed.len()));
+    let gone: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let width = repo.storage.profile().request_width;
     try_for_each_bounded(width, &listed, |(key, id)| {
         shutdown.check()?;
@@ -136,17 +143,19 @@ pub(crate) fn load_snapshots_strict(
                 VykarError::Other(format!("snapshot object {key}: {e}"))
             }
         };
-        // Under the maintenance lock nobody deletes a snapshot between the
-        // listing and this GET, so a listed key that is gone is a reaped lock,
-        // an out-of-band delete or a false "not found", and the snapshot may
-        // be live. Lock-free deletes (10d) may skip it only after a second
-        // listing of snapshots/, taken after the GETs, no longer shows it; a
-        // key still listed with a not-found keeps failing closed.
-        let blob = repo
-            .storage
-            .get(key)
-            .map_err(frame)?
-            .ok_or_else(|| VykarError::Other(format!("{key} was listed but is gone")))?;
+        // A listed key that is gone is a concurrent delete or prune (they
+        // take no lock beside a lock-free compact, 04 step 9), a reaped lock,
+        // an out-of-band delete or a false "not found" (a proxy's 404, a
+        // pooled filesystem branch dropping out), and in the last cases the
+        // snapshot may be live. It is skipped only after a second listing,
+        // taken after every GET, no longer shows it; a key still listed with
+        // a not-found fails closed.
+        let Some(blob) = repo.storage.get(key).map_err(frame)? else {
+            gone.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(key.clone());
+            return Ok(());
+        };
         let meta = decode_snapshot_meta(id, &blob, repo.crypto.as_ref()).map_err(frame)?;
         loaded
             .lock()
@@ -154,6 +163,21 @@ pub(crate) fn load_snapshots_strict(
             .push(LiveSnapshot { id: *id, meta });
         Ok::<(), VykarError>(())
     })?;
+    let gone = gone.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if !gone.is_empty() {
+        shutdown.check()?;
+        let again: std::collections::HashSet<String> =
+            repo.storage.list("snapshots/")?.into_iter().collect();
+        for key in &gone {
+            if again.contains(key) {
+                return Err(VykarError::Other(format!("{key} was listed but is gone")));
+            }
+            tracing::debug!(
+                key,
+                "mark: a listed snapshot was deleted before its read; skipped"
+            );
+        }
+    }
     let mut snaps = loaded.into_inner().unwrap_or_else(PoisonError::into_inner);
     snaps.sort_by(|a, b| {
         a.meta

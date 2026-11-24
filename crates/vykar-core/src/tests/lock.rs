@@ -2539,14 +2539,29 @@ mod exclusion {
     #[test]
     fn register_session_probe_issues_no_lock_put() {
         let (storage, log) = RecordingBackend::new();
-        register_session_inner(&storage, "free", 1, 10, &HostEnv::system()).unwrap();
+        register_session_inner(
+            &storage,
+            "free",
+            1,
+            10,
+            &HostEnv::system(),
+            Default::default(),
+        )
+        .unwrap();
         assert!(storage.exists(&session_marker_key("free")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
 
         let held = acquire_lock(&storage, &HostEnv::system()).unwrap();
         log.clear();
-        let err =
-            register_session_inner(&storage, "blocked", 1, 10, &HostEnv::system()).unwrap_err();
+        let err = register_session_inner(
+            &storage,
+            "blocked",
+            1,
+            10,
+            &HostEnv::system(),
+            Default::default(),
+        )
+        .unwrap_err();
         assert_eq!(locked_key(err), held.key());
         assert!(!storage.exists(&session_marker_key("blocked")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());

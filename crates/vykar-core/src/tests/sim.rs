@@ -829,6 +829,7 @@ const TESTED_IDS: &[&str] = &[
     "H4-conditional",
     "H-mixed-aged-lock",
     "H-mixed-late-create",
+    "H-committing-reaped",
 ];
 
 #[test]
@@ -872,6 +873,14 @@ fn known_hazard_h_mixed_aged_lock() {
 #[test]
 fn known_hazard_h_mixed_late_create() {
     hazards::assert_reproduces("H-mixed-late-create");
+}
+
+/// H-committing-reaped (phase F part 10d, R1): a lock-free backup whose
+/// committing marker is reaped by age after its marker probe, before its
+/// snapshot PUT, commits a snapshot a lock-free compact swept meanwhile.
+#[test]
+fn known_hazard_h_committing_reaped() {
+    hazards::assert_reproduces("H-committing-reaped");
 }
 
 /// What each known hazard does on a store that honours put-if-absent: H3,

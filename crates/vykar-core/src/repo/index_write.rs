@@ -342,8 +342,98 @@ impl Repository {
     /// maintenance segment over the loaded head, which must be the latest, or
     /// a base without a head (repair, upgrade).
     pub(super) fn persist_segmented_index(&mut self) -> Result<()> {
+        match self.persist_segmented_index_inner()? {
+            MaintenanceWrite::Written => Ok(()),
+            MaintenanceWrite::Moved => Err(stale_index_error()),
+        }
+    }
+
+    /// [`Self::persist_segmented_index`] for lock-free maintenance (04 step
+    /// 9): a head that moved since the index was loaded, or a generation
+    /// another writer created, is [`MaintenanceWrite::Moved`] instead of the
+    /// "index changed" error. Nothing on storage names a moved write (its
+    /// objects are unreferenced garbage); the index edits are kept and the
+    /// pending sweep is consumed, as on any failure. Not dirty: nothing is
+    /// written. Saves the file cache after a write, as `save_state` does.
+    pub(crate) fn persist_maintenance(&mut self) -> Result<MaintenanceWrite> {
+        if !self.index_dirty {
+            return Ok(MaintenanceWrite::Written);
+        }
+        let written = self.persist_segmented_index_inner();
+        if !matches!(written, Ok(MaintenanceWrite::Written)) {
+            self.pending_sweep = None;
+        }
+        if matches!(written, Ok(MaintenanceWrite::Written)) {
+            self.save_file_cache_if_dirty()?;
+        }
+        written
+    }
+
+    /// Rebase a repack batch's pending relocations onto the latest head (04
+    /// step 9, lock-free compact): take the pending segment (relocations and
+    /// their packs' trailers only; anything else is a BUG error), discard
+    /// the edits, load the index at the latest head, and re-apply each
+    /// relocation whose chunk that index still holds in one of `sources`
+    /// (the batch's source packs), with its new pack's trailer length.
+    /// Another writer's head in between is safe to rebase over by this
+    /// match: a chunk a sweep removed, or another compact moved, is dropped
+    /// (its copy in this batch's new pack is dead bytes for a later
+    /// compact). Returns how many relocations were dropped, and the sources
+    /// at least one relocation was re-applied from.
+    pub(crate) fn rebase_relocations(
+        &mut self,
+        sources: &std::collections::HashSet<vykar_types::pack_id::PackId>,
+    ) -> Result<(
+        usize,
+        std::collections::HashSet<vykar_types::pack_id::PackId>,
+    )> {
+        let seg = self.chunk_index.pending_segment(SegmentKind::Maintenance)?;
+        if !seg.additions.is_empty() || !seg.removals.is_empty() {
+            return Err(VykarError::Other(
+                "BUG: a repack batch to rebase holds additions or removals".into(),
+            ));
+        }
+        let trailers: std::collections::HashMap<_, _> = seg.pack_trailers.into_iter().collect();
+        self.discard_index_edits();
+        self.load_chunk_index_under_lock()?;
+        let mut dropped = 0;
+        let mut kept_from = std::collections::HashSet::new();
+        for (id, loc) in seg.relocations {
+            let from = self
+                .chunk_index
+                .get(&id)
+                .map(|e| e.pack_id)
+                .filter(|p| sources.contains(p));
+            let here = from.is_some();
+            kept_from.extend(from);
+            let trailer = trailers.get(&loc.pack_id).copied();
+            match (here, trailer) {
+                (true, Some(trailer_len)) => {
+                    let index = self.chunk_index_mut();
+                    index.set_pack_trailer(loc.pack_id, trailer_len);
+                    index.update_location(&id, loc.pack_id, loc.pack_offset, loc.stored_size);
+                }
+                (true, None) => {
+                    return Err(VykarError::Other(format!(
+                        "BUG: a repack relocation into pack {} without its trailer length",
+                        loc.pack_id
+                    )));
+                }
+                (false, _) => dropped += 1,
+            }
+        }
+        Ok((dropped, kept_from))
+    }
+
+    /// [`Self::persist_segmented_index`], a moved head or a taken generation
+    /// being [`MaintenanceWrite::Moved`].
+    fn persist_segmented_index_inner(&mut self) -> Result<MaintenanceWrite> {
         let listed_at = MarkerStamp::now(self.host_env().clock.as_ref());
-        let head = self.current_head_for_write()?;
+        let head = match self.current_head_for_write() {
+            Ok(head) => head,
+            Err(e) if is_stale_index_error(&e) => return Ok(MaintenanceWrite::Moved),
+            Err(e) => return Err(e),
+        };
         let Some(head) = head else {
             // The fold's own listing chooses the generation.
             return self.publish_index_state(None, None, false, None);
@@ -358,7 +448,7 @@ impl Repository {
             self.chunk_index.load_empty();
         }
         if *self.chunk_index.state() != IndexState::of_head(&head) {
-            return Err(stale_index_error());
+            return Ok(MaintenanceWrite::Moved);
         }
         let start = std::time::Instant::now();
         let seg = self.chunk_index.pending_segment(SegmentKind::Maintenance)?;
@@ -393,16 +483,17 @@ impl Repository {
     /// sweep is pending. On error nothing
     /// local changes (a requested fold stays requested) and at most an
     /// unreferenced object is left on storage. A generation another writer
-    /// created is the "index changed" error (04 "Compact" 4: a maintenance
+    /// created is [`MaintenanceWrite::Moved`] (its callers under the lock
+    /// make it the "index changed" error: 04 "Compact" 4, a maintenance
     /// write stops). `listed_at`: when the head listing that chose the
     /// generation started (`PublishMachine::listed_at`).
-    pub(super) fn publish_index_state(
+    fn publish_index_state(
         &mut self,
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
         backup: bool,
         listed_at: Option<MarkerStamp>,
-    ) -> Result<()> {
+    ) -> Result<MaintenanceWrite> {
         let mut m = PublishMachine::publish(self, prev, seg, backup).listed_at(listed_at);
         let events = |_: CommitEvent| {};
         match drive_blocking(
@@ -412,8 +503,8 @@ impl Repository {
                 events: &events,
             },
         )? {
-            Published::Head(_) => Ok(()),
-            Published::Taken { .. } => Err(stale_index_error()),
+            Published::Head(_) => Ok(MaintenanceWrite::Written),
+            Published::Taken { .. } => Ok(MaintenanceWrite::Moved),
         }
     }
 
@@ -451,20 +542,36 @@ impl Repository {
         }
     }
 
-    /// Index upkeep at the end of `compact`, under the lock: fold when the
-    /// chain reached the soft limit, then delete old heads and unreferenced
-    /// `index.d/` objects. The deletion is age-gated, so it never deletes a
-    /// concurrent writer's fresh segment (H4-segment). The soft limit counts
-    /// only the foldable prefix; young backup segments stay in the head
-    /// (04 step 7). The deletion runs only when this handle created the
-    /// latest head (the fold's, or the run's last index write): a writer
-    /// that read an older head then finds its generation taken (04 step 8).
-    pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
+    /// Index upkeep at the end of `compact`: fold when the chain reached
+    /// the soft limit, then delete old heads and unreferenced `index.d/`
+    /// objects. The deletion is age-gated, so it never deletes a concurrent
+    /// writer's fresh segment (H4-segment). The soft limit counts only the
+    /// foldable prefix; young backup segments stay in the head (04 step 7).
+    /// The deletion runs only when this handle created the latest head (the
+    /// fold's, or the run's last index write): a writer that read an older
+    /// head then finds its generation taken (04 step 8). `on_moved`: what a
+    /// head that moved since the index was loaded, or a fold whose
+    /// generation another writer created, does: the "index changed" error
+    /// under the lock (`Fail`), or nothing more this run (`Skip`, a
+    /// lock-free compact, 04 step 9: the fold and the collection run in a
+    /// later compact or a backup's fold).
+    pub(crate) fn maintain_segmented_index(&mut self, on_moved: OnMoved) -> Result<()> {
+        let skip = |e: VykarError| match on_moved {
+            OnMoved::Skip if is_stale_index_error(&e) => {
+                debug!("the index head moved; index fold and garbage collection skipped");
+                Ok(())
+            }
+            _ => Err(e),
+        };
         if self.index_dirty {
             self.save_state()?;
         }
         let listed_at = MarkerStamp::now(self.host_env().clock.as_ref());
-        let Some(head) = self.current_head_for_write()? else {
+        let head = match self.current_head_for_write() {
+            Ok(head) => head,
+            Err(e) => return skip(e),
+        };
+        let Some(head) = head else {
             return Ok(());
         };
         let k = self.foldable_prefix(&head.segments);
@@ -479,7 +586,10 @@ impl Repository {
             }
             // A fold writes the same state as a base and the kept segments.
             let new_head =
-                self.put_base(Some(&head), false, FoldRequest::Eligible, Some(listed_at))?;
+                match self.put_base(Some(&head), false, FoldRequest::Eligible, Some(listed_at)) {
+                    Ok(h) => h,
+                    Err(e) => return skip(e),
+                };
             self.index_generation = new_head.generation;
             self.index_head = Some(new_head.clone());
             new_head
@@ -489,6 +599,11 @@ impl Repository {
         if self.created_head != Some(latest.generation) {
             debug!("no index head written by this run; index garbage collection skipped");
             return Ok(());
+        }
+        if self.is_lock_free() {
+            // A lock-free compact's marker check (04 step 9) guards its
+            // deletes too.
+            self.check_lock_fence()?;
         }
         let gc = index_store::collect_index_garbage(
             self.storage.as_ref(),
@@ -682,9 +797,34 @@ impl Repository {
 /// The error a write returns when the head moved since the index was loaded,
 /// or another writer created the generation it tried.
 fn stale_index_error() -> VykarError {
-    VykarError::Other(
-        "the index changed on storage after it was loaded; retry the operation".into(),
-    )
+    VykarError::Other(STALE_INDEX_TEXT.into())
+}
+
+const STALE_INDEX_TEXT: &str =
+    "the index changed on storage after it was loaded; retry the operation";
+
+/// Whether `e` is [`stale_index_error`].
+fn is_stale_index_error(e: &VykarError) -> bool {
+    matches!(e, VykarError::Other(m) if m == STALE_INDEX_TEXT)
+}
+
+/// What a lock-free maintenance write found (04 step 9, phase F part 10d).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceWrite {
+    /// The write is published (or there was nothing to write).
+    Written,
+    /// The latest head is not the loaded one, or the head create found its
+    /// generation taken: nothing on storage names this write.
+    Moved,
+}
+
+/// What [`Repository::maintain_segmented_index`] does on a moved head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnMoved {
+    /// The "index changed" error (under the lock).
+    Fail,
+    /// Skip the fold and the garbage collection (lock-free compact).
+    Skip,
 }
 
 /// The error of a backup commit whose head generation another writer took

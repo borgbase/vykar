@@ -930,8 +930,20 @@ fn check_stepped_decisions(name: &str, o: &Outcome) -> usize {
 fn stepped_compact_replays_identically() {
     let mut most = 0;
     for (kind, t) in both_templates() {
-        most = most.max(stepped_compact_replays_identically_on(kind, &t));
+        most = most.max(stepped_compact_replays_identically_on(
+            kind,
+            &t,
+            StoreKind::Plain,
+        ));
     }
+    // Lock-free (phase F part 10d): the encrypted template on the
+    // conditional store; its compact registers, lists sessions twice and
+    // deregisters, so it makes more step ops.
+    most = most.max(stepped_compact_replays_identically_on(
+        TemplateKind::Encrypted,
+        &Template::encrypted(),
+        StoreKind::Conditional,
+    ));
     if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
         eprintln!("stepped compact: at most {most} step ops");
     }
@@ -943,7 +955,11 @@ fn stepped_compact_replays_identically() {
 
 /// [`stepped_compact_replays_identically`] on one template; the most step
 /// ops a stepped compact made.
-fn stepped_compact_replays_identically_on(kind: TemplateKind, t: &Template) -> usize {
+fn stepped_compact_replays_identically_on(
+    kind: TemplateKind,
+    t: &Template,
+    storage: StoreKind,
+) -> usize {
     let mut cases: Vec<(String, Case)> = compact_cases()
         .into_iter()
         .map(|(n, c)| (n.to_string(), stepped(&c)))
@@ -971,8 +987,11 @@ fn stepped_compact_replays_identically_on(kind: TemplateKind, t: &Template) -> u
     }
     let mut most = 0;
     for (name, c) in &cases {
-        let name = format!("{name} {kind:?}");
-        let c = on(kind, c);
+        let name = format!("{name} {kind:?} {storage:?}");
+        let c = Case {
+            storage,
+            ..on(kind, c)
+        };
         let a = run_case(t, &c);
         let b = run_case(t, &c);
         assert_eq!(
@@ -1397,11 +1416,386 @@ fn a_late_lock_head_over_a_compact_head_is_a_late_index_write() {
         BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
         "not a lock client"
     );
-    let mut e = ev;
+    let mut e = ev.clone();
     e.kind = StoreKind::Conditional;
     assert_eq!(
         judge(&e),
         BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
         "the conditional store"
     );
+    // The next generation's skip is claimed only when that head was built
+    // on the replaced one: its write (and its writer's read of the replaced
+    // generation) before the release. Moved after it, the skip is left.
+    let release = ev
+        .log
+        .iter()
+        .find(|r| {
+            matches!(r.outcome, OpOutcome::Released(_))
+                && r.op == OpKind::Put
+                && r.key.starts_with("index.h/")
+        })
+        .expect("b's late head PUT");
+    let (rel, gen_) = (
+        release.step,
+        vykar_protocol::head_generation(&release.key).expect("a head key"),
+    );
+    let next = ev
+        .log
+        .iter()
+        .find(|r| {
+            r.op.is_write()
+                && r.applied()
+                && vykar_protocol::head_generation(&r.key) == Some(gen_ + 1)
+        })
+        .expect("the next generation was written")
+        .clone();
+    let mut e = ev.clone();
+    for (pos, rec) in e.log.iter_mut().enumerate() {
+        let gen_of = vykar_protocol::head_generation(&rec.key);
+        let built = rec.client == next.client
+            && rec.run == next.run
+            && ((rec.op.is_write() && gen_of == Some(gen_ + 1))
+                || (rec.op == OpKind::Get && gen_of == Some(gen_)));
+        if built {
+            rec.step = rel + 10_000 + pos as u64;
+        }
+    }
+    assert_eq!(
+        judge(&e),
+        BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
+        "the next head built after the release"
+    );
+    // Unrelated damage beside the claim stays Unknown.
+    let mut unrelated = o.report.clone();
+    unrelated.violations.push(Violation {
+        invariant: Invariant::CommittedSnapshotsRestore,
+        kind: ViolationKind::RestoreDiffers,
+        subject: "a1".into(),
+        detail: "injected by the test".into(),
+        step: None,
+    });
+    assert_eq!(
+        classify(&o.sim, &unrelated, &o.trace.entries),
+        BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
+        "an unrelated violation of a1"
+    );
+}
+
+/// `LateIndexWrite`'s claim of a lock holder's plain head PUT over a late
+/// one (seed `mixed-late-lock-head-replaced`, phase F part 10d): lock
+/// client b's first commit's head PUT lands after b1 failed, and b2, which
+/// read the head before, replaces it. Only a lock client's released plain
+/// PUT of a run that failed without a snapshot, replaced by a lock client's
+/// plain PUT on `ConditionalOverwrite`, qualifies; each edit of that, and
+/// an unrelated violation, leaves `Unknown`.
+#[test]
+fn a_late_lock_head_replaced_by_a_lock_holder_is_a_late_index_write() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/sim-regressions/mixed-late-lock-head-replaced.json");
+    let seed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the seed")).expect("json");
+    let c: Case = serde_json::from_value(seed["case"].clone()).expect("the seed's case");
+    let o = Templates::new().run(&c);
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::LateIndexWrite]),
+        "{}",
+        o.trace.render()
+    );
+    let ev = Evidence::of(&o.sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    let late = ev
+        .log
+        .iter()
+        .position(|r| r.key.starts_with("index.h/") && matches!(r.outcome, OpOutcome::Released(_)))
+        .expect("b1's late head PUT");
+    let run_at = ev
+        .runs
+        .iter()
+        .position(|r| Some(r.index) == ev.log[late].run)
+        .expect("b1's run");
+    let unknown = |set: &BTreeSet<Signature>| set.contains(&Signature::Unknown);
+    type Edit = Box<dyn Fn(&mut Evidence)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "the late PUT applied when issued",
+            Box::new(move |e| e.log[late].outcome = OpOutcome::Ok),
+        ),
+        (
+            "the late run succeeded",
+            Box::new(move |e| {
+                e.runs[run_at].outcome = RunOutcome::Ok {
+                    removed: vec![],
+                    detail: String::new(),
+                }
+            }),
+        ),
+        (
+            "the late run wrote a snapshot",
+            Box::new(move |e| {
+                let mut snap = e.log[late].clone();
+                snap.key = "snapshots/injected-by-the-test".into();
+                snap.outcome = OpOutcome::Ok;
+                e.log.push(snap);
+            }),
+        ),
+        ("no lock clients", Box::new(|e| e.lock_clients.clear())),
+        (
+            "the conditional store",
+            Box::new(|e| e.kind = StoreKind::Conditional),
+        ),
+        (
+            "the overwriter read the head after the late one landed",
+            Box::new(move |e| {
+                let landed = e.log[late].step;
+                let over = e
+                    .log
+                    .iter()
+                    .find(|r| {
+                        r.step > landed
+                            && r.op == OpKind::Put
+                            && r.key == e.log[late].key
+                            && r.applied()
+                    })
+                    .map(|r| (r.client, r.run, r.step))
+                    .expect("the overwrite");
+                for r in &mut e.log {
+                    if (r.client, r.run) == (over.0, over.1)
+                        && r.step < over.2
+                        && !r.op.is_mutation()
+                        && r.key.starts_with("index.h/")
+                    {
+                        r.step = landed + 1;
+                    }
+                }
+            }),
+        ),
+    ];
+    for (what, edit) in edits {
+        let mut e = ev.clone();
+        edit(&mut e);
+        assert!(unknown(&judge(&e)), "{what}: {:?}", judge(&e));
+    }
+    let mut unrelated = o.report.clone();
+    unrelated.violations.push(Violation {
+        invariant: Invariant::CommittedSnapshotsRestore,
+        kind: ViolationKind::RestoreDiffers,
+        subject: "b2".into(),
+        detail: "injected by the test".into(),
+        step: None,
+    });
+    assert!(unknown(&classify(&o.sim, &unrelated, &o.trace.entries)));
+}
+
+/// R5's claim of a late overwrite (seed
+/// `mixed-aged-marker-late-compact-head`): `AgedSessionReaped` claims the
+/// `HeadOverwritten` of the lock holder's late plain head PUT only as a
+/// lock client's on `ConditionalOverwrite`, and only after an aged reap of
+/// the replaced head's writer's marker. A young reap, or an overwriter
+/// that is not a lock client, leaves the overwrite to `Unknown`.
+#[test]
+fn a_late_overwrite_is_r5s_only_after_an_aged_reap_and_as_a_lock_clients_put() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/sim-regressions/mixed-aged-marker-late-compact-head.json");
+    let seed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the seed")).expect("json");
+    let c: Case = serde_json::from_value(seed["case"].clone()).expect("the seed's case");
+    let o = Templates::new().run(&c);
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::AgedSessionReaped]),
+        "{}",
+        o.trace.render()
+    );
+    let ev = Evidence::of(&o.sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    assert_eq!(judge(&ev), BTreeSet::from([Signature::AgedSessionReaped]));
+    let mut e = ev.clone();
+    e.lock_clients.clear();
+    assert!(
+        judge(&e).contains(&Signature::Unknown),
+        "the overwriter is not a lock client: {:?}",
+        judge(&e)
+    );
+    // The reap made young: each marker key it deleted written just before.
+    let mut e = ev.clone();
+    let reaps: Vec<usize> = e
+        .log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.op.is_delete()
+                && r.key.starts_with("sessions/")
+                && r.key.ends_with(".json")
+                && e.log
+                    .iter()
+                    .any(|w| w.op.is_write() && w.key == r.key && w.client != r.client)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!reaps.is_empty(), "a's marker reaped by b");
+    for &reap in reaps.iter().rev() {
+        let key = e.log[reap].key.clone();
+        let mut copy = e
+            .log
+            .iter()
+            .rfind(|w| w.step < e.log[reap].step && w.op.is_write() && w.applied() && w.key == key)
+            .expect("the reaped key's write")
+            .clone();
+        copy.step = e.log[reap].step;
+        e.log.insert(reap, copy);
+    }
+    assert!(
+        !judge(&e).contains(&Signature::AgedSessionReaped),
+        "the reap was young: {:?}",
+        judge(&e)
+    );
+}
+
+/// `AgedSessionReaped`'s claim of a backup's packs deleted by a run that
+/// found the backup's session stale by age at its listing, in both modes:
+/// seed `aged-session-reaped-mark-after-listing-lockfree` (the lock-free
+/// compact listed c's 12 h old key, c's commit mark wrote the next one,
+/// the compact deleted the key it listed and c's packs) and seed
+/// `mixed-aged-session-reaped-before-listing` (a lock client's backup
+/// reaped c's key, its locked compact then listed no key of c, c's commit
+/// mark wrote the next one, the compact deleted c's packs). Each condition
+/// of the claim has a negative that leaves the deletes `Unknown`.
+#[test]
+fn a_delete_after_a_stale_listing_is_claimed_narrowly() {
+    for name in [
+        "aged-session-reaped-mark-after-listing-lockfree",
+        "mixed-aged-session-reaped-before-listing",
+    ] {
+        stale_listing_claim_is_narrow(name);
+    }
+}
+
+fn stale_listing_claim_is_narrow(name: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/sim-regressions/{name}.json"));
+    let seed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the seed")).expect("json");
+    let c: Case = serde_json::from_value(seed["case"].clone()).expect("the seed's case");
+    let o = Templates::new().run(&c);
+    let aged = BTreeSet::from([Signature::AgedSessionReaped]);
+    let unknown = BTreeSet::from([Signature::Unknown]);
+    assert_eq!(o.signatures, aged, "{name}: {}", o.trace.render());
+    let deletes: Vec<u64> = o
+        .report
+        .violations
+        .iter()
+        .filter(|v| v.kind == ViolationKind::LiveSessionPackDeleted)
+        .filter_map(|v| v.step)
+        .collect();
+    assert_eq!(deletes.len(), 2, "{name}: {}", o.report);
+    let ev = Evidence::of(&o.sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    assert_eq!(judge(&ev), aged, "{name}");
+    let first = ev
+        .log
+        .iter()
+        .find(|r| r.step == deletes[0])
+        .expect("the first delete");
+    let deleter = first.run.expect("the deleting run");
+    let packs: Vec<String> = ev
+        .log
+        .iter()
+        .filter(|r| deletes.contains(&r.step))
+        .map(|r| r.key.clone())
+        .collect();
+    let victim = ev
+        .log
+        .iter()
+        .find(|w| w.op.is_write() && w.applied() && w.key == first.key)
+        .and_then(|w| w.run)
+        .expect("the deleted pack's writer");
+    let is_listing =
+        |r: &OpRecord| r.run == Some(deleter) && r.op == OpKind::ListMeta && r.key == "sessions/";
+    let listing = ev
+        .log
+        .iter()
+        .rfind(|r| r.step < deletes[0] && is_listing(r))
+        .expect("the deleter's listing")
+        .clone();
+    let is_victim_marker = |r: &OpRecord| {
+        r.run == Some(victim)
+            && r.op.is_write()
+            && r.applied()
+            && r.key.starts_with("sessions/")
+            && r.key.ends_with(".json")
+    };
+
+    // The victim's session young at the listing: its marker keys written
+    // at the listing's time.
+    let mut e = ev.clone();
+    for r in e.log.iter_mut().filter(|r| is_victim_marker(r)) {
+        r.at = listing.at;
+    }
+    assert_eq!(judge(&e), unknown, "{name}: young at the listing");
+
+    // The victim wrote a snapshot.
+    let mut e = ev.clone();
+    let mut snap = e
+        .log
+        .iter()
+        .rfind(|r| r.run == Some(victim) && r.op.is_write() && r.applied())
+        .expect("a write of the victim")
+        .clone();
+    snap.op = OpKind::Put;
+    snap.key = "snapshots/injected".into();
+    e.log.push(snap);
+    assert_eq!(judge(&e), unknown, "{name}: the victim wrote a snapshot");
+
+    // Another run deleted the packs, not the one that listed.
+    let mut e = ev.clone();
+    for r in &mut e.log {
+        if deletes.contains(&r.step) {
+            r.run = Some(usize::MAX);
+        }
+    }
+    assert_eq!(
+        judge(&e),
+        unknown,
+        "{name}: deleted by a run that did not list"
+    );
+
+    // The deletes before the listing.
+    let mut e = ev.clone();
+    let after = deletes.iter().max().expect("a delete") + 1;
+    for r in e.log.iter_mut().filter(|r| is_listing(r)) {
+        r.step = after;
+    }
+    assert_eq!(judge(&e), unknown, "{name}: deleted before the listing");
+
+    // A victim key written before the listing, present at the deletes.
+    let mut e = ev.clone();
+    let mut key = e
+        .log
+        .iter()
+        .find(|r| is_victim_marker(r))
+        .expect("a marker key of the victim")
+        .clone();
+    key.key = "sessions/injected.9.json".into();
+    key.step = listing.step - 1;
+    let at = e
+        .log
+        .iter()
+        .position(|r| r.step >= listing.step)
+        .expect("the listing");
+    e.log.insert(at, key);
+    assert_eq!(
+        judge(&e),
+        unknown,
+        "{name}: a key written before the listing present at the deletes"
+    );
+
+    // The packs younger than PACK_AGE_LIMIT at the deleter's "now".
+    let mut e = ev.clone();
+    for r in &mut e.log {
+        if r.op.is_write() && packs.contains(&r.key) {
+            r.at = listing.at;
+        }
+    }
+    assert_eq!(judge(&e), unknown, "{name}: the packs were young");
 }

@@ -63,8 +63,11 @@ impl Repository {
     }
 
     /// Load the chunk index as storage holds it now. For maintenance
-    /// operations that hold the repository lock, so nothing can change it
-    /// until the lock is released. Replaces any index loaded at open.
+    /// operations: under the repository lock nothing else changes it until
+    /// the lock is released; in a lock-free maintenance session (04 step 9)
+    /// other writers may move the head, and every write of the session
+    /// checks for that (`Repository::persist_maintenance`). Replaces any
+    /// index loaded at open.
     pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
         debug_assert!(self.write_session.is_none() && !self.index_dirty);
         let start = std::time::Instant::now();

@@ -40,6 +40,7 @@ pub(crate) fn run_compact(
             );
         }
         print_young_unreferenced(&stats);
+        print_repack_held(&stats);
         print_compact_warnings(&stats);
     } else {
         print_compact_summary(&stats);
@@ -97,8 +98,50 @@ pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {
             format_bytes(stats.bytes_unreferenced),
         );
     }
+    if stats.packs_abandoned > 0 {
+        println!(
+            "  {} repacked pack(s) abandoned: another compact running at the same time repacked \
+             the same data first; they are deleted by a compact once {} h old",
+            stats.packs_abandoned,
+            commands::compact::ORPHAN_PACK_GRACE.as_secs() / 3600,
+        );
+    }
     print_young_unreferenced(stats);
+    print_repack_held(stats);
+    print_sweep_skipped(stats);
     print_compact_warnings(stats);
+}
+
+/// Packs a lock-free compact did not repack under its source rule (04 step
+/// 9), on stdout: a later compact repacks them.
+fn print_repack_held(stats: &commands::compact::CompactStats) {
+    if stats.packs_repack_held > 0 {
+        println!(
+            "  {} pack(s) with unused space not repacked this run: younger than {} h, of unknown \
+             age, or newer than the start of a backup that is still running; a later compact \
+             repacks them",
+            stats.packs_repack_held,
+            commands::compact::ORPHAN_PACK_GRACE.as_secs() / 3600,
+        );
+    }
+}
+
+/// Why a compact that ran beside committing backups removed no index
+/// entry (04 step 9), on stdout: the next compact sweeps.
+fn print_sweep_skipped(stats: &commands::compact::CompactStats) {
+    use commands::compact::SweepSkipped;
+    match stats.sweep_skipped {
+        Some(SweepSkipped::Committing) => println!(
+            "  No unreferenced chunks removed this run: a backup was committing; a later \
+             compact removes them"
+        ),
+        Some(SweepSkipped::Contention) => println!(
+            "  No unreferenced chunks removed this run: backups committed during each of {} \
+             marks; a later compact removes them",
+            commands::compact::COMPACT_MARK_ATTEMPTS,
+        ),
+        None => {}
+    }
 }
 
 /// Unreferenced chunks the sweep kept because recent backups added them

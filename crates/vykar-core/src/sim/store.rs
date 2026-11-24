@@ -150,6 +150,9 @@ struct State {
     /// Runs that wrote (or attempted) a session marker key flagged
     /// `committing` ([`SimStore::committed_lock_free_in_run`]).
     committing_runs: BTreeSet<usize>,
+    /// Runs that wrote (or attempted) any session marker key
+    /// ([`SimStore::registered_in_run`]).
+    registered_runs: BTreeSet<usize>,
 }
 
 /// How [`State::apply`] treats an effect.
@@ -491,6 +494,7 @@ impl SimStore {
                     head_overwrites: Vec::new(),
                     lock_clients: BTreeSet::new(),
                     committing_runs: BTreeSet::new(),
+                    registered_runs: BTreeSet::new(),
                 }),
                 gate_cv: Condvar::new(),
             }),
@@ -813,6 +817,13 @@ impl SimStore {
     /// `RunRecord::lock_free`.
     pub fn committed_lock_free_in_run(&self, run: usize) -> bool {
         self.state().committing_runs.contains(&run)
+    }
+
+    /// Whether run `run` wrote (or attempted) a session marker key: a
+    /// maintenance run that did ran lock-free (04 step 9: under the lock
+    /// maintenance registers no session); `RunRecord::lock_free`.
+    pub fn registered_in_run(&self, run: usize) -> bool {
+        self.state().registered_runs.contains(&run)
     }
 
     /// Tag `client`'s operations with `run` until set to None.
@@ -1246,10 +1257,14 @@ impl vykar_storage::StorageBackend for SimClient {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        if key.starts_with("sessions/") && key.ends_with(".json") && is_committing_marker(data) {
+        if key.starts_with("sessions/") && key.ends_with(".json") {
+            let committing = is_committing_marker(data);
             let mut st = self.store.state();
             if let Some(run) = st.runs.get(&self.client).copied() {
-                st.committing_runs.insert(run);
+                st.registered_runs.insert(run);
+                if committing {
+                    st.committing_runs.insert(run);
+                }
             }
         }
         self.write(OpKind::Put, key, data.to_vec())

@@ -28,8 +28,9 @@ const OBSERVER: ClientId = ClientId(0);
 const TAMPER: ClientId = ClientId(1);
 
 /// What the store's backend does with heads and conditional writes (04 step
-/// 8). Every kind keeps an identical re-PUT of an `index.d/` or `index.h/`
-/// key as a no-op with its first mtime (vykar-server's rule).
+/// 8). Every kind but `ConditionalOverwrite` keeps an identical re-PUT of
+/// an `index.d/` or `index.h/` key as a no-op with its first mtime
+/// (vykar-server's rule).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoreKind {
     /// No put-if-absent (`conditional()` is None): a backend that does not
@@ -52,11 +53,12 @@ pub enum StoreKind {
     RacyRelease,
     /// Local, OpenSSH SFTP, AWS S3: put-if-absent honoured; a plain PUT
     /// replaces any object, heads included (phase F part 10b: what a
-    /// lock-mode client's plain head PUT does beside a lock-free one). An
-    /// identical re-PUT of an index key still keeps its first mtime, as on
-    /// every kind (vykar-server's rule; these backends renew it): only a
-    /// plaintext repository re-creates identical names, and it never
-    /// commits lock-free.
+    /// lock-mode client's plain head PUT does beside a lock-free one), and
+    /// an identical re-PUT of an `index.d/` or `index.h/` key renews its
+    /// mtime (and writer), as these backends do: a duplicated plain head
+    /// PUT of a lock client makes that head younger, which keeps it from
+    /// the index GC longer, and only a plaintext repository re-creates
+    /// identical object names, which never commits lock-free.
     ConditionalOverwrite,
 }
 
@@ -145,6 +147,9 @@ struct State {
     head_overwrites: Vec<(String, u64, ClientId)>,
     /// Clients whose handles offer no put-if-absent ([`SimStore::set_lock_client`]).
     lock_clients: BTreeSet<ClientId>,
+    /// Runs that wrote (or attempted) a session marker key flagged
+    /// `committing` ([`SimStore::committed_lock_free_in_run`]).
+    committing_runs: BTreeSet<usize>,
 }
 
 /// How [`State::apply`] treats an effect.
@@ -325,15 +330,19 @@ impl State {
                 // vykar-server's rule for content-addressed `index.d/` and
                 // write-once `index.h/` keys: a PUT of the stored bytes stores
                 // nothing and renews neither mtime nor writer (answered 204,
-                // in append-only mode too). A head PUT with other bytes is
-                // refused 409 on the conditional kind (vykar-server) and
-                // replaces the head on the others.
+                // in append-only mode too); `ConditionalOverwrite` (local,
+                // SFTP, S3) rewrites the object, renewing both. A head PUT
+                // with other bytes is refused 409 on the conditional kind
+                // (vykar-server) and replaces the head on the others.
                 if let Some(existing) = self.objects.get(key) {
                     let write_once = matches!(
                         vykar_protocol::put_rule(key),
                         vykar_protocol::PutRule::NamedByBlake3 | vykar_protocol::PutRule::WriteOnce
                     );
-                    if existing.data == *data && write_once {
+                    if existing.data == *data
+                        && write_once
+                        && rules.kind != StoreKind::ConditionalOverwrite
+                    {
                         return Ok(Some(absent));
                     }
                     if !rules.tamper
@@ -481,6 +490,7 @@ impl SimStore {
                     next_gate: 0,
                     head_overwrites: Vec::new(),
                     lock_clients: BTreeSet::new(),
+                    committing_runs: BTreeSet::new(),
                 }),
                 gate_cv: Condvar::new(),
             }),
@@ -578,6 +588,11 @@ impl SimStore {
     /// Every later [`Self::handle`] of `client` offers no put-if-absent.
     pub fn set_lock_client(&self, client: ClientId) {
         self.state().lock_clients.insert(client);
+    }
+
+    /// The clients [`set_lock_client`](Self::set_lock_client) named.
+    pub fn lock_clients(&self) -> BTreeSet<ClientId> {
+        self.state().lock_clients.clone()
     }
 
     fn new_handle(&self, client: ClientId, no_conditional: bool) -> SimClient {
@@ -787,6 +802,17 @@ impl SimStore {
         };
         st.record(TAMPER, OpKind::Delete, key, &[], None, outcome);
         existed
+    }
+
+    /// Whether run `run` attempted a session marker PUT flagged
+    /// `committing`: the lock-free writer's commit mark, which a backup
+    /// writes only once it decided to commit lock-free
+    /// (`PendingCommit::commit_mode`: an encrypted repository, a passed
+    /// put-if-absent check and a continuous marker record) and a lock-mode
+    /// commit never writes. The simulator's record of a run's mode,
+    /// `RunRecord::lock_free`.
+    pub fn committed_lock_free_in_run(&self, run: usize) -> bool {
+        self.state().committing_runs.contains(&run)
     }
 
     /// Tag `client`'s operations with `run` until set to None.
@@ -1195,6 +1221,14 @@ impl ConditionalWrite for SimClient {
     }
 }
 
+/// Whether a session marker body carries `"committing": true`.
+fn is_committing_marker(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|v| v.get("committing").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn found_or_not<T>(v: Option<T>, len: Option<u64>) -> (Result<Option<T>>, OpOutcome, Option<u64>) {
     match v {
         Some(v) => (Ok(Some(v)), OpOutcome::Ok, len),
@@ -1212,6 +1246,12 @@ impl vykar_storage::StorageBackend for SimClient {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if key.starts_with("sessions/") && key.ends_with(".json") && is_committing_marker(data) {
+            let mut st = self.store.state();
+            if let Some(run) = st.runs.get(&self.client).copied() {
+                st.committing_runs.insert(run);
+            }
+        }
         self.write(OpKind::Put, key, data.to_vec())
     }
 
@@ -2216,6 +2256,41 @@ mod tests {
         let overwrites = store.head_overwrites();
         assert_eq!(overwrites.len(), 1);
         assert_eq!(overwrites[0].2, b.client());
+    }
+
+    /// Local, SFTP, S3 rewrite an object PUT again with the same bytes, so its
+    /// mtime and writer are renewed (vykar-server and every other kind keep
+    /// them); the replacement is no head overwrite. A marker PUT flagged
+    /// `committing` is recorded for the run of its handle's client.
+    #[test]
+    fn conditional_overwrite_renews_an_identical_re_put() {
+        for (kind, renews) in [
+            (StoreKind::ConditionalOverwrite, true),
+            (StoreKind::Conditional, false),
+            (StoreKind::Plain, false),
+        ] {
+            let (store, a, b) = of_kind(kind);
+            let object = format!("index.d/{}", "ab".repeat(32));
+            for key in ["index.h/2", object.as_str()] {
+                a.put(key, b"same").unwrap();
+                let first = store.object(key).unwrap().mtime;
+                store.advance_clock(std::time::Duration::from_secs(60));
+                b.put(key, b"same").unwrap();
+                let obj = store.object(key).unwrap();
+                assert_eq!(obj.mtime != first, renews, "{kind:?} {key}");
+                assert_eq!(obj.writer == b.client(), renews, "{kind:?} {key}");
+            }
+            assert!(store.head_overwrites().is_empty(), "{kind:?}");
+        }
+        let (store, a, _) = of_kind(StoreKind::ConditionalOverwrite);
+        store.set_current_run(a.client(), Some(3));
+        a.put("sessions/s.1.json", br#"{"committing":false}"#)
+            .unwrap();
+        assert!(!store.committed_lock_free_in_run(3));
+        a.put("sessions/s.2.json", br#"{"committing":true}"#)
+            .unwrap();
+        assert!(store.committed_lock_free_in_run(3));
+        assert!(!store.committed_lock_free_in_run(4));
     }
 
     /// A handle without put-if-absent beside one with it, on one store;

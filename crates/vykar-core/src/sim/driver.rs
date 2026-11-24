@@ -13,9 +13,11 @@
 //! live heartbeat is blocked on virtual time again, so the store sees
 //! nothing between decisions.
 //!
-//! A backup is upload (registration, open and phase 1), then up to
-//! [`LOCK_ATTEMPTS`] single attempts at the commit lock, then one decision
-//! per step of its `BackupCommit` machine
+//! A backup is upload (registration, open, phase 1 and the commit mode's
+//! decision), then up to [`LOCK_ATTEMPTS`] single attempts at the commit
+//! lock (lock mode) or its commit mark and up to [`LOCK_ATTEMPTS`] probes of
+//! `locks/` (lock-free, 04 step 9: encrypted template, put-if-absent
+//! verified), then one decision per step of its `BackupCommit` machine
 //! (`Local` steps run right after the step before them), then its finish.
 //! Compact is one decision (`Maintenance::Whole`, every seed recorded
 //! before 04 step 7) or one decision per protocol-key operation
@@ -45,15 +47,15 @@ use super::fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedId,
 };
 use super::gate::{GateId, GateRule};
-use super::history::{ClientOp, RunOutcome};
+use super::history::{ClientOp, RunOutcome, RunRecord};
 use super::log::{OpOutcome, OpRecord, key_class};
 use super::runner::{Call, GATE_TIMEOUT, RunResult, Sim, SourceTree, Spawned, seeded_bytes};
 pub use super::store::StoreKind;
 use crate::commands::backup::{self, BackupRequest, CommitInProgress, PendingCommit};
 use crate::compress::Compression;
-use crate::repo::Committed;
 use crate::repo::control::{CancelToken, CommitEvent};
 use crate::repo::machine::StepKind;
+use crate::repo::{CommitMode, Committed};
 use vykar_storage::StorageBackend;
 use vykar_types::error::VykarError;
 
@@ -338,6 +340,13 @@ pub enum Policy {
 /// The label of a lock attempt that found the lock taken.
 pub const LABEL_LOCKED: &str = "lock (locked)";
 
+/// The label of a lock-free backup's commit mark (04 step 9).
+pub const LABEL_MARK_COMMITTING: &str = "mark-committing";
+
+/// The label of a lock-free backup's probe of `locks/` that found no live
+/// lock (one that did is [`LABEL_LOCKED`]).
+pub const LABEL_PROBE_LOCKS: &str = "probe-locks";
+
 /// Which of `actions` are free under preemption bounding, given the
 /// decisions before it (`previous`): the pick-0 step of the client that
 /// stepped last, if it has one and its last step neither was labelled
@@ -540,7 +549,9 @@ pub enum Action {
 /// `LateHeadSegmentCollected`, `AgedLockSegmentCollected` and
 /// `AgedLockPacksCollected` on conditional stores (`Case::storage`) and
 /// narrows `LateIndexWrite` there; the fallback store (`StoreKind::Plain`)
-/// keeps them all.
+/// keeps them all. Part 10c (lock-free backups) adds the mixed-mode
+/// residual `LateHeadCreateReplaced`, which claims one overwrite and
+/// never cascades.
 ///
 /// The driver's time jumps move the store and every client clock together,
 /// so a jump is a genuine stall of every client, and ages on the store's
@@ -608,7 +619,15 @@ pub enum Signature {
     /// uploads inside their marker's horizon as well as by age; a reaped
     /// marker leaves only the age guard, and a victim whose marker record
     /// is broken commits only while its packs are younger than T_pack − M
-    /// − 30 min (I8). Since 04 step 7's young segments (phase F part 8c) a
+    /// − 30 min (I8). Since phase F part 10c also R5, the mixed-mode case:
+    /// a lock-free writer's `committing` marker reaped by age while it still
+    /// creates heads, so a lock holder no longer yields to it, and the
+    /// holder's plain head PUT replaces the lock-free head (also when that
+    /// PUT timed out and landed late, seed
+    /// `mixed-aged-marker-late-compact-head`); claims that
+    /// `HeadOverwritten` and the damage from it on. A lock-free commit
+    /// probes its marker before its snapshot PUT, so a reap before that
+    /// probe ends it `MarkerLostDuringCommit`. Since 04 step 7's young segments (phase F part 8c) a
     /// victim's own segment stays a segment until T_pack old and the sweep
     /// leaves its additions, and packs a sweep empties are kept while
     /// young: the swept-packs route needs a stall of T_pack in all between
@@ -626,6 +645,13 @@ pub enum Signature {
     /// the commit path; on conditional stores fewer of its writes remain (a
     /// taken create writes nothing). Part 10 (04 step 9) takes the lock off
     /// it. Claims the lock-exclusion violation it is derived from.
+    /// Since phase F part 10c (lock-free backups) also R4, the mixed-mode
+    /// case: a lock-mode run whose lock was reaped by age goes on and
+    /// plain-PUTs a head over one a lock-free writer created meanwhile
+    /// (`StoreKind::ConditionalOverwrite`: local, SFTP, S3). Claims that
+    /// `HeadOverwritten` and, from it on, the damage it cascades to (the
+    /// replaced head's snapshot loses its index coverage); known hazard
+    /// `H-mixed-aged-lock`.
     AgedLockReaped,
     /// A protected write while the store held a lock key that a delayed or
     /// duplicated lock PUT left behind after its writer had deleted it (a
@@ -771,7 +797,36 @@ pub enum Signature {
     /// released head lands only at a generation nobody created, extending
     /// the head it was built on; released `index.d/` writes remain. Retires
     /// with invariant 7 when part 10 takes the lock off the commit path.
+    /// Since phase F part 10c also, on `StoreKind::ConditionalOverwrite`, the
+    /// invariant-12 trace of a lock client's released plain head PUT that
+    /// nothing else claimed (no lost coverage, no absent pack): the
+    /// `HeadOverwritten` at the release and the `HeadSkipsPredecessor` of
+    /// the generation after the one it replaced (seed
+    /// `mixed-late-lock-head-replaces-compact-head`: a compact had built
+    /// on the head the late PUT replaced and published the next one).
     LateIndexWrite,
+    /// Mixed modes (phase F part 10c) on the store whose plain PUT replaces
+    /// heads (`StoreKind::ConditionalOverwrite`: local, SFTP, S3): a
+    /// lock-free run's head create times out, its GET finds the key absent,
+    /// and the run fails with the error and deregisters, writing no
+    /// snapshot; the abandoned request then lands late, after a lock client
+    /// (no put-if-absent) took the lock, listed sessions (nothing to yield
+    /// to) and read the head before it; the lock client's plain PUT of the
+    /// same generation replaces the late head (`HeadOverwritten`). The
+    /// replaced head named only the failed run's objects, which stay debris;
+    /// no committed snapshot loses coverage. Requires all of: the replaced
+    /// write is a released put-if-absent of `index.h/`, applied after its
+    /// run returned; that run did not succeed and has no applied
+    /// `snapshots/` write; the overwrite is a plain PUT by a lock client
+    /// on `ConditionalOverwrite`. Claims that `HeadOverwritten` only:
+    /// any other violation of the case stays `Unknown`. While the creating
+    /// run is alive (its request in flight) its `committing` marker is
+    /// listed and the lock holder yields, so only a run that gave up on its
+    /// create gets here (known hazard `H-mixed-late-create`, seed
+    /// `mixed-late-create-replaced`). Closed (a campaign failure) without
+    /// lock clients and on `StoreKind::Conditional`, where no plain PUT
+    /// replaces a head. Not planned to close: the lock's fallback.
+    LateHeadCreateReplaced,
     /// A violation no signature above claims, or anything not evaluated
     /// with no cascading signature.
     Unknown,
@@ -941,6 +996,9 @@ enum Phase {
     Idle,
     /// Uploaded; waiting for the commit lock.
     Lock(Box<LockWait>),
+    /// Uploaded, lock-free (04 step 9): marking the session marker
+    /// `committing`, then probing `locks/`.
+    Probe(Box<ProbeWait>),
     /// The commit machine runs.
     Commit(Box<Running>),
     /// The machine ended with this result; the finish is next.
@@ -966,6 +1024,17 @@ struct LockWait {
     /// The wait's reading of the store's clock, shared by its attempts as
     /// `acquire_lock_with_deadline` shares it.
     store_clock: crate::repo::ages::StoreClock,
+}
+
+/// A lock-free backup between its upload and its commit machine: the
+/// mark, then up to [`LOCK_ATTEMPTS`] probes of `locks/`, one decision
+/// each, as `PendingCommit::wait_until_unlocked` runs them.
+struct ProbeWait {
+    run: RunCtx,
+    pending: PendingCommit,
+    marked: bool,
+    attempts: u32,
+    fold: bool,
 }
 
 struct Running {
@@ -1253,6 +1322,7 @@ impl<'c> Driver<'c> {
         let label = match phase {
             Phase::Idle => self.start_command(i),
             Phase::Lock(w) => self.lock_attempt(i, w),
+            Phase::Probe(w) => self.probe_step(i, w),
             Phase::Commit(r) => self.commit_step(i, r, pick),
             Phase::Finish(r, result) => self.finish(i, r, *result),
             Phase::Maint(m) => self.maint_step(i, m),
@@ -1417,13 +1487,32 @@ impl<'c> Driver<'c> {
                 ) {
                     Ok(mut pending) => {
                         pending.join_background_writes();
-                        self.actors[i].phase = Phase::Lock(Box::new(LockWait {
-                            run,
-                            pending,
-                            attempts: 0,
-                            fold,
-                            store_clock: Default::default(),
-                        }));
+                        // The mode is decided with the upload (its
+                        // put-if-absent check writes probes under locks/).
+                        match pending.commit_mode() {
+                            Ok(CommitMode::LockFree) => {
+                                self.actors[i].phase = Phase::Probe(Box::new(ProbeWait {
+                                    run,
+                                    pending,
+                                    marked: false,
+                                    attempts: 0,
+                                    fold,
+                                }));
+                            }
+                            Ok(CommitMode::Lock) => {
+                                self.actors[i].phase = Phase::Lock(Box::new(LockWait {
+                                    run,
+                                    pending,
+                                    attempts: 0,
+                                    fold,
+                                    store_clock: Default::default(),
+                                }));
+                            }
+                            Err(e) => {
+                                pending.abandon();
+                                self.end_run(i, run, Err(e));
+                            }
+                        }
                     }
                     Err((_, e)) => self.end_run(i, run, Err(e)),
                 }
@@ -1463,7 +1552,7 @@ impl<'c> Driver<'c> {
                 if fold {
                     pending.repo_mut().request_index_fold();
                 }
-                let commit = pending.begin_commit(guard);
+                let commit = pending.begin_commit(backup::CommitLock::Held(guard));
                 let mut label = String::from("lock");
                 self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
                 label
@@ -1478,6 +1567,57 @@ impl<'c> Driver<'c> {
                 pending.abandon();
                 self.end_run(i, run, Err(e));
                 "lock (gave up)".into()
+            }
+        }
+    }
+
+    /// A lock-free backup's mark (its first decision after the upload) or
+    /// one probe of `locks/`; a probe that finds no live lock starts the
+    /// commit machine in the same decision, as a lock attempt does.
+    fn probe_step(&mut self, i: usize, mut w: Box<ProbeWait>) -> String {
+        if !w.marked {
+            self.label(i, LABEL_MARK_COMMITTING);
+            return match w.pending.mark_committing() {
+                Ok(()) => {
+                    w.marked = true;
+                    self.actors[i].phase = Phase::Probe(w);
+                    LABEL_MARK_COMMITTING.into()
+                }
+                Err(e) => {
+                    let ProbeWait { run, pending, .. } = *w;
+                    pending.abandon();
+                    self.end_run(i, run, Err(e));
+                    format!("{LABEL_MARK_COMMITTING} (failed)")
+                }
+            };
+        }
+        self.label(i, LABEL_PROBE_LOCKS);
+        match w.pending.try_probe() {
+            Ok(()) => {
+                let ProbeWait {
+                    run,
+                    mut pending,
+                    fold,
+                    ..
+                } = *w;
+                if fold {
+                    pending.repo_mut().request_index_fold();
+                }
+                let commit = pending.begin_commit(backup::CommitLock::Free);
+                let mut label = String::from(LABEL_PROBE_LOCKS);
+                self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
+                label
+            }
+            Err(VykarError::Locked(_)) if w.attempts + 1 < LOCK_ATTEMPTS => {
+                w.attempts += 1;
+                self.actors[i].phase = Phase::Probe(w);
+                LABEL_LOCKED.into()
+            }
+            Err(e) => {
+                let ProbeWait { run, pending, .. } = *w;
+                pending.abandon();
+                self.end_run(i, run, Err(e));
+                format!("{LABEL_PROBE_LOCKS} (gave up)")
             }
         }
     }
@@ -1557,6 +1697,11 @@ impl<'c> Driver<'c> {
             Phase::Idle => None,
             Phase::Lock(w) => {
                 let LockWait { run, pending, .. } = *w;
+                drop(pending);
+                Some(run)
+            }
+            Phase::Probe(w) => {
+                let ProbeWait { run, pending, .. } = *w;
                 drop(pending);
                 Some(run)
             }
@@ -1733,12 +1878,70 @@ impl<'r> Claims<'r> {
     }
 }
 
+/// [`Signature::LateHeadCreateReplaced`]: `over`, a lock client's plain
+/// head PUT on the store whose plain PUT replaces heads, replaced
+/// `created`, a head create released after its run had returned, by a run
+/// that did not succeed and wrote no snapshot.
+fn late_create_replaced(ev: &Evidence, created: &OpRecord, over: &OpRecord) -> bool {
+    let failed_without_snapshot = created
+        .run
+        .and_then(|i| ev.runs.iter().find(|x| x.index == i))
+        .is_some_and(|run| {
+            run.last_step < created.step
+                && !run.is_ok()
+                && !ev.log.iter().any(|r| {
+                    r.run == Some(run.index)
+                        && r.op.is_write()
+                        && r.applied()
+                        && r.key.starts_with("snapshots/")
+                })
+        });
+    ev.kind == StoreKind::ConditionalOverwrite
+        && over.op == OpKind::Put
+        && ev.lock_clients.contains(&over.client)
+        && created.op == OpKind::PutIfAbsent
+        && matches!(created.outcome, OpOutcome::Released(_))
+        && failed_without_snapshot
+}
+
+/// What [`classify_evidence`] reads of a simulation: its store log, its
+/// runs, and the store facts a signature depends on.
+#[derive(Clone, Debug)]
+pub(crate) struct Evidence {
+    pub log: Vec<OpRecord>,
+    pub runs: Vec<RunRecord>,
+    /// Clients whose handles offer no put-if-absent (`Sim::set_lock_client`).
+    pub lock_clients: BTreeSet<ClientId>,
+    pub kind: StoreKind,
+}
+
+impl Evidence {
+    pub(crate) fn of(sim: &Sim) -> Self {
+        Self {
+            log: sim.store().log(),
+            runs: sim.history().runs.clone(),
+            lock_clients: sim.store().lock_clients(),
+            kind: sim.store().config().kind,
+        }
+    }
+}
+
 /// What the case's damage looks like: the hazard signatures that claim its
 /// violations, and `Unknown` when any violation (or skipped evaluation) is
 /// left unclaimed.
 pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BTreeSet<Signature> {
-    let log = sim.store().log();
-    let runs = &sim.history().runs;
+    classify_evidence(&Evidence::of(sim), report, entries)
+}
+
+/// [`classify`] on evidence a test may have edited (to show that a
+/// signature's claim needs each of its conditions).
+pub(crate) fn classify_evidence(
+    ev: &Evidence,
+    report: &Report,
+    entries: &[TraceEntry],
+) -> BTreeSet<Signature> {
+    let log = ev.log.as_slice();
+    let runs = &ev.runs;
     let released = |r: &OpRecord| matches!(r.outcome, OpOutcome::Released(_));
     let first_released_write = |prefix: &str| {
         log.iter()
@@ -1762,7 +1965,7 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
     // every client together, so the two agree.
     let mut writers: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
     let mut reaps: Vec<Reap> = Vec::new();
-    for r in &log {
+    for r in log {
         if r.op.is_write() && r.applied() && is_lock_key(&r.key) {
             writers.insert(&r.key, (r.client, r.run, r.step));
         }
@@ -1951,11 +2154,93 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
         });
     }
 
+    // R4 (phase F part 10c, mixed modes): a lock-mode run whose lock was
+    // reaped by age goes on and plain-PUTs a head over one a lock-free
+    // writer created meanwhile (local, SFTP, S3 replace it). The overwrite
+    // and the damage after it (the replaced head's snapshot loses its index
+    // coverage) are `AgedLockReaped`'s, from the overwrite on.
+    // R5: the same overwrite after the lock-free writer's marker was reaped
+    // by age (a stall over the session staleness while it still creates
+    // heads), so the lock holder did not yield to it: `AgedSessionReaped`'s.
+    // Otherwise the replaced head may be a late create of a lock-free run
+    // that had already failed without a snapshot (its request abandoned
+    // after a timeout, landing after the run deregistered): the lock
+    // holder saw no session to yield to. `LateHeadCreateReplaced`'s, the
+    // overwrite only.
+    let mut marker_reaps: Vec<(u64, ClientId, Option<usize>, bool)> = Vec::new();
+    {
+        let mut written: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
+        for r in log {
+            if r.op.is_write()
+                && r.applied()
+                && r.key.starts_with("sessions/")
+                && r.key.ends_with(".json")
+            {
+                written.insert(&r.key, (r.client, r.run, r.step));
+            }
+            for k in r.deleted_keys() {
+                if let Some((w, run, at)) = written.get(k).copied()
+                    && w != r.client
+                {
+                    let aged = clock_at(at)
+                        .zip(clock_at(r.step))
+                        .is_some_and(|(t, now)| (now - t).num_seconds() > STALE_SESSION_SECS);
+                    marker_reaps.push((r.step, w, run, aged));
+                }
+            }
+        }
+    }
+    for (i, v) in report
+        .violations
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.kind == ViolationKind::HeadOverwritten)
+    {
+        let Some(step) = v.step else { continue };
+        let Some(rec) = log.iter().find(|r| r.step == step) else {
+            continue;
+        };
+        // A late head write is judged with `LateHeadWrite` below, unless the
+        // replaced head's writer had its marker reaped by age (R5 with the
+        // lock holder's PUT landing late, seed
+        // `mixed-aged-marker-late-compact-head`).
+        let late = released(rec);
+        let aged_lock = !late
+            && reaps
+                .iter()
+                .any(|x| x.step < step && x.victim == rec.client && x.run == rec.run && x.aged());
+        // The run whose head was replaced: the last applied write of the
+        // key before the overwrite.
+        let replaced_write = log
+            .iter()
+            .rfind(|r| r.step < step && r.key == rec.key && r.op.is_write() && r.applied());
+        let replaced = replaced_write.map(|r| (r.client, r.run));
+        let aged_marker = replaced.is_some_and(|(c, run)| {
+            marker_reaps
+                .iter()
+                .any(|&(s, w, r, aged)| aged && s < step && w == c && r == run)
+        });
+        let sig = if aged_lock {
+            Signature::AgedLockReaped
+        } else if aged_marker {
+            Signature::AgedSessionReaped
+        } else {
+            // A failed lock-free run's late create, replaced: nothing
+            // else is damaged, so it claims the overwrite alone.
+            if !late && replaced_write.is_some_and(|w| late_create_replaced(ev, w, rec)) {
+                claims.claim_index(Signature::LateHeadCreateReplaced, i);
+            }
+            continue;
+        };
+        claims.cascade(sig, step);
+        claims.skipped = true;
+    }
+
     // Session markers deleted by another client while their writer's run
     // was still in progress: the victim run's disallowed error and the
     // violations of its snapshot.
     let mut marker_writes: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
-    for r in &log {
+    for r in log {
         if r.op.is_write()
             && r.applied()
             && r.key.starts_with("sessions/")
@@ -2146,6 +2431,51 @@ pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BT
             && report.violated_for(Invariant::CommittedSnapshotsRestore, snapshot)
         {
             claims.claim(Signature::LateSnapshotWrite, |v| v.subject == *snapshot);
+        }
+    }
+
+    // On the store whose plain PUT replaces heads, a lock client's head PUT
+    // released late (H3's mechanism, the fallback's) that nothing above
+    // took for damage still shows in invariant 12: the head it replaced
+    // (`HeadOverwritten` at the release) and the next generation not naming
+    // the replaced head's objects (`HeadSkipsPredecessor`). Both are the
+    // late write itself, claimed with its lock violation (seed
+    // `mixed-late-lock-head-replaces-compact-head`).
+    if ev.kind == StoreKind::ConditionalOverwrite {
+        let late_lock_heads: Vec<(u64, Option<u64>)> = log
+            .iter()
+            .filter(|r| {
+                released(r)
+                    && r.op == OpKind::Put
+                    && r.key.starts_with("index.h/")
+                    && ev.lock_clients.contains(&r.client)
+            })
+            .map(|r| (r.step, vykar_protocol::head_generation(&r.key)))
+            .collect();
+        let late_lock_head: Vec<usize> = report
+            .violations
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                !claims.claimed[*i]
+                    && match v.kind {
+                        ViolationKind::HeadOverwritten => {
+                            late_lock_heads.iter().any(|(s, _)| v.step == Some(*s))
+                        }
+                        ViolationKind::HeadSkipsPredecessor => {
+                            vykar_protocol::head_generation(&v.subject).is_some_and(|next| {
+                                late_lock_heads
+                                    .iter()
+                                    .any(|(_, g)| g.is_some() && *g == next.checked_sub(1))
+                            })
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in late_lock_head {
+            claims.claim_index(Signature::LateIndexWrite, i);
         }
     }
 

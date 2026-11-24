@@ -9,6 +9,7 @@ mod listing;
 mod phases;
 #[cfg(any(test, feature = "sim"))]
 pub(crate) use phases::CommitInProgress;
+pub(crate) use phases::CommitLock;
 pub(crate) use phases::PendingCommit;
 pub(crate) mod pipeline;
 mod source;
@@ -36,7 +37,7 @@ use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
-use crate::repo::{HostEnv, Repository, WriteSessionOptions};
+use crate::repo::{CommitMode, HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
@@ -458,15 +459,24 @@ pub(crate) fn run_scoped(
         host_env,
     )?;
 
-    // ── Phase 2: Commit (exclusive lock) ────────────────────────────────
-    let guard = match pending.wait_for_lock(&mut progress, shutdown) {
-        Ok(g) => g,
+    // ── Phase 2: Commit (lock-free, or under the commit lock) ───────────
+    let mut pending = pending;
+    let protection = pending.commit_mode().and_then(|mode| match mode {
+        CommitMode::LockFree => pending
+            .wait_until_unlocked(&mut progress, shutdown)
+            .map(|()| CommitLock::Free),
+        CommitMode::Lock => pending
+            .wait_for_lock(&mut progress, shutdown)
+            .map(CommitLock::Held),
+    });
+    let lock = match protection {
+        Ok(lock) => lock,
         Err(e) => {
             pending.abandon();
             return Err((FailureScope::Repository, e));
         }
     };
-    let mut commit = pending.begin_commit(guard);
+    let mut commit = pending.begin_commit(lock);
     let result = {
         let events = FnMutSink::new(|e: CommitEvent| emit_progress(&mut progress, e.into()));
         commit.drive(&events)

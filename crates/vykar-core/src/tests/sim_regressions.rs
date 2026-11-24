@@ -10,7 +10,11 @@
 //! A seed without `storage` runs on the fallback store (`StoreKind::Plain`,
 //! every seed recorded before 04 step 8); a `<name>-conditional` seed is
 //! the same case on the conditional store (phase F part 9), with what that
-//! store leaves of the hazard.
+//! store leaves of the hazard; a `<name>-lockfree` seed is the same case on
+//! the encrypted template and the conditional store, where its backups
+//! commit lock-free (phase F part 10c: each lock decision becomes the commit
+//! mark and the probe of `locks/`), and a `mixed-…` seed has a lock client
+//! beside a lock-free one.
 
 // Printing a seed is the point of the promotion helper; every other path
 // asserts.
@@ -81,6 +85,10 @@ fn fixed_by(s: Signature) -> &'static str {
         Signature::LateIndexWrite => {
             "head writes: 04 step 8 on conditional backends; index.d/ writes: with \
              invariant 7, part 10"
+        }
+        Signature::LateHeadCreateReplaced => {
+            "not planned: mixed modes' residual (a failed lock-free run's late create replaced \
+             by a lock client's plain PUT; nothing committed is damaged)"
         }
         Signature::Unknown => "nothing: Unknown is never expected",
     }

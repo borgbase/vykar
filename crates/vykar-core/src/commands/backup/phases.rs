@@ -20,7 +20,9 @@ use crate::repo::lock;
 use crate::repo::machine::{Machine, StepKind};
 use crate::repo::machine::{StepCx, drive_blocking};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{BackupCommit, Committed, HostEnv, Repository, WriteSessionOptions};
+use crate::repo::{
+    BackupCommit, CommitMode, Committed, EncryptionMode, HostEnv, Repository, WriteSessionOptions,
+};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_common::display::{format_bytes, format_count};
 use vykar_storage::StorageBackend;
@@ -462,15 +464,24 @@ pub(crate) struct PendingCommit {
     pub(super) report: RunReport,
 }
 
-/// Phase 2 in progress: the commit lock held, its fence installed, and the
-/// commit machine. Production drives it with [`Self::drive`], the
-/// simulator one step at a time with [`Self::step`]; either way
-/// [`Self::finish`] ends it. Dropped without `finish` (a crashed client in
-/// the simulator), the session deregisters and the lock stays.
+/// How a commit is protected: the commit lock (lock mode), or nothing but
+/// its flagged session marker (lock-free, 04 step 9; the marker was marked
+/// `committing` and `locks/` probed: [`PendingCommit::wait_until_unlocked`]).
+pub(crate) enum CommitLock {
+    Held(lock::LockGuard),
+    Free,
+}
+
+/// Phase 2 in progress: the commit lock held and its fence installed (lock
+/// mode) or the marker flagged (lock-free), and the commit machine.
+/// Production drives it with [`Self::drive`], the simulator one step at a
+/// time with [`Self::step`]; either way [`Self::finish`] ends it. Dropped
+/// without `finish` (a crashed client in the simulator), the session
+/// deregisters and a lock stays.
 pub(crate) struct CommitInProgress {
     session: BackupSession,
     repo: Repository,
-    guard: lock::LockGuard,
+    guard: Option<lock::LockGuard>,
     machine: BackupCommit,
     report: RunReport,
 }
@@ -481,20 +492,65 @@ impl PendingCommit {
         &mut self.repo
     }
 
-    /// Production: wait for the commit lock (`COMMIT_LOCK_MAX_WAIT`, with
-    /// backoff), reporting "waiting for commit lock" once contended.
+    /// The handle's commit mode ([`Repository::commit_mode`]), decided after
+    /// the upload and before any commit write; `Lock` for a session whose
+    /// marker record is already not [continuous](lock::MarkerReport::continuous)
+    /// here (a machine suspended over `MARKER_GAP_LIMIT`, marker writes
+    /// failing that long, a slow marker write, a miss). A lock holder may
+    /// have taken such a session for ended, and its record never becomes
+    /// continuous again, so lock-free it would always refuse its snapshot
+    /// (`check_marker_before_snapshot`). Under the lock it commits as any
+    /// lock-mode backup: its listing of `sessions/` yields to committing
+    /// lock-free writers, and `lock::commit_marker_check` with its pack-age
+    /// term judges the record, a marker found missing included.
+    pub(crate) fn commit_mode(&mut self) -> Result<CommitMode> {
+        let mode = self.repo.commit_mode()?;
+        if mode != CommitMode::LockFree {
+            return Ok(mode);
+        }
+        let Some(marker) = self.session.marker() else {
+            return Ok(mode);
+        };
+        let report = marker.report(self.repo.host_env().clock.as_ref());
+        if report.continuous() {
+            return Ok(mode);
+        }
+        info!(
+            session_id = %self.session.id,
+            ?report,
+            "this backup's session marker went unrefreshed for a while (machine suspended?), \
+             was found missing, or a marker write was slow: a lock holder may have taken the \
+             session for ended, so it commits under the repository lock"
+        );
+        self.repo.commit_under_lock();
+        Ok(CommitMode::Lock)
+    }
+
+    /// Whether lock holders run the marker handshake's yield here: only an
+    /// encrypted repository can have lock-free writers.
+    fn yields_to_flagged(&self) -> bool {
+        self.repo.config.encryption != EncryptionMode::None
+    }
+
+    /// Production, lock mode: wait for the commit lock
+    /// (`COMMIT_LOCK_MAX_WAIT`, with backoff), reporting "waiting for commit
+    /// lock" once contended. On an encrypted repository a confirmed lock is
+    /// released again while a lock-free writer is committing (04 step 9,
+    /// [`lock::acquire_commit_lock`]): that is contention too.
     pub(crate) fn wait_for_lock(
         &self,
         progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
         shutdown: &CancelToken,
     ) -> Result<lock::LockGuard> {
         let env = self.repo.host_env().clone();
-        lock::acquire_lock_with_deadline(
+        lock::acquire_commit_lock(
             self.repo.storage.as_ref(),
             &env,
             lock::COMMIT_LOCK_MAX_WAIT,
             500,
             shutdown,
+            &self.session.id,
+            self.yields_to_flagged(),
             |_| {
                 emit_progress(
                     progress,
@@ -514,11 +570,83 @@ impl PendingCommit {
         &self,
         store_clock: &mut crate::repo::ages::StoreClock,
     ) -> Result<lock::LockGuard> {
-        lock::acquire_lock_reading(
-            self.repo.storage.as_ref(),
-            self.repo.host_env(),
-            store_clock,
+        let storage = self.repo.storage.as_ref();
+        let env = self.repo.host_env();
+        let guard = lock::acquire_lock_reading(storage, env, store_clock)?;
+        lock::commit_lock_yield(
+            storage,
+            env,
+            guard,
+            &self.session.id,
+            self.yields_to_flagged(),
         )
+    }
+
+    /// Production, lock-free (04 step 9): mark the session marker
+    /// `committing` ([`Self::mark_committing`]), then wait until `locks/`
+    /// holds no live lock ([`Self::try_probe`]; `COMMIT_LOCK_MAX_WAIT`, with
+    /// backoff and `shutdown` checked as [`Self::wait_for_lock`] does),
+    /// reporting "waiting for commit lock" once contended. The flag stays
+    /// set while waiting, so lock holders yield meanwhile, and until
+    /// deregistration.
+    pub(crate) fn wait_until_unlocked(
+        &mut self,
+        progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+        shutdown: &CancelToken,
+    ) -> Result<()> {
+        if shutdown.is_cancelled() {
+            return Err(VykarError::Interrupted);
+        }
+        self.mark_committing()?;
+        let env = self.repo.host_env().clone();
+        lock::wait_while_locked(
+            &env,
+            lock::COMMIT_LOCK_MAX_WAIT,
+            500,
+            shutdown,
+            |_| {
+                emit_progress(
+                    progress,
+                    BackupProgressEvent::CommitStage {
+                        stage: "waiting for commit lock",
+                    },
+                );
+            },
+            |_| self.try_probe(),
+        )
+    }
+
+    /// Write a marker key with `committing` (the lock-free writer's first
+    /// half of the marker handshake). A failed PUT fails the commit.
+    pub(crate) fn mark_committing(&mut self) -> Result<()> {
+        let marker = self.marker()?;
+        let key = marker.mark(
+            self.repo.storage.as_ref(),
+            self.repo.host_env().clock.as_ref(),
+            lock::MarkerFlags {
+                committing: true,
+                writes_heads: false,
+            },
+        )?;
+        debug!(key, "session marked committing");
+        Ok(())
+    }
+
+    /// One probe of `locks/` after the mark ([`lock::probe_unlocked_at`]
+    /// with the marker's current key): `Ok` records "now" (the key's mtime,
+    /// for the fold's segment ages); `Err(Locked)` while a live lock is
+    /// held.
+    pub(crate) fn try_probe(&mut self) -> Result<()> {
+        let (_, key) = self.marker()?.current();
+        let now = lock::probe_unlocked_at(self.repo.storage.as_ref(), self.repo.host_env(), &key)?;
+        self.repo.set_lock_store_time(now);
+        Ok(())
+    }
+
+    fn marker(&self) -> Result<Arc<lock::SessionMarker>> {
+        self.session.marker().ok_or_else(|| {
+            VykarError::Other("BUG: a lock-free commit without a session marker".into())
+        })
     }
 
     /// Join the background journal write Phase 1 leaves running (the
@@ -529,9 +657,9 @@ impl PendingCommit {
         self.repo.join_journal_write();
     }
 
-    /// Install the lock fence and build the commit machine. No storage
-    /// access.
-    pub(crate) fn begin_commit(self, guard: lock::LockGuard) -> CommitInProgress {
+    /// Build the commit machine; under a held lock, install its fence first.
+    /// No storage access.
+    pub(crate) fn begin_commit(self, lock: CommitLock) -> CommitInProgress {
         let Self {
             session,
             mut repo,
@@ -539,13 +667,29 @@ impl PendingCommit {
             snapshot_packed,
             report,
         } = self;
-        let fence =
-            lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
-        repo.set_lock_fence(fence);
-        // "Now" for the backup fold's segment ages (04 step 7): the commit
-        // lock key's mtime; cleared with the fence at release.
-        repo.set_lock_store_time(guard.store_time());
-        let machine = BackupCommit::new(&repo, snapshot_entry, snapshot_packed, session.marker());
+        let (guard, mode) = match lock {
+            CommitLock::Held(guard) => {
+                let fence = lock::build_lock_fence(
+                    &guard,
+                    Arc::clone(&repo.storage),
+                    repo.host_env().clone(),
+                );
+                repo.set_lock_fence(fence);
+                // "Now" for the backup fold's segment ages (04 step 7): the
+                // commit lock key's mtime; cleared with the fence at release.
+                repo.set_lock_store_time(guard.store_time());
+                (Some(guard), CommitMode::Lock)
+            }
+            // "Now" is the marked key's mtime, recorded by the probe.
+            CommitLock::Free => (None, CommitMode::LockFree),
+        };
+        let machine = BackupCommit::new(
+            &repo,
+            snapshot_entry,
+            snapshot_packed,
+            session.marker(),
+            mode,
+        );
         CommitInProgress {
             session,
             repo,
@@ -555,7 +699,7 @@ impl PendingCommit {
         }
     }
 
-    /// The lock was not acquired: flush the packs (`flush_on_abort` writes
+    /// The lock was not acquired (or the lock-free probe gave up): flush the packs (`flush_on_abort` writes
     /// the journal, so the next run's recovery can find them), then drop,
     /// which deregisters the session.
     pub(crate) fn abandon(mut self) {
@@ -602,8 +746,8 @@ impl CommitInProgress {
     }
 
     /// End Phase 2 once the machine ended with `result`: the post-commit
-    /// work, deregistration and lock release on success; on failure,
-    /// deregistration, the lock release, then `flush_on_abort`.
+    /// work, deregistration and the lock release (lock mode) on success; on
+    /// failure, deregistration, the lock release, then `flush_on_abort`.
     /// `shutdown` only shortens the post-commit wait for the local
     /// file-cache lock.
     pub(crate) fn finish(
@@ -622,14 +766,16 @@ impl CommitInProgress {
 
         // Once the snapshot is committed, deregister the session and delete
         // its journal on a helper thread while the commit finishes its local
-        // post-commit work (the file cache save), instead of after it. The
-        // lock is still held throughout and released only after that thread
-        // is joined, below: deregistration happens under the lock as before.
-        // The guard's Drop stops the heartbeat thread and joins it
-        // before the markers are deleted, so no concurrent refresh
-        // call can race with this delete. This sequencing is why the commit
-        // path releases the lock itself instead of running under
-        // `with_repo_lock`.
+        // post-commit work (the file cache save), instead of after it. In
+        // lock mode the lock is still held throughout and released only
+        // after that thread is joined, below: deregistration happens under
+        // the lock. Lock-free there is no lock: deregistration, which ends
+        // the `committing` flag, follows the snapshot PUT, which is all the
+        // marker handshake and a compact's mark need. The guard's Drop stops
+        // the heartbeat thread and joins it before the markers are deleted,
+        // so no concurrent refresh call can race with this delete. This
+        // sequencing is why the commit path releases the lock itself instead
+        // of running under `with_repo_lock`.
         let repo_storage = Arc::clone(&repo.storage);
         let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
         let ok = result.is_ok();
@@ -670,14 +816,19 @@ impl CommitInProgress {
         // cleanup, inline.
         session.end();
 
-        crate::commands::util::clear_fence_and_release(
-            &mut repo,
-            guard,
-            ok,
-            // Unlike `run_under_fence`, this path has a progress sink, so the
-            // release warning reaches GUI/CLI consumers and not just the log.
-            &mut |msg| emit_post_commit_warning(progress, msg),
-        );
+        match guard {
+            Some(guard) => crate::commands::util::clear_fence_and_release(
+                &mut repo,
+                guard,
+                ok,
+                // Unlike `run_under_fence`, this path has a progress sink, so
+                // the release warning reaches GUI/CLI consumers and not just
+                // the log.
+                &mut |msg| emit_post_commit_warning(progress, msg),
+            ),
+            // Lock-free: the store time, live sessions and segment ages.
+            None => repo.clear_lock_fence(),
+        }
 
         if let Err(e) = result {
             // flush_on_abort writes the remote sessions/<id>.index so the next

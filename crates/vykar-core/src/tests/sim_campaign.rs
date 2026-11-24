@@ -1,6 +1,13 @@
 //! The long simulation campaign (08 step 5): the wider bounded searches of
 //! `sim_exhaustive::campaign_scenarios`, then random cases with seeds from
-//! the clock, until a deadline. A case with damage of an unknown shape is a
+//! the clock, until a deadline. Workers take scenarios from one shared
+//! counter, in the list's order, until [`SCENARIO_SHARE`] of the budget has
+//! passed (a search still running then stops [`SEARCH_GRACE_SHARE`] later,
+//! incomplete), and run random cases from then (or once the list is done)
+//! until the deadline; the report says which scenarios completed, which
+//! were cut short and which never started, per family. A campaign that ran
+//! no random case fails; one of [`FULL_BUDGET`] or more also fails unless
+//! every family completed a scenario and a K >= 2 search completed. A case with damage of an unknown shape is a
 //! failure: its trace is written and the run fails at the end, after every
 //! failure of the run was collected. Each worker's case in progress is on
 //! disk, so a panic (or a CI timeout) leaves it replayable.
@@ -16,13 +23,14 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proptest::test_runner::{TestCaseError, TestError};
 
-use super::sim_exhaustive::{backup, campaign_scenarios};
-use super::sim_explore::{general, runner_with};
+use super::sim_exhaustive::{HANDSHAKE_CAMPAIGN_K, backup, campaign_scenarios, handshake_search};
+use super::sim_explore::{campaign_cases, runner_with};
 use crate::sim::driver::*;
 use crate::sim::explore::{Bound, Control, explore_with};
 
@@ -30,8 +38,26 @@ use crate::sim::explore::{Bound, Control, explore_with};
 /// otherwise outlast any deadline check between searches).
 const SEARCH_MAX_RUNS: usize = 200_000;
 
+/// The share of the budget in which workers take new scenarios; the rest
+/// is the random cases'.
+const SCENARIO_SHARE: f64 = 0.6;
+
+/// How much of the budget a search in progress at the scenario deadline
+/// still gets before it stops, incomplete: the random cases keep their
+/// share.
+const SEARCH_GRACE_SHARE: f64 = 0.02;
+
+/// From this budget on (the weekly job's), a campaign fails unless every
+/// family completed at least one scenario and at least one K >= 2 search
+/// completed; below it that only warns.
+const FULL_BUDGET: Duration = Duration::from_secs(3600);
+
 struct CampaignConfig {
     deadline: Instant,
+    /// No new scenario is started after this.
+    scenario_deadline: Instant,
+    /// A search still running stops here, incomplete.
+    search_deadline: Instant,
     jobs: usize,
     trace_dir: PathBuf,
     scenarios: Vec<(String, Case, u32)>,
@@ -54,8 +80,40 @@ struct CampaignReport {
     failures: Vec<PathBuf>,
     /// The first trace of each signature seen, for regression seeds.
     examples: BTreeMap<Signature, PathBuf>,
-    /// Per search: name, runs, complete, elapsed.
-    searches: Vec<(String, usize, bool, Duration)>,
+    /// Per search started: its index in the scenario list, name, runs,
+    /// complete, elapsed.
+    searches: Vec<(usize, String, usize, bool, Duration)>,
+}
+
+/// A scenario's family, for the report: which store and template it runs
+/// on (see `sim_exhaustive::campaign_scenarios`).
+fn family(case: &Case) -> &'static str {
+    match (case.template, case.storage) {
+        (TemplateKind::Encrypted, StoreKind::ConditionalOverwrite) => "mixed",
+        (TemplateKind::Encrypted, _) => "lockfree",
+        (_, StoreKind::Conditional) => "conditional",
+        _ => "plain",
+    }
+}
+
+/// Per family: (completed, incomplete, not started).
+type FamilyCounts = BTreeMap<&'static str, (usize, usize, usize)>;
+
+fn family_counts(cfg: &CampaignConfig, r: &CampaignReport) -> FamilyCounts {
+    let mut out = FamilyCounts::new();
+    let mut started = vec![None; cfg.scenarios.len()];
+    for (i, _, _, complete, _) in &r.searches {
+        started[*i] = Some(*complete);
+    }
+    for ((_, case, _), s) in cfg.scenarios.iter().zip(started) {
+        let e = out.entry(family(case)).or_default();
+        match s {
+            Some(true) => e.0 += 1,
+            Some(false) => e.1 += 1,
+            None => e.2 += 1,
+        }
+    }
+    out
 }
 
 /// The signatures 04 step 8 closes on a store that honours put-if-absent.
@@ -75,12 +133,23 @@ const CLOSED_ON_CONDITIONAL: [Signature; 4] = [
 const CLOSED_EVERYWHERE: [Signature; 1] = [Signature::AgedLockSegmentCollected];
 
 /// The campaign's rule: damage no signature explains, damage of a shape
-/// closed on every store, or, on the conditional store, damage of a shape
-/// 04 step 8 closed there.
+/// closed on every store, or, where every client creates heads with
+/// put-if-absent, damage of a shape 04 step 8 closed there. That is the
+/// conditional store (vykar-server) and, without lock clients, the store
+/// whose plain PUT overwrites (local, SFTP, S3: phase F part 10c decides it
+/// as the conditional store, V1); with a lock client there its plain head
+/// PUTs can replace heads again, so those shapes stay open.
+/// `LateHeadCreateReplaced` (a lock client's plain PUT over a failed
+/// lock-free run's late create) is open only there: without lock clients,
+/// or on the conditional store, it is a failure.
 fn unknown(o: &Outcome) -> bool {
+    let case = &o.trace.case;
     o.signatures.contains(&Signature::Unknown)
         || CLOSED_EVERYWHERE.iter().any(|s| o.signatures.contains(s))
-        || (o.trace.case.storage == StoreKind::Conditional
+        || (o.signatures.contains(&Signature::LateHeadCreateReplaced)
+            && (case.lock_clients.is_empty() || case.storage == StoreKind::Conditional))
+        || (case.storage.honours_creates()
+            && case.lock_clients.is_empty()
             && CLOSED_ON_CONDITIONAL
                 .iter()
                 .any(|s| o.signatures.contains(s)))
@@ -137,12 +206,19 @@ fn stop(cfg: &CampaignConfig, report: &Mutex<CampaignReport>) -> bool {
     Instant::now() >= cfg.deadline || lock(report).failures.len() >= cfg.max_failures
 }
 
-fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
+fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, next: &AtomicUsize, j: usize) {
     let templates = Templates::new();
-    for (name, base, k) in cfg.scenarios.iter().skip(j).step_by(cfg.jobs) {
+    loop {
         if stop(cfg, report) {
             return;
         }
+        if Instant::now() >= cfg.scenario_deadline {
+            break;
+        }
+        let pos = next.fetch_add(1, Ordering::Relaxed);
+        let Some((name, base, k)) = cfg.scenarios.get(pos) else {
+            break;
+        };
         let mut n = 0usize;
         let e = explore_with(
             templates.get(base.template),
@@ -155,7 +231,7 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
             |o| {
                 n += 1;
                 record(cfg, report, o, Some(&format!("{name}-{n}")));
-                if stop(cfg, report) {
+                if stop(cfg, report) || Instant::now() >= cfg.search_deadline {
                     Control::Stop
                 } else {
                     Control::Continue
@@ -166,9 +242,13 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
             "campaign worker {j}: {name}: {} runs, complete {}, {} clean, {:?}",
             e.search.runs, e.search.complete, e.clean, e.elapsed
         );
-        lock(report)
-            .searches
-            .push((name.clone(), e.search.runs, e.search.complete, e.elapsed));
+        lock(report).searches.push((
+            pos,
+            name.clone(),
+            e.search.runs,
+            e.search.complete,
+            e.elapsed,
+        ));
     }
     let mut round = 0usize;
     while cfg.random_rounds.is_none_or(|n| round < n) && !stop(cfg, report) {
@@ -180,7 +260,7 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
         // After a round's first failure every run is a shrink rerun: it is
         // judged but not counted.
         let shrinking = Cell::new(false);
-        let result = runner_with(cfg.cases_per_round, seed).run(&general(), |case| {
+        let result = runner_with(cfg.cases_per_round, seed).run(&campaign_cases(), |case| {
             write_current(&cfg.trace_dir, j, &case);
             let o = templates.run(&case);
             let failed = if shrinking.get() {
@@ -213,16 +293,18 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
 }
 
 /// Run the campaign: `cfg.jobs` workers, each with its own template,
-/// worker j taking scenarios j, j + jobs, …, then random rounds. A worker
-/// that panics is a failure pointing at its `.current` case.
+/// taking the next scenario from a shared counter until
+/// `cfg.scenario_deadline` (or the list's end), then random rounds. A
+/// worker that panics is a failure pointing at its `.current` case.
 fn run_campaign(cfg: &CampaignConfig) -> CampaignReport {
     std::fs::create_dir_all(&cfg.trace_dir).expect("create the trace directory");
     let report = Mutex::new(CampaignReport::default());
+    let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for j in 0..cfg.jobs {
-            let report = &report;
+            let (report, next) = (&report, &next);
             s.spawn(move || {
-                let r = std::panic::catch_unwind(AssertUnwindSafe(|| worker(cfg, report, j)));
+                let r = std::panic::catch_unwind(AssertUnwindSafe(|| worker(cfg, report, next, j)));
                 let current = current_path(&cfg.trace_dir, j);
                 match r {
                     Ok(()) => {
@@ -242,13 +324,21 @@ fn run_campaign(cfg: &CampaignConfig) -> CampaignReport {
     report.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn print_report(r: &CampaignReport, elapsed: Duration) {
+fn print_report(cfg: &CampaignConfig, r: &CampaignReport, elapsed: Duration) -> FamilyCounts {
     eprintln!(
         "campaign: {} runs ({} random cases) in {elapsed:?}",
         r.runs, r.random_cases
     );
-    for (name, runs, complete, took) in &r.searches {
+    let mut searches: Vec<_> = r.searches.iter().collect();
+    searches.sort_by_key(|s| s.0);
+    for (_, name, runs, complete, took) in searches {
         eprintln!("  search {name}: {runs} runs, complete {complete}, {took:?}");
+    }
+    let counts = family_counts(cfg, r);
+    for (family, (done, cut, unstarted)) in &counts {
+        eprintln!(
+            "  scenarios {family}: {done} completed, {cut} incomplete, {unstarted} not started"
+        );
     }
     eprintln!("  signatures: {:?}", r.signatures);
     for (s, p) in &r.examples {
@@ -257,6 +347,7 @@ fn print_report(r: &CampaignReport, elapsed: Duration) {
     for p in &r.failures {
         eprintln!("  failure: {}", p.display());
     }
+    counts
 }
 
 #[test]
@@ -281,8 +372,11 @@ fn campaign() {
         trace_dir.display()
     );
     let start = Instant::now();
+    let budget = Duration::from_secs(secs);
     let cfg = CampaignConfig {
-        deadline: start + Duration::from_secs(secs),
+        deadline: start + budget,
+        scenario_deadline: start + budget.mul_f64(SCENARIO_SHARE),
+        search_deadline: start + budget.mul_f64(SCENARIO_SHARE + SEARCH_GRACE_SHARE),
         jobs,
         trace_dir: trace_dir.clone(),
         scenarios: campaign_scenarios(),
@@ -291,13 +385,110 @@ fn campaign() {
         max_failures: 50,
         failure: unknown,
     };
-    let report = run_campaign(&cfg);
-    print_report(&report, start.elapsed());
+    // Beside the workers: the marker handshake's gate search at the
+    // campaign's bound (phase F part 10c).
+    let (report, handshake) = std::thread::scope(|s| {
+        let handshake = s.spawn(|| {
+            let start = Instant::now();
+            let (search, tally) = handshake_search(
+                &Template::encrypted(),
+                Bound {
+                    preemptions: HANDSHAKE_CAMPAIGN_K,
+                    max_runs: SEARCH_MAX_RUNS,
+                },
+            );
+            eprintln!(
+                "campaign: handshake search K = {HANDSHAKE_CAMPAIGN_K}: {search:?} {tally:?} in {:?}",
+                start.elapsed()
+            );
+            (search, tally)
+        });
+        let report = run_campaign(&cfg);
+        (
+            report,
+            handshake.join().expect("the handshake search panicked"),
+        )
+    });
+    let counts = print_report(&cfg, &report, start.elapsed());
+    let unstarted: usize = counts.values().map(|c| c.2).sum();
+    if unstarted > 0 {
+        eprintln!(
+            "campaign: WARNING: {unstarted} of {} scenarios were not started in {secs} s",
+            cfg.scenarios.len()
+        );
+    }
+    let coverage = coverage_gaps(&cfg, &report, &counts);
+    for gap in &coverage {
+        eprintln!("campaign: WARNING: {gap}");
+    }
+    let (search, tally) = handshake;
+    assert!(
+        search.complete,
+        "the handshake search did not complete: {search:?}"
+    );
+    assert_eq!(
+        tally.damaged, 0,
+        "the handshake search: {:?}",
+        tally.first_damage
+    );
     assert!(
         report.failures.is_empty(),
         "{} failing cases; traces in {}",
         report.failures.len(),
         trace_dir.display()
+    );
+    assert!(
+        report.random_cases > 0,
+        "the campaign ran no random case in {secs} s"
+    );
+    assert!(
+        budget < FULL_BUDGET || coverage.is_empty(),
+        "the campaign's coverage in {secs} s: {coverage:?}"
+    );
+}
+
+/// What the campaign failed to cover: a family with no completed scenario,
+/// no completed K >= 2 search.
+fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts) -> Vec<String> {
+    let mut gaps: Vec<String> = ["plain", "conditional", "lockfree", "mixed"]
+        .into_iter()
+        .filter(|f| counts.get(f).is_none_or(|c| c.0 == 0))
+        .map(|f| format!("no {f} scenario completed"))
+        .collect();
+    let wide_done = r
+        .searches
+        .iter()
+        .any(|(i, _, _, complete, _)| *complete && cfg.scenarios[*i].2 >= 2);
+    if !wide_done {
+        gaps.push("no K >= 2 search completed".into());
+    }
+    gaps
+}
+
+/// The campaign's order reaches every family and a wider search early: the
+/// first twenty scenarios hold a K = 1 scenario of each family and a
+/// K >= 2 search, and the first half of the list holds at least a third
+/// of the K >= 2 searches.
+#[test]
+fn campaign_order_reaches_every_family_early() {
+    let all = campaign_scenarios();
+    let head = &all[..20];
+    for f in ["plain", "conditional", "lockfree", "mixed"] {
+        assert!(
+            head.iter().any(|(_, c, k)| *k == 1 && family(c) == f),
+            "no K = 1 {f} scenario among the first 20: {:?}",
+            head.iter().map(|s| &s.0).collect::<Vec<_>>()
+        );
+    }
+    assert!(head.iter().any(|(_, _, k)| *k >= 2));
+    let wide = all.iter().filter(|(_, _, k)| *k >= 2).count();
+    let early = all[..all.len() / 2]
+        .iter()
+        .filter(|(_, _, k)| *k >= 2)
+        .count();
+    assert!(
+        early * 3 >= wide,
+        "{early} of {wide} K >= 2 searches in the first half"
     );
 }
 
@@ -325,8 +516,11 @@ fn campaign_writes_failing_traces() {
         template: TemplateKind::Plain,
         lock_clients: vec![],
     };
+    let deadline = Instant::now() + Duration::from_secs(600);
     let cfg = CampaignConfig {
-        deadline: Instant::now() + Duration::from_secs(600),
+        deadline,
+        scenario_deadline: deadline,
+        search_deadline: deadline,
         jobs: 1,
         trace_dir: dir.path().to_path_buf(),
         scenarios: vec![("h3".into(), h3, 1)],
@@ -347,4 +541,30 @@ fn campaign_writes_failing_traces() {
         o.trace.render()
     );
     assert!(!current_path(dir.path(), 0).exists());
+}
+
+/// `LateHeadCreateReplaced` is open only with a lock client on the store
+/// whose plain PUT replaces heads: the same outcome judged as a case
+/// without lock clients, or on the conditional store, is a failure.
+#[test]
+fn late_head_create_replaced_is_closed_without_lock_clients() {
+    let mut o = run_case(
+        &Template::encrypted(),
+        &super::sim_driver::late_create_replaced_case(),
+    );
+    assert_eq!(
+        o.signatures,
+        std::collections::BTreeSet::from([Signature::LateHeadCreateReplaced]),
+        "{}",
+        o.trace.render()
+    );
+    assert!(!unknown(&o));
+    let case = o.trace.case.clone();
+    o.trace.case.lock_clients.clear();
+    assert!(unknown(&o), "without lock clients");
+    o.trace.case = Case {
+        storage: StoreKind::Conditional,
+        ..case
+    };
+    assert!(unknown(&o), "on the conditional store");
 }

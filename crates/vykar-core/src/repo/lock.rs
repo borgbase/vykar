@@ -293,9 +293,122 @@ fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv, marker_key: &str)
     }
 }
 
+/// [`probe_unlocked`] for a writer whose marker now carries a flag (04
+/// step 9, the marker handshake: the lock-free writer's half, after its
+/// flagged key `marker_key` was written). Lists `sessions/` with mtimes,
+/// "now" being `marker_key`'s mtime there, whether or not a lock is
+/// listed (a lock-free commit's fold needs "now" either way), then reaps
+/// stale locks with that "now". `Ok(now)` when no live lock is left;
+/// `Err(Locked)` naming one. A failed listing is an error.
+pub(crate) fn probe_unlocked_at(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    marker_key: &str,
+) -> Result<Option<StoreNow>> {
+    let listing = storage.list_meta(SESSIONS_PREFIX)?;
+    let now = StoreNow::of_written(&listing, marker_key);
+    let held = cleanup_stale_locks(
+        storage,
+        Duration::seconds(DEFAULT_STALE_LOCK_SECS),
+        env,
+        NowSource::Known(now),
+    )?;
+    match held.first() {
+        Some(key) => Err(VykarError::Locked(build_lock_holder(
+            storage,
+            key,
+            env.clock.as_ref(),
+        ))),
+        None => Ok(now),
+    }
+}
+
+/// The lock holder's half of the marker handshake (04 step 9): right
+/// after a lock is confirmed and before any write. Reaps stale sessions
+/// ("now" = `now`, the lock key's mtime) and lists the live ones, as
+/// [`cleanup_stale_sessions_keeping`] does; then `Err(Locked)` naming the
+/// first live session other than `own` whose newest key may write heads
+/// ([`SessionEntry::may_write_heads`]). With `own` (a backup's commit
+/// lock) orphan journals are not deleted. A newest key that is malformed, or
+/// gone on GET twice, counts as flagged (fail closed); one gone on GET is
+/// listed again once, and a session with no key left then has
+/// deregistered. `Ok((cleaned, live))` otherwise.
+///
+/// Why it is enough: a lock-free writer writes its flagged key before it
+/// lists `locks/` ([`probe_unlocked_at`]), and a lock holder writes its
+/// lock before it lists `sessions/`: by the LIST contract at least one of
+/// the two sees the other, and a lock-free writer's flagged key stays
+/// until its deregistration.
+pub(crate) fn yield_to_lock_free_writers(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    now: Option<StoreNow>,
+    own: Option<&str>,
+) -> Result<(Vec<String>, Vec<LiveSession>)> {
+    // A backup (`own`) reaps stale markers but leaves orphan journals to
+    // maintenance, as before its lock listed sessions.
+    let (cleaned, live) = reap_sessions(
+        storage,
+        default_stale_session_duration(),
+        env,
+        now,
+        own.is_none(),
+    )?;
+    let holder = |key: String, entry: Option<&SessionEntry>| {
+        VykarError::Locked(LockHolder {
+            key,
+            details: entry.map(|e| LockHolderDetails {
+                hostname: e.hostname.clone(),
+                pid: e.pid,
+                age: format_age(&env.now_utc(), &e.registered_at),
+            }),
+        })
+    };
+    let mut unread: Vec<&str> = Vec::new();
+    for s in live.iter().filter(|s| Some(s.session_id.as_str()) != own) {
+        match &s.entry {
+            Some(entry) if entry.may_write_heads() => {
+                return Err(holder(session_marker_key(&s.session_id), Some(entry)));
+            }
+            Some(_) => {}
+            None => unread.push(&s.session_id),
+        }
+    }
+    if !unread.is_empty() {
+        // Malformed, or gone since the LIST (a rotation the LIST half-saw,
+        // or a deregistration): list again and read the newest key again.
+        let keys = storage.list(SESSIONS_PREFIX)?;
+        let sessions = group_session_markers(&keys);
+        for id in unread {
+            let Some(&(_, newest)) = sessions.get(id).and_then(|m| m.last()) else {
+                debug!(
+                    session_id = id,
+                    "session deregistered during the lock holder's listing"
+                );
+                continue;
+            };
+            let entry = storage
+                .get(newest)?
+                .and_then(|data| serde_json::from_slice::<SessionEntry>(&data).ok());
+            match entry {
+                Some(entry) if !entry.may_write_heads() => {}
+                // The key itself is named: a malformed one stays until it is
+                // stale by its mtime, and where the listing reports none it
+                // is never reaped (`break-lock --sessions` removes it). A
+                // key gone since this listing (`None` from the GET) reads
+                // the same: unreadable or just removed, run again.
+                entry => return Err(holder(newest.to_string(), entry.as_ref())),
+            }
+        }
+    }
+    Ok((cleaned, live))
+}
+
 /// Where a reaper reads "now" on the store's clock. Resolved only when the
 /// listing it judges reports an mtime for at least one lock key.
 pub(crate) enum NowSource<'a> {
+    /// Read already by the caller (`None`: unknown).
+    Known(Option<StoreNow>),
     /// `key`, which this client has just written: LIST its directory with
     /// mtimes and take the key's mtime.
     Written(&'a str),
@@ -326,6 +439,7 @@ impl NowSource<'_> {
                 }
             }
             Self::Probe(clock) => clock.now(storage, env),
+            Self::Known(now) => (now, None),
         }
     }
 }
@@ -784,9 +898,26 @@ pub struct SessionEntry {
     /// `None` from writers before 04 step 7: their horizon is unknown (−∞).
     #[serde(default)]
     pub elapsed_secs: Option<u64>,
+    /// A lock-free backup from its commit mark until deregistration: it may
+    /// create index heads without the lock, and its snapshot may not be
+    /// listed yet (04 step 9). Absent when false, so a marker of a backup
+    /// that commits under the lock is what it was before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub committing: bool,
+    /// A lock-free maintenance session that may create index heads without
+    /// the lock, for its whole run (lock-free compact; no writer sets it
+    /// yet). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writes_heads: bool,
 }
 
 impl SessionEntry {
+    /// Whether the session may create index heads without the lock: a lock
+    /// holder yields to it (04 step 9, the marker handshake).
+    pub(crate) fn may_write_heads(&self) -> bool {
+        self.committing || self.writes_heads
+    }
+
     /// The marker of `env`'s process, registered at `registered_at`, last
     /// written at `last_refresh`. The one place that fills the identity
     /// fields. `elapsed_secs` is 0: registration's key is written before
@@ -805,8 +936,18 @@ impl SessionEntry {
             installation_id: env.host.installation_id.clone(),
             pid_ns: env.host.pid_ns,
             elapsed_secs: Some(0),
+            committing: false,
+            writes_heads: false,
         }
     }
+}
+
+/// The flags a session marker carries (04 step 9): every key the session
+/// writes after a flag is set carries it, the heartbeat's included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MarkerFlags {
+    pub committing: bool,
+    pub writes_heads: bool,
 }
 
 /// `d` in whole seconds, rounded up.
@@ -958,8 +1099,9 @@ fn deregister_keys(storage: &dyn StorageBackend, session_id: &str, keys: &[Strin
 /// intervals, below the 45-minute staleness.
 pub(crate) const MARKER_GAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// What a session knows about its marker; shared by the heartbeat (the only
-/// writer) and the commit.
+/// What a session knows about its marker; shared by the heartbeat and the
+/// commit, whose writes (the heartbeat's refreshes and rechecks, a lock-free
+/// commit's [`Self::mark`]) are serialised by `write`.
 ///
 /// The `n`-th refresh attempt PUTs a new key, generation `n`, checks with an
 /// EXISTS that the key it replaces is still there, and deletes the key
@@ -983,9 +1125,14 @@ pub(crate) struct SessionMarker {
     /// The session's start (t0): when its registration key was written.
     started: MarkerStamp,
     state: std::sync::Mutex<MarkerState>,
+    /// Held for the whole of a refresh, a recheck or a mark: one marker
+    /// write at a time, so no two writers take one generation's turn.
+    write: std::sync::Mutex<()>,
 }
 
 struct MarkerState {
+    /// The flags every key written from now on carries.
+    flags: MarkerFlags,
     /// Generation of the key that is the marker now: the newest one whose
     /// PUT succeeded.
     current: u64,
@@ -1102,6 +1249,7 @@ impl SessionMarker {
             entry: registration.entry.clone(),
             started: registration.written,
             state: std::sync::Mutex::new(MarkerState {
+                flags: MarkerFlags::default(),
                 current: 0,
                 current_written: registration.written,
                 attempted: 0,
@@ -1116,6 +1264,7 @@ impl SessionMarker {
                 slow_puts: 0,
                 pullback: std::time::Duration::ZERO,
             }),
+            write: std::sync::Mutex::new(()),
         }
     }
 
@@ -1163,7 +1312,8 @@ impl SessionMarker {
         (generation, self.key(generation))
     }
 
-    /// One refresh attempt (the heartbeat; never concurrently with itself).
+    /// One refresh attempt (the heartbeat), serialised with every other
+    /// marker write by `write`.
     ///
     /// PUTs the next generation's key; then checks the key it replaces and
     /// every superseded key whose earlier check failed; then deletes the
@@ -1175,18 +1325,65 @@ impl SessionMarker {
         storage: &dyn StorageBackend,
         clock: &dyn Clock,
     ) -> RefreshOutcome {
-        let (generation, to_check) = {
+        let _write = self.write_turn();
+        self.refresh_locked(storage, clock)
+    }
+
+    /// Set `flags` and write a new key carrying them (04 step 9, the
+    /// lock-free writer's half of the marker handshake): one refresh
+    /// attempt, serialised with the heartbeat. `Ok(key)`: the key whose PUT
+    /// succeeded (it carries the flags); what the attempt found about
+    /// superseded keys (gone, unchecked) and a slow PUT is recorded as a
+    /// heartbeat refresh records it. `Err`: the PUT failed; the flags stay
+    /// set for later refreshes.
+    pub(crate) fn mark(
+        &self,
+        storage: &dyn StorageBackend,
+        clock: &dyn Clock,
+        flags: MarkerFlags,
+    ) -> Result<String> {
+        let _write = self.write_turn();
+        self.lock().flags = flags;
+        match self.refresh_locked(storage, clock) {
+            RefreshOutcome::Failed(e) => Err(e),
+            outcome => {
+                debug!(
+                    session_id = self.session_id,
+                    ?flags,
+                    ?outcome,
+                    "session marker flagged"
+                );
+                Ok(self.current().1)
+            }
+        }
+    }
+
+    /// The flags every key written from now on carries.
+    #[cfg(test)]
+    pub(crate) fn flags(&self) -> MarkerFlags {
+        self.lock().flags
+    }
+
+    fn write_turn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`Self::refresh`] with `write` held.
+    fn refresh_locked(&self, storage: &dyn StorageBackend, clock: &dyn Clock) -> RefreshOutcome {
+        let (generation, to_check, flags) = {
             let mut st = self.lock();
             st.attempted += 1;
             let generation = st.attempted;
             st.owned.insert(generation);
             let mut to_check: Vec<u64> = st.unchecked.iter().copied().collect();
             to_check.push(st.current);
-            (generation, to_check)
+            (generation, to_check, st.flags)
         };
         let entry = SessionEntry {
             last_refresh: clock.now_utc().to_rfc3339(),
             elapsed_secs: Some(ceil_secs(self.elapsed(clock))),
+            committing: flags.committing,
+            writes_heads: flags.writes_heads,
             ..self.entry.clone()
         };
         // On the suspend-aware clock, as `elapsed_secs`: a suspend during
@@ -1296,6 +1493,7 @@ impl SessionMarker {
     /// when all are settled present (`gap`: the stretch this closed),
     /// `Missing` when one was gone, `Unchecked` when a check failed again.
     pub(crate) fn recheck(&self, storage: &dyn StorageBackend) -> RefreshOutcome {
+        let _write = self.write_turn();
         let missing_before = self.lock().missing;
         let result = self.check_unchecked(storage);
         if self.lock().missing && !missing_before {
@@ -1744,6 +1942,20 @@ pub(crate) fn cleanup_stale_sessions_keeping(
     env: &HostEnv,
     now: Option<StoreNow>,
 ) -> Result<(Vec<String>, Vec<LiveSession>)> {
+    reap_sessions(storage, max_age, env, now, true)
+}
+
+/// [`cleanup_stale_sessions_keeping`]; `delete_orphan_journals`: whether its
+/// second pass runs (a backup's commit-lock yield skips it, so a crashed
+/// session's journal keeps its grace until the next maintenance, as before
+/// backups listed sessions at their lock).
+fn reap_sessions(
+    storage: &dyn StorageBackend,
+    max_age: Duration,
+    env: &HostEnv,
+    now: Option<StoreNow>,
+    delete_orphan_journals: bool,
+) -> Result<(Vec<String>, Vec<LiveSession>)> {
     let local_now = env.now_utc();
     let listing = storage.list_meta(SESSIONS_PREFIX)?;
     let mtimes: std::collections::HashMap<&str, Option<std::time::SystemTime>> =
@@ -1848,7 +2060,7 @@ pub(crate) fn cleanup_stale_sessions_keeping(
     // AND that were not cleaned in *this* invocation. Files cleaned this run get
     // a one-run grace period so the next backup can recover their journal via
     // `recover_pending_index()`.
-    for key in &keys {
+    for key in keys.iter().filter(|_| delete_orphan_journals) {
         if let Some(id) = key
             .strip_prefix(SESSIONS_PREFIX)
             .and_then(|s| s.strip_suffix(".index"))
@@ -2046,8 +2258,95 @@ pub fn acquire_lock_with_deadline(
     max_wait: std::time::Duration,
     base_delay_ms: u64,
     shutdown: &CancelToken,
-    mut on_contended: impl FnMut(&LockHolder),
+    on_contended: impl FnMut(&LockHolder),
 ) -> Result<LockGuard> {
+    wait_while_locked(
+        env,
+        max_wait,
+        base_delay_ms,
+        shutdown,
+        on_contended,
+        |clock| acquire_lock_reading(storage, env, clock),
+    )
+}
+
+/// [`acquire_lock_with_deadline`] for a backup's commit in lock mode (04
+/// step 9): each attempt, once its lock is confirmed and on an encrypted
+/// repository (`yield_to_flagged`; no flagged marker exists on a
+/// plaintext one), runs the lock holder's half of the marker handshake
+/// ([`yield_to_lock_free_writers`], `own` excluded) and releases the lock
+/// again when a session that may write heads without it is live: that
+/// counts as contention. A failed session listing releases the lock and
+/// fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acquire_commit_lock(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    max_wait: std::time::Duration,
+    base_delay_ms: u64,
+    shutdown: &CancelToken,
+    own: &str,
+    yield_to_flagged: bool,
+    on_contended: impl FnMut(&LockHolder),
+) -> Result<LockGuard> {
+    wait_while_locked(
+        env,
+        max_wait,
+        base_delay_ms,
+        shutdown,
+        on_contended,
+        |clock| {
+            let guard = acquire_lock_reading(storage, env, clock)?;
+            commit_lock_yield(storage, env, guard, own, yield_to_flagged)
+        },
+    )
+}
+
+/// One attempt of [`acquire_commit_lock`] after its lock was confirmed:
+/// the guard, or the lock released and the yield's error.
+pub(crate) fn commit_lock_yield(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    guard: LockGuard,
+    own: &str,
+    yield_to_flagged: bool,
+) -> Result<LockGuard> {
+    if !yield_to_flagged {
+        return Ok(guard);
+    }
+    match yield_to_lock_free_writers(storage, env, guard.store_time(), Some(own)) {
+        Ok((cleaned, _)) => {
+            if !cleaned.is_empty() {
+                info!(count = cleaned.len(), sessions = ?cleaned, "cleaned up stale backup sessions");
+            }
+            Ok(guard)
+        }
+        Err(e) => {
+            if let VykarError::Locked(holder) = &e {
+                debug!(holder = %describe_holder(holder), "a lock-free writer is committing; releasing the lock");
+            }
+            if let Err(release) = release_lock(storage, guard) {
+                debug!(error = %release, "could not release the lock after yielding");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The wait loop of [`acquire_lock_with_deadline`] around `attempt`: until
+/// it returns something other than `Locked`, or `max_wait` has elapsed
+/// (one final attempt after the deadline). `shutdown` is checked before
+/// every attempt and every 500 ms of a sleep (`Interrupted`);
+/// `on_contended` is called once, on the first `Locked`. The attempts
+/// share one reading of the store's clock.
+pub(crate) fn wait_while_locked<T>(
+    env: &HostEnv,
+    max_wait: std::time::Duration,
+    base_delay_ms: u64,
+    shutdown: &CancelToken,
+    mut on_contended: impl FnMut(&LockHolder),
+    mut attempt_once: impl FnMut(&mut StoreClock) -> Result<T>,
+) -> Result<T> {
     let start = env.clock.monotonic();
     let deadline = start + max_wait;
     let mut attempt: usize = 0;
@@ -2056,8 +2355,8 @@ pub fn acquire_lock_with_deadline(
         if shutdown.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
-        let holder = match acquire_lock_reading(storage, env, &mut store_clock) {
-            Ok(guard) => return Ok(guard),
+        let holder = match attempt_once(&mut store_clock) {
+            Ok(v) => return Ok(v),
             Err(VykarError::Locked(holder)) => holder,
             Err(e) => return Err(e),
         };

@@ -260,13 +260,30 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()>
     // Clean up stale sessions; the ones kept are live. Backups may run
     // beside maintenance (04 step 7): compact keeps their uploads by age and
     // by their marker's horizon.
+    //
+    // On an encrypted repository the same listing is the lock holder's half
+    // of the marker handshake (04 step 9): a live session that may write
+    // heads without the lock (a lock-free backup committing) makes this
+    // holder yield with `Locked` naming it, before any write; the user
+    // retries. A plaintext repository has no lock-free writers.
     let stale_threshold = lock::default_stale_session_duration();
-    let live = match lock::cleanup_stale_sessions_keeping(
-        repo.storage.as_ref(),
-        stale_threshold,
-        repo.host_env(),
-        repo.lock_store_time(),
-    ) {
+    let listed = if repo.config.encryption == crate::repo::EncryptionMode::None {
+        lock::cleanup_stale_sessions_keeping(
+            repo.storage.as_ref(),
+            stale_threshold,
+            repo.host_env(),
+            repo.lock_store_time(),
+        )
+    } else {
+        lock::yield_to_lock_free_writers(
+            repo.storage.as_ref(),
+            repo.host_env(),
+            repo.lock_store_time(),
+            None,
+        )
+    };
+    let live = match listed {
+        Err(e @ VykarError::Locked(_)) => return Err(e),
         Ok((cleaned, live)) => {
             if !cleaned.is_empty() {
                 info!(
@@ -308,6 +325,8 @@ mod tests {
             installation_id: None,
             pid_ns: None,
             elapsed_secs: None,
+            committing: false,
+            writes_heads: false,
         }
     }
 

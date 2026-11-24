@@ -26,7 +26,12 @@
 //!    when the head moved, since the session began, in a way that can
 //!    remove entries; only packs not verified yet are verified.
 //! 5. Check the fence (and, when a head was written, the pack-age term
-//!    again with no allowance: the binding check) and PUT the snapshot.
+//!    again with no allowance: the binding check; lock-free, that the
+//!    session marker is still there) and PUT the snapshot.
+//!
+//! Under the commit lock, or lock-free (04 step 9): then no lock and no
+//! fence; the session marker carries `committing` from before the flush
+//! (`PendingCommit::wait_until_unlocked`) until deregistration.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +39,6 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use super::Repository;
 use super::commit::{check_reused_chunks, commit_additions, needs_recheck};
 use super::index_store::{self, SyncedIndex};
 use super::index_write::head_contention_error;
@@ -46,6 +50,7 @@ use super::manifest::SnapshotEntry;
 use super::publish_machine::{HeadCheck, PublishMachine, Published};
 use super::snapshot_cache::{self, SnapshotRefresh};
 use super::write_session::SessionView;
+use super::{CommitMode, Repository};
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::{Location, SegmentBody};
 use crate::index::table::IndexState;
@@ -89,7 +94,8 @@ pub(crate) struct Committed {
     pub(crate) entry: SnapshotEntry,
 }
 
-/// A backup's commit under the lock: the machine of steps 1-5 above.
+/// A backup's commit, under the lock or lock-free: the machine of steps
+/// 1-5 above.
 pub(crate) struct BackupCommit {
     entry: Option<SnapshotEntry>,
     packed: Vec<u8>,
@@ -115,6 +121,9 @@ pub(crate) struct BackupCommit {
     delta: Option<IndexDelta>,
     /// Just before the head read that chose this attempt's generation.
     listed_at: Option<MarkerStamp>,
+    /// Lock-free (04 step 9): no lock fence; the marker must still be
+    /// there before the snapshot PUT.
+    lock_free: bool,
     state: CommitState,
 }
 
@@ -239,8 +248,10 @@ impl BackupCommit {
         entry: SnapshotEntry,
         packed: Vec<u8>,
         marker: Option<Arc<SessionMarker>>,
+        mode: CommitMode,
     ) -> Self {
         Self {
+            lock_free: mode == CommitMode::LockFree,
             entry: Some(entry),
             packed,
             session_id: repo.ws().session_id.clone(),
@@ -352,6 +363,7 @@ impl BackupCommit {
                 self.open_stage(cx, "write snapshot");
                 cx.repo.check_lock_fence()?;
                 self.check_landed_head(cx.repo)?;
+                self.check_marker_before_snapshot(cx.repo)?;
                 CommitState::PutSnapshot
             }
             CommitState::PutSnapshot => {
@@ -413,7 +425,7 @@ impl BackupCommit {
     /// may be [`PACK_AGE_LIMIT`](super::ages::PACK_AGE_LIMIT) old by now does not write its snapshot.
     /// The head stays without its snapshot, the state of a commit whose
     /// snapshot PUT failed: the error is `StaleChunksDuringCommit`, and a
-    /// retry uploads the backup's chunks again.
+    /// retry deduplicates against that head (it indexes this run's chunks).
     fn check_landed_head(&self, repo: &Repository) -> Result<()> {
         let (true, Some(m)) = (self.wrote_head, &self.marker) else {
             return Ok(());
@@ -425,6 +437,54 @@ impl BackupCommit {
             m.elapsed(clock),
             Duration::ZERO,
         )
+    }
+
+    /// A lock-free commit (04 step 9) writes its snapshot only while its
+    /// marker was never reaped: the marker handshake keeps lock holders
+    /// out of this commit, and a compact's mark relies on the marker until
+    /// the snapshot is listed, both only while the marker is visible. A
+    /// present current key and a [continuous](lock::MarkerReport::continuous)
+    /// record mean no reap. A miss alone is not enough: a reaper deletes
+    /// the keys its listing showed, so one that listed key n aged (the
+    /// record has a gap over `MARKER_GAP_LIMIT`, since a key ages only
+    /// unrefreshed) and deletes it after the heartbeat wrote n + 1 and found
+    /// n present leaves n + 1 present and no miss recorded, while it
+    /// believes the session reaped and did not yield to it. Otherwise
+    /// `MarkerLostDuringCommit`: the head stays without its snapshot. A
+    /// retry reads its sources again (the failed run saved no file cache)
+    /// but deduplicates against that head, which indexes this run's chunks:
+    /// it uploads only what it would have uploaded beside a committed run.
+    /// A session whose record was already not continuous before its mark
+    /// does not get here: it commits under the lock
+    /// (`PendingCommit::commit_mode`), so this refusal catches only a
+    /// discontinuity that arose while committing. A failed probe fails the
+    /// commit with its error.
+    fn check_marker_before_snapshot(&self, repo: &Repository) -> Result<()> {
+        let (true, Some(m)) = (self.lock_free, &self.marker) else {
+            return Ok(());
+        };
+        let present = m.probe(repo.storage.as_ref())?;
+        let report = m.report(repo.host_env().clock.as_ref());
+        if present && report.continuous() {
+            return Ok(());
+        }
+        if !present {
+            m.note_missing();
+            warn!(
+                session_id = self.session_id,
+                "the session marker was gone before the snapshot was written; a concurrent \
+                 compact may have swept its chunks; retry the backup"
+            );
+        } else {
+            warn!(
+                session_id = self.session_id,
+                ?report,
+                "the session marker's record is not continuous before the snapshot write \
+                 (unrefreshed for a while, a slow marker write, or a miss): a lock holder may \
+                 have reaped it; retry the backup"
+            );
+        }
+        Err(VykarError::MarkerLostDuringCommit)
     }
 
     /// Step 1. The "refresh snapshots" stage starts whether or not the

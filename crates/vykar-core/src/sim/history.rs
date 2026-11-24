@@ -28,6 +28,9 @@ pub enum AllowedError {
     Locked,
     ActiveSessions,
     StaleChunksDuringCommit,
+    /// A lock-free commit's marker reaped or its record broken between its
+    /// commit mark and its snapshot write (`MarkerLostDuringCommit`).
+    MarkerLostDuringCommit,
     LockExpired,
     IndexChanged,
     Interrupted,
@@ -63,6 +66,7 @@ pub fn classify(err: &VykarError) -> ErrorClass {
         VykarError::Locked(_) => Some(AllowedError::Locked),
         VykarError::ActiveSessions(_) => Some(AllowedError::ActiveSessions),
         VykarError::StaleChunksDuringCommit => Some(AllowedError::StaleChunksDuringCommit),
+        VykarError::MarkerLostDuringCommit => Some(AllowedError::MarkerLostDuringCommit),
         VykarError::LockExpired(_) => Some(AllowedError::LockExpired),
         VykarError::Interrupted => Some(AllowedError::Interrupted),
         VykarError::Other(m) if m.contains(INDEX_CHANGED_TEXT) => Some(AllowedError::IndexChanged),
@@ -112,8 +116,9 @@ pub struct RunRecord {
     pub last_step: u64,
     pub outcome: RunOutcome,
     /// The run committed in lock-free mode (04 step 9): its protected
-    /// writes need no lock, and invariant 7 does not judge them. Nothing
-    /// sets it before phase F part 10c.
+    /// writes need no lock, and invariant 7 does not judge them. Set for a
+    /// backup on an encrypted repository whose handle's put-if-absent check
+    /// passed (phase F part 10c; maintenance takes the lock in every mode).
     pub lock_free: bool,
 }
 

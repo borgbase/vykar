@@ -1714,6 +1714,8 @@ fn orphans_inside_a_live_horizon_are_kept() {
                 installation_id: None,
                 pid_ns: None,
                 elapsed_secs: Some(elapsed_hours * 3600),
+                committing: false,
+                writes_heads: false,
             }),
             mtime: Some(now),
         }]));

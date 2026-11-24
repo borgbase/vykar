@@ -151,6 +151,13 @@ pub enum Call {
         snapshot: String,
         tree: SourceTree,
     },
+    /// [`Call::Backup`] that stops (`Interrupted`) once `shutdown` is
+    /// cancelled, as a signal stops the CLI's.
+    BackupCancellable {
+        snapshot: String,
+        tree: SourceTree,
+        shutdown: CancelToken,
+    },
     Delete {
         names: Vec<String>,
     },
@@ -681,7 +688,9 @@ impl Sim {
                 return Ok(Some(p));
             }
             if !self.store.gate_armed(gate) {
-                return Ok(None);
+                // Open or missed, or it took its operation after the wait
+                // above timed out: look once more.
+                return Ok(self.store.gate_paused(gate));
             }
             let ended = self
                 .in_flight
@@ -848,43 +857,13 @@ impl Sim {
     fn prepare(&mut self, c: ClientId, call: Call) -> (ClientOp, Body) {
         match call {
             Call::Backup { snapshot, tree } => {
-                let src = self.prepare_backup_source(&snapshot, tree);
-                let op = ClientOp::Backup {
-                    snapshot: snapshot.clone(),
-                };
-                let body: Body = Box::new(
-                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
-                        let handle = store.handle(c);
-                        let wrap = move |_: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
-                            Box::new(handle.clone())
-                        };
-                        let source_paths = vec![src.to_string_lossy().into_owned()];
-                        let outcome = backup::run_impl(
-                            &cfg,
-                            backup::BackupRequest {
-                                snapshot_name: &snapshot,
-                                passphrase: cfg.encryption.passphrase.as_deref(),
-                                source_paths: &source_paths,
-                                source_label: "sim",
-                                exclude_patterns: &[],
-                                exclude_if_present: &[],
-                                one_file_system: true,
-                                git_ignore: false,
-                                xattrs_enabled: false,
-                                compression: Compression::None,
-                                command_dumps: &[],
-                                verbose: false,
-                            },
-                            None,
-                            &CancelToken::new(),
-                            Some(&wrap),
-                            env,
-                        )?;
-                        Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
-                    },
-                );
-                (op, body)
+                self.prepare_backup(c, snapshot, tree, CancelToken::new())
             }
+            Call::BackupCancellable {
+                snapshot,
+                tree,
+                shutdown,
+            } => self.prepare_backup(c, snapshot, tree, shutdown),
             Call::Delete { names } => {
                 let op = ClientOp::Delete {
                     names: names.clone(),
@@ -1091,6 +1070,53 @@ impl Sim {
         }
     }
 
+    /// The op and the body of a backup of `tree` as `snapshot`, stopped by
+    /// `shutdown`.
+    fn prepare_backup(
+        &mut self,
+        c: ClientId,
+        snapshot: String,
+        tree: SourceTree,
+        shutdown: CancelToken,
+    ) -> (ClientOp, Body) {
+        let src = self.prepare_backup_source(&snapshot, tree);
+        let op = ClientOp::Backup {
+            snapshot: snapshot.clone(),
+        };
+        let body: Body = Box::new(
+            move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                let handle = store.handle(c);
+                let wrap = move |_: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+                    Box::new(handle.clone())
+                };
+                let source_paths = vec![src.to_string_lossy().into_owned()];
+                let outcome = backup::run_impl(
+                    &cfg,
+                    backup::BackupRequest {
+                        snapshot_name: &snapshot,
+                        passphrase: cfg.encryption.passphrase.as_deref(),
+                        source_paths: &source_paths,
+                        source_label: "sim",
+                        exclude_patterns: &[],
+                        exclude_if_present: &[],
+                        one_file_system: true,
+                        git_ignore: false,
+                        xattrs_enabled: false,
+                        compression: Compression::None,
+                        command_dumps: &[],
+                        verbose: false,
+                    },
+                    None,
+                    &shutdown,
+                    Some(&wrap),
+                    env,
+                )?;
+                Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
+            },
+        );
+        (op, body)
+    }
+
     /// Write the source tree of backup `snapshot` and record it for the
     /// checker; returns the source directory.
     pub(super) fn prepare_backup_source(&mut self, snapshot: &str, tree: SourceTree) -> PathBuf {
@@ -1216,6 +1242,13 @@ impl Sim {
 
     /// Insert the run in index order and its observation in step order.
     fn record(&mut self, index: usize, c: ClientId, op: ClientOp, f: Finished) -> RunRecord {
+        // A backup commits lock-free once it decided to (an encrypted
+        // repository, a passed put-if-absent check and a continuous marker
+        // record: `PendingCommit::commit_mode`), which its commit mark
+        // shows; maintenance takes the lock in every mode (phase F part
+        // 10c).
+        let lock_free =
+            matches!(op, ClientOp::Backup { .. }) && self.store.committed_lock_free_in_run(index);
         let record = RunRecord {
             index,
             client: c,
@@ -1223,7 +1256,7 @@ impl Sim {
             first_step: f.first_step,
             last_step: f.last_step,
             outcome: f.outcome,
-            lock_free: false,
+            lock_free,
         };
         let at = self.history.runs.partition_point(|r| r.index < index);
         self.history.runs.insert(at, record.clone());

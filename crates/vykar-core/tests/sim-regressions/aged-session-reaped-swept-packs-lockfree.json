@@ -1,0 +1,252 @@
+{
+  "name": "aged-session-reaped-swept-packs-lockfree",
+  "note": "Lock-free twin of aged-session-reaped-swept-packs (phase F part 10c): encrypted template, conditional store, the lock decision replaced by the commit mark and the probe. a's segment is younger than T_pack at b's compact, as in its twin: no signature. a's snapshot fence refuses (MarkerLostDuringCommit, StaleChunksDuringCommit before 10c fix round 2) before b's compact reaps the marker: the 3 h jump left a gap over MARKER_GAP_LIMIT in its marker record, and a lock-free commit writes its snapshot only on a continuous record (10c fix round 1; before it, the snapshot was written and the compact then reaped the marker). The jump falls after the commit mark: a gap before it would make a commit under the lock (10c fix round 2).",
+  "expect": [],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 10860
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fold-prefix +local +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-base"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "collect-garbage +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "finish"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "whole delete"
+    ],
+    [
+      "Stop",
+      "stop"
+    ]
+  ],
+  "case": {
+    "hosts": "SameHostname",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": true
+          }
+        },
+        "DeleteControl"
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [
+      {
+        "client": 1,
+        "class": "IndexObject",
+        "nth": 1,
+        "kind": "Duplicate"
+      }
+    ],
+    "crash": true,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      0,
+      5,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      1,
+      0,
+      0,
+      0
+    ],
+    "policy": "First",
+    "storage": "Conditional",
+    "template": "Encrypted"
+  }
+}

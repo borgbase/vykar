@@ -2027,7 +2027,7 @@ fn backup_with(
     let guard = pending
         .wait_for_lock(&mut None, &CancelToken::new())
         .unwrap();
-    let mut commit = pending.begin_commit(guard);
+    let mut commit = pending.begin_commit(commands::backup::CommitLock::Held(guard));
     let result = commit.drive(&no_events);
     commit
         .finish(result, &mut None, &crate::repo::control::CancelToken::new())

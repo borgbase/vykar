@@ -3,9 +3,10 @@ use crate::repo::host_env::{Clock, StopSignal};
 use crate::repo::lock::{
     HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, NowSource, RefreshOutcome,
     SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, acquire_lock, break_lock,
-    cleanup_stale_locks, cleanup_stale_sessions, clear_all_sessions, commit_marker_check,
-    default_stale_session_duration, format_age, format_age_since, parse_session_marker_key,
-    register_session, release_lock, session_marker_key, session_marker_key_at,
+    cleanup_stale_locks, cleanup_stale_sessions, cleanup_stale_sessions_keeping,
+    clear_all_sessions, commit_marker_check, default_stale_session_duration, format_age,
+    format_age_since, parse_session_marker_key, probe_unlocked_at, register_session, release_lock,
+    session_marker_key, session_marker_key_at, yield_to_lock_free_writers,
 };
 use crate::repo::{HostEnv, HostIdentity, SystemClock};
 use crate::sim::env::{SimTime, TimeMode};
@@ -13,6 +14,7 @@ use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
 use vykar_storage::StorageBackend;
+use vykar_types::error::{LockHolder, VykarError};
 
 /// Stub pid_alive function that always returns true (conservative default).
 fn pid_always_alive(_pid: u32) -> bool {
@@ -443,6 +445,8 @@ fn write_session_marker_with_host(
         installation_id: None,
         pid_ns: None,
         elapsed_secs: None,
+        committing: false,
+        writes_heads: false,
     };
     let data = serde_json::to_vec(&entry).unwrap();
     storage.put(&key, &data).unwrap();
@@ -1888,6 +1892,8 @@ fn session_entry(host: &HostIdentity, at: &str) -> SessionEntry {
         installation_id: host.installation_id.clone(),
         pid_ns: host.pid_ns,
         elapsed_secs: None,
+        committing: false,
+        writes_heads: false,
     }
 }
 
@@ -2647,6 +2653,8 @@ mod store_clock {
             installation_id: None,
             pid_ns: None,
             elapsed_secs: None,
+            committing: false,
+            writes_heads: false,
         };
         storage
             .put(
@@ -3011,4 +3019,235 @@ mod store_clock {
         assert_eq!(probes(&storage), vec![young.to_string()]);
         release_lock(&storage, guard).unwrap();
     }
+}
+
+// ── The marker handshake (04 step 9, phase F part 10c) ──────────────────
+
+/// `me()` on another machine: a session no same-host rule reaps.
+fn elsewhere() -> HostEnv {
+    HostEnv::system().with_host(HostIdentity {
+        hostname: "elsewhere".into(),
+        pid: 7,
+        boot_id: Some("boot-x".into()),
+        installation_id: Some("inst-x".into()),
+        pid_ns: Some(1),
+    })
+}
+
+const COMMITTING: crate::repo::lock::MarkerFlags = crate::repo::lock::MarkerFlags {
+    committing: true,
+    writes_heads: false,
+};
+
+/// Both flags false serialise to the marker JSON of before (no new keys);
+/// a flagged entry parses back; a body without them parses unflagged.
+#[test]
+fn a_flagged_marker_round_trips_and_a_plain_one_is_unchanged() {
+    let now = Utc::now();
+    let plain = SessionEntry::new(&HostEnv::system().with_host(me()), now, now);
+    let json = serde_json::to_string(&plain).unwrap();
+    assert!(
+        !json.contains("committing") && !json.contains("writes_heads"),
+        "{json}"
+    );
+    let flagged = SessionEntry {
+        committing: true,
+        ..plain.clone()
+    };
+    let json = serde_json::to_string(&flagged).unwrap();
+    assert!(json.contains("\"committing\":true"), "{json}");
+    assert!(!json.contains("writes_heads"), "{json}");
+    let back: SessionEntry = serde_json::from_str(&json).unwrap();
+    assert!(back.committing && !back.writes_heads && back.may_write_heads());
+    let compact = SessionEntry {
+        writes_heads: true,
+        ..plain.clone()
+    };
+    let back: SessionEntry =
+        serde_json::from_str(&serde_json::to_string(&compact).unwrap()).unwrap();
+    assert!(back.writes_heads && back.may_write_heads());
+    let old = r#"{"hostname":"h","pid":1,"registered_at":"2026-01-01T00:00:00Z","last_refresh":"2026-01-01T00:00:00Z","elapsed_secs":3}"#;
+    let back: SessionEntry = serde_json::from_str(old).unwrap();
+    assert!(!back.committing && !back.writes_heads && !back.may_write_heads());
+}
+
+/// `mark` writes a new generation carrying the flag, and every later
+/// refresh (the heartbeat's) carries it too. Marks and refreshes from two
+/// threads are serialised: the current key is always the newest one
+/// written, never an earlier generation that finished last.
+#[test]
+fn mark_writes_a_new_key_with_the_flag_and_refreshes_keep_it() {
+    let storage = MemoryBackend::new();
+    let (_time, env) = sim_env();
+    let m = registered(&storage, "flag", &env);
+    let key = m.mark(&storage, env.clock.as_ref(), COMMITTING).unwrap();
+    assert_eq!(key, session_marker_key_at("flag", 1));
+    assert!(entry_at(&storage, &key).committing);
+    assert!(!entry_at(&storage, &session_marker_key("flag")).committing);
+    assert!(matches!(
+        m.refresh(&storage, env.clock.as_ref()),
+        RefreshOutcome::Refreshed { .. }
+    ));
+    let (generation, current) = m.current();
+    assert_eq!(generation, 2);
+    assert!(entry_at(&storage, &current).committing);
+    assert_eq!(m.flags(), COMMITTING);
+
+    for _ in 0..100 {
+        let storage = MemoryBackend::new();
+        let m = registered(&storage, "race", &env);
+        std::thread::scope(|s| {
+            s.spawn(|| m.mark(&storage, env.clock.as_ref(), COMMITTING).unwrap());
+            s.spawn(|| m.refresh(&storage, env.clock.as_ref()));
+        });
+        let (generation, current) = m.current();
+        assert_eq!(generation, 2, "the current key is the newest written");
+        assert!(storage.exists(&current).unwrap());
+    }
+}
+
+/// A backend whose GET of `key` finds nothing while LIST still lists it;
+/// with `deregister`, the first such GET also deletes the key (a session
+/// that deregistered between a holder's LIST and its GET).
+struct VanishingGet {
+    inner: MemoryBackend,
+    key: String,
+    deregister: bool,
+}
+
+impl vykar_storage::InnerBackend for VanishingGet {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for VanishingGet;
+    except [get];
+
+    fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        if key == self.key {
+            if self.deregister {
+                self.inner.delete(key)?;
+            }
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+}
+
+/// A lock holder's yield (04 step 9): a live session whose newest key
+/// carries `committing` (or `writes_heads`) fails the holder `Locked`,
+/// naming the committing host; an unflagged one and its own do not.
+#[test]
+fn a_lock_holder_yields_to_a_flagged_session() {
+    let storage = MemoryBackend::new();
+    let them = elsewhere();
+    let other = registered(&storage, "other", &them);
+    let own = HostEnv::system().with_host(me());
+    registered(&storage, "own", &own);
+    let yield_to = |own_id| yield_to_lock_free_writers(&storage, &own, None, own_id);
+    let (_, live) = yield_to(Some("own")).unwrap();
+    assert_eq!(live.len(), 2);
+    other
+        .mark(&storage, them.clock.as_ref(), COMMITTING)
+        .unwrap();
+    match yield_to(Some("own")) {
+        Err(VykarError::Locked(holder)) => {
+            let d = holder.details.expect("the committing host is named");
+            assert_eq!(d.hostname, "elsewhere");
+            assert_eq!(d.pid, 7);
+        }
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    // The flagged session itself, as a holder, does not yield to itself.
+    yield_to_lock_free_writers(&storage, &them, None, Some("other")).unwrap();
+}
+
+/// Fail closed: a malformed newest key, or one gone on GET twice, counts
+/// as flagged; one gone because its session deregistered does not.
+#[test]
+fn a_lock_holder_yields_to_a_malformed_or_vanished_newest_key() {
+    let own = HostEnv::system().with_host(me());
+    let storage = MemoryBackend::new();
+    storage.put("sessions/bad.json", b"not json").unwrap();
+    // Without mtimes (this backend lists none) it is never reaped by age:
+    // the error names the key and the remedy.
+    match yield_to_lock_free_writers(&storage, &own, None, None) {
+        Err(VykarError::Locked(holder @ LockHolder { details: None, .. })) => {
+            assert_eq!(holder.key, "sessions/bad.json");
+            let text = holder.to_string();
+            assert!(
+                text.contains("sessions/bad.json") && text.contains("break-lock --sessions"),
+                "{text}"
+            );
+        }
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    let (cleaned, _) =
+        cleanup_stale_sessions_keeping(&storage, default_stale_session_duration(), &own, None)
+            .unwrap();
+    assert!(cleaned.is_empty(), "a malformed key without an mtime stays");
+
+    for deregister in [false, true] {
+        let inner = MemoryBackend::new();
+        registered(&inner, "gone", &elsewhere());
+        let storage = VanishingGet {
+            inner,
+            key: session_marker_key("gone"),
+            deregister,
+        };
+        let result = yield_to_lock_free_writers(&storage, &own, None, None);
+        if deregister {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(VykarError::Locked(_))), "{result:?}");
+        }
+    }
+}
+
+/// A flagged marker that went unwritten longer than the session staleness
+/// (on the store's clock) is reaped, not yielded to: a crashed committing
+/// backup blocks lock holders for at most 45 minutes.
+#[test]
+fn a_lock_holder_does_not_yield_to_a_stale_one() {
+    let storage = MemoryBackend::with_mtimes();
+    let them = elsewhere();
+    let other = registered(&storage, "stale", &them);
+    let key = other
+        .mark(&storage, them.clock.as_ref(), COMMITTING)
+        .unwrap();
+    let now = std::time::SystemTime::now();
+    for k in storage.list("sessions/").unwrap() {
+        storage.set_mtime(&k, now - std::time::Duration::from_secs(46 * 60));
+    }
+    let own = HostEnv::system().with_host(me());
+    let (cleaned, live) =
+        yield_to_lock_free_writers(&storage, &own, Some(vykar_storage::StoreNow::at(now)), None)
+            .unwrap();
+    assert_eq!(cleaned, vec!["stale".to_string()]);
+    assert!(live.is_empty());
+    assert!(!storage.exists(&key).unwrap());
+}
+
+/// The lock-free writer's probe reads "now" (its flagged key's mtime) even
+/// when `locks/` is empty, and fails `Locked` on a live lock.
+#[test]
+fn probe_unlocked_at_reads_now_without_a_lock_listed() {
+    let storage = MemoryBackend::with_mtimes();
+    let env = HostEnv::system().with_host(me());
+    let m = registered(&storage, "probe", &env);
+    let key = m.mark(&storage, env.clock.as_ref(), COMMITTING).unwrap();
+    let written = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+    storage.set_mtime(&key, written);
+    assert_eq!(
+        probe_unlocked_at(&storage, &env, &key).unwrap(),
+        Some(vykar_storage::StoreNow::at(written))
+    );
+    let held = acquire_lock(&storage, &elsewhere()).unwrap();
+    assert!(matches!(
+        probe_unlocked_at(&storage, &env, &key),
+        Err(VykarError::Locked(_))
+    ));
+    release_lock(&storage, held).unwrap();
 }

@@ -591,6 +591,9 @@ pub struct Repository {
     /// The notice this handle logged when its heads fell back to plain PUTs
     /// (04 "Fallback"): logged once per handle, set when logged.
     head_fallback: Option<index_store::HeadFallback>,
+    /// How this handle commits, decided once (`Self::commit_mode`); `None`
+    /// until a writer asked.
+    commit_mode: Option<CommitMode>,
     /// What the next index write records in the head's `sweep`; consumed by it.
     pending_sweep: Option<index_write::PendingSweep>,
     /// Graces of `collect_index_garbage`: `IndexGcGrace::DEFAULT`; tests
@@ -615,6 +618,15 @@ pub struct Repository {
     segment_ages: Option<ages::SegmentAges>,
     /// The latest index a relocation loaded, see [`relocate`].
     relocation: relocate::RelocationCache,
+}
+
+/// How a handle writes index heads (04 step 9): `LockFree` on an encrypted
+/// repository whose storage passed the put-if-absent check, `Lock` (the
+/// repository lock, 04 "Fallback") otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitMode {
+    Lock,
+    LockFree,
 }
 
 /// What [`Repository::save_file_cache_cancellable`] did.
@@ -1003,6 +1015,61 @@ impl Repository {
     /// [`ages::foldable_prefix`] with this handle's ages and grace.
     pub(crate) fn foldable_prefix(&self, segments: &[crate::index::head::SegmentRef]) -> usize {
         ages::foldable_prefix(segments, self.segment_ages.as_ref(), self.segment_grace)
+    }
+
+    /// How this handle commits, decided once per handle (the put-if-absent
+    /// check once per backend instance, `vykar_storage::Verifier`):
+    /// `Lock` on a plaintext repository (they never commit lock-free: their
+    /// index objects are named by their contents), or when the storage
+    /// offers no put-if-absent or its check concluded `Unsupported`;
+    /// `LockFree` when the check passed. An undecided check (no write
+    /// permission, a transport failure) is an error: no guess either way.
+    pub(crate) fn commit_mode(&mut self) -> Result<CommitMode> {
+        if let Some(mode) = self.commit_mode {
+            return Ok(mode);
+        }
+        let mode = if self.config.encryption == EncryptionMode::None {
+            CommitMode::Lock
+        } else {
+            let reason = match self.storage.conditional() {
+                None => Some(None),
+                Some(cond) => match cond.verify()? {
+                    vykar_storage::ConditionalSupport::Verified => None,
+                    vykar_storage::ConditionalSupport::Unsupported { reason } => Some(Some(reason)),
+                },
+            };
+            match reason {
+                None => CommitMode::LockFree,
+                Some(reason) => {
+                    if index_store::note_fallback(&mut self.head_fallback, reason.as_deref()) {
+                        tracing::info!(
+                            "this client commits under the repository lock; lock-free writers on \
+                             this repository wait for it"
+                        );
+                    }
+                    CommitMode::Lock
+                }
+            }
+        };
+        match mode {
+            CommitMode::LockFree => tracing::debug!("this client commits lock-free"),
+            CommitMode::Lock => tracing::debug!("this client commits under the repository lock"),
+        }
+        self.commit_mode = Some(mode);
+        Ok(mode)
+    }
+
+    /// Commit under the repository lock from now on, whatever the check
+    /// decided: a backup whose session marker record is not continuous
+    /// before its commit mark (`PendingCommit::commit_mode`).
+    pub(crate) fn commit_under_lock(&mut self) {
+        self.commit_mode = Some(CommitMode::Lock);
+    }
+
+    /// Whether this handle decided to commit lock-free: its head creates
+    /// then never fall back to a plain PUT (04 step 9, O4).
+    pub(crate) fn is_lock_free(&self) -> bool {
+        self.commit_mode == Some(CommitMode::LockFree)
     }
 
     /// Check the lock fence if one is installed. No-op if no fence is set.

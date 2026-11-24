@@ -15,7 +15,7 @@ use super::commit_op_order::{project, run_records};
 use crate::repo::machine::{Access, StepKind};
 use crate::sim::checker::{Invariant, NotEvaluated, Report, Violation, ViolationKind, run_subject};
 use crate::sim::driver::*;
-use crate::sim::history::{AllowedError, ErrorClass};
+use crate::sim::history::{AllowedError, ErrorClass, RunOutcome};
 use crate::sim::{ClientOp, OpKind, OpOutcome, OpRecord, RunRecord};
 
 fn backup() -> Command {
@@ -1194,3 +1194,214 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     // pack maps; the lock release runs in this last decision
     "compact List packmaps/",
 ];
+
+/// The mixed-mode residual `LateHeadCreateReplaced` (phase F part 10c),
+/// on seed `mixed-late-create-replaced`'s case: lock-free a's head create
+/// is delayed, its GET finds the key absent and a fails with the error,
+/// deregistered and without a snapshot; lock client b takes the lock, lists
+/// no session, reads the head; a's create lands; b's plain PUT replaces it.
+/// The overwrite is the only violation and the signature claims it alone.
+pub(super) fn late_create_replaced_case() -> Case {
+    let mut choices = vec![0u16; 23];
+    choices.push(1);
+    Case {
+        choices,
+        policy: Policy::Continue,
+        storage: StoreKind::ConditionalOverwrite,
+        template: TemplateKind::Encrypted,
+        lock_clients: vec![1],
+        advances: false,
+        ..case(
+            HostPlan::Distinct,
+            vec![vec![backup()], vec![backup()]],
+            vec![FaultSpec {
+                client: 0,
+                class: KeyClass::IndexHead,
+                nth: 1,
+                kind: FaultKind::Delay,
+            }],
+        )
+    }
+}
+
+/// [`late_create_replaced_case`] gives `LateHeadCreateReplaced` and
+/// nothing else, and the claim needs each of its conditions: with the
+/// create not released late, the creating run still running when it
+/// landed, that run successful or with a snapshot PUT, the overwriter not
+/// a lock client, or the store the conditional one, the overwrite is left
+/// to `Unknown`; an unrelated violation is too.
+#[test]
+fn late_head_create_replaced_claims_only_a_failed_runs_late_create() {
+    let t = Template::encrypted();
+    let o = run_case(&t, &late_create_replaced_case());
+    let render = || o.trace.render();
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::LateHeadCreateReplaced]),
+        "{}",
+        render()
+    );
+    assert!(!Signature::LateHeadCreateReplaced.cascades());
+    assert_eq!(o.report.violations.len(), 1, "{}", render());
+    assert_eq!(o.report.violations[0].kind, ViolationKind::HeadOverwritten);
+    assert!(o.report.not_evaluated.is_empty(), "{}", render());
+    let backups = driven_backups(&o);
+    let ra = backups
+        .iter()
+        .find(|r| o.sim.store().client_name(r.client) == "a")
+        .expect("a ran");
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Injected)),
+        "{}",
+        render()
+    );
+    assert!(backup_of_b(&o).is_ok(), "{}", render());
+
+    let ev = Evidence::of(&o.sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    assert_eq!(
+        judge(&ev),
+        BTreeSet::from([Signature::LateHeadCreateReplaced])
+    );
+    let created = ev
+        .log
+        .iter()
+        .position(|r| r.key.starts_with("index.h/") && matches!(r.outcome, OpOutcome::Released(_)))
+        .expect("a's create was released");
+    let creator = ev.log[created].run.expect("the create has a run");
+    let run_at = ev
+        .runs
+        .iter()
+        .position(|r| r.index == creator)
+        .expect("the creating run");
+    let unknown = BTreeSet::from([Signature::Unknown]);
+    type Edit = Box<dyn Fn(&mut Evidence)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "the create applied when issued",
+            Box::new(move |e| e.log[created].outcome = OpOutcome::Ok),
+        ),
+        (
+            "the creating run returned after the create landed",
+            Box::new(move |e| e.runs[run_at].last_step = e.log[created].step + 1),
+        ),
+        (
+            "the creating run succeeded",
+            Box::new(move |e| {
+                e.runs[run_at].outcome = RunOutcome::Ok {
+                    removed: vec![],
+                    detail: String::new(),
+                }
+            }),
+        ),
+        (
+            "the creating run wrote a snapshot",
+            Box::new(move |e| {
+                let mut snap = e.log[created].clone();
+                snap.op = OpKind::Put;
+                snap.key = "snapshots/injected-by-the-test".into();
+                snap.outcome = OpOutcome::Ok;
+                e.log.push(snap);
+            }),
+        ),
+        (
+            "the overwriter is not a lock client",
+            Box::new(|e| e.lock_clients.clear()),
+        ),
+        (
+            "the conditional store",
+            Box::new(|e| e.kind = StoreKind::Conditional),
+        ),
+    ];
+    for (what, edit) in edits {
+        let mut e = ev.clone();
+        edit(&mut e);
+        assert_eq!(judge(&e), unknown, "{what}");
+    }
+    let mut unrelated = o.report.clone();
+    unrelated.violations.push(Violation {
+        invariant: Invariant::CommittedSnapshotsRestore,
+        kind: ViolationKind::RestoreDiffers,
+        subject: "b1".into(),
+        detail: "injected by the test".into(),
+        step: None,
+    });
+    assert_eq!(
+        classify(&o.sim, &unrelated, &o.trace.entries),
+        BTreeSet::from([Signature::LateHeadCreateReplaced, Signature::Unknown])
+    );
+}
+
+/// `LateIndexWrite`'s invariant-12 claim on `ConditionalOverwrite` (seed
+/// `mixed-late-lock-head-replaces-compact-head`): lock client b's head PUT
+/// lands late over the head 4 compact created, and head 5 no longer names
+/// head 4's objects. Only a lock client's late plain PUT on that store
+/// qualifies: as another client's, or on the conditional store, both
+/// violations are left to `Unknown`.
+#[test]
+fn a_late_lock_head_over_a_compact_head_is_a_late_index_write() {
+    let mut choices = vec![0u16; 29];
+    choices.push(1);
+    let c = Case {
+        choices,
+        policy: Policy::Continue,
+        storage: StoreKind::ConditionalOverwrite,
+        template: TemplateKind::Encrypted,
+        lock_clients: vec![1],
+        advances: false,
+        ..case(
+            HostPlan::Distinct,
+            vec![
+                vec![backup()],
+                vec![backup()],
+                vec![Command::DeleteControl, Command::Compact],
+            ],
+            vec![FaultSpec {
+                client: 1,
+                class: KeyClass::IndexHead,
+                nth: 1,
+                kind: FaultKind::Delay,
+            }],
+        )
+    };
+    let o = run_case(&Template::encrypted(), &c);
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::LateIndexWrite]),
+        "{}",
+        o.trace.render()
+    );
+    let kinds: BTreeSet<String> = o
+        .report
+        .violations
+        .iter()
+        .map(|v| format!("{:?}", v.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([
+            "HeadOverwritten".to_string(),
+            "HeadSkipsPredecessor".to_string(),
+            "WriteWithoutLock".to_string(),
+        ]),
+        "{}",
+        o.trace.render()
+    );
+    let ev = Evidence::of(&o.sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    let mut e = ev.clone();
+    e.lock_clients.clear();
+    assert_eq!(
+        judge(&e),
+        BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
+        "not a lock client"
+    );
+    let mut e = ev;
+    e.kind = StoreKind::Conditional;
+    assert_eq!(
+        judge(&e),
+        BTreeSet::from([Signature::LateIndexWrite, Signature::Unknown]),
+        "the conditional store"
+    );
+}

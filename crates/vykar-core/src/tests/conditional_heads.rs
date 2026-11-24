@@ -447,7 +447,13 @@ fn session(repo: &mut Repository, name: &str, chunks: &[&[u8]]) -> BackupCommit 
         repo.store_chunk(c, Compression::None, PackType::Data)
             .unwrap();
     }
-    BackupCommit::new(repo, entry(name), b"snapshot".to_vec(), None)
+    BackupCommit::new(
+        repo,
+        entry(name),
+        b"snapshot".to_vec(),
+        None,
+        crate::repo::CommitMode::Lock,
+    )
 }
 
 fn no_events(_: CommitEvent) {}
@@ -1100,5 +1106,97 @@ fn checker_exempts_a_repair_head() {
             .any(|v| v.kind == ViolationKind::HeadSkipsPredecessor),
         "head {}: {report}",
         latest.generation
+    );
+}
+
+// ── A lock-free writer never falls back (04 step 9, O4) ────────────────
+
+/// A backend whose put-if-absent check passes and whose later creates are
+/// refused as "unsupported", reaching `create_head`'s fallback branch
+/// directly (`vykar_storage::Verifier` would turn such a refusal into a
+/// failed write first).
+struct RefusesAfterCheck {
+    inner: Arc<dyn vykar_storage::StorageBackend>,
+}
+
+impl vykar_storage::InnerBackend for RefusesAfterCheck {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for RefusesAfterCheck;
+    except [conditional];
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        Some(self)
+    }
+}
+
+impl vykar_storage::ConditionalWrite for RefusesAfterCheck {
+    fn put_if_absent(
+        &self,
+        _key: &str,
+        _data: &[u8],
+    ) -> vykar_types::error::Result<vykar_storage::Created> {
+        Err(vykar_storage::put_if_absent_unavailable(
+            "test: refused after the check",
+        ))
+    }
+    fn verify(&self) -> vykar_types::error::Result<vykar_storage::ConditionalSupport> {
+        Ok(vykar_storage::ConditionalSupport::Verified)
+    }
+}
+
+/// O4: an encrypted repository whose storage passed the check commits
+/// lock-free; a create refused after that fails the commit, and no head is
+/// written with a plain PUT (there is no lock to make one safe).
+#[test]
+fn a_refusal_after_a_passed_check_fails_the_commit() {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::Conditional,
+        encrypted: true,
+        ..SimConfig::default()
+    });
+    let a = sim.client("a");
+    let before = sim.store().step();
+    let mut repo = Repository::open(
+        Box::new(RefusesAfterCheck {
+            inner: Arc::new(sim.store().handle(a)),
+        }),
+        Some(crate::sim::SIM_PASSPHRASE),
+        Some(sim.client_dir(a).join("repo-cache")),
+        OpenOptions::new().with_index().host_env(sim.host_env(a)),
+    )
+    .unwrap();
+    assert_eq!(
+        repo.commit_mode().unwrap(),
+        crate::repo::CommitMode::LockFree
+    );
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
+    repo.store_chunk(b"chunk of a", Compression::None, PackType::Data)
+        .unwrap();
+    let mut m = BackupCommit::new(
+        &repo,
+        entry("a1"),
+        b"snapshot".to_vec(),
+        None,
+        crate::repo::CommitMode::LockFree,
+    );
+    let err = step_until(&mut repo, &mut m, |_| false).unwrap_err();
+    assert!(err.to_string().contains("never writes"), "{err}");
+    repo.flush_on_abort();
+    let ops = ops_after(&sim, a, before);
+    assert!(
+        !ops.iter()
+            .any(|r| r.op.is_write() && r.key.starts_with("index.h/")),
+        "a head was written: {ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|r| r.key.starts_with("snapshots/") && r.op.is_write()),
+        "{ops:?}"
     );
 }

@@ -28,6 +28,7 @@ mod listing_readers;
 mod listing_writer;
 mod lock;
 mod lock_fence;
+mod lock_free;
 mod maintenance_index;
 mod manifest;
 mod mark;

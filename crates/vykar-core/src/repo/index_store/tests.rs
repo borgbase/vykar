@@ -2165,7 +2165,7 @@ fn create_head_classifies_every_answer() {
 
     let s = scripted(None, |st, k, d| st.put(k, d).map(|_| Created::Yes));
     assert_eq!(
-        create_head(&s, 2, mine, &mut None).unwrap(),
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
         HeadPut::Created
     );
 
@@ -2173,13 +2173,19 @@ fn create_head_classifies_every_answer() {
     // or nothing any more.
     let s = scripted(Some(mine), |_, _, _| Ok(Created::AlreadyExists));
     assert_eq!(
-        create_head(&s, 2, mine, &mut None).unwrap(),
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
         HeadPut::Created
     );
     let s = scripted(Some(other), |_, _, _| Ok(Created::AlreadyExists));
-    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
+        HeadPut::Taken
+    );
     let s = scripted(None, |_, _, _| Ok(Created::AlreadyExists));
-    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
+        HeadPut::Taken
+    );
 
     // An unknown outcome: the GET decides; absent keeps the error.
     let s = scripted(None, move |st, k, d| {
@@ -2187,14 +2193,17 @@ fn create_head_classifies_every_answer() {
         Err(lost())
     });
     assert_eq!(
-        create_head(&s, 2, mine, &mut None).unwrap(),
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
         HeadPut::Created
     );
     let s = scripted(None, move |_, _, _| Err(lost()));
-    let err = create_head(&s, 2, mine, &mut None).unwrap_err();
+    let err = create_head(&s, 2, mine, &mut None, false).unwrap_err();
     assert!(err.to_string().contains("connection reset"), "{err}");
     let s = scripted(Some(other), move |_, _, _| Err(lost()));
-    assert_eq!(create_head(&s, 2, mine, &mut None).unwrap(), HeadPut::Taken);
+    assert_eq!(
+        create_head(&s, 2, mine, &mut None, false).unwrap(),
+        HeadPut::Taken
+    );
 
     // The check concluded Unsupported: today's plain PUT.
     let s = scripted(None, |_, _, _| {
@@ -2204,18 +2213,33 @@ fn create_head_classifies_every_answer() {
     });
     let mut noted = None;
     assert_eq!(
-        create_head(&s, 2, mine, &mut noted).unwrap(),
+        create_head(&s, 2, mine, &mut noted, false).unwrap(),
         HeadPut::Created
     );
     assert_eq!(s.inner.get(&head_key(2)).unwrap().as_deref(), Some(mine));
     assert_eq!(noted, Some(HeadFallback::Refused));
+    // A lock-free writer (04 step 9, O4) fails instead and writes nothing.
+    let s = scripted(None, |_, _, _| {
+        Err(vykar_storage::put_if_absent_unavailable(
+            "test: ignores the condition",
+        ))
+    });
+    let mut noted = None;
+    let err = create_head(&s, 2, mine, &mut noted, true).unwrap_err();
+    assert!(err.to_string().contains("never writes"), "{err}");
+    assert!(s.inner.get(&head_key(2)).unwrap().is_none());
+    assert_eq!(noted, None);
+    let plain = MemoryBackend::new();
+    let err = create_head(&plain, 2, mine, &mut None, true).unwrap_err();
+    assert!(err.to_string().contains("never writes"), "{err}");
+    assert!(plain.get(&head_key(2)).unwrap().is_none());
 
     // Over the size cap: refused, never written unconditionally.
     let s = scripted(None, |_, _, _| {
         Err(VykarError::InvalidFormat("put-if-absent: too large".into()))
     });
     assert!(matches!(
-        create_head(&s, 2, mine, &mut None),
+        create_head(&s, 2, mine, &mut None, false),
         Err(VykarError::InvalidFormat(_))
     ));
     assert!(s.inner.get(&head_key(2)).unwrap().is_none());

@@ -154,6 +154,30 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: h_racy,
         conditional: OnConditional::OwnKind,
     },
+    KnownHazard {
+        id: "H-mixed-aged-lock",
+        summary: "mixed modes on a store whose plain PUT replaces heads (local, SFTP, S3): \
+                  a lock-mode backup stalls 6 h between its fence and its head PUT, a \
+                  lock-free backup reaps the aged lock and creates the generation, and the \
+                  late plain head PUT replaces it (invariant 12)",
+        fixed_by: "not planned: the lock's documented limit (AgedLockReaped, R4 of phase F \
+                   part 10); only a lock-mode writer's own stall of 6 h opens it",
+        run: h_mixed_aged_lock,
+        conditional: OnConditional::OwnKind,
+    },
+    KnownHazard {
+        id: "H-mixed-late-create",
+        summary: "mixed modes on a store whose plain PUT replaces heads (local, SFTP, S3): \
+                  a lock-free backup's head create times out and the backup fails and \
+                  deregisters without a snapshot; the abandoned create lands after a \
+                  lock-mode backup read the head, whose plain PUT then replaces it \
+                  (invariant 12); nothing committed is damaged",
+        fixed_by: "not planned: the lock protocol's fallback beside lock-free writers \
+                   (LateHeadCreateReplaced, phase F part 10c); the failed run's objects \
+                   are debris",
+        run: h_mixed_late_create,
+        conditional: OnConditional::OwnKind,
+    },
 ];
 
 pub const REGRESSIONS: &[Regression] = &[
@@ -620,6 +644,134 @@ pub fn h_racy() -> HazardOutcome {
         .any(|v| v.kind == ViolationKind::HeadOverwritten);
     let evidence = format!("{report}");
     if overwritten && b1_unindexed(&report) {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
+    }
+}
+
+/// H-mixed-aged-lock (phase F part 10c, R4): on an encrypted repository
+/// over `StoreKind::ConditionalOverwrite`, lock-mode backup l (its handle
+/// offers no put-if-absent) is held after its fence, at its plain head
+/// PUT; 6 h 1 min pass (its lock ages past the stale age); lock-free
+/// backup f reaps the lock at registration, commits the generation l
+/// computed; l's PUT then replaces f's head: `HeadOverwritten`, and f1
+/// loses its index coverage.
+pub fn h_mixed_aged_lock() -> HazardOutcome {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::ConditionalOverwrite,
+        encrypted: true,
+        ..SimConfig::default()
+    });
+    let (l, f) = (sim.client("l"), sim.client("f"));
+    sim.set_lock_client(l);
+    let gate = sim.gate(GateRule::new(
+        l,
+        OpMatch::Kind(super::fault::OpKind::Put),
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let rl = sim.spawn(
+        l,
+        Call::Backup {
+            snapshot: "l1".into(),
+            tree: SourceTree::seeded("l1", 3, FILE_SIZE),
+        },
+    );
+    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
+        return broken(String::from("l never reached its head PUT"));
+    }
+    sim.advance(std::time::Duration::from_secs(6 * 3600 + 60));
+    let rf = sim.backup(f, "f1", &SourceTree::seeded("f1", 3, FILE_SIZE));
+    if !rf.is_ok() || !rf.lock_free {
+        return broken(format!("f1 should commit lock-free: {}", rf.detail()));
+    }
+    sim.resume(gate);
+    let rl = sim.join(rl);
+    let report = sim.check_invariants(Invariant::STEP8);
+    let overwritten = report
+        .violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::HeadOverwritten);
+    let evidence = format!("l1: {}; {report}", rl.detail());
+    if overwritten {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
+    }
+}
+
+/// H-mixed-late-create (phase F part 10c): on an encrypted repository over
+/// `StoreKind::ConditionalOverwrite`, lock-free backup f's head create is
+/// delayed (a request the client abandoned on a timeout); its GET finds the
+/// key absent, so f fails with the error, deregistered and without a
+/// snapshot. Lock-mode backup l (its handle offers no put-if-absent) lists
+/// no session to yield to and is held at its plain head PUT; f's create
+/// lands; l's PUT replaces it: `HeadOverwritten` (invariant 12) and
+/// nothing else (l1 restores, f wrote no snapshot).
+pub fn h_mixed_late_create() -> HazardOutcome {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::ConditionalOverwrite,
+        encrypted: true,
+        ..SimConfig::default()
+    });
+    let (f, l) = (sim.client("f"), sim.client("l"));
+    sim.set_lock_client(l);
+    sim.fault(
+        FaultRule::new(
+            OpMatch::Kind(super::fault::OpKind::PutIfAbsent),
+            KeyMatch::Prefix("index.h/".into()),
+            FaultAction::Delay,
+        )
+        .client(f),
+    );
+    let rf = sim.backup(f, "f1", &SourceTree::seeded("f1", 3, FILE_SIZE));
+    if rf.error_class() != Some(&ErrorClass::Allowed(AllowedError::Injected)) {
+        return broken(format!(
+            "f1 should fail with the injected fault: {}",
+            rf.detail()
+        ));
+    }
+    let parked = sim.store().parked();
+    if parked.len() != 1 || !parked[0].key.starts_with("index.h/") {
+        return broken(format!("expected f's head create parked, got {parked:?}"));
+    }
+    if !sim.store().keys_written_by(f, "snapshots/").is_empty() {
+        return broken("f wrote a snapshot");
+    }
+    let gate = sim.gate(GateRule::new(
+        l,
+        OpMatch::Kind(super::fault::OpKind::Put),
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let rl = sim.spawn(
+        l,
+        Call::Backup {
+            snapshot: "l1".into(),
+            tree: SourceTree::seeded("l1", 3, FILE_SIZE),
+        },
+    );
+    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
+        let rl = sim.join(rl);
+        return broken(format!("l never reached its head PUT: {}", rl.detail()));
+    }
+    sim.release_all();
+    sim.resume(gate);
+    let rl = sim.join(rl);
+    if !rl.is_ok() || rl.lock_free {
+        return broken(format!("l1 should commit under the lock: {}", rl.detail()));
+    }
+    let report = sim.check_invariants(Invariant::STEP8);
+    let evidence = format!("{report}");
+    let only_overwrite = !report.violations.is_empty()
+        && report
+            .violations
+            .iter()
+            .all(|v| v.kind == ViolationKind::HeadOverwritten);
+    if only_overwrite {
         HazardOutcome::Reproduced { evidence }
     } else if report.is_clean() {
         HazardOutcome::NotReproduced { evidence }

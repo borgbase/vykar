@@ -222,7 +222,9 @@ pub(crate) enum HeadFallback {
 /// - `Err(UnsupportedBackend)` (a check concluded the storage refuses or
 ///   ignores the condition; normally seen at the fence first) → noted in
 ///   `fallback` ([`note_fallback`]), then a plain PUT → `Created`. Never
-///   silently unconditional.
+///   silently unconditional. A `lock_free` writer (04 step 9, O4: it holds
+///   no lock, so a plain PUT could replace another writer's head) fails
+///   instead, as it does when the backend offers no put-if-absent.
 /// - Any other `Err` (outcome unknown) → GET the key: the same bytes →
 ///   `Created`; other bytes → `Taken`; absent, or the GET fails → the
 ///   original error (the create may still land, and only at a generation
@@ -236,9 +238,13 @@ pub(crate) fn create_head(
     generation: u64,
     packed: &[u8],
     fallback: &mut Option<HeadFallback>,
+    lock_free: bool,
 ) -> Result<HeadPut> {
     let key = head_key(generation);
     let Some(cond) = storage.conditional() else {
+        if lock_free {
+            return Err(lock_free_without_condition(None));
+        }
         storage.put(&key, packed)?;
         return Ok(HeadPut::Created);
     };
@@ -256,6 +262,9 @@ pub(crate) fn create_head(
         Ok(vykar_storage::Created::AlreadyExists) => {
             Ok(compare(storage)?.unwrap_or(HeadPut::Taken))
         }
+        Err(VykarError::UnsupportedBackend(reason)) if lock_free => {
+            Err(lock_free_without_condition(Some(&reason)))
+        }
         Err(VykarError::UnsupportedBackend(reason)) => {
             note_fallback(fallback, Some(&reason));
             storage.put(&key, packed)?;
@@ -267,6 +276,17 @@ pub(crate) fn create_head(
             Ok(None) | Err(_) => Err(e),
         },
     }
+}
+
+/// The error of a lock-free writer (04 step 9) whose storage no longer
+/// offers put-if-absent (`reason`: the check's or the refusal's verdict):
+/// it holds no lock, so it never writes a head with a plain PUT (O4).
+pub(crate) fn lock_free_without_condition(reason: Option<&str>) -> VykarError {
+    VykarError::Other(format!(
+        "the storage no longer offers put-if-absent ({}); a lock-free commit never writes \
+         an index head with a plain PUT. Retry the backup",
+        reason.unwrap_or("not offered")
+    ))
 }
 
 /// Log that heads fall back to plain PUTs under the lock, once per handle:

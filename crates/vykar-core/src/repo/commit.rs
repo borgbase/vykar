@@ -254,7 +254,7 @@ impl Repository {
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
-        let mut m = BackupCommit::new(self, entry, packed, None);
+        let mut m = BackupCommit::new(self, entry, packed, None, super::CommitMode::Lock);
         let committed = drive_blocking(&mut m, &mut StepCx { repo: self, events })?;
         self.finish_backup_commit(
             committed,

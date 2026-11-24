@@ -1,0 +1,209 @@
+{
+  "name": "mixed-aged-marker-late-compact-head",
+  "note": "AgedSessionReaped, R5 of phase F part 10c with the lock holder's head PUT landing late (from a random case of a 120 s make sim-campaign): lock-free backup a marks committing, probes locks and stalls 46 min (its marker ages past the session staleness); lock-mode compact b (lock client, store ConditionalOverwrite) takes the lock, reaps a's aged flagged marker instead of yielding, compacts, and its plain head PUT of generation 3 times out (delayed) before it releases the lock and fails Injected. a then writes its segment and creates generation 3; b's late PUT lands and replaces it (HeadOverwritten; its lock-exclusion violation is the late index write). a's marker probe before its snapshot PUT finds the marker gone and a fails MarkerLostDuringCommit, so no snapshot is lost. The aged reap is the enabler (with a young marker b yields and writes no head), so AgedSessionReaped claims the overwrite and the damage after it, released or not. The marker's documented limit (a stall of 45 min while committing). Not planned to close.",
+  "expect": [
+    "AgedSessionReaped"
+  ],
+  "at": [
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 61
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 2760
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head +local"
+    ],
+    [
+      {
+        "Release": {
+          "parked": 0
+        }
+      },
+      "release"
+    ]
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [
+      {
+        "client": 1,
+        "class": "IndexHead",
+        "nth": 1,
+        "kind": "Delay"
+      }
+    ],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      2,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      5,
+      0,
+      0,
+      0,
+      0,
+      7,
+      0,
+      0,
+      0,
+      3
+    ],
+    "policy": "First",
+    "storage": "ConditionalOverwrite",
+    "template": "Encrypted",
+    "lock_clients": [
+      1
+    ]
+  }
+}

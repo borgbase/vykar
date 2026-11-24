@@ -92,6 +92,29 @@ impl fmt::Display for LockHolder {
     /// as `FAILED: {e}` (see `vykar-cli`'s `print_summary`), where multi-line
     /// output would break the alignment.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A session marker (`sessions/*.json`) holds the repository when a
+        // lock-free backup is committing (the marker handshake).
+        if self.key.starts_with("sessions/") {
+            return match &self.details {
+                Some(d) => write!(
+                    f,
+                    "a backup on {} (PID {}, started {} ago) is committing without the lock. \
+                     Wait for it to finish, or run `vykar break-lock --sessions` if that \
+                     process is gone.",
+                    d.hostname, d.pid, d.age
+                ),
+                // Malformed, or gone between the listing and the read of it.
+                None => write!(
+                    f,
+                    "a session marker that may belong to a committing backup is unreadable or \
+                     was just removed (key: {}). Run the command again; if it persists and no \
+                     backup is running, run `vykar break-lock --sessions` (an unreadable marker \
+                     blocks lock holders until it is 45 minutes old by its modification time, \
+                     and for good where the storage reports none).",
+                    self.key
+                ),
+            };
+        }
         match &self.details {
             Some(d) => write!(
                 f,
@@ -286,6 +309,17 @@ pub enum VykarError {
 
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
+
+    /// A backup committing without the lock found its session marker
+    /// reaped, or its record of the marker broken, between its commit mark
+    /// and its snapshot write: a lock holder may have taken the session for
+    /// ended. The index head it wrote stays without its snapshot; a retry
+    /// deduplicates against that head.
+    #[error(
+        "commit failed: this backup's session marker was reaped or lost while it was committing; \
+         run the backup again (the data it uploaded is reused)"
+    )]
+    MarkerLostDuringCommit,
 
     /// A reader planned a chunk read from a head that a concurrent prune and
     /// compact made obsolete: the pack answered 404 and the latest head has no

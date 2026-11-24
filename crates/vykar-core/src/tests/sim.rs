@@ -827,6 +827,8 @@ const TESTED_IDS: &[&str] = &[
     "H3-conditional",
     "H3-compact-conditional",
     "H4-conditional",
+    "H-mixed-aged-lock",
+    "H-mixed-late-create",
 ];
 
 #[test]
@@ -854,6 +856,22 @@ fn regressions_hold() {
 #[test]
 fn known_hazard_h_racy() {
     hazards::assert_reproduces("H-racy");
+}
+
+/// H-mixed-aged-lock (phase F part 10c, R4): a lock-mode backup whose lock
+/// aged out while it stalled before its plain head PUT replaces the head a
+/// lock-free backup created meanwhile.
+#[test]
+fn known_hazard_h_mixed_aged_lock() {
+    hazards::assert_reproduces("H-mixed-aged-lock");
+}
+
+/// H-mixed-late-create (phase F part 10c): a failed lock-free backup's
+/// late head create is replaced by a lock-mode backup's plain head PUT;
+/// the overwrite is the only damage.
+#[test]
+fn known_hazard_h_mixed_late_create() {
+    hazards::assert_reproduces("H-mixed-late-create");
 }
 
 /// What each known hazard does on a store that honours put-if-absent: H3,

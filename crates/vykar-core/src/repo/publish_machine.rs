@@ -1222,13 +1222,22 @@ fn write_step(
             // like a failed PUT; `Unsupported`, or a backend that offers no
             // put-if-absent, falls back to a plain PUT, logged once per
             // handle (never silently unconditional).
+            // A lock-free writer (04 step 9) holds no lock: it fails
+            // instead (O4).
+            let lock_free = repo.is_lock_free();
             match repo.storage.conditional() {
                 Some(cond) => {
                     if let vykar_storage::ConditionalSupport::Unsupported { reason } =
                         cond.verify()?
                     {
+                        if lock_free {
+                            return Err(index_store::lock_free_without_condition(Some(&reason)));
+                        }
                         index_store::note_fallback(&mut repo.head_fallback, Some(&reason));
                     }
+                }
+                None if lock_free => {
+                    return Err(index_store::lock_free_without_condition(None));
                 }
                 None => {
                     index_store::note_fallback(&mut repo.head_fallback, None);
@@ -1256,11 +1265,13 @@ fn write_step(
                 Some(packed) => packed,
                 None => index_store::pack_head(&w.head, repo.crypto.as_ref())?,
             };
+            let lock_free = repo.is_lock_free();
             let created = index_store::create_head(
                 repo.storage.as_ref(),
                 generation,
                 &packed,
                 &mut repo.head_fallback,
+                lock_free,
             );
             let mut outcome = match created {
                 Ok(outcome) => outcome,

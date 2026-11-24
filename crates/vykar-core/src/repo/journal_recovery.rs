@@ -569,6 +569,8 @@ mod tests {
             installation_id: None,
             pid_ns: None,
             elapsed_secs: None,
+            committing: false,
+            writes_heads: false,
         };
         let data = serde_json::to_vec(&entry).unwrap();
         storage.put(&key, &data).unwrap();

@@ -209,6 +209,33 @@ pub struct Case {
     /// the checker also judges invariant 12 and every retained head.
     #[serde(default, skip_serializing_if = "StoreKind::is_plain")]
     pub storage: StoreKind,
+    /// The template a case forks (phase F part 10): Plain (every seed before
+    /// part 10b) or Encrypted, where the lock-free path exists (O1).
+    #[serde(default, skip_serializing_if = "TemplateKind::is_plain")]
+    pub template: TemplateKind,
+    /// Clients (indices into clients) whose storage handle offers no
+    /// put-if-absent: they run the lock protocol beside the others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_clients: Vec<u8>,
+}
+
+/// The repository a [`Template`] holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TemplateKind {
+    /// Plaintext (every seed recorded before phase F part 10b).
+    #[default]
+    Plain,
+    /// AES-256-GCM with a cheap KDF: object names are random per run
+    /// (nonces), so nothing the driver decides may depend on them.
+    Encrypted,
+}
+
+impl TemplateKind {
+    // serde's `skip_serializing_if` passes a reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_plain(&self) -> bool {
+        *self == TemplateKind::Plain
+    }
 }
 
 /// How the driver runs a Compact command.
@@ -349,6 +376,7 @@ impl Case {
 /// shared file), forked per case.
 pub struct Template {
     sim: Sim,
+    kind: TemplateKind,
 }
 
 impl Default for Template {
@@ -359,7 +387,27 @@ impl Default for Template {
 
 impl Template {
     pub fn new() -> Self {
-        Self::build(true)
+        Self::build(true, TemplateKind::Plain)
+    }
+
+    /// [`Self::new`] on an encrypted repository (`TemplateKind::Encrypted`).
+    pub fn encrypted() -> Self {
+        Self::build(true, TemplateKind::Encrypted)
+    }
+
+    /// [`Self::young`] on an encrypted repository.
+    pub fn encrypted_young() -> Self {
+        Self::build(false, TemplateKind::Encrypted)
+    }
+
+    /// The template for cases of `kind`, aged ([`Self::new`] or
+    /// [`Self::encrypted`]).
+    pub fn of_kind(kind: TemplateKind) -> Self {
+        Self::build(true, kind)
+    }
+
+    pub fn kind(&self) -> TemplateKind {
+        self.kind
     }
 
     /// The template without the jump after c0's backup: c0's segment is
@@ -367,11 +415,17 @@ impl Template {
     /// keeps it as a segment (the young-entries rule of 04 step 7 under
     /// search, `tests::sim_exhaustive`).
     pub fn young() -> Self {
-        Self::build(false)
+        Self::build(false, TemplateKind::Plain)
     }
 
-    fn build(aged: bool) -> Self {
-        let mut sim = Sim::new();
+    fn build(aged: bool, kind: TemplateKind) -> Self {
+        let mut sim = match kind {
+            TemplateKind::Plain => Sim::new(),
+            TemplateKind::Encrypted => Sim::with_config(super::store::SimConfig {
+                encrypted: true,
+                ..super::store::SimConfig::default()
+            }),
+        };
         let ctl = sim.client("ctl");
         sim.backup(ctl, "c0", &backup_tree("c0", true)).expect_ok();
         if aged {
@@ -381,7 +435,7 @@ impl Template {
             // reuse of a swept chunk stay reachable without jumps.
             sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
         }
-        Self { sim }
+        Self { sim, kind }
     }
 
     /// A fork of the template, as each case starts from.
@@ -393,6 +447,34 @@ impl Template {
     /// built on `Plain`).
     pub fn fork_as(&self, kind: StoreKind) -> Sim {
         self.sim.fork_for_case_as(kind)
+    }
+}
+
+/// One aged template of each kind, each built on first use: what a caller
+/// that runs cases of either kind holds (the campaign, the seed runner,
+/// replays).
+#[derive(Default)]
+pub struct Templates {
+    plain: std::cell::OnceCell<Template>,
+    encrypted: std::cell::OnceCell<Template>,
+}
+
+impl Templates {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The template of `kind`, built on first use.
+    pub fn get(&self, kind: TemplateKind) -> &Template {
+        match kind {
+            TemplateKind::Plain => self.plain.get_or_init(Template::new),
+            TemplateKind::Encrypted => self.encrypted.get_or_init(Template::encrypted),
+        }
+    }
+
+    /// [`run_case`] on the template `case` names.
+    pub fn run(&self, case: &Case) -> Outcome {
+        run_case(self.get(case.template), case)
     }
 }
 
@@ -826,7 +908,14 @@ pub struct Outcome {
 }
 
 /// Run `case` on a fork of `template`'s store and judge the end state.
+///
+/// Panics when `template` is not of the case's `template` kind.
 pub fn run_case(template: &Template, case: &Case) -> Outcome {
+    assert_eq!(
+        template.kind, case.template,
+        "a case of template {:?} run on a {:?} template",
+        case.template, template.kind
+    );
     let mut d = Driver::new(template, case);
     d.run();
     d.verdict()
@@ -956,6 +1045,12 @@ impl<'c> Driver<'c> {
                 }
             })
             .collect();
+        for &c in &case.lock_clients {
+            let actor = actors
+                .get(usize::from(c))
+                .unwrap_or_else(|| panic!("lock client {c} is not a client of the case"));
+            sim.set_lock_client(actor.client);
+        }
         for (actor, &skew) in actors.iter().zip(&case.skews) {
             if skew != 0 {
                 sim.set_skew(actor.client, chrono::Duration::seconds(skew));
@@ -1292,7 +1387,7 @@ impl<'c> Driver<'c> {
                 let source_paths = vec![src.to_string_lossy().into_owned()];
                 let req = BackupRequest {
                     snapshot_name: &snapshot,
-                    passphrase: None,
+                    passphrase: cfg.encryption.passphrase.as_deref(),
                     source_paths: &source_paths,
                     source_label: "sim",
                     exclude_patterns: &[],

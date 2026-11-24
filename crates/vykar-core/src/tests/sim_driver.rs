@@ -37,6 +37,8 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
+        template: TemplateKind::Plain,
+        lock_clients: vec![],
     }
 }
 
@@ -718,7 +720,7 @@ fn replay_from_env() {
     };
     let text = std::fs::read_to_string(&path).unwrap();
     let c = case_from_trace(&text).unwrap();
-    let o = run_case(&Template::new(), &c);
+    let o = Templates::new().run(&c);
     eprintln!("{}", o.trace.render());
 }
 
@@ -730,6 +732,53 @@ fn stepped(c: &Case) -> Case {
         maintenance: Maintenance::Stepped,
         ..c.clone()
     }
+}
+
+/// The encrypted template holds an AES-256-GCM repository whose key is
+/// wrapped with the cheap KDF, and its cases run: a backup on it commits
+/// and restores (the checker opens it with the passphrase).
+#[test]
+fn the_encrypted_template_is_encrypted_with_a_cheap_key() {
+    let t = Template::encrypted();
+    assert_eq!(t.kind(), TemplateKind::Encrypted);
+    let sim = t.fork();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = crate::sim::checker::open_observer(sim.store(), tmp.path()).unwrap();
+    assert_eq!(
+        repo.config.encryption,
+        crate::repo::EncryptionMode::Aes256Gcm
+    );
+    let blob = sim
+        .store()
+        .object(crate::repo::KEY_PRIMARY)
+        .expect("key blob");
+    let key = vykar_crypto::key::inspect_key_blob(&blob.data).unwrap();
+    assert_eq!(
+        (key.kdf.time_cost, key.kdf.memory_cost, key.kdf.parallelism),
+        (1, 8, 1)
+    );
+    let o = run_case(&t, &on(TemplateKind::Encrypted, &two_backups()));
+    assert!(o.report.is_clean(), "{}", o.trace.render());
+    assert!(o.signatures.is_empty(), "{}", o.trace.render());
+    assert_eq!(driven_backups(&o).iter().filter(|r| r.is_ok()).count(), 2);
+}
+
+/// `c` on the template of `kind`.
+fn on(kind: TemplateKind, c: &Case) -> Case {
+    Case {
+        template: kind,
+        ..c.clone()
+    }
+}
+
+/// Both templates (phase F part 10b): the determinism tests run on each.
+/// Encrypted objects get random nonces, so pack and index object names
+/// differ between runs there; a driver decision that read one would show.
+fn both_templates() -> [(TemplateKind, Template); 2] {
+    [
+        (TemplateKind::Plain, Template::new()),
+        (TemplateKind::Encrypted, Template::encrypted()),
+    ]
 }
 
 /// The compact cases of the op-order and determinism tests, no time jumps:
@@ -810,10 +859,17 @@ fn outcomes(o: &Outcome) -> Vec<String> {
 /// which.
 #[test]
 fn stepped_compact_issues_the_ops_of_the_whole_one() {
-    let t = Template::new();
+    for (kind, t) in both_templates() {
+        stepped_compact_issues_the_ops_of_the_whole_one_on(kind, &t);
+    }
+}
+
+fn stepped_compact_issues_the_ops_of_the_whole_one_on(kind: TemplateKind, t: &Template) {
     for (name, c) in compact_cases() {
-        let whole = run_case(&t, &c);
-        let step = run_case(&t, &stepped(&c));
+        let name = format!("{name} {kind:?}");
+        let c = on(kind, &c);
+        let whole = run_case(t, &c);
+        let step = run_case(t, &stepped(&c));
         assert_eq!(
             compact_ops(&whole),
             compact_ops(&step),
@@ -872,7 +928,22 @@ fn check_stepped_decisions(name: &str, o: &Outcome) -> usize {
 /// `MAX_MAINTENANCE_STEPS` must be at least twice of.
 #[test]
 fn stepped_compact_replays_identically() {
-    let t = Template::new();
+    let mut most = 0;
+    for (kind, t) in both_templates() {
+        most = most.max(stepped_compact_replays_identically_on(kind, &t));
+    }
+    if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
+        eprintln!("stepped compact: at most {most} step ops");
+    }
+    assert!(
+        2 * most <= MAX_MAINTENANCE_STEPS,
+        "a stepped compact made {most} step ops; raise MAX_MAINTENANCE_STEPS"
+    );
+}
+
+/// [`stepped_compact_replays_identically`] on one template; the most step
+/// ops a stepped compact made.
+fn stepped_compact_replays_identically_on(kind: TemplateKind, t: &Template) -> usize {
     let mut cases: Vec<(String, Case)> = compact_cases()
         .into_iter()
         .map(|(n, c)| (n.to_string(), stepped(&c)))
@@ -900,8 +971,10 @@ fn stepped_compact_replays_identically() {
     }
     let mut most = 0;
     for (name, c) in &cases {
-        let a = run_case(&t, c);
-        let b = run_case(&t, c);
+        let name = format!("{name} {kind:?}");
+        let c = on(kind, c);
+        let a = run_case(t, &c);
+        let b = run_case(t, &c);
         assert_eq!(
             a.trace.canonical(),
             b.trace.canonical(),
@@ -909,24 +982,23 @@ fn stepped_compact_replays_identically() {
             a.trace.render(),
             b.trace.render()
         );
-        most = most.max(check_stepped_decisions(name, &a));
+        most = most.max(check_stepped_decisions(&name, &a));
     }
-    if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
-        eprintln!("stepped compact: at most {most} step ops");
-    }
-    assert!(
-        2 * most <= MAX_MAINTENANCE_STEPS,
-        "a stepped compact made {most} step ops; raise MAX_MAINTENANCE_STEPS"
-    );
+    most
 }
 
 /// The decisions of a stepped compact after a backup and the delete of c0,
 /// as measured. A change of compact's op order fails here first.
 #[test]
 fn stepped_compact_steps_in_this_order() {
-    let t = Template::new();
-    let (_, c) = &compact_cases()[1];
-    let o = run_case(&t, &stepped(c));
+    for (kind, t) in both_templates() {
+        let (_, c) = &compact_cases()[1];
+        stepped_compact_steps_in_this_order_on(&t, &on(kind, c));
+    }
+}
+
+fn stepped_compact_steps_in_this_order_on(t: &Template, c: &Case) {
+    let o = run_case(t, &stepped(c));
     let labels: Vec<&str> = o
         .trace
         .entries
@@ -976,10 +1048,17 @@ fn stepped_cases_with_jumps_and_crashes() -> Vec<(String, Case)> {
 /// crashes replays identically.
 #[test]
 fn stepped_compact_with_jumps_and_crashes_is_deterministic() {
-    let t = Template::new();
+    for (kind, t) in both_templates() {
+        stepped_compact_with_jumps_and_crashes_is_deterministic_on(kind, &t);
+    }
+}
+
+fn stepped_compact_with_jumps_and_crashes_is_deterministic_on(kind: TemplateKind, t: &Template) {
     for (name, c) in stepped_cases_with_jumps_and_crashes() {
-        let a = run_case(&t, &c);
-        let b = run_case(&t, &c);
+        let name = format!("{name} {kind:?}");
+        let c = on(kind, &c);
+        let a = run_case(t, &c);
+        let b = run_case(t, &c);
         assert_eq!(
             a.trace.canonical(),
             b.trace.canonical(),

@@ -20,7 +20,7 @@ use super::gate::{GateId, GateRule, Paused};
 use super::history::{
     ClientOp, ErrorRecord, History, Observation, ObservationCause, RunOutcome, RunRecord, classify,
 };
-use super::store::{SimConfig, SimStore, StoreKind};
+use super::store::{SIM_PASSPHRASE, SimConfig, SimStore, StoreKind};
 
 thread_local! {
     /// The store kind `Sim::new` uses on this thread (`with_store_kind`).
@@ -287,18 +287,29 @@ impl Sim {
     }
 
     /// Creates the store, registers client "init" and runs Init as run 0.
+    /// With `config.encrypted` the repository is AES-256-GCM with the
+    /// passphrase [`SIM_PASSPHRASE`] and a cheap KDF
+    /// (`repo::with_cheap_kdf`; Init runs inline, on this thread).
     pub fn with_config(config: SimConfig) -> Self {
+        let encrypted = config.encrypted;
         let mut sim = Self::from_store(SimStore::new(config));
         let init = sim.client("init");
         sim.run_inline(init, ClientOp::Init, |store, cfg, _, _, _| {
-            let repo = Repository::init(
-                Box::new(store.handle(init)),
-                EncryptionMode::None,
-                ChunkerParams::default(),
-                None,
-                Some(&cfg.repository.init_options()),
-                util::cache_dir_from_config(&cfg),
-            )?;
+            let mode = if encrypted {
+                EncryptionMode::Aes256Gcm
+            } else {
+                EncryptionMode::None
+            };
+            let repo = crate::repo::with_cheap_kdf(|| {
+                Repository::init(
+                    Box::new(store.handle(init)),
+                    mode,
+                    ChunkerParams::default(),
+                    cfg.encryption.passphrase.as_deref(),
+                    Some(&cfg.repository.init_options()),
+                    util::cache_dir_from_config(&cfg),
+                )
+            })?;
             // As `commands::init`: pin at once, with the init client's cache.
             identity::verify_or_pin(
                 &cfg.repository.url,
@@ -343,6 +354,13 @@ impl Sim {
 
     pub fn store(&self) -> &SimStore {
         &self.store
+    }
+
+    /// Every later handle of `c` offers no put-if-absent
+    /// ([`SimStore::set_lock_client`]): `c` runs the lock protocol beside
+    /// clients that have it.
+    pub fn set_lock_client(&self, c: ClientId) {
+        self.store.set_lock_client(c);
     }
 
     pub fn history(&self) -> &History {
@@ -798,10 +816,18 @@ impl Sim {
                 url: self.repo_url.clone(),
                 ..Default::default()
             },
-            encryption: EncryptionConfig {
-                mode: EncryptionModeConfig::None,
-                passphrase: None,
-                passcommand: None,
+            encryption: if self.store.config().encrypted {
+                EncryptionConfig {
+                    mode: EncryptionModeConfig::Aes256Gcm,
+                    passphrase: Some(SIM_PASSPHRASE.to_string()),
+                    passcommand: None,
+                }
+            } else {
+                EncryptionConfig {
+                    mode: EncryptionModeConfig::None,
+                    passphrase: None,
+                    passcommand: None,
+                }
             },
             cache_dir: Some(
                 self.client_dir(c)
@@ -837,7 +863,7 @@ impl Sim {
                             &cfg,
                             backup::BackupRequest {
                                 snapshot_name: &snapshot,
-                                passphrase: None,
+                                passphrase: cfg.encryption.passphrase.as_deref(),
                                 source_paths: &source_paths,
                                 source_label: "sim",
                                 exclude_patterns: &[],
@@ -948,7 +974,7 @@ impl Sim {
                         let mut repo = util::open_repo_on(
                             Box::new(store.handle(c)),
                             &util::open_request(&cfg),
-                            None,
+                            cfg.encryption.passphrase.as_deref(),
                             OpenOptions::new().host_env(env),
                         )?;
                         let result = check::run_on_repo(
@@ -976,7 +1002,7 @@ impl Sim {
                         let mut repo = util::open_repo_on(
                             Box::new(store.handle(c)),
                             &util::open_request(&cfg),
-                            None,
+                            cfg.encryption.passphrase.as_deref(),
                             check::repair_open_options(mode).host_env(env),
                         )?;
                         let result = check::run_with_repair_on_repo(
@@ -1018,7 +1044,7 @@ impl Sim {
                         let mut repo = util::open_repo_on(
                             Box::new(store.handle(c)),
                             &util::open_request(&cfg),
-                            None,
+                            cfg.encryption.passphrase.as_deref(),
                             OpenOptions::new().host_env(env),
                         )?;
                         let dest = dir.join(format!("restore-{idx}"));
@@ -1197,6 +1223,7 @@ impl Sim {
             first_step: f.first_step,
             last_step: f.last_step,
             outcome: f.outcome,
+            lock_free: false,
         };
         let at = self.history.runs.partition_point(|r| r.index < index);
         self.history.runs.insert(at, record.clone());
@@ -1224,7 +1251,7 @@ fn open_for(store: &SimStore, c: ClientId, cfg: &VykarConfig, env: HostEnv) -> R
     util::open_repo_on(
         Box::new(store.handle(c)),
         &util::open_request(cfg),
-        None,
+        cfg.encryption.passphrase.as_deref(),
         OpenOptions::new().host_env(env),
     )
 }
@@ -1284,7 +1311,7 @@ fn observe_store(store: &SimStore, cause: ObservationCause) -> Observation {
     let cache = tempfile::tempdir().expect("observer cache");
     let repo = Repository::open(
         Box::new(store.observer()),
-        None,
+        store.passphrase(),
         Some(cache.path().to_path_buf()),
         OpenOptions::new()
             .tolerate_broken_index()

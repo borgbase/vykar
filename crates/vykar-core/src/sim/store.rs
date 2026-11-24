@@ -39,9 +39,8 @@ pub enum StoreKind {
     /// fallback; every seed recorded before 04 step 8 runs on it.
     #[default]
     Plain,
-    /// vykar-server, local, OpenSSH SFTP and AWS S3: honest put-if-absent;
-    /// a plain PUT of an existing head with other bytes is refused (409, as
-    /// vykar-server answers).
+    /// vykar-server: honest put-if-absent; a plain PUT of an existing head
+    /// with other bytes is refused (409, as vykar-server answers).
     Conditional,
     /// Garage 2.5.0: put-if-absent overwrites and answers Yes; the client's
     /// check concludes Unsupported and it falls back to plain PUTs, which
@@ -51,6 +50,14 @@ pub enum StoreKind {
     /// create that lands later overwrites whatever is there (the
     /// concurrent-create failure the check cannot see).
     RacyRelease,
+    /// Local, OpenSSH SFTP, AWS S3: put-if-absent honoured; a plain PUT
+    /// replaces any object, heads included (phase F part 10b: what a
+    /// lock-mode client's plain head PUT does beside a lock-free one). An
+    /// identical re-PUT of an index key still keeps its first mtime, as on
+    /// every kind (vykar-server's rule; these backends renew it): only a
+    /// plaintext repository re-creates identical names, and it never
+    /// commits lock-free.
+    ConditionalOverwrite,
 }
 
 impl StoreKind {
@@ -63,7 +70,10 @@ impl StoreKind {
     /// Whether the store honours put-if-absent, so heads are immutable
     /// (04 I3) and the checker judges it.
     pub fn honours_creates(self) -> bool {
-        self == StoreKind::Conditional
+        matches!(
+            self,
+            StoreKind::Conditional | StoreKind::ConditionalOverwrite
+        )
     }
 }
 
@@ -74,7 +84,14 @@ pub struct SimConfig {
     /// `batch_delete()` offered (REST/S3-like) instead of None.
     pub batch_delete: bool,
     pub kind: StoreKind,
+    /// The repository the harness initialises on it is encrypted (phase F
+    /// part 10b: the lock-free path exists only there), with a cheap KDF
+    /// and the passphrase [`SIM_PASSPHRASE`].
+    pub encrypted: bool,
 }
+
+/// The passphrase of every encrypted simulator repository.
+pub const SIM_PASSPHRASE: &str = "sim";
 
 impl Default for SimConfig {
     fn default() -> Self {
@@ -88,6 +105,7 @@ impl Default for SimConfig {
             append_only: false,
             batch_delete: false,
             kind: StoreKind::Plain,
+            encrypted: false,
         }
     }
 }
@@ -125,6 +143,8 @@ struct State {
     next_gate: u32,
     /// Every replacement of a stored head by other bytes: (key, step, writer).
     head_overwrites: Vec<(String, u64, ClientId)>,
+    /// Clients whose handles offer no put-if-absent ([`SimStore::set_lock_client`]).
+    lock_clients: BTreeSet<ClientId>,
 }
 
 /// How [`State::apply`] treats an effect.
@@ -340,7 +360,9 @@ impl State {
                 let overwrite = match rules.kind {
                     StoreKind::Ignoring => true,
                     StoreKind::RacyRelease => rules.release,
-                    StoreKind::Plain | StoreKind::Conditional => false,
+                    StoreKind::Plain | StoreKind::Conditional | StoreKind::ConditionalOverwrite => {
+                        false
+                    }
                 };
                 if self.objects.contains_key(key) && !overwrite {
                     return Ok(None);
@@ -458,6 +480,7 @@ impl SimStore {
                     gates: Vec::new(),
                     next_gate: 0,
                     head_overwrites: Vec::new(),
+                    lock_clients: BTreeSet::new(),
                 }),
                 gate_cv: Condvar::new(),
             }),
@@ -466,7 +489,7 @@ impl SimStore {
 
     /// A deep copy for invariant 9: same objects, clock, step counter,
     /// client names and config; empty log; no rules, parked effects,
-    /// crashes, runs or gates (faults have stopped).
+    /// crashes, runs, gates or lock clients (faults have stopped).
     pub fn fork(&self) -> SimStore {
         self.fork_as(self.shared.config.kind)
     }
@@ -515,6 +538,11 @@ impl SimStore {
         &self.shared.config
     }
 
+    /// The passphrase of the repository the harness initialised here.
+    pub fn passphrase(&self) -> Option<&'static str> {
+        self.shared.config.encrypted.then_some(SIM_PASSPHRASE)
+    }
+
     pub fn register_client(&self, name: &str) -> ClientId {
         let mut st = self.state();
         let id = ClientId(u16::try_from(st.names.len()).expect("too many clients"));
@@ -530,8 +558,29 @@ impl SimStore {
             .unwrap_or_else(|| format!("client#{}", client.0))
     }
 
-    /// Storage handle for `client`: logged, faultable.
+    /// Storage handle for `client`: logged, faultable. A lock client's
+    /// ([`Self::set_lock_client`]) offers no put-if-absent, as
+    /// [`Self::handle_without_conditional`]: every handle the harness builds
+    /// comes from here, so the client falls back in every run.
     pub fn handle(&self, client: ClientId) -> SimClient {
+        let lock_client = self.state().lock_clients.contains(&client);
+        self.new_handle(client, lock_client)
+    }
+
+    /// A handle for `client` whose `conditional()` is None on every store
+    /// kind: a client whose backend does not offer put-if-absent, or whose
+    /// check concluded Unsupported, beside clients that have it (the
+    /// mixed-verdict case of phase F part 10).
+    pub fn handle_without_conditional(&self, client: ClientId) -> SimClient {
+        self.new_handle(client, true)
+    }
+
+    /// Every later [`Self::handle`] of `client` offers no put-if-absent.
+    pub fn set_lock_client(&self, client: ClientId) {
+        self.state().lock_clients.insert(client);
+    }
+
+    fn new_handle(&self, client: ClientId, no_conditional: bool) -> SimClient {
         assert!(
             client != OBSERVER && client != TAMPER,
             "reserved client id {client:?}"
@@ -540,6 +589,7 @@ impl SimStore {
             store: self.clone(),
             client,
             observer: false,
+            no_conditional,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -550,6 +600,7 @@ impl SimStore {
             store: self.clone(),
             client: OBSERVER,
             observer: true,
+            no_conditional: false,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -1087,6 +1138,9 @@ pub struct SimClient {
     store: SimStore,
     client: ClientId,
     observer: bool,
+    /// `conditional()` is None whatever the store's kind
+    /// ([`SimStore::handle_without_conditional`]).
+    no_conditional: bool,
     /// The put-if-absent check's cache, as a production backend instance
     /// has one: shared by this handle's clones (one per run).
     cond: Arc<Verifier>,
@@ -1302,6 +1356,9 @@ impl vykar_storage::StorageBackend for SimClient {
     }
 
     fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        if self.no_conditional {
+            return None;
+        }
         match self.store.shared.config.kind {
             StoreKind::Plain => None,
             _ => (!self.cond.refused()).then_some(self as &dyn ConditionalWrite),
@@ -2134,6 +2191,56 @@ mod tests {
         assert!(matches!(last(&store).outcome, OpOutcome::Released(_)));
         assert_eq!(store.object("index.h/2").unwrap().data, b"a");
         assert_eq!(store.head_overwrites().len(), 1);
+    }
+
+    /// Local, SFTP, S3: a create of an existing key is refused, a plain PUT
+    /// of a head replaces it (recorded).
+    #[test]
+    fn conditional_overwrite_replaces_a_head_on_a_plain_put() {
+        let (store, a, b) = of_kind(StoreKind::ConditionalOverwrite);
+        assert!(StoreKind::ConditionalOverwrite.honours_creates());
+        let cond = a.conditional().expect("offered");
+        assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
+        assert_eq!(cond.put_if_absent("index.h/2", b"a").unwrap(), Created::Yes);
+        assert_eq!(
+            b.conditional()
+                .unwrap()
+                .put_if_absent("index.h/2", b"b")
+                .unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(store.object("index.h/2").unwrap().data, b"a");
+        assert!(store.head_overwrites().is_empty());
+        b.put("index.h/2", b"c").unwrap();
+        assert_eq!(store.object("index.h/2").unwrap().data, b"c");
+        let overwrites = store.head_overwrites();
+        assert_eq!(overwrites.len(), 1);
+        assert_eq!(overwrites[0].2, b.client());
+    }
+
+    /// A handle without put-if-absent beside one with it, on one store;
+    /// a lock client's every handle has none.
+    #[test]
+    fn handle_without_conditional_offers_no_put_if_absent() {
+        for kind in [
+            StoreKind::Conditional,
+            StoreKind::ConditionalOverwrite,
+            StoreKind::RacyRelease,
+        ] {
+            let (store, a, b) = of_kind(kind);
+            assert!(
+                store
+                    .handle_without_conditional(a.client())
+                    .conditional()
+                    .is_none()
+            );
+            assert!(a.conditional().is_some(), "{kind:?}");
+            store.set_lock_client(b.client());
+            assert!(store.handle(b.client()).conditional().is_none(), "{kind:?}");
+            assert!(store.handle(a.client()).conditional().is_some(), "{kind:?}");
+            // A fork forgets its lock clients, as it forgets runs.
+            assert!(store.fork().handle(b.client()).conditional().is_some());
+        }
     }
 
     #[test]

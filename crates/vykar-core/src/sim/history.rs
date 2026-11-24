@@ -104,6 +104,10 @@ pub struct RunRecord {
     /// Store step when the run returned.
     pub last_step: u64,
     pub outcome: RunOutcome,
+    /// The run committed in lock-free mode (04 step 9): its protected
+    /// writes need no lock, and invariant 7 does not judge them. Nothing
+    /// sets it before phase F part 10c.
+    pub lock_free: bool,
 }
 
 impl RunRecord {

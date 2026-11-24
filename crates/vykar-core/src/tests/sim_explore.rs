@@ -157,6 +157,8 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
                     Maintenance::Whole
                 },
                 storage,
+                template: TemplateKind::Plain,
+                lock_clients: vec![],
             },
         )
 }
@@ -184,6 +186,8 @@ fn one_hostname_family() -> impl Strategy<Value = Case> {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
+        template: TemplateKind::Plain,
+        lock_clients: vec![],
     })
 }
 
@@ -211,6 +215,8 @@ fn h3_family() -> impl Strategy<Value = Case> {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
+        template: TemplateKind::Plain,
+        lock_clients: vec![],
     })
 }
 

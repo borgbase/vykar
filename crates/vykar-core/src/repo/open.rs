@@ -69,6 +69,39 @@ fn storage_label(init_opts: Option<&InitOptions>) -> String {
         .unwrap_or_else(|| "the configured server".to_string())
 }
 
+#[cfg(any(test, feature = "sim"))]
+thread_local! {
+    /// Set by [`with_cheap_kdf`]: init on this thread wraps the master key
+    /// with Argon2id parameters cheap enough for the simulator.
+    static CHEAP_KDF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every `Repository::init` on this thread wrapping the
+/// master key with Argon2id t = 1, m = 8 KiB, p = 1 (the simulator's
+/// encrypted template; tests). Opens derive with the parameters the blob
+/// stores, so later opens of such a repository are cheap without it.
+#[cfg(any(test, feature = "sim"))]
+pub(crate) fn with_cheap_kdf<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHEAP_KDF.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CHEAP_KDF.with(|c| c.replace(true)));
+    f()
+}
+
+/// Wrap a new repository's master key with the passphrase: the product's
+/// Argon2id parameters, or [`with_cheap_kdf`]'s inside it.
+fn wrap_master_key(master_key: &MasterKey, pass: &str) -> Result<EncryptedKey> {
+    #[cfg(any(test, feature = "sim"))]
+    if CHEAP_KDF.with(std::cell::Cell::get) {
+        return master_key.to_encrypted_with_kdf(pass, 1, 8, 1);
+    }
+    master_key.to_encrypted(pass)
+}
+
 /// The file cache loading beside the open, and the stamp of the file it read.
 type FileCacheLoad =
     std::thread::JoinHandle<(FileCache, Option<super::file_cache::FileCacheStamp>)>;
@@ -174,7 +207,7 @@ impl Repository {
                     let pass = passphrase.ok_or_else(|| {
                         VykarError::Config("passphrase required for encrypted repository".into())
                     })?;
-                    let enc_key = master_key.to_encrypted(pass)?;
+                    let enc_key = wrap_master_key(&master_key, pass)?;
                     (key::build_engine(mode, format, &master_key)?, Some(enc_key))
                 }
             };

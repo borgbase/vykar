@@ -189,6 +189,26 @@ impl MasterKey {
     /// Returns an error when key derivation, serialization, or encryption
     /// fails, or when the operating system entropy source is unavailable.
     pub fn to_encrypted<P: AsRef<[u8]>>(&self, passphrase: P) -> Result<EncryptedKey> {
+        // 64 MiB.
+        self.to_encrypted_with_kdf(passphrase, 3, 65536, 4)
+    }
+
+    /// [`Self::to_encrypted`] with explicit Argon2id parameters (the
+    /// simulator's cheap key; tests). Not for product code: weak parameters
+    /// weaken the key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::to_encrypted`], and when the parameters are ones
+    /// Argon2id refuses.
+    #[doc(hidden)]
+    pub fn to_encrypted_with_kdf<P: AsRef<[u8]>>(
+        &self,
+        passphrase: P,
+        time_cost: u32,
+        memory_kib: u32,
+        parallelism: u32,
+    ) -> Result<EncryptedKey> {
         let passphrase = passphrase.as_ref();
 
         // Generate salt using OS entropy
@@ -200,9 +220,9 @@ impl MasterKey {
         // Derive a wrapping key from the passphrase
         let kdf = KdfParams {
             algorithm: "argon2id".to_string(),
-            time_cost: 3,
-            memory_cost: 65536, // 64 MiB
-            parallelism: 4,
+            time_cost,
+            memory_cost: memory_kib,
+            parallelism,
             salt: salt.clone(),
         };
         let wrapping_key = derive_key_from_passphrase(passphrase, &kdf)?;
@@ -630,6 +650,37 @@ mod tests {
 
         assert_eq!(key.encryption_key, decrypted.encryption_key);
         assert_eq!(key.chunk_id_key, decrypted.chunk_id_key);
+    }
+
+    /// The simulator's cheap parameters pass the blob screen and unwrap;
+    /// `to_encrypted` still writes the product parameters.
+    #[test]
+    fn to_encrypted_with_kdf_round_trips() {
+        let key = MasterKey::generate().unwrap();
+        let encrypted = key.to_encrypted_with_kdf(TEST_PASSPHRASE, 1, 8, 1).unwrap();
+        assert_eq!(
+            (
+                encrypted.kdf.time_cost,
+                encrypted.kdf.memory_cost,
+                encrypted.kdf.parallelism
+            ),
+            (1, 8, 1)
+        );
+        let bytes = rmp_serde::to_vec(&encrypted).unwrap();
+        let inspected = inspect_key_blob(&bytes).unwrap();
+        let recovered = MasterKey::from_encrypted(&inspected, TEST_PASSPHRASE).unwrap();
+        assert!(key.ct_eq(&recovered));
+        assert!(MasterKey::from_encrypted(&inspected, "wrong").is_err());
+
+        let product = key.to_encrypted(TEST_PASSPHRASE).unwrap();
+        assert_eq!(
+            (
+                product.kdf.time_cost,
+                product.kdf.memory_cost,
+                product.kdf.parallelism
+            ),
+            (3, 65536, 4)
+        );
     }
 
     fn wrapped(passphrase: &str) -> Vec<u8> {

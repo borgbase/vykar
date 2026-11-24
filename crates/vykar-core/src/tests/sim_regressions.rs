@@ -92,7 +92,7 @@ fn regression_seeds_hold() {
         .collect();
     paths.sort();
     assert!(!paths.is_empty(), "no seeds in {}", seed_dir().display());
-    let template = Template::new();
+    let templates = Templates::new();
     let mut failures = Vec::new();
     for path in &paths {
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -111,7 +111,7 @@ fn regression_seeds_hold() {
             failures.push(format!("seed {stem}: expects Unknown"));
             continue;
         }
-        let o = run_case(&template, &seed.case);
+        let o = templates.run(&seed.case);
         if seed.case.choices.len() > o.trace.entries.len() {
             failures.push(format!(
                 "seed {stem}: {} choices but only {} decisions ran; trim the choices",
@@ -184,13 +184,13 @@ fn regression_seeds_are_skew_invariant() {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
     paths.sort();
-    let template = Template::new();
+    let templates = Templates::new();
     let mut failures = Vec::new();
     for path in &paths {
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let seed: Seed = serde_json::from_str(&std::fs::read_to_string(path).unwrap())
             .unwrap_or_else(|e| panic!("seed {stem}: {e}"));
-        let plain = run_case(&template, &seed.case);
+        let plain = templates.run(&seed.case);
         let mut skewed_case = seed.case.clone();
         skewed_case.skews = SKEWS
             .iter()
@@ -198,7 +198,7 @@ fn regression_seeds_are_skew_invariant() {
             .cycle()
             .take(seed.case.clients.len())
             .collect();
-        let skewed = run_case(&template, &skewed_case);
+        let skewed = templates.run(&skewed_case);
         let n = seed.case.choices.len();
         if taken(&plain, n) != taken(&skewed, n)
             || plain.signatures != skewed.signatures
@@ -225,7 +225,7 @@ fn promote_from_env() {
     };
     let text = std::fs::read_to_string(&path).unwrap();
     let mut case = case_from_trace(&text).unwrap();
-    let o = run_case(&Template::new(), &case);
+    let o = Templates::new().run(&case);
     case.choices.truncate(o.trace.entries.len());
     assert!(
         !o.signatures.contains(&Signature::Unknown),

@@ -345,7 +345,7 @@ pub(crate) fn open_observer(
 ) -> vykar_types::error::Result<Repository> {
     Repository::open(
         Box::new(store.observer()),
-        None,
+        store.passphrase(),
         Some(cache.to_path_buf()),
         OpenOptions::new()
             .tolerate_broken_index()
@@ -830,8 +830,11 @@ fn is_lock_key(key: &str) -> bool {
 /// Invariant 7, as the store sees it: replay the op log, tracking which
 /// lock keys exist and which (client, run) last wrote each, and judge every
 /// applied protected write against the keys present just before it. Late
-/// effects count at the step they land. The tamper client and the Init run
-/// (`Repository::init` writes `index.h/1` with no lock) are exempt.
+/// effects count at the step they land. The tamper client, the Init run
+/// (`Repository::init` writes `index.h/1` with no lock) and lock-free runs
+/// (`RunRecord::lock_free`, 04 step 9: they write heads with put-if-absent
+/// and no lock) are exempt; every lock-mode run is judged, beside lock-free
+/// ones too.
 ///
 /// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
 /// tentative key that can coexist with the holder's until the loser deletes
@@ -842,10 +845,10 @@ fn is_lock_key(key: &str) -> bool {
 /// decision. A delayed or duplicated lock PUT that lands later is a key
 /// with no holder; the driver names that shape (`OrphanLockKey`).
 fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
-    let init_runs: BTreeSet<usize> = history
+    let exempt_runs: BTreeSet<usize> = history
         .runs
         .iter()
-        .filter(|r| matches!(r.op, ClientOp::Init))
+        .filter(|r| matches!(r.op, ClientOp::Init) || r.lock_free)
         .map(|r| r.index)
         .collect();
     let mut held: BTreeMap<String, (ClientId, Option<usize>)> = BTreeMap::new();
@@ -863,7 +866,7 @@ fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report
             false
         };
         let exempt =
-            rec.client == store.tamper_id() || rec.run.is_some_and(|r| init_runs.contains(&r));
+            rec.client == store.tamper_id() || rec.run.is_some_and(|r| exempt_runs.contains(&r));
         if protected && !exempt {
             let mine = (rec.client, rec.run);
             let kind = match held.len() {
@@ -1266,6 +1269,7 @@ mod tests {
                 removed: Vec::new(),
                 detail: String::new(),
             },
+            lock_free: false,
         }
     }
 
@@ -1285,6 +1289,35 @@ mod tests {
     }
 
     const PACK: &str = "packs/aa/aa00";
+
+    /// Invariant 7 judges a lock-mode run's head write without a lock and
+    /// exempts the same write by a lock-free run (phase F part 10b).
+    #[test]
+    fn lock_exclusion_exempts_lock_free_runs() {
+        use crate::sim::store::{SimConfig, SimStore};
+        use vykar_storage::StorageBackend;
+        for lock_free in [false, true] {
+            let store = SimStore::new(SimConfig::default());
+            let a = store.register_client("a");
+            store.set_current_run(a, Some(0));
+            store.handle(a).put("index.h/2", b"head").unwrap();
+            let history = History {
+                runs: vec![RunRecord {
+                    lock_free,
+                    ..run(0, a, ClientOp::Compact, store.step())
+                }],
+                ..History::default()
+            };
+            let mut report = Report::default();
+            check_lock_exclusion(&store, &history, &mut report);
+            let want = if lock_free {
+                vec![]
+            } else {
+                vec![ViolationKind::WriteWithoutLock]
+            };
+            assert_eq!(kinds(&report.violations), want, "lock_free {lock_free}");
+        }
+    }
 
     #[test]
     fn checker_flags_a_young_orphan_delete() {

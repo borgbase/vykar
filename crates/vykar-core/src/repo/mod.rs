@@ -42,6 +42,8 @@ pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;
+#[cfg(any(test, feature = "sim"))]
+pub(crate) use open::with_cheap_kdf;
 mod read;
 pub(crate) use read::TreeChunkSource;
 pub(crate) mod relocate;

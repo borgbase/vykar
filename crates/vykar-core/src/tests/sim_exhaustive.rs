@@ -50,6 +50,8 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
+        template: TemplateKind::Plain,
+        lock_clients: vec![],
     }
 }
 
@@ -66,6 +68,25 @@ pub(super) fn stepped(c: Case) -> Case {
 pub(super) fn conditional(c: Case) -> Case {
     Case {
         storage: StoreKind::Conditional,
+        ..c
+    }
+}
+
+/// `c` on the encrypted template (phase F part 10b), where the lock-free
+/// path of 04 step 9 exists.
+pub(super) fn encrypted(c: Case) -> Case {
+    Case {
+        template: TemplateKind::Encrypted,
+        ..c
+    }
+}
+
+/// `c` on the store whose plain PUT overwrites heads (local, SFTP, S3),
+/// with clients `lock_clients` falling back to the lock protocol.
+pub(super) fn mixed(c: Case, lock_clients: Vec<u8>) -> Case {
+    Case {
+        storage: StoreKind::ConditionalOverwrite,
+        lock_clients,
         ..c
     }
 }
@@ -240,7 +261,7 @@ fn search(t: &Template, c: &Case, stop_on_damage: bool) -> Exploration {
 
 /// Every schedule of `c` within the bound is clean.
 fn assert_clean(name: &str, c: &Case) {
-    let t = Template::new();
+    let t = Template::of_kind(c.template);
     let e = search(&t, c, true);
     print_search(name, &e);
     if let Some((sig, (_, case))) = e.signatures.iter().next() {
@@ -269,6 +290,18 @@ fn lock_pair_on_a_conditional_store_is_clean() {
     assert_clean(
         "pair-hostname-conditional",
         &conditional(lock_pair(HostPlan::SameHostname)),
+    );
+}
+
+/// The pair on the encrypted template and the conditional store (phase F
+/// part 10b): every client still commits under the lock, so every schedule
+/// is clean, and the search completes in the pre-commit bound although
+/// object names are random per run.
+#[test]
+fn encrypted_lock_pair_is_clean() {
+    assert_clean(
+        "pair-distinct-encrypted-conditional",
+        &encrypted(conditional(lock_pair(HostPlan::Distinct))),
     );
 }
 
@@ -427,7 +460,15 @@ impl Contender {
 /// done (or at the start) every held client is free; anything else is a
 /// preemption.
 fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
-    let template = Template::new();
+    lock_acquisitions_on(&Template::new(), hosts, bound)
+}
+
+/// [`lock_acquisitions`] on `template`.
+fn lock_acquisitions_on(
+    template: &Template,
+    hosts: HostPlan,
+    bound: Bound,
+) -> (Search, LockPairTally) {
     let mut tally = LockPairTally::default();
     let search = dfs(bound, |prefix| {
         let mut sim = template.fork();
@@ -643,5 +684,166 @@ fn measure_bounds() {
                 start.elapsed()
             );
         }
+    }
+}
+
+/// `VYKAR_SIM_MEASURE=1`: the searches phase F parts 10c and 10d name, as
+/// far as they exist before them, on the encrypted template (runs and wall
+/// time, against `PRECOMMIT_MAX_RUNS`): every client still commits under
+/// the lock here, so a lock-free search's size is estimated by its
+/// lock-mode twin. The plaintext twin of the first search gives the
+/// encrypted template's cost per run.
+#[test]
+fn measure_part_10_searches() {
+    if std::env::var("VYKAR_SIM_MEASURE").ok().as_deref() != Some("1") {
+        return;
+    }
+    let start = Instant::now();
+    let plain = Template::new();
+    let enc = Template::encrypted();
+    eprintln!("encrypted template built in {:?}", start.elapsed());
+    let start = Instant::now();
+    let young = Template::encrypted_young();
+    eprintln!("encrypted young template built in {:?}", start.elapsed());
+    let shared = Command::Backup {
+        shared: true,
+        fold: false,
+    };
+    let delete_during_compact = base(
+        HostPlan::Distinct,
+        vec![
+            vec![backup(), Command::DeleteControl],
+            vec![Command::Compact],
+        ],
+    );
+    let two_compacts = base(
+        HostPlan::Distinct,
+        vec![vec![shared, Command::Compact], vec![Command::Compact]],
+    );
+    let advances = |mut c: Case| {
+        c.advances = true;
+        c
+    };
+    let crash = |mut c: Case| {
+        c.crash = true;
+        c
+    };
+    let cvc = || commit_vs_compact(HostPlan::Distinct);
+    fn k1<'t>(name: &str, t: &'t Template, c: Case) -> (String, &'t Template, Case, u32) {
+        (name.to_string(), t, c, 1)
+    }
+    let searches: Vec<(String, &Template, Case, u32)> = vec![
+        // The plaintext twin: the encrypted template's cost per run.
+        k1(
+            "pair-distinct-conditional (plain)",
+            &plain,
+            conditional(lock_pair(HostPlan::Distinct)),
+        ),
+        // 10c.
+        k1(
+            "lock_free_pair_is_clean: pair-distinct",
+            &enc,
+            encrypted(conditional(lock_pair(HostPlan::Distinct))),
+        ),
+        k1(
+            "lock_free_pair_is_clean: pair-hostname",
+            &enc,
+            encrypted(conditional(lock_pair(HostPlan::SameHostname))),
+        ),
+        k1(
+            "lock_free_backup_against_a_locked_compact: whole",
+            &enc,
+            encrypted(conditional(cvc())),
+        ),
+        k1(
+            "lock_free_backup_against_a_locked_compact: stepped",
+            &enc,
+            encrypted(conditional(stepped(cvc()))),
+        ),
+        k1(
+            "mixed_lock_and_lock_free_backups: pair-distinct",
+            &enc,
+            encrypted(mixed(lock_pair(HostPlan::Distinct), vec![1])),
+        ),
+        // 10d.
+        k1(
+            "lock_free_backup_against_lock_free_compact: stepped advances",
+            &enc,
+            encrypted(conditional(advances(stepped(cvc())))),
+        ),
+        k1(
+            "lock_free_backup_against_lock_free_compact: stepped crash",
+            &enc,
+            encrypted(conditional(crash(stepped(cvc())))),
+        ),
+        k1(
+            "lock_free_backup_against_lock_free_compact: young whole",
+            &young,
+            encrypted(conditional(cvc())),
+        ),
+        k1(
+            "lock_free_backup_against_lock_free_compact: young stepped",
+            &young,
+            encrypted(conditional(stepped(cvc()))),
+        ),
+        k1(
+            "lock_free_backup_against_lock_free_compact: young stepped advances",
+            &young,
+            encrypted(conditional(advances(stepped(cvc())))),
+        ),
+        k1(
+            "lock_free_backup_against_lock_free_compact: young stepped crash",
+            &young,
+            encrypted(conditional(crash(stepped(cvc())))),
+        ),
+        k1(
+            "lock_free_delete_during_compact: stepped",
+            &enc,
+            encrypted(conditional(stepped(delete_during_compact))),
+        ),
+        k1(
+            "two_lock_free_compacts: stepped",
+            &enc,
+            encrypted(conditional(stepped(two_compacts))),
+        ),
+        (
+            "three-clients-lockfree (campaign) K = 2".to_string(),
+            &enc,
+            encrypted(conditional(three_clients())),
+            2,
+        ),
+        (
+            "three-clients-mixed (campaign) K = 2".to_string(),
+            &enc,
+            encrypted(mixed(three_clients(), vec![2])),
+            2,
+        ),
+    ];
+    for (name, t, c, k) in searches {
+        let e = explore(
+            t,
+            &c,
+            Bound {
+                preemptions: k,
+                max_runs: 100_000,
+            },
+            |_| Control::Continue,
+        );
+        print_search(&format!("{name} K = {k}"), &e);
+    }
+    for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
+        let start = Instant::now();
+        let (s, tally) = lock_acquisitions_on(
+            &enc,
+            hosts,
+            Bound {
+                preemptions: GATE_K,
+                max_runs: 100_000,
+            },
+        );
+        eprintln!(
+            "gate {hosts:?} K = {GATE_K} (encrypted): {s:?} {tally:?} in {:?}",
+            start.elapsed()
+        );
     }
 }

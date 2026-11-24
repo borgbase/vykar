@@ -129,14 +129,14 @@ fn stop(cfg: &CampaignConfig, report: &Mutex<CampaignReport>) -> bool {
 }
 
 fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
-    let template = Template::new();
+    let templates = Templates::new();
     for (name, base, k) in cfg.scenarios.iter().skip(j).step_by(cfg.jobs) {
         if stop(cfg, report) {
             return;
         }
         let mut n = 0usize;
         let e = explore_with(
-            &template,
+            templates.get(base.template),
             base,
             Bound {
                 preemptions: *k,
@@ -173,7 +173,7 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
         let shrinking = Cell::new(false);
         let result = runner_with(cfg.cases_per_round, seed).run(&general(), |case| {
             write_current(&cfg.trace_dir, j, &case);
-            let o = run_case(&template, &case);
+            let o = templates.run(&case);
             let failed = if shrinking.get() {
                 (cfg.failure)(&o)
             } else {
@@ -190,7 +190,7 @@ fn worker(cfg: &CampaignConfig, report: &Mutex<CampaignReport>, j: usize) {
         match result {
             Ok(()) => {}
             Err(TestError::Fail(_, case)) => {
-                let o = run_case(&template, &case);
+                let o = templates.run(&case);
                 let path = o
                     .trace
                     .write_in(&cfg.trace_dir, &format!("random-{seed}"))
@@ -313,6 +313,8 @@ fn campaign_writes_failing_traces() {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
+        template: TemplateKind::Plain,
+        lock_clients: vec![],
     };
     let cfg = CampaignConfig {
         deadline: Instant::now() + Duration::from_secs(600),

@@ -280,3 +280,39 @@ fn failed_dump_leaves_its_packs_in_the_journal() {
     );
     check_clean(&config);
 }
+
+/// An unchanged dump stores nothing on the next backup: every dump chunk is
+/// found again through the one chunk-store entry.
+#[cfg(unix)]
+#[test]
+fn unchanged_dump_stores_nothing_on_the_second_backup() {
+    const DUMP_LEN: usize = 2 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let config = config_in(dir.path());
+    let output = dir.path().join("dump-output");
+    fs::write(&output, pseudo_random(DUMP_LEN, 5)).unwrap();
+    let dump = CommandDump {
+        name: "db.dump".into(),
+        command: format!("cat '{}'", output.display()),
+    };
+
+    let first = backup_with_dump(&config, &src, "s1", &dump).unwrap();
+    assert!(
+        first.stats.deduplicated_size >= DUMP_LEN as u64,
+        "{}",
+        first.stats.deduplicated_size
+    );
+    let second = backup_with_dump(&config, &src, "s2", &dump).unwrap();
+    assert_eq!(second.stats.deduplicated_size, 0);
+
+    let chunks_of = |snapshot: &str| {
+        let items = items_of(&config, snapshot);
+        let dumped = item(&items, "db.dump").expect("the dump is in the snapshot");
+        assert_eq!(dumped.size, DUMP_LEN as u64);
+        dumped.chunks.clone()
+    };
+    assert_eq!(chunks_of("s1"), chunks_of("s2"));
+    check_clean(&config);
+}

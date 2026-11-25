@@ -128,7 +128,7 @@ Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 i
 
 The repository's chunk index is one memory-mapped **chunk table** per base, the head's segments applied over it in memory, and this process's edits (`LiveIndex`, see [Local Optimization Caches](#local-optimization-caches-client-machine)). There is one lookup path for backup, restore, compact and check; no dedup mode is chosen.
 
-**Dedup check during a write session** (`WriteSession::bump_ref_if_exists` and the backup consumer):
+**Dedup check during a write session** (`WriteSession::store`, the one chunk-store entry of backup, dumps and the item stream):
 1. **Chunks stored earlier in this session** — a small `session_new` map
 2. **The session's view of the index** — first the additions of the head's segments applied over the table (found by key, and recorded as reused by key), then an xor filter (`xorf::Xor8`, built once per table) as probabilistic negative check and a binary search of the mapped table. A table hit is recorded as reused by *table position* (`ReusedChunks`: one bit per table entry, and a key set for everything outside the table); no count is kept. The commit checks the reused chunks again only when the head changed in a way that can have removed entries (see [Commit Check](#commit-check)). Backup workers run this check themselves (`DedupPrefilter`) and send a confirmed hit without its data. Over an index with unsaved edits (repair) the lookup goes through the live index by key instead, with no prefilter.
 3. **Chunks recovered** from an interrupted session's journal

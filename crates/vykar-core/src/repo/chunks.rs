@@ -9,16 +9,201 @@ use super::write_session::{WriteSession, duration_nanos};
 use crate::compress;
 use crate::index::PendingChunkEntry;
 use crate::index::table::DedupPrefilter;
+use crate::snapshot::item::ChunkRef;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
+/// A chunk a backup worker prepared (compressed and encrypted).
+pub(crate) struct PreparedChunk {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) uncompressed_size: u32,
+    pub(crate) packed: Vec<u8>,
+}
+
+/// Where the worker found an existing chunk in the session's view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingAt {
+    /// At this position of the view's table, so the consumer can record the
+    /// reuse without a second lookup.
+    Table(u32),
+    /// Among the additions of the view's segments: reuse recorded by key.
+    Added,
+}
+
+/// A chunk the worker confirmed in the session's view.
+pub(crate) struct ExistingChunk {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) uncompressed_size: u32,
+    pub(crate) stored_size: u32,
+    pub(crate) at: ExistingAt,
+}
+
+/// What a backup worker hands the session for one chunk (the result of
+/// worker-side classify).
+pub(crate) enum WorkerChunk {
+    /// Not in the session's table, or no filter: already
+    /// compressed+encrypted. The consumer still dedups it against chunks
+    /// added earlier in this session.
+    Prepared(PreparedChunk),
+    /// Confirmed dedup hit in the session's table: no data retained.
+    Existing(ExistingChunk),
+}
+
+/// A chunk for [`WriteSession::store`].
+pub(crate) enum ChunkInput<'a> {
+    /// Classified by a backup worker. `prefilter` is the one the worker
+    /// classified with: with one, a `Prepared` chunk is known to be outside
+    /// the session's table and an `Existing` hit was found through it;
+    /// without one every chunk is `Prepared`.
+    Worker {
+        chunk: WorkerChunk,
+        prefilter: Option<&'a DedupPrefilter>,
+    },
+    /// Plain bytes from the calling thread (the item stream, command
+    /// dumps): hashed here, looked up, and compressed and encrypted only
+    /// when the chunk is new.
+    Plain {
+        data: &'a [u8],
+        compression: compress::Compression,
+    },
+}
+
+/// What [`WriteSession::store`] did with a chunk.
+pub(crate) struct StoredChunk {
+    /// `size`: plaintext length; `csize`: stored size.
+    pub(crate) chunk_ref: ChunkRef,
+    /// Packed by this call: found neither in the session, nor in its view
+    /// of the index, nor among recovered or pending chunks.
+    pub(crate) new: bool,
+}
+
 impl WriteSession {
+    /// The one chunk-store entry: record the reuse of an existing chunk,
+    /// or pack a new one into `pack_type`'s writer (a new tree chunk also
+    /// goes to the local tree-chunk cache).
+    pub(crate) fn store(
+        &mut self,
+        repo: &Repo,
+        chunk: ChunkInput<'_>,
+        pack_type: PackType,
+    ) -> Result<StoredChunk> {
+        match chunk {
+            ChunkInput::Worker {
+                chunk: WorkerChunk::Prepared(p),
+                prefilter,
+            } => {
+                // With a prefilter, the worker established the chunk is not
+                // in the session's view; it can only dedup against chunks
+                // added during this session.
+                let existing = if prefilter.is_some() {
+                    self.reuse_after_prefilter_miss(repo, &p.chunk_id)
+                } else {
+                    self.reuse_if_exists(repo, &p.chunk_id)
+                };
+                let (csize, new) = match existing {
+                    Some(csize) => (csize, false),
+                    None => (self.add_new(repo, p.chunk_id, p.packed, pack_type)?, true),
+                };
+                Ok(StoredChunk {
+                    chunk_ref: ChunkRef {
+                        id: p.chunk_id,
+                        size: p.uncompressed_size,
+                        csize,
+                    },
+                    new,
+                })
+            }
+            ChunkInput::Worker {
+                chunk: WorkerChunk::Existing(e),
+                prefilter,
+            } => {
+                let prefilter = prefilter.ok_or_else(|| {
+                    VykarError::Other(format!(
+                        "BUG: pre-session dedup hit for chunk {} without a prefilter",
+                        e.chunk_id
+                    ))
+                })?;
+                match e.at {
+                    ExistingAt::Table(position) => {
+                        self.reuse_table_hit(repo, &e.chunk_id, e.stored_size, position, prefilter)?
+                    }
+                    ExistingAt::Added => {
+                        self.reuse_added_hit(repo, &e.chunk_id, e.stored_size, prefilter)?
+                    }
+                }
+                Ok(StoredChunk {
+                    chunk_ref: ChunkRef {
+                        id: e.chunk_id,
+                        size: e.uncompressed_size,
+                        csize: e.stored_size,
+                    },
+                    new: false,
+                })
+            }
+            ChunkInput::Plain { data, compression } => {
+                let size = u32::try_from(data.len()).map_err(|_| {
+                    VykarError::Other(format!("chunk of {} bytes is too large", data.len()))
+                })?;
+                let id = ChunkId::compute(repo.crypto.chunk_hasher(), data);
+                if let Some(csize) = self.reuse_if_exists(repo, &id) {
+                    return Ok(StoredChunk {
+                        chunk_ref: ChunkRef { id, size, csize },
+                        new: false,
+                    });
+                }
+                let compressed = compress::compress(compression, data)?;
+                // Encrypt and wrap in repo object envelope
+                let packed = pack_object_with_context(
+                    ObjectType::ChunkData,
+                    id.as_bytes(),
+                    &compressed,
+                    repo.crypto.as_ref(),
+                )?;
+                let csize = self.add_new(repo, id, packed, pack_type)?;
+                Ok(StoredChunk {
+                    chunk_ref: ChunkRef { id, size, csize },
+                    new: true,
+                })
+            }
+        }
+    }
+
+    /// Pack a new chunk: a tree chunk first goes to the local tree-chunk
+    /// cache (as stored bytes), then the blob goes to the writer.
+    fn add_new(
+        &mut self,
+        repo: &Repo,
+        chunk_id: ChunkId,
+        packed: Vec<u8>,
+        pack_type: PackType,
+    ) -> Result<u32> {
+        if pack_type == PackType::Tree
+            && let Some(cache) = &repo.tree_cache
+        {
+            cache.insert(&chunk_id, &packed);
+        }
+        self.commit_packed(repo, chunk_id, packed, pack_type)
+    }
+
+    /// Store plain bytes through `Self::store`. Returns (chunk_id,
+    /// stored_size, was_new). For tests and tools; backup code calls `store`.
+    pub fn store_chunk(
+        &mut self,
+        repo: &Repo,
+        data: &[u8],
+        compression: compress::Compression,
+        pack_type: PackType,
+    ) -> Result<(ChunkId, u32, bool)> {
+        let s = self.store(repo, ChunkInput::Plain { data, compression }, pack_type)?;
+        Ok((s.chunk_ref.id, s.chunk_ref.csize, s.new))
+    }
+
     /// Resolve a cache-hit chunk reference, recording the reuse.
     /// Returns the stored size from the authoritative index/recovered entry.
     /// Errors if the chunk is not found in any state (committed, recovered,
     /// or pending pack writer) — this indicates storage corruption.
     pub fn reuse_cached_chunk_ref(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Result<u32> {
-        self.bump_ref_if_exists(repo, chunk_id).ok_or_else(|| {
+        self.reuse_if_exists(repo, chunk_id).ok_or_else(|| {
             VykarError::Other(format!(
                 "cache hit references unresolvable chunk {chunk_id}"
             ))
@@ -32,7 +217,7 @@ impl WriteSession {
     /// edited after the session began: repair, tests) in the live index by
     /// key. Records the reuse in the session delta and returns the stored
     /// size; `None` when not found.
-    fn bump_existing(&mut self, repo: &Repo, id: &ChunkId, skip_filter: bool) -> Option<u32> {
+    fn reuse_existing(&mut self, repo: &Repo, id: &ChunkId, skip_filter: bool) -> Option<u32> {
         let edited = repo.chunk_index.is_modified();
         let keyed_hit = if edited {
             repo.chunk_index.get(id).map(|e| e.stored_size)
@@ -75,14 +260,14 @@ impl WriteSession {
     /// pending state. Returns stored size when found. Falls back to recovered
     /// chunks from a previous interrupted session, then to the pending pack
     /// writers.
-    pub fn bump_ref_if_exists(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Option<u32> {
-        if let Some(stored_size) = self.bump_existing(repo, chunk_id, false) {
+    pub(super) fn reuse_if_exists(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Option<u32> {
+        if let Some(stored_size) = self.reuse_existing(repo, chunk_id, false) {
             return Some(stored_size);
         }
         if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
             return Some(stored_size);
         }
-        self.bump_ref_pending(chunk_id)
+        self.find_pending(chunk_id)
     }
 
     /// A worker confirmed `chunk_id` in the session's table through
@@ -99,7 +284,7 @@ impl WriteSession {
     ///
     /// Errors, rather than recording a possibly dangling reference, if the
     /// prefilter does not belong to the active session.
-    pub(crate) fn bump_ref_presession_hit(
+    fn reuse_table_hit(
         &mut self,
         repo: &Repo,
         chunk_id: &ChunkId,
@@ -123,8 +308,8 @@ impl WriteSession {
 
     /// A worker found `chunk_id` among the additions of the session's view
     /// (`PrefilterVerdict::PresentAdded`): record the reference by key.
-    /// The same identity check as [`Self::bump_ref_presession_hit`].
-    pub(crate) fn bump_ref_presession_added(
+    /// The same identity check as [`Self::reuse_table_hit`].
+    fn reuse_added_hit(
         &mut self,
         repo: &Repo,
         chunk_id: &ChunkId,
@@ -174,7 +359,7 @@ impl WriteSession {
     /// Prefilter said "not in the session's table" (`PrefilterVerdict::Absent`:
     /// a filter miss, or a false positive the worker ruled out in the table)
     /// — session-new → recovered → pending only.
-    pub fn bump_ref_prefilter_miss(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Option<u32> {
+    fn reuse_after_prefilter_miss(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Option<u32> {
         let found = {
             let ws = &mut *self;
             match ws.session_new.get(chunk_id).copied() {
@@ -192,44 +377,19 @@ impl WriteSession {
         }
         if repo.chunk_index.is_modified() {
             // Edits after the session began are only seen by key.
-            if let Some(stored_size) = self.bump_existing(repo, chunk_id, true) {
+            if let Some(stored_size) = self.reuse_existing(repo, chunk_id, true) {
                 return Some(stored_size);
             }
         }
         if let Some(stored_size) = self.promote_recovered_chunk(chunk_id) {
             return Some(stored_size);
         }
-        self.bump_ref_pending(chunk_id)
-    }
-
-    /// Inline false-positive path: compress + encrypt + commit a chunk whose ChunkId
-    /// was already computed by the worker. Avoids re-hashing via `store_chunk`.
-    pub fn commit_chunk_inline(
-        &mut self,
-        repo: &Repo,
-        chunk_id: ChunkId,
-        data: &[u8],
-        compression: compress::Compression,
-        pack_type: PackType,
-    ) -> Result<u32> {
-        debug_assert_eq!(
-            ChunkId::compute(repo.crypto.chunk_hasher(), data),
-            chunk_id,
-            "inline commit: chunk_id mismatch"
-        );
-        let compressed = compress::compress(compression, data)?;
-        let packed = pack_object_with_context(
-            ObjectType::ChunkData,
-            chunk_id.as_bytes(),
-            &compressed,
-            repo.crypto.as_ref(),
-        )?;
-        self.commit_prepacked_chunk(repo, chunk_id, packed, pack_type)
+        self.find_pending(chunk_id)
     }
 
     /// Commit a pre-compressed and pre-encrypted chunk to the selected pack writer.
     /// Returns the stored size in bytes.
-    pub fn commit_prepacked_chunk(
+    fn commit_packed(
         &mut self,
         repo: &Repo,
         chunk_id: ChunkId,
@@ -353,43 +513,6 @@ impl WriteSession {
         });
 
         Ok(())
-    }
-
-    /// Store a chunk in the repository. Returns (chunk_id, stored_size, was_new).
-    /// If the chunk already exists (dedup), only its reuse is recorded.
-    pub fn store_chunk(
-        &mut self,
-        repo: &Repo,
-        data: &[u8],
-        compression: compress::Compression,
-        pack_type: PackType,
-    ) -> Result<(ChunkId, u32, bool)> {
-        let chunk_id = ChunkId::compute(repo.crypto.chunk_hasher(), data);
-
-        if let Some(stored_size) = self.bump_ref_if_exists(repo, &chunk_id) {
-            return Ok((chunk_id, stored_size, false));
-        }
-
-        // Compress
-        let compressed = compress::compress(compression, data)?;
-
-        // Encrypt and wrap in repo object envelope
-        let packed = pack_object_with_context(
-            ObjectType::ChunkData,
-            chunk_id.as_bytes(),
-            &compressed,
-            repo.crypto.as_ref(),
-        )?;
-        // New tree chunks go to the local tree-chunk cache as they are
-        // written; dedup hits returned above and are not cached.
-        if pack_type == PackType::Tree
-            && let Some(cache) = &repo.tree_cache
-        {
-            cache.insert(&chunk_id, &packed);
-        }
-        let stored_size = self.commit_prepacked_chunk(repo, chunk_id, packed, pack_type)?;
-
-        Ok((chunk_id, stored_size, true))
     }
 
     /// Flush all pending pack writes and wait for background uploads.

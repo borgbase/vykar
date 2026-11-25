@@ -4,18 +4,40 @@ use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, RetainedHit};
 use crate::repo::pack::PackType;
-use crate::repo::{Repo, WriteSession};
+use crate::repo::{ChunkInput, Repo, StoredChunk, WriteSession};
 use crate::snapshot::item::{ChunkRef, Item};
 use crate::snapshot::{ByteCounterSnapshot, SnapshotStats};
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
-use super::chunk_process::{ExistingAt, WorkerChunk};
+use super::chunk_process::WorkerChunk;
 use super::{
     BackupProgressEvent, FileStatus, ListingWriter, emit_progress, emit_stats_progress,
     stamp_item_metadata,
 };
 
-/// Commit worker chunks into a repository, updating item and stats.
+/// Store one content chunk of a file or a command dump and account for it:
+/// its reference goes to `chunks`, its sizes to `stats` (`deduplicated_size`
+/// only when the chunk is new).
+pub(super) fn commit_file_chunk(
+    repo: &Repo,
+    ws: &mut WriteSession,
+    chunk: ChunkInput<'_>,
+    stats: &mut SnapshotStats,
+    chunks: &mut Vec<ChunkRef>,
+) -> Result<()> {
+    let StoredChunk { chunk_ref, new } = ws.store(repo, chunk, PackType::Data)?;
+    stats.original_size += chunk_ref.size as u64;
+    stats.compressed_size += chunk_ref.csize as u64;
+    if new {
+        stats.deduplicated_size += chunk_ref.csize as u64;
+    }
+    chunks.push(chunk_ref);
+    Ok(())
+}
+
+/// Commit worker chunks into a repository through
+/// [`WriteSession::store`], updating item and stats. `prefilter` is the
+/// one the workers classified with.
 ///
 /// Shared by `ProcessedFile` and `FileSegment` consumer arms.
 pub(super) fn process_worker_chunks(
@@ -26,76 +48,14 @@ pub(super) fn process_worker_chunks(
     stats: &mut SnapshotStats,
     prefilter: Option<&DedupPrefilter>,
 ) -> Result<()> {
-    for worker_chunk in chunks {
-        match worker_chunk {
-            WorkerChunk::Prepared(prepared) => {
-                let size = prepared.uncompressed_size;
-                // With a prefilter, the worker established the chunk is not
-                // in the session's view; it can only dedup against chunks
-                // added during this session.
-                let existing = if prefilter.is_some() {
-                    ws.bump_ref_prefilter_miss(repo, &prepared.chunk_id)
-                } else {
-                    ws.bump_ref_if_exists(repo, &prepared.chunk_id)
-                };
-                if let Some(csize) = existing {
-                    stats.original_size += size as u64;
-                    stats.compressed_size += csize as u64;
-                    item.chunks.push(ChunkRef {
-                        id: prepared.chunk_id,
-                        size,
-                        csize,
-                    });
-                } else {
-                    let csize = ws.commit_prepacked_chunk(
-                        repo,
-                        prepared.chunk_id,
-                        prepared.packed,
-                        PackType::Data,
-                    )?;
-                    stats.original_size += size as u64;
-                    stats.compressed_size += csize as u64;
-                    stats.deduplicated_size += csize as u64;
-                    item.chunks.push(ChunkRef {
-                        id: prepared.chunk_id,
-                        size,
-                        csize,
-                    });
-                }
-            }
-            WorkerChunk::Existing(existing) => {
-                let prefilter = prefilter.ok_or_else(|| {
-                    VykarError::Other(format!(
-                        "BUG: pre-session dedup hit for chunk {} without a prefilter",
-                        existing.chunk_id
-                    ))
-                })?;
-                match existing.at {
-                    ExistingAt::Table(position) => ws.bump_ref_presession_hit(
-                        repo,
-                        &existing.chunk_id,
-                        existing.stored_size,
-                        position,
-                        prefilter,
-                    )?,
-                    ExistingAt::Added => ws.bump_ref_presession_added(
-                        repo,
-                        &existing.chunk_id,
-                        existing.stored_size,
-                        prefilter,
-                    )?,
-                }
-                let size = existing.uncompressed_size;
-                let csize = existing.stored_size;
-                stats.original_size += size as u64;
-                stats.compressed_size += csize as u64;
-                item.chunks.push(ChunkRef {
-                    id: existing.chunk_id,
-                    size,
-                    csize,
-                });
-            }
-        }
+    for chunk in chunks {
+        commit_file_chunk(
+            repo,
+            ws,
+            ChunkInput::Worker { chunk, prefilter },
+            stats,
+            &mut item.chunks,
+        )?;
     }
     Ok(())
 }
@@ -360,7 +320,7 @@ mod tests {
         use vykar_types::pack_id::PackId;
 
         /// An index holding `stored`.
-        fn index_of(stored: &[(ChunkId, u32)]) -> ChunkIndex {
+        pub(super) fn index_of(stored: &[(ChunkId, u32)]) -> ChunkIndex {
             let mut index = ChunkIndex::new();
             for &(id, stored_size) in stored {
                 index.add(id, stored_size, PackId::from_bytes([0x01; 32]), 0);
@@ -368,7 +328,11 @@ mod tests {
             index
         }
 
-        fn classify(repo: &Repo, prefilter: &DedupPrefilter, data: &[u8]) -> WorkerChunk {
+        pub(super) fn classify(
+            repo: &Repo,
+            prefilter: &DedupPrefilter,
+            data: &[u8],
+        ) -> WorkerChunk {
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
             classify_chunk(
                 id,
@@ -510,6 +474,176 @@ mod tests {
             assert_eq!(stats.original_size, 2 * data.len() as u64);
             assert_eq!(stats.compressed_size, 2 * csize as u64);
             assert_eq!(stats.deduplicated_size, csize as u64, "stored once");
+            ws.flush_packs(&repo).unwrap();
+        }
+    }
+
+    mod store {
+        use super::prefilter::{classify, index_of};
+        use super::*;
+        use crate::commands::backup::chunk_process::classify_chunk;
+        use crate::compress::Compression;
+        use std::borrow::Cow;
+
+        fn plain(data: &[u8]) -> ChunkInput<'_> {
+            ChunkInput::Plain {
+                data,
+                compression: Compression::None,
+            }
+        }
+
+        /// A worker chunk classified without a prefilter: always `Prepared`.
+        fn prepared(repo: &Repo, data: &[u8]) -> WorkerChunk {
+            let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
+            classify_chunk(
+                id,
+                Cow::Borrowed(data),
+                None,
+                Compression::None,
+                repo.crypto().as_ref(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn plain_store_is_new_once_then_reused() {
+            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let data = b"one tree chunk of the item stream";
+            let first = ws.store(&repo, plain(data), PackType::Tree).unwrap();
+            let second = ws.store(&repo, plain(data), PackType::Tree).unwrap();
+            assert!(first.new);
+            assert!(!second.new);
+            assert_eq!(
+                first.chunk_ref.id,
+                ChunkId::compute(repo.crypto().chunk_hasher(), data)
+            );
+            assert_eq!(second.chunk_ref.id, first.chunk_ref.id);
+            assert_eq!(second.chunk_ref.csize, first.chunk_ref.csize);
+            assert_eq!(first.chunk_ref.size, data.len() as u32);
+            assert_eq!(second.chunk_ref.size, data.len() as u32);
+            ws.flush_packs(&repo).unwrap();
+        }
+
+        #[test]
+        fn plain_store_dedups_against_a_worker_chunk() {
+            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let data = b"a file chunk, later also a dump chunk";
+            let mut stats = SnapshotStats::default();
+            let mut chunks = Vec::new();
+            let chunk = prepared(&repo, data);
+            assert!(matches!(chunk, WorkerChunk::Prepared(_)));
+            commit_file_chunk(
+                &repo,
+                &mut ws,
+                ChunkInput::Worker {
+                    chunk,
+                    prefilter: None,
+                },
+                &mut stats,
+                &mut chunks,
+            )
+            .unwrap();
+            let dedup = stats.deduplicated_size;
+            assert!(dedup > 0);
+
+            let stored = ws.store(&repo, plain(data), PackType::Data).unwrap();
+            assert!(!stored.new);
+            assert_eq!(stored.chunk_ref.csize, chunks[0].csize);
+            commit_file_chunk(&repo, &mut ws, plain(data), &mut stats, &mut chunks).unwrap();
+            assert_eq!(stats.deduplicated_size, dedup, "stored once");
+            ws.flush_packs(&repo).unwrap();
+        }
+
+        #[test]
+        fn existing_chunk_without_prefilter_errors() {
+            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let data = b"already stored before this session";
+            let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
+            repo.set_session_table_for_test(&mut ws, &index_of(&[(id, 77)]));
+            let prefilter = ws.dedup_prefilter().unwrap();
+            let chunk = classify(&repo, &prefilter, data);
+            assert!(matches!(chunk, WorkerChunk::Existing(_)));
+
+            let err = match ws.store(
+                &repo,
+                ChunkInput::Worker {
+                    chunk,
+                    prefilter: None,
+                },
+                PackType::Data,
+            ) {
+                Err(err) => err,
+                Ok(_) => panic!("an existing chunk needs its prefilter"),
+            };
+            assert!(err.to_string().contains("without a prefilter"), "{err}");
+            assert!(!ws.delta_reuses(&id));
+        }
+
+        /// A `Prepared` chunk classified without a prefilter gets the full
+        /// lookup, table included, not the prefilter-miss one.
+        #[test]
+        fn prepared_chunk_without_prefilter_finds_the_table() {
+            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let data = b"already stored before this session";
+            let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
+            repo.set_session_table_for_test(&mut ws, &index_of(&[(id, 77)]));
+            let mut stats = SnapshotStats::default();
+            let mut chunks = Vec::new();
+            commit_file_chunk(
+                &repo,
+                &mut ws,
+                ChunkInput::Worker {
+                    chunk: prepared(&repo, data),
+                    prefilter: None,
+                },
+                &mut stats,
+                &mut chunks,
+            )
+            .unwrap();
+            assert_eq!(chunks[0].id, id);
+            assert_eq!(chunks[0].csize, 77);
+            assert_eq!(stats.deduplicated_size, 0);
+            assert!(ws.delta_reuses(&id));
+            assert!(
+                !ws.write_session_delta_for_test().reused.is_keyed(&id),
+                "recorded by table position"
+            );
+        }
+
+        #[test]
+        fn commit_file_chunk_accounts_new_and_reused() {
+            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let old = b"already stored before this session";
+            let fresh = b"new in this session";
+            let old_id = ChunkId::compute(repo.crypto().chunk_hasher(), old);
+            repo.set_session_table_for_test(&mut ws, &index_of(&[(old_id, 77)]));
+            let prefilter = ws.dedup_prefilter().unwrap();
+
+            let mut stats = SnapshotStats::default();
+            let mut chunks = Vec::new();
+            for data in [&fresh[..], &old[..]] {
+                let chunk = classify(&repo, &prefilter, data);
+                commit_file_chunk(
+                    &repo,
+                    &mut ws,
+                    ChunkInput::Worker {
+                        chunk,
+                        prefilter: Some(&prefilter),
+                    },
+                    &mut stats,
+                    &mut chunks,
+                )
+                .unwrap();
+            }
+            assert_eq!(chunks.len(), 2);
+            let fresh_id = ChunkId::compute(repo.crypto().chunk_hasher(), fresh);
+            assert_eq!(chunks[0].id, fresh_id);
+            assert_eq!(chunks[1].id, old_id);
+            assert_eq!(chunks[1].csize, 77);
+            let new_csize = u64::from(chunks[0].csize);
+            assert_eq!(stats.original_size, (fresh.len() + old.len()) as u64);
+            assert_eq!(stats.compressed_size, new_csize + 77);
+            assert_eq!(stats.deduplicated_size, new_csize);
             ws.flush_packs(&repo).unwrap();
         }
     }
@@ -920,9 +1054,10 @@ mod tests {
         }
 
         fn store_new(repo: &Repo, ws: &mut WriteSession, data: &[u8]) -> ChunkId {
-            let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
-            ws.commit_chunk_inline(repo, id, data, Compression::None, PackType::Data)
+            let (id, _, new) = ws
+                .store_chunk(repo, data, Compression::None, PackType::Data)
                 .unwrap();
+            assert!(new, "new");
             id
         }
 
@@ -940,7 +1075,7 @@ mod tests {
             };
 
             let txn = FileTxn::begin(&mut ws, &stats, stats.deduplicated_size);
-            assert!(ws.bump_ref_if_exists(&repo, &table_chunk).is_some());
+            assert!(ws.reuse_cached_chunk_ref(&repo, &table_chunk).is_ok());
             assert!(ws.delta_reuses(&table_chunk));
             let new_chunk = store_new(&repo, &mut ws, b"a skipped file's new chunk");
             stats.original_size += 100;
@@ -959,7 +1094,7 @@ mod tests {
                 (10, 20, 30)
             );
             assert!(
-                ws.bump_ref_if_exists(&repo, &new_chunk).is_some(),
+                ws.reuse_cached_chunk_ref(&repo, &new_chunk).is_ok(),
                 "the skipped file's chunk is still found"
             );
             ws.flush_packs(&repo).unwrap();
@@ -980,7 +1115,7 @@ mod tests {
             let stats = SnapshotStats::default();
 
             let txn = FileTxn::begin(&mut ws, &stats, 42);
-            assert!(ws.bump_ref_if_exists(&repo, &table_chunk).is_some());
+            assert!(ws.reuse_cached_chunk_ref(&repo, &table_chunk).is_ok());
             assert_eq!(txn.commit(&mut ws), 42);
             assert!(!ws.file_reuse_staged());
             assert!(ws.delta_reuses(&table_chunk));

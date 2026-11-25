@@ -1636,7 +1636,7 @@ pub(crate) enum PrefilterVerdict {
 /// immediately instead of holding them until the consumer resolves the hit.
 /// Sound because the view is immutable: a chunk present here is still
 /// present when the consumer records its reuse (see
-/// `WriteSession::bump_ref_presession_hit`).
+/// `WriteSession::store`, arm `Existing`).
 #[derive(Clone)]
 pub(crate) struct DedupPrefilter {
     filter: Option<Arc<Xor8>>,

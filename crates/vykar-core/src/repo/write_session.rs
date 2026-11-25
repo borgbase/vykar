@@ -403,7 +403,7 @@ impl WriteSession {
     /// Check only pending pack writers for a dedup hit (shared helper). A
     /// pending chunk is among the session's own additions once its pack is
     /// sealed, so no reuse is recorded.
-    pub(crate) fn bump_ref_pending(&mut self, chunk_id: &ChunkId) -> Option<u32> {
+    pub(super) fn find_pending(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         self.data_pack_writer
             .get_pending_stored_size(chunk_id)
             .or_else(|| self.tree_pack_writer.get_pending_stored_size(chunk_id))

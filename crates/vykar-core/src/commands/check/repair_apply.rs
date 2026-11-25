@@ -66,7 +66,7 @@ fn apply_item_level_rewrites(
         return Ok(());
     }
 
-    // 1. Begin a write session so store_chunk can pack new tree chunks.
+    // 1. Begin a write session so store can pack new tree chunks.
     //    Every return below consumes it: saved, or flushed on error.
     let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
 
@@ -104,7 +104,7 @@ fn apply_item_level_rewrites(
     if prepared.is_empty() {
         // No work survived preparation — close the session via save_session
         // so any pending state is consistent. The trailing sweep removes any
-        // orphan chunks store_chunk may have produced.
+        // orphan chunks store may have produced.
         if let Err(e) = ws.flush_packs(repo) {
             ws.flush_on_abort(repo);
             return Err(e);
@@ -412,7 +412,7 @@ pub(super) fn execute_repair(
 
     // Step 4.5: Rewrite snapshots that survived item-level repair gates.
     // Mirrors the backup commit (`repo::commit_machine::BackupCommit`):
-    // begin_write_session → store_chunk per surviving item → flush_packs →
+    // begin_write_session → store per surviving item → flush_packs →
     // save_state (persists chunks BEFORE any snapshot blob references them).
     // Per-action errors are logged and skipped; the trailing sweep
     // garbage-collects any orphan chunks. The publish loop deliberately

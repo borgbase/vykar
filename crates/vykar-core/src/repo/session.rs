@@ -750,7 +750,7 @@ mod tests {
             .recover_pending_index(&repo, &crate::repo::control::CancelToken::new())
             .unwrap();
         assert_eq!(recovery.recovered_chunks, 1);
-        assert!(ws2.bump_ref_if_exists(&repo, &chunk_id).is_some());
+        assert!(ws2.reuse_if_exists(&repo, &chunk_id).is_some());
         let delta = ws2.write_session_delta_for_test();
         assert!(
             delta
@@ -845,10 +845,10 @@ mod tests {
         ws = repo.begin_write_session(&WriteSessionOptions::default());
         assert!(ws.dedup_prefilter().is_none());
         assert!(
-            ws.bump_ref_if_exists(&repo, &removed).is_none(),
+            ws.reuse_if_exists(&repo, &removed).is_none(),
             "the removal is seen"
         );
-        assert!(ws.bump_ref_if_exists(&repo, &kept).is_some());
+        assert!(ws.reuse_if_exists(&repo, &kept).is_some());
         let delta = ws.index_delta.as_ref().unwrap();
         assert!(delta.reused.is_keyed(&kept));
         assert!(delta.reused.positional().is_none());

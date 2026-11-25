@@ -138,7 +138,7 @@ pub fn compress(compression: Compression, data: &[u8]) -> Result<Vec<u8>> {
     compress_append(compression, data, &mut out)?;
     // compress_append (LZ4 path) resizes to worst-case then truncates length,
     // leaving excess capacity. Shrink so callers that hold the Vec (e.g.
-    // store_chunk → pack_object_with_context) don't carry oversized buffers.
+    // store → pack_object_with_context) don't carry oversized buffers.
     out.shrink_to_fit();
     Ok(out)
 }

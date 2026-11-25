@@ -1,7 +1,8 @@
 //! The one writer of snapshot listings (backup, command dumps, the
 //! `check --repair` rewriter): entries are encoded into the item stream
 //! one at a time, the stream is cut into tree chunks after whole entries
-//! (see [`ItemStreamCutter`]), and each chunk is stored as it closes.
+//! (see [`ItemStreamCutter`]), and each chunk is stored as it closes,
+//! through [`WriteSession::store`].
 //!
 //! Entries are encoded in snapshot format `CURRENT_FORMAT_VERSION`, which
 //! [`ListingWriter::finish`] reports.
@@ -24,7 +25,7 @@ use vykar_types::error::Result;
 use super::item_cut::ItemStreamCutter;
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
-use crate::repo::{Repo, WriteSession};
+use crate::repo::{ChunkInput, Repo, WriteSession};
 use crate::snapshot::item::Item;
 use crate::snapshot::listing::{ListingIndexBuilder, encode_ext};
 
@@ -146,9 +147,15 @@ impl ListingWriter {
             return Ok(());
         }
         let chunk = std::mem::take(&mut self.buf);
-        let (chunk_id, _csize, _is_new) =
-            ws.store_chunk(repo, &chunk, self.compression, PackType::Tree)?;
-        self.item_ptrs.push(chunk_id);
+        let stored = ws.store(
+            repo,
+            ChunkInput::Plain {
+                data: &chunk,
+                compression: self.compression,
+            },
+            PackType::Tree,
+        )?;
+        self.item_ptrs.push(stored.chunk_ref.id);
         Ok(())
     }
 }

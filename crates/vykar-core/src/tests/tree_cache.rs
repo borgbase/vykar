@@ -23,7 +23,8 @@ use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::tree_cache::TreeChunkCache;
 use crate::repo::{
-    ChunkerParams, EncryptionMode, OpenOptions, Repo, TreeChunkSource, WriteSessionOptions,
+    ChunkInput, ChunkerParams, EncryptionMode, OpenOptions, Repo, TreeChunkSource,
+    WriteSessionOptions,
 };
 use crate::testutil::{PutLog, RecordingBackend, init_test_environment};
 
@@ -152,6 +153,56 @@ fn store_caches_new_tree_chunks_as_stored_bytes_only() {
         }
         assert!(!cache.contains(&data_id), "{mode:?}: data chunk cached");
     }
+}
+
+/// A new tree chunk stored through `WriteSession::store` is cached; a
+/// dedup hit is not cached again, and a data chunk never is.
+#[test]
+fn store_caches_only_new_tree_chunks() {
+    let (repo, mut ws, _log) = memory_repo(EncryptionMode::Aes256Gcm);
+    let tree = b"a tree chunk through the one entry";
+    let stored = ws
+        .store(
+            &repo,
+            ChunkInput::Plain {
+                data: tree,
+                compression: Compression::None,
+            },
+            PackType::Tree,
+        )
+        .unwrap();
+    assert!(stored.new);
+    let id = stored.chunk_ref.id;
+    assert!(cache_of(&repo).contains(&id));
+
+    clear(cache_of(&repo));
+    let again = ws
+        .store(
+            &repo,
+            ChunkInput::Plain {
+                data: tree,
+                compression: Compression::None,
+            },
+            PackType::Tree,
+        )
+        .unwrap();
+    assert!(!again.new);
+    assert_eq!(again.chunk_ref.id, id);
+    assert!(!cache_of(&repo).contains(&id), "a dedup hit is not cached");
+
+    let data = ws
+        .store(
+            &repo,
+            ChunkInput::Plain {
+                data: b"a data chunk through the one entry",
+                compression: Compression::None,
+            },
+            PackType::Data,
+        )
+        .unwrap();
+    assert!(data.new);
+    assert!(!cache_of(&repo).contains(&data.chunk_ref.id));
+    ws.flush_packs(&repo).unwrap();
 }
 
 #[test]

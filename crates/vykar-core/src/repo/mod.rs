@@ -52,6 +52,9 @@ pub use session::WriteSessionOptions;
 mod upgrade;
 pub use upgrade::UpgradeOutcome;
 mod writer;
+pub(crate) use chunks::{
+    ChunkInput, ExistingAt, ExistingChunk, PreparedChunk, StoredChunk, WorkerChunk,
+};
 pub use write_session::WriteSession;
 pub(crate) use writer::Fence;
 pub use writer::RepoWriter;

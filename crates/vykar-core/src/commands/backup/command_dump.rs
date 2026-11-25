@@ -11,14 +11,12 @@ use crate::chunker;
 use crate::compress::Compression;
 use crate::config::CommandDump;
 use crate::platform::shell;
-use crate::repo::pack::PackType;
-use crate::repo::{Repo, WriteSession};
+use crate::repo::{ChunkInput, Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::commit::{FileKind, FileOutcome, finish_file, start_file};
+use super::commit::{FileKind, FileOutcome, commit_file_chunk, finish_file, start_file};
 use super::{BackupProgressEvent, ListingWriter, emit_stats_progress};
 
 /// Default timeout for command_dump execution (1 hour).
@@ -149,7 +147,6 @@ fn stream_dump_command(
     };
 
     // Stream stdout through chunker.
-    let chunk_hasher = repo.crypto().chunk_hasher().clone();
     let stdout = stdout.ok_or_else(|| {
         VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
     })?;
@@ -174,28 +171,16 @@ fn stream_dump_command(
         debug_assert!(chunk.data.len() <= u32::MAX as usize);
         let size = chunk.data.len() as u32;
         total_size += size as u64;
-        let chunk_id = ChunkId::compute(&chunk_hasher, &chunk.data);
-
-        if let Some(csize) = ws.bump_ref_if_exists(repo, &chunk_id) {
-            stats.original_size += size as u64;
-            stats.compressed_size += csize as u64;
-            chunk_refs.push(ChunkRef {
-                id: chunk_id,
-                size,
-                csize,
-            });
-        } else {
-            let csize =
-                ws.commit_chunk_inline(repo, chunk_id, &chunk.data, compression, PackType::Data)?;
-            stats.original_size += size as u64;
-            stats.compressed_size += csize as u64;
-            stats.deduplicated_size += csize as u64;
-            chunk_refs.push(ChunkRef {
-                id: chunk_id,
-                size,
-                csize,
-            });
-        }
+        commit_file_chunk(
+            repo,
+            ws,
+            ChunkInput::Plain {
+                data: &chunk.data,
+                compression,
+            },
+            stats,
+            &mut chunk_refs,
+        )?;
 
         bytes_since_progress += size as u64;
         if bytes_since_progress >= PROGRESS_INTERVAL_BYTES {

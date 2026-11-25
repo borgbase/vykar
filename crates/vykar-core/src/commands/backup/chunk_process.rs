@@ -7,39 +7,7 @@ use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 
-pub(crate) struct PreparedChunk {
-    pub(crate) chunk_id: ChunkId,
-    pub(crate) uncompressed_size: u32,
-    pub(crate) packed: Vec<u8>,
-}
-
-/// Where the worker found an existing chunk in the session's view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExistingAt {
-    /// At this position of the view's table, so the consumer can record the
-    /// reuse without a second lookup.
-    Table(u32),
-    /// Among the additions of the view's segments: reuse recorded by key.
-    Added,
-}
-
-/// A chunk the worker confirmed in the session's view.
-pub(crate) struct ExistingChunk {
-    pub(crate) chunk_id: ChunkId,
-    pub(crate) uncompressed_size: u32,
-    pub(crate) stored_size: u32,
-    pub(crate) at: ExistingAt,
-}
-
-/// Result of worker-side classify.
-pub(crate) enum WorkerChunk {
-    /// Not in the session's table, or no filter: already
-    /// compressed+encrypted. The consumer still dedups it against chunks
-    /// added earlier in this session.
-    Prepared(PreparedChunk),
-    /// Confirmed dedup hit in the session's table: no data retained.
-    Existing(ExistingChunk),
-}
+pub(crate) use crate::repo::{ExistingAt, ExistingChunk, PreparedChunk, WorkerChunk};
 
 /// Classify a single chunk: hash → prefilter → transform, or data-less hit.
 ///

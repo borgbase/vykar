@@ -269,6 +269,10 @@ pub(crate) enum Commands {
         /// Also remove all session markers (orphaned by crashed backups)
         #[arg(long)]
         sessions: bool,
+
+        /// Skip interactive confirmation (for scripting)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Run scheduled backups as a foreground daemon

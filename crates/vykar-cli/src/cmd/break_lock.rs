@@ -12,6 +12,7 @@ pub(crate) fn run_break_lock(
     config: &VykarConfig,
     _label: Option<&str>,
     sessions: bool,
+    yes: bool,
     out: &mut Output,
 ) -> CliResult<()> {
     let storage = vykar_core::storage::backend_from_config(
@@ -27,7 +28,7 @@ pub(crate) fn run_break_lock(
     })?;
 
     if sessions {
-        clear_sessions(storage.as_ref(), out)?;
+        clear_sessions(storage.as_ref(), yes, out)?;
     }
 
     Ok(())
@@ -76,7 +77,11 @@ impl Report for SessionsReport {
     }
 }
 
-fn clear_sessions(storage: &dyn vykar_storage::StorageBackend, out: &mut Output) -> CliResult<()> {
+fn clear_sessions(
+    storage: &dyn vykar_storage::StorageBackend,
+    yes: bool,
+    out: &mut Output,
+) -> CliResult<()> {
     let entries = lock::list_session_entries(storage)?;
 
     if entries.is_empty() {
@@ -100,19 +105,22 @@ fn clear_sessions(storage: &dyn vykar_storage::StorageBackend, out: &mut Output)
     eprintln!();
     eprintln!("WARNING: Removing sessions may interrupt live backups on other machines.");
 
-    if !out.interactive() {
-        return Err(CliError::from(
-            "refusing to remove sessions without confirmation in non-interactive mode",
-        ));
-    }
+    if !yes {
+        if !out.interactive() {
+            return Err(CliError::from(
+                "refusing to remove sessions without confirmation in non-interactive mode; \
+                 use --yes to skip the prompt",
+            ));
+        }
 
-    eprint!("Remove all sessions? [y/N]: ");
-    std::io::stderr().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if !input.trim().eq_ignore_ascii_case("y") {
-        eprintln!("Aborted.");
-        return Ok(());
+        eprint!("Remove all sessions? [y/N]: ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
     }
 
     let removed = lock::clear_all_sessions(storage)?;

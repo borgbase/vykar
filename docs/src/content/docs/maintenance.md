@@ -136,6 +136,9 @@ vykar break-lock
 
 # Also remove session markers left by crashed backups
 vykar break-lock --sessions
+
+# Non-interactive (for scripting)
+vykar break-lock --sessions --yes
 ```
 
 `--sessions` also removes the markers of backups that are committing, and of compacts, prunes and deletes that are running, without the lock right now (encrypted repositories on storage with put-if-absent): run it only when no backup or maintenance command is running.

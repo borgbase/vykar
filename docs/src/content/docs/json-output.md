@@ -14,7 +14,7 @@ The flag is global, so `vykar --json list` and `vykar list --json` are the same.
 
 - stdout holds exactly one compact JSON document on one line, also when the command fails. Pipe it through `jq` to read it indented.
 - The [exit codes](/commands#exit-codes) are unchanged, and the document's `status` matches them.
-- Sizes and counts are plain integers in bytes and items. Times are RFC 3339 in UTC (`2026-01-15T14:30:00.123456789Z`). Paths are arrays of strings. A missing value is `null`, never `"-"` or `""`.
+- Sizes and counts are plain integers in bytes and items. Times are RFC 3339 in UTC (`2026-01-15T14:30:00.123456789Z`). A single path is a string and a list of paths is an array of strings. A missing value is `null`, never `"-"` or `""`.
 - A command never prompts. Commands that ask for confirmation need their `--yes` flag (`--yes-delete-this-repo` for `delete`), and `config` needs `--dest`. Set `VYKAR_PASSPHRASE` or `passcommand` for encrypted repositories.
 - stderr carries progress, warnings and error text as before. It is meant for people and logs, not for parsing.
 - `version` changes only for a change that breaks existing consumers. New fields can appear at any time, so ignore fields you do not know.

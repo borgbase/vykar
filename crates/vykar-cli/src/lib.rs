@@ -492,17 +492,17 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], out: &mut Output) -> ExitCo
         }
     }
 
-    if signal::SHUTDOWN.load(Ordering::SeqCst) {
+    let status = if signal::SHUTDOWN.load(Ordering::SeqCst) {
         eprintln!("Interrupted");
-        return ExitCode::from(EXIT_INTERRUPTED);
-    }
-    if had_error {
-        return ExitCode::from(EXIT_ERROR);
-    }
-    if had_partial {
-        return ExitCode::from(EXIT_PARTIAL);
-    }
-    ExitCode::SUCCESS
+        Status::Interrupted
+    } else if had_error {
+        Status::Error
+    } else if had_partial {
+        Status::Partial
+    } else {
+        Status::Ok
+    };
+    status.exit_code()
 }
 
 /// Run `action` inside the repo-level hooks for `command`. The CLI error is

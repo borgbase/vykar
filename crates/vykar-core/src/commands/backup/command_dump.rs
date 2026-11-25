@@ -18,10 +18,8 @@ use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::{
-    BackupProgressEvent, ListingWriter, emit_progress, emit_stats_progress,
-    with_rollback_checkpoint,
-};
+use super::commit::{FileKind, FileOutcome, finish_file, start_file};
+use super::{BackupProgressEvent, ListingWriter, emit_stats_progress, with_rollback_checkpoint};
 
 /// Default timeout for command_dump execution (1 hour).
 pub(super) const COMMAND_DUMP_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -289,12 +287,8 @@ pub(super) fn process_command_dumps(
             "executing command dump (streaming)"
         );
 
-        emit_progress(
-            progress,
-            BackupProgressEvent::FileStarted {
-                path: format!("vykar-dumps/{}", dump.name),
-            },
-        );
+        let path = format!("vykar-dumps/{}", dump.name);
+        let dedup_before = start_file(progress, stats, &path);
 
         let (chunk_refs, total_size) = stream_dump_command(
             repo,
@@ -306,10 +300,8 @@ pub(super) fn process_command_dumps(
             progress,
         )?;
 
-        stats.nfiles += 1;
-
         let dump_item = Item {
-            path: format!("vykar-dumps/{}", dump.name),
+            path,
             entry_type: ItemType::RegularFile,
             mode: 0o644,
             uid: 0,
@@ -326,9 +318,22 @@ pub(super) fn process_command_dumps(
             raw_names: None,
             hardlink: None,
         };
-        dump_items.push(dump_item);
-
-        emit_stats_progress(progress, stats, Some(format!("vykar-dumps/{}", dump.name)));
+        // `verbose` is unused for a dump (no FileProcessed event).
+        finish_file(
+            repo,
+            ws,
+            stats,
+            listing,
+            progress,
+            false,
+            FileOutcome {
+                item: dump_item,
+                dedup_before,
+                kind: FileKind::Dump {
+                    items: &mut dump_items,
+                },
+            },
+        )?;
     }
 
     // Name order within vykar-dumps/ (06 order 1); dumps still run in config

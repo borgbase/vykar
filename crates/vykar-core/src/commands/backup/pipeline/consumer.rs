@@ -4,25 +4,24 @@
 //! `ProcessedEntry` has been restored to walk-order. For each entry this
 //! commits pack-bound chunks via `process_worker_chunks`, advances the
 //! segmented-file state machine (delegating to [`super::segmentation`]),
-//! updates stats / file-cache, appends the entry to the listing, and
-//! surfaces progress events.
+//! and hands each finished file to the per-file epilogue
+//! (`commit::finish_file`), which updates stats / file-cache, appends the
+//! entry to the listing and surfaces progress events.
 //! Releases budget bytes once chunks are committed so the walker can
 //! proceed. Skip / rollback handling lives in the orchestrator, not here.
 
-use tracing::debug;
-
 use crate::index::table::DedupPrefilter;
-use crate::repo::file_cache::{CachedChunks, FileCache};
+use crate::repo::file_cache::FileCache;
 use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use vykar_types::error::{Result, VykarError};
 
-use super::super::commit::{commit_cache_hit, process_worker_chunks};
-use super::super::concurrency::ByteBudget;
-use super::super::{
-    BackupProgressEvent, FileStatus, ListingWriter, emit_progress, emit_stats_progress,
-    stamp_item_metadata,
+use super::super::commit::{
+    FileCaches, FileKind, FileOutcome, commit_cache_hit, finish_file, process_worker_chunks,
+    start_file,
 };
+use super::super::concurrency::ByteBudget;
+use super::super::{BackupProgressEvent, ListingWriter, emit_progress, emit_stats_progress};
 use super::ProcessedEntry;
 use super::segmentation::{LargeFileAccum, validate_segment_accum};
 
@@ -50,53 +49,33 @@ pub(super) fn consume_processed_entry(
             chunks,
             acquired_bytes,
         } => {
-            if let Some(cb) = progress.as_deref_mut() {
-                cb(BackupProgressEvent::FileStarted {
-                    path: item.path.clone(),
-                });
-            }
-
-            let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
+            let dedup_before = start_file(progress, stats, &item.path);
 
             process_worker_chunks(repo, ws, &mut item, chunks, stats, prefilter)?;
 
             // Release budget bytes now that chunks are committed.
             budget.release(acquired_bytes);
 
-            stats.nfiles += 1;
-
-            stamp_item_metadata(&mut item, &pre_meta);
-
-            if verbose {
-                let added_bytes = stats.deduplicated_size - dedup_before;
-                let status = if old_file_cache.contains(&abs_path) {
-                    FileStatus::Modified
-                } else {
-                    FileStatus::New
-                };
-                emit_progress(
-                    progress,
-                    BackupProgressEvent::FileProcessed {
-                        path: item.path.clone(),
-                        status,
-                        added_bytes,
+            finish_file(
+                repo,
+                ws,
+                stats,
+                listing,
+                progress,
+                verbose,
+                FileOutcome {
+                    item,
+                    dedup_before,
+                    kind: FileKind::Read {
+                        abs_path: &abs_path,
+                        pre_meta,
+                        caches: FileCaches {
+                            old: old_file_cache,
+                            new: new_file_cache,
+                        },
                     },
-                );
-            }
-
-            listing.push(repo, ws, &item)?;
-
-            new_file_cache.insert(
-                &abs_path,
-                pre_meta.device,
-                pre_meta.inode,
-                pre_meta.mtime_ns,
-                pre_meta.ctime_ns,
-                pre_meta.size,
-                CachedChunks::from_chunk_refs(&item.chunks),
-            );
-
-            emit_stats_progress(progress, stats, Some(std::mem::take(&mut item.path)));
+                },
+            )?;
         }
 
         ProcessedEntry::FileSegment {
@@ -108,19 +87,10 @@ pub(super) fn consume_processed_entry(
             segment_index,
             num_segments,
         } => {
-            // For segment 0, fire progress event before validation consumes `item`.
-            if segment_index == 0
-                && let (Some(cb), Some(it)) = (progress.as_deref_mut(), item.as_ref())
-            {
-                cb(BackupProgressEvent::FileStarted {
-                    path: it.path.clone(),
-                });
-            }
-
-            let dedup_baseline = if verbose && segment_index == 0 {
-                stats.deduplicated_size
-            } else {
-                0
+            // Segment 0 announces the file before validation consumes `item`.
+            let dedup_baseline = match (segment_index, item.as_ref()) {
+                (0, Some(it)) => start_file(progress, stats, &it.path),
+                _ => 0,
             };
 
             validate_segment_accum(
@@ -149,51 +119,37 @@ pub(super) fn consume_processed_entry(
 
             if segment_index == num_segments - 1 {
                 // Last segment: finalize.
-                let mut accum = large_file_accum.take().ok_or_else(|| {
+                let accum = large_file_accum.take().ok_or_else(|| {
                     VykarError::Other(
                         "BUG: large_file_accum missing at segment finalization".into(),
                     )
                 })?;
-                stats.nfiles += 1;
 
                 // Commit the checkpoint — all segments landed successfully.
                 ws.commit_rollback_checkpoint();
 
                 // Segment 0's pre_meta is canonical: it matches the chunks
                 // committed across all segments.
-                let canon = accum.metadata;
-                stamp_item_metadata(&mut accum.item, &canon);
-
-                if verbose {
-                    let added_bytes = stats.deduplicated_size - accum.dedup_baseline;
-                    let status = if old_file_cache.contains(&accum.abs_path) {
-                        FileStatus::Modified
-                    } else {
-                        FileStatus::New
-                    };
-                    emit_progress(
-                        progress,
-                        BackupProgressEvent::FileProcessed {
-                            path: accum.item.path.clone(),
-                            status,
-                            added_bytes,
+                finish_file(
+                    repo,
+                    ws,
+                    stats,
+                    listing,
+                    progress,
+                    verbose,
+                    FileOutcome {
+                        item: accum.item,
+                        dedup_before: accum.dedup_baseline,
+                        kind: FileKind::Read {
+                            abs_path: &accum.abs_path,
+                            pre_meta: accum.metadata,
+                            caches: FileCaches {
+                                old: old_file_cache,
+                                new: new_file_cache,
+                            },
                         },
-                    );
-                }
-
-                listing.push(repo, ws, &accum.item)?;
-
-                new_file_cache.insert(
-                    &accum.abs_path,
-                    canon.device,
-                    canon.inode,
-                    canon.mtime_ns,
-                    canon.ctime_ns,
-                    canon.size,
-                    CachedChunks::from_chunk_refs(&accum.item.chunks),
-                );
-
-                emit_stats_progress(progress, stats, Some(std::mem::take(&mut accum.item.path)));
+                    },
+                )?;
             }
         }
 
@@ -204,40 +160,32 @@ pub(super) fn consume_processed_entry(
             cached_refs,
             retained,
         } => {
-            if let Some(cb) = progress.as_deref_mut() {
-                cb(BackupProgressEvent::FileStarted {
-                    path: item.path.clone(),
-                });
-            }
+            let dedup_before = start_file(progress, stats, &item.path);
 
             commit_cache_hit(repo, ws, &mut item, &cached_refs, stats)?;
 
-            if verbose {
-                emit_progress(
-                    progress,
-                    BackupProgressEvent::FileProcessed {
-                        path: item.path.clone(),
-                        status: FileStatus::Unchanged,
-                        added_bytes: 0,
+            finish_file(
+                repo,
+                ws,
+                stats,
+                listing,
+                progress,
+                verbose,
+                FileOutcome {
+                    item,
+                    dedup_before,
+                    kind: FileKind::CacheHit {
+                        abs_path: &abs_path,
+                        metadata,
+                        cached_refs,
+                        retained,
+                        caches: FileCaches {
+                            old: old_file_cache,
+                            new: new_file_cache,
+                        },
                     },
-                );
-            }
-
-            listing.push(repo, ws, &item)?;
-
-            new_file_cache.insert_cache_hit(
-                &abs_path,
-                retained,
-                metadata.device,
-                metadata.inode,
-                metadata.mtime_ns,
-                metadata.ctime_ns,
-                metadata.size,
-                cached_refs,
-            );
-
-            debug!(path = %item.path, "file cache hit (parallel)");
-            emit_stats_progress(progress, stats, Some(std::mem::take(&mut item.path)));
+                },
+            )?;
         }
 
         ProcessedEntry::NonFile { item } => {

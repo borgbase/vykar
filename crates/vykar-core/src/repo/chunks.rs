@@ -4,10 +4,9 @@ use std::time::Instant;
 
 use super::Repo;
 use super::format::{ObjectType, pack_object_with_context};
-use super::pack::{PackType, SealedPack, compute_data_pack_target};
+use super::pack::{ClosedPack, PackType, compute_data_pack_target};
 use super::write_session::{WriteSession, duration_nanos};
 use crate::compress;
-use crate::index::PendingChunkEntry;
 use crate::index::table::DedupPrefilter;
 use crate::snapshot::item::ChunkRef;
 use vykar_types::chunk_id::ChunkId;
@@ -424,13 +423,14 @@ impl WriteSession {
         Ok(stored_size)
     }
 
-    /// Seal a pack writer and upload in the background.
-    /// The index is updated immediately; the upload proceeds in a separate thread.
+    /// Close a pack writer and upload the pack in the background.
     ///
-    /// The `SealedPack` is destructured: `entries` consumed on the main thread
-    /// for index updates, `data` (the heap buffer, or the staged temp file
-    /// whose fsync + rename is the upload) moved into the upload thread.
-    /// `pack_id` is `Copy` so it's used in both places.
+    /// The pack's chunks become dedup hits at once (`session_new`); their
+    /// index entries, the pack's trailer length and its journal entry follow
+    /// once its upload is confirmed. The upload thread finishes the pack
+    /// (encrypts and appends its trailer, computes its ID) and stores it:
+    /// the heap buffer, or the staged temp file whose fsync + rename is the
+    /// upload.
     pub(super) fn flush_writer_async(&mut self, repo: &Repo, pack_type: PackType) -> Result<()> {
         // Keep upload fan-out bounded to avoid excessive memory/thread pressure.
         let incoming = match pack_type {
@@ -441,17 +441,17 @@ impl WriteSession {
         self.cap_pending_uploads(&repo.storage, &repo.crypto, incoming)?;
         let cap_wait = cap_start.elapsed();
 
-        let crypto = Arc::clone(&repo.crypto);
+        let encrypting = repo.crypto.is_encrypting();
         let ws = &mut *self;
         let seal_start = Instant::now();
-        let SealedPack {
-            pack_id,
+        let ClosedPack {
             entries,
-            data,
             len: pack_bytes,
+            trailer_len,
+            tail,
         } = match pack_type {
-            PackType::Data => ws.data_pack_writer.seal(crypto.as_ref())?,
-            PackType::Tree => ws.tree_pack_writer.seal(crypto.as_ref())?,
+            PackType::Data => ws.data_pack_writer.close(encrypting)?,
+            PackType::Tree => ws.tree_pack_writer.close(encrypting)?,
         };
         let seal_time = seal_start.elapsed();
 
@@ -481,38 +481,33 @@ impl WriteSession {
             ws.data_pack_writer.set_target_size(new_target);
         }
 
-        // Record journal entries before apply_sealed_entries consumes them.
-        let journal_chunks: Vec<PendingChunkEntry> = entries
-            .iter()
-            .map(|&(chunk_id, stored_size, offset)| PendingChunkEntry {
-                chunk_id,
-                stored_size,
-                pack_offset: offset,
-            })
-            .collect();
-        // The journal entry itself waits for the upload to be confirmed.
+        self.record_closed(&entries);
 
-        // The trailer length follows from the blob count and whether this
-        // repository's engine encrypts.
-        self.apply_sealed_entries(pack_id, entries, repo.crypto.is_encrypting());
-
-        let bytes = data.capacity();
+        let bytes = tail.heap_bytes();
+        let crypto = Arc::clone(&repo.crypto);
         let storage = Arc::clone(&repo.storage);
-        let key = pack_id.storage_key();
         let put_nanos = Arc::clone(&self.metrics.upload_put_nanos);
+        let seal_nanos = Arc::clone(&self.metrics.upload_seal_nanos);
         let existing = self.existing_packs.clone();
-        self.spawn_upload(pack_id, journal_chunks, bytes, move |held| {
+        self.submit_upload(entries, trailer_len, bytes, move |held| {
+            let (pack_id, data) = {
+                let _span = tracing::debug_span!("pack_seal").entered();
+                let start = Instant::now();
+                let finished = tail.finish(&*crypto);
+                seal_nanos.fetch_add(duration_nanos(start.elapsed()), Ordering::Relaxed);
+                finished?
+            };
+            let key = pack_id.storage_key();
             let _span = tracing::debug_span!("pack_upload").entered();
             let start = Instant::now();
             let result = data.put_to(&*storage, &key, move || held.release());
             put_nanos.fetch_add(duration_nanos(start.elapsed()), Ordering::Relaxed);
-            match (result, existing) {
+            let result = match (result, existing) {
                 (Err(e), Some(existing)) => existing.settle_refused(&*storage, &key, pack_bytes, e),
                 (result, _) => result,
-            }
-        });
-
-        Ok(())
+            };
+            result.map(|()| pack_id)
+        })
     }
 
     /// Flush all pending pack writes and wait for background uploads.

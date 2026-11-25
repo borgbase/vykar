@@ -1037,12 +1037,16 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
         .file("x.bin", chunk_x)
         .file("y.bin", chunk_y);
     sim.backup(a, "keep", &tree("keep")).expect_ok();
-    // B1 loads the index, then is held before its first pack.
+    // B1 loads the index, then is held before its packs. Its data pack
+    // (P') and its tree pack upload on separate threads, in either order:
+    // hold both, so P' is written after the wait whichever comes first.
     let upload = sim.gate(GateRule::new(
         b,
         OpMatch::AnyWrite,
         KeyMatch::Prefix("packs/".into()),
     ));
+    let upload_2 =
+        sim.gate(GateRule::new(b, OpMatch::AnyWrite, KeyMatch::Prefix("packs/".into())).nth(2));
     let s1 = sim.spawn(
         b,
         Call::Backup {
@@ -1068,7 +1072,9 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
         )
         .client(b),
     );
+    sim.expect_paused(upload_2, "b1 before its second upload");
     sim.resume(upload);
+    sim.resume(upload_2);
     let r1 = sim.join(s1);
     expect_class(&r1, AllowedError::Injected);
     assert_eq!(

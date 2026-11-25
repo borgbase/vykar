@@ -208,10 +208,10 @@ impl WriteSession {
             warn!("flush_on_abort: failed to seal tree pack: {e}");
         }
 
-        // Join all in-flight upload threads so packs land on storage.
+        // Wait for every queued upload so packs land on storage.
         for upload in self.uploads.take_all() {
             if let Err(e) = self.finish_upload(upload) {
-                warn!("flush_on_abort: upload thread failed: {e}");
+                warn!("flush_on_abort: upload failed: {e}");
             }
         }
 
@@ -461,8 +461,7 @@ mod tests {
         )
         .unwrap();
         ws.flush_writer_async(&repo, PackType::Data).unwrap();
-        let pack_id = ws.uploads.pending()[0].pack_id;
-        while !ws.uploads.pending()[0].handle.is_finished() {
+        while !ws.uploads.pending()[0].is_finished() {
             std::thread::yield_now();
         }
 
@@ -470,13 +469,9 @@ mod tests {
             .unwrap();
 
         assert!(ws.uploads.is_empty());
-        assert!(
-            ws.journal
-                .entries
-                .to_wire()
-                .iter()
-                .any(|e| e.pack_id == pack_id)
-        );
+        let journaled = journal_pack_ids(&ws);
+        assert_eq!(journaled.len(), 1);
+        assert!(repo.storage.exists(&journaled[0].storage_key()).unwrap());
         drop(ws);
     }
 
@@ -498,7 +493,11 @@ mod tests {
         let m = ws.write_metrics();
         assert_eq!(m.data_packs, 1, "first and second share the pack");
         assert_eq!(m.tree_packs, 1);
-        assert!(m.seal > std::time::Duration::ZERO || m.upload_put > std::time::Duration::ZERO);
+        assert!(
+            m.seal > std::time::Duration::ZERO
+                || m.upload_put > std::time::Duration::ZERO
+                || m.upload_seal > std::time::Duration::ZERO
+        );
 
         let stored: u64 = repo
             .storage
@@ -508,6 +507,201 @@ mod tests {
             .map(|key| repo.storage.get(key).unwrap().unwrap().len() as u64)
             .sum();
         assert_eq!(m.data_pack_bytes + m.tree_pack_bytes, stored);
+        drop(ws);
+    }
+
+    /// The packs of the session's journal, in journal order.
+    fn journal_pack_ids(ws: &crate::repo::WriteSession) -> Vec<vykar_types::pack_id::PackId> {
+        ws.journal
+            .entries
+            .to_wire()
+            .iter()
+            .map(|e| e.pack_id)
+            .collect()
+    }
+
+    /// A fresh repository on a memory backend, plaintext or encrypting, with
+    /// a write session begun over it.
+    fn repo_with_session(
+        mode: crate::repo::EncryptionMode,
+    ) -> (crate::repo::Repo, crate::repo::WriteSession) {
+        crate::testutil::init_test_environment();
+        let passphrase = match mode {
+            crate::repo::EncryptionMode::None => None,
+            _ => Some("test-pass"),
+        };
+        let repo = crate::repo::Repo::init(
+            Box::new(crate::testutil::MemoryBackend::new()),
+            mode,
+            crate::repo::ChunkerParams::default(),
+            passphrase,
+            None,
+            None,
+        )
+        .expect("init");
+        let ws = repo.begin_write_session(&WriteSessionOptions::default());
+        (repo, ws)
+    }
+
+    /// A closed pack's chunks are dedup hits at once, but its index entries
+    /// and trailer length wait for the upload: then they name the pack the
+    /// upload thread stored, under the ID of its bytes.
+    #[test]
+    fn sealed_pack_enters_the_delta_when_confirmed() {
+        use crate::compress::Compression;
+        use crate::repo::EncryptionMode;
+        use crate::repo::pack::PackType;
+        use vykar_types::pack_id::PackId;
+
+        for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
+            let (mut repo, mut ws) = repo_with_session(mode);
+            let (gated, tx) = crate::testutil::PackUploadBackend::gated(Arc::clone(&repo.storage));
+            repo.storage = Arc::new(gated);
+
+            let (chunk_id, _, is_new) = ws
+                .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
+                .unwrap();
+            assert!(is_new);
+            ws.flush_writer_async(&repo, PackType::Data).unwrap();
+            assert!(!ws.uploads.pending()[0].is_finished(), "upload is gated");
+
+            let (_, _, is_new) = ws
+                .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
+                .unwrap();
+            assert!(!is_new, "a closed pack's chunk is a dedup hit");
+            let delta = ws.index_delta.as_ref().unwrap();
+            assert!(!delta.new_entries.iter().any(|e| e.chunk_id == chunk_id));
+            assert!(ws.pack_trailers.is_empty());
+
+            tx.send(()).unwrap();
+            ws.flush_packs(&repo).unwrap();
+            let journaled = journal_pack_ids(&ws);
+            assert_eq!(journaled.len(), 1);
+            let pack_id = journaled[0];
+            let delta = ws.index_delta.as_ref().unwrap();
+            let entries: Vec<_> = delta
+                .new_entries
+                .iter()
+                .filter(|e| e.chunk_id == chunk_id)
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].pack_id, pack_id);
+            assert_eq!(
+                ws.pack_trailers.get(&pack_id).copied(),
+                Some(crate::repo::pack_trailer::trailer_frame_len(
+                    1,
+                    repo.crypto.is_encrypting()
+                ))
+            );
+            let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
+            assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
+            drop(ws);
+        }
+    }
+
+    /// Fails every pack upload.
+    struct FailPacks(Arc<dyn StorageBackend>);
+
+    impl InnerBackend for FailPacks {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.0
+        }
+    }
+
+    delegate_storage_backend! {
+        for FailPacks;
+        except [put, put_owned, put_pack, begin_staged_put, conditional, profile];
+
+        // Test wrapper: keeps every write on the intercepted paths.
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
+
+        fn begin_staged_put(
+            &self,
+            _prefix: &str,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            Ok(None)
+        }
+
+        fn profile(&self) -> BackendProfile {
+            BackendProfile {
+                staged_put: false,
+                ..self.0.profile()
+            }
+        }
+
+        fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+            if key.starts_with("packs/") {
+                return Err(vykar_types::error::VykarError::Other("injected pack failure".into()));
+            }
+            self.0.put(key, data)
+        }
+
+        fn put_owned(&self, key: &str, data: Vec<u8>) -> vykar_types::error::Result<()> {
+            if key.starts_with("packs/") {
+                return Err(vykar_types::error::VykarError::Other("injected pack failure".into()));
+            }
+            self.0.put_owned(key, data)
+        }
+
+        fn put_pack(
+            &self,
+            key: &str,
+            data: vykar_storage::PackData,
+        ) -> vykar_types::error::Result<()> {
+            if key.starts_with("packs/") {
+                return Err(vykar_types::error::VykarError::Other("injected pack failure".into()));
+            }
+            self.0.put_pack(key, data)
+        }
+    }
+
+    /// A failed upload leaves nothing of its pack in the delta, the trailer
+    /// lengths or the journal.
+    #[test]
+    fn failed_upload_never_enters_the_delta() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        repo.storage = Arc::new(FailPacks(Arc::clone(&repo.storage)));
+        let (chunk_id, _, _) = ws
+            .store_chunk(&repo, b"lost chunk", Compression::None, PackType::Data)
+            .unwrap();
+        assert!(ws.flush_packs(&repo).is_err());
+
+        let delta = ws.index_delta.as_ref().unwrap();
+        assert!(!delta.new_entries.iter().any(|e| e.chunk_id == chunk_id));
+        assert!(ws.pack_trailers.is_empty());
+        assert!(ws.journal.entries.is_empty());
+        drop(ws);
+    }
+
+    /// Many packs reuse the same few upload threads.
+    #[test]
+    fn many_packs_keep_the_upload_threads_flat() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+        use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
+
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        for i in 0..200u32 {
+            ws.store_chunk(
+                &repo,
+                format!("chunk {i}").as_bytes(),
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+            ws.flush_writer_async(&repo, PackType::Data).unwrap();
+        }
+        ws.flush_packs(&repo).unwrap();
+        assert!(
+            ws.uploads.worker_count() <= ws.uploads.max_in_flight_uploads + UPLOAD_QUEUE_HEADROOM
+        );
+        assert_eq!(ws.journal.entries.len(), 200);
+        assert_eq!(ws.write_metrics().data_packs, 200);
         drop(ws);
     }
 
@@ -538,7 +732,8 @@ mod tests {
         );
         ws.stream_data_packs = true;
 
-        ws.store_chunk(&repo, b"streamed chunk", Compression::None, PackType::Data)
+        let (data_chunk, _, _) = ws
+            .store_chunk(&repo, b"streamed chunk", Compression::None, PackType::Data)
             .unwrap();
         ws.store_chunk(&repo, b"tree chunk", Compression::None, PackType::Tree)
             .unwrap();
@@ -549,25 +744,25 @@ mod tests {
         assert_eq!(staging_files(dir.path()).len(), 1, "data pack is staged");
 
         ws.flush_writer_async(&repo, PackType::Data).unwrap();
-        let (pack_id, bytes) = {
-            (
-                ws.uploads.pending()[0].pack_id,
-                ws.uploads.pending()[0].bytes,
-            )
-        };
-        assert_eq!(bytes, 0, "a staged pack counts no heap bytes");
+        assert_eq!(
+            ws.uploads.pending()[0].bytes,
+            0,
+            "a staged pack counts no heap bytes"
+        );
 
         ws.flush_packs(&repo).unwrap();
         assert!(staging_files(dir.path()).is_empty());
+        // The data pack is the journal entry holding the streamed chunk.
+        let pack_id = ws
+            .journal
+            .entries
+            .to_wire()
+            .iter()
+            .find(|e| e.chunks.iter().any(|c| c.chunk_id == data_chunk))
+            .expect("the data pack is journaled")
+            .pack_id;
         let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
         assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
-        assert!(
-            ws.journal
-                .entries
-                .to_wire()
-                .iter()
-                .any(|e| e.pack_id == pack_id)
-        );
         drop(ws);
     }
 
@@ -645,22 +840,20 @@ mod tests {
         released_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let pack_id = {
+        {
             let upload = &ws.uploads.pending()[0];
             assert!(upload.bytes > 0);
-            assert!(!upload.handle.is_finished());
+            assert!(!upload.is_finished());
             assert_eq!(upload.held_bytes(), 0);
-            upload.pack_id
-        };
+        }
 
         gate_tx.send(()).unwrap();
         ws.flush_packs(&repo).unwrap();
-        assert!(
-            ws.journal
-                .entries
-                .to_wire()
-                .iter()
-                .any(|e| e.pack_id == pack_id)
+        let journaled = journal_pack_ids(&ws);
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(
+            repo.storage.list("packs/").unwrap(),
+            vec![journaled[0].storage_key()]
         );
         drop(ws);
     }
@@ -713,28 +906,17 @@ mod tests {
             )
             .unwrap();
         ws.flush_writer_async(&repo, PackType::Data).unwrap();
-        let pack_id = {
-            assert_eq!(ws.uploads.len(), 1);
-            assert!(
-                !ws.uploads.pending()[0].handle.is_finished(),
-                "upload is gated"
-            );
-            ws.uploads.pending()[0].pack_id
-        };
+        assert_eq!(ws.uploads.len(), 1);
+        assert!(!ws.uploads.pending()[0].is_finished(), "upload is gated");
 
         ws.drop_file_reuse();
         tx.send(()).unwrap();
         ws.flush_packs(&repo).unwrap();
 
         assert!(ws.uploads.is_empty());
-        assert!(
-            ws.journal
-                .entries
-                .to_wire()
-                .iter()
-                .any(|e| e.pack_id == pack_id),
-            "a skipped file's pack is journaled"
-        );
+        let journaled = journal_pack_ids(&ws);
+        assert_eq!(journaled.len(), 1, "a skipped file's pack is journaled");
+        let pack_id = journaled[0];
         ws.flush_on_abort(&repo);
         assert!(repo.storage.exists("sessions/default.index").unwrap());
 

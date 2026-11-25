@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use crate::index::hasher::ChunkIdHashMap;
 use crate::index::table::{IndexState, IndexView};
-use crate::index::{IndexDelta, LiveIndex, PendingChunkEntry, RecoveredChunkEntry};
+use crate::index::{
+    IndexDelta, LiveIndex, PendingChunkEntry, PendingIndexJournal, RecoveredChunkEntry,
+};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
@@ -17,18 +19,22 @@ use super::host_env::Clock;
 use super::journal_recovery::{self, PendingIndexRecovery, RecoveryTarget};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 use super::session_journal::SessionJournal;
-use super::upload_queue::{HeldBytes, PendingUpload, UploadQueue};
+use super::upload_queue::{ConfirmedPack, HeldBytes, PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
 
 /// Diagnostic counters of one write session, for the backup's debug summary.
-/// Updated on the thread that seals packs; `upload_put_nanos` by upload threads.
+/// Updated on the thread that seals packs; `upload_put_nanos` and
+/// `upload_seal_nanos` by upload threads.
 #[derive(Debug, Default)]
 pub(crate) struct WriteMetrics {
     pub(crate) counters: WriteMetricsSnapshot,
     /// Sum of `put_to` durations over all upload threads (they overlap, so this
     /// can exceed wall time). Read after the uploads are joined.
     pub(crate) upload_put_nanos: Arc<AtomicU64>,
+    /// Sum of `PackTail::finish` durations over all upload threads (trailer
+    /// encryption and the pack ID hash); overlapping like `upload_put_nanos`.
+    pub(crate) upload_seal_nanos: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,7 +43,8 @@ pub(crate) struct WriteMetricsSnapshot {
     pub(crate) tree_packs: u64,
     pub(crate) data_pack_bytes: u64,
     pub(crate) tree_pack_bytes: u64,
-    /// Time inside `PackWriter::seal` (pack ID hash for heap packs).
+    /// Time the sealing thread spent closing packs (`PackWriter::close`);
+    /// the upload threads build the trailer and the pack ID (`upload_seal`).
     pub(crate) seal: Duration,
     /// Time the sealing thread spent in `cap_pending_uploads` (upload backpressure).
     pub(crate) upload_cap_wait: Duration,
@@ -45,12 +52,15 @@ pub(crate) struct WriteMetricsSnapshot {
     pub(crate) final_upload_wait: Duration,
     /// Filled from `upload_put_nanos` by `snapshot()`.
     pub(crate) upload_put: Duration,
+    /// Filled from `upload_seal_nanos` by `snapshot()`.
+    pub(crate) upload_seal: Duration,
 }
 
 impl WriteMetrics {
     pub(crate) fn snapshot(&self) -> WriteMetricsSnapshot {
         WriteMetricsSnapshot {
             upload_put: Duration::from_nanos(self.upload_put_nanos.load(Ordering::Relaxed)),
+            upload_seal: Duration::from_nanos(self.upload_seal_nanos.load(Ordering::Relaxed)),
             ..self.counters
         }
     }
@@ -76,8 +86,9 @@ pub struct WriteSession {
     pub(crate) data_pack_writer: PackWriter,
     /// Pack writer for item-stream metadata chunks.
     pub(crate) tree_pack_writer: PackWriter,
-    /// Background pack uploads; a pack enters `journal` only after its
-    /// upload returns `Ok`.
+    /// Pack uploads, run on a fixed pool of upload threads; a pack enters
+    /// `journal`, `index_delta` and `pack_trailers` only after its upload
+    /// returns `Ok`.
     pub(crate) uploads: UploadQueue,
     /// Stream data packs into the backend's staging area as they fill
     /// instead of buffering them on the heap, when the backend supports it
@@ -89,7 +100,8 @@ pub struct WriteSession {
     /// (then every lookup goes through the live index by key). Immutable for
     /// the session.
     pub(crate) view: Option<SessionView>,
-    /// `trailer_len` of every pack this session sealed or recovered.
+    /// `trailer_len` of every pack whose upload this session confirmed, or
+    /// that it recovered.
     pub(crate) pack_trailers: StdHashMap<PackId, u32>,
     /// Chunks sealed or promoted in this session -> stored size.
     pub(crate) session_new: ChunkIdHashMap<u32>,
@@ -177,37 +189,49 @@ impl WriteSession {
             || self.journal.needs_write()
     }
 
-    /// Run `upload` on a background thread and queue it for joining.
-    /// `bytes` is the heap the upload holds until it releases it or returns.
-    pub(crate) fn spawn_upload<F>(
+    /// Queue `upload` for an upload thread; it returns the ID of the pack
+    /// it stored, whose `entries` and `trailer_len` are recorded once it is
+    /// confirmed. `bytes` is the heap the upload holds until it releases it
+    /// or returns. Err only when an upload thread cannot be started.
+    pub(crate) fn submit_upload<F>(
         &mut self,
-        pack_id: PackId,
-        journal_chunks: Vec<PendingChunkEntry>,
+        entries: Vec<PackedChunkEntry>,
+        trailer_len: u32,
         bytes: usize,
         upload: F,
-    ) where
-        F: FnOnce(HeldBytes) -> Result<()> + Send + 'static,
+    ) -> Result<()>
+    where
+        F: FnOnce(HeldBytes) -> Result<PackId> + Send + 'static,
     {
-        self.uploads.spawn(pack_id, journal_chunks, bytes, upload);
+        self.uploads.submit(entries, trailer_len, bytes, upload)
     }
 
-    /// Join one upload and journal its pack if it succeeded. A failed
+    /// Join one upload and record its pack if it succeeded. A failed
     /// upload is never journaled.
     pub(crate) fn finish_upload(&mut self, upload: PendingUpload) -> Result<()> {
-        let (pack_id, chunks) = UploadQueue::finish(upload)?;
-        self.journal.entries.record_pack(pack_id, chunks);
+        let confirmed = UploadQueue::finish(upload)?;
+        record_confirmed(
+            &mut self.journal.entries,
+            &mut self.pack_trailers,
+            &mut self.index_delta,
+            confirmed,
+        );
         Ok(())
     }
 
-    /// Join all finished upload threads, propagating the first error.
+    /// Join all finished uploads, propagating the first error.
     pub(crate) fn drain_finished_uploads(
         &mut self,
         storage: &Arc<dyn StorageBackend>,
         crypto: &Arc<dyn CryptoEngine>,
     ) -> Result<()> {
-        let journal = &mut self.journal.entries;
+        let (journal, trailers, delta) = (
+            &mut self.journal.entries,
+            &mut self.pack_trailers,
+            &mut self.index_delta,
+        );
         self.uploads
-            .drain_finished(|id, chunks| journal.record_pack(id, chunks))?;
+            .drain_finished(|c| record_confirmed(journal, trailers, delta, c))?;
         self.maybe_write_pending_index(storage, crypto);
         Ok(())
     }
@@ -250,10 +274,14 @@ impl WriteSession {
     /// Join every queued upload (journaling the successful ones) and any
     /// background journal write; the first upload error, if any.
     fn join_all_uploads(&mut self) -> Result<()> {
-        let journal = &mut self.journal.entries;
+        let (journal, trailers, delta) = (
+            &mut self.journal.entries,
+            &mut self.pack_trailers,
+            &mut self.index_delta,
+        );
         let result = self
             .uploads
-            .join_all(|id, chunks| journal.record_pack(id, chunks));
+            .join_all(|c| record_confirmed(journal, trailers, delta, c));
         self.join_journal_write();
         result
     }
@@ -268,19 +296,26 @@ impl WriteSession {
         incoming: usize,
     ) -> Result<()> {
         self.drain_finished_uploads(storage, crypto)?;
-        let journal = &mut self.journal.entries;
+        let (journal, trailers, delta) = (
+            &mut self.journal.entries,
+            &mut self.pack_trailers,
+            &mut self.index_delta,
+        );
         if self
             .uploads
-            .wait_below_count_cap(|id, chunks| journal.record_pack(id, chunks))?
+            .wait_below_count_cap(|c| record_confirmed(journal, trailers, delta, c))?
         {
             self.maybe_write_pending_index(storage, crypto);
         }
         let cap = self.data_pack_writer.target_size();
-        let journal = &mut self.journal.entries;
-        if self
-            .uploads
-            .wait_below_byte_cap(incoming, cap, |id, chunks| journal.record_pack(id, chunks))?
-        {
+        let (journal, trailers, delta) = (
+            &mut self.journal.entries,
+            &mut self.pack_trailers,
+            &mut self.index_delta,
+        );
+        if self.uploads.wait_below_byte_cap(incoming, cap, |c| {
+            record_confirmed(journal, trailers, delta, c);
+        })? {
             self.maybe_write_pending_index(storage, crypto);
         }
         Ok(())
@@ -320,27 +355,13 @@ impl WriteSession {
             .write_best_effort(&self.session_id, storage, crypto);
     }
 
-    // --- Sealed entry dispatch ---
+    // --- Closed and confirmed packs ---
 
-    /// Record the entries of a freshly sealed pack: in `session_new` and
-    /// the session's delta, and its trailer length (`encrypting`: whether
-    /// the repository's engine encrypts, which fixes the trailer's size).
-    /// `entries` holds every blob of the pack: what the trailer lists.
-    pub(crate) fn apply_sealed_entries(
-        &mut self,
-        pack_id: PackId,
-        entries: Vec<PackedChunkEntry>,
-        encrypting: bool,
-    ) {
-        self.pack_trailers.insert(
-            pack_id,
-            crate::repo::pack_trailer::trailer_frame_len(entries.len(), encrypting),
-        );
-        for (chunk_id, stored_size, offset) in entries {
+    /// Make a closed pack's chunks dedup hits at once (`session_new`); its
+    /// index entries wait for the upload (`record_confirmed`).
+    pub(crate) fn record_closed(&mut self, entries: &[PackedChunkEntry]) {
+        for &(chunk_id, stored_size, _) in entries {
             self.session_new.insert(chunk_id, stored_size);
-            if let Some(ref mut delta) = self.index_delta {
-                delta.add_new_entry(chunk_id, stored_size, pack_id, offset);
-            }
         }
     }
 
@@ -407,6 +428,38 @@ impl WriteSession {
         self.data_pack_writer
             .get_pending_stored_size(chunk_id)
             .or_else(|| self.tree_pack_writer.get_pending_stored_size(chunk_id))
+    }
+}
+
+/// A confirmed upload: its pack enters the journal, its chunks the
+/// session's delta and its trailer length `pack_trailers`. A free function
+/// over the three fields, so a caller can hold `&mut self.uploads` at the
+/// same time.
+fn record_confirmed(
+    journal: &mut PendingIndexJournal,
+    pack_trailers: &mut StdHashMap<PackId, u32>,
+    index_delta: &mut Option<IndexDelta>,
+    confirmed: ConfirmedPack,
+) {
+    let ConfirmedPack {
+        pack_id,
+        entries,
+        trailer_len,
+    } = confirmed;
+    let chunks: Vec<PendingChunkEntry> = entries
+        .iter()
+        .map(|&(chunk_id, stored_size, offset)| PendingChunkEntry {
+            chunk_id,
+            stored_size,
+            pack_offset: offset,
+        })
+        .collect();
+    journal.record_pack(pack_id, chunks);
+    pack_trailers.insert(pack_id, trailer_len);
+    if let Some(delta) = index_delta {
+        for (chunk_id, stored_size, offset) in entries {
+            delta.add_new_entry(chunk_id, stored_size, pack_id, offset);
+        }
     }
 }
 
@@ -721,12 +774,23 @@ pub(super) mod tests {
 
     // ── Upload confirmation ──────────────────────────────────────────────
 
+    /// `fake_pack`'s chunks as the entries of a closed pack.
+    fn fake_entries(entry: &PendingPackEntry) -> Vec<PackedChunkEntry> {
+        entry
+            .chunks
+            .iter()
+            .map(|c| (c.chunk_id, c.stored_size, c.pack_offset))
+            .collect()
+    }
+
     fn spawn_upload(ws: &mut WriteSession, storage: &std::sync::Arc<PackUploadBackend>, seed: u8) {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
-        ws.spawn_upload(pack_id, entry.chunks, 0, move |_| {
-            storage.put_owned(&pack_id.storage_key(), data)
-        });
+        ws.submit_upload(fake_entries(&entry), 0, 0, move |_| {
+            storage.put_owned(&pack_id.storage_key(), data)?;
+            Ok(pack_id)
+        })
+        .unwrap();
     }
 
     /// Queue an upload that holds `bytes` and completes only when the
@@ -740,10 +804,12 @@ pub(super) mod tests {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        ws.spawn_upload(pack_id, entry.chunks, bytes, move |_held| {
+        ws.submit_upload(fake_entries(&entry), 0, bytes, move |_held| {
             let _ = gate.recv();
-            storage.put_owned(&pack_id.storage_key(), data)
-        });
+            storage.put_owned(&pack_id.storage_key(), data)?;
+            Ok(pack_id)
+        })
+        .unwrap();
         release
     }
 

@@ -113,6 +113,7 @@ impl BackupInstrumentation {
             upload_cap_wait_ms = ms(w.upload_cap_wait),
             final_upload_wait_ms = ms(w.final_upload_wait),
             upload_put_ms = ms(w.upload_put),
+            upload_seal_ms = ms(w.upload_seal),
             "backup write stats"
         );
     }

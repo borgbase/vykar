@@ -1027,7 +1027,7 @@ pub(crate) fn transfer_width(max_connections: Option<usize>) -> usize {
 }
 
 /// Sealed packs a writer may hold beyond [`BackendProfile::transfer_width`],
-/// each already on its own upload thread, so up to
+/// each already handed to an upload thread, so up to
 /// `transfer_width + UPLOAD_HEADROOM` pack uploads run at once and a sealed
 /// pack is ready the moment a transfer finishes. Consumed by the writer
 /// only; the HTTP part-slot and pool sizes are independent formulas.

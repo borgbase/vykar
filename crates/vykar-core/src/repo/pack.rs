@@ -61,8 +61,10 @@ enum PackBuffer {
     Failed,
 }
 
-/// A sealed pack ready for upload. Destructurable so callers can split ownership
-/// between the main thread (pack_id + entries) and upload thread (data).
+/// A sealed pack ready for upload: named, every byte final. Destructurable,
+/// so a caller can keep `pack_id` and `entries` and hand `data` to whatever
+/// uploads it. The backup instead closes its packs ([`PackWriter::close`])
+/// and lets the upload thread finish them ([`PackTail::finish`]).
 pub struct SealedPack {
     pub pack_id: PackId,
     pub entries: Vec<PackedChunkEntry>,
@@ -80,13 +82,121 @@ pub enum SealedData {
     Staged(Box<dyn StagedPut>),
 }
 
-// Compile-time assertion: SealedData must be Send for thread::spawn upload.
+/// A pack closed for writing (`PackWriter::close`): its blobs, offsets and
+/// exact length are final; its trailer is built but not yet encrypted or
+/// appended, and its ID is not computed. `tail` is `Send` and goes to the
+/// upload thread, which finishes the pack.
+pub struct ClosedPack {
+    /// Every blob of the pack, in pack order (what the trailer lists).
+    pub entries: Vec<PackedChunkEntry>,
+    /// Exact length of the finished pack, trailer frame included.
+    pub len: u64,
+    /// Length of the trailer frame `PackTail::finish` appends: the
+    /// `trailer_len` the index records for the pack.
+    pub trailer_len: u32,
+    pub tail: PackTail,
+}
+
+/// What turns a closed pack into its final bytes and ID.
+pub struct PackTail {
+    trailer: PackTrailer,
+    hash_algo: HashAlgorithm,
+    trailer_len: u32,
+    len: u64,
+    buffer: ClosedBuffer,
+}
+
+/// The bytes of a closed pack, all but its trailer frame.
+enum ClosedBuffer {
+    Memory(Vec<u8>),
+    Staged {
+        object: Box<dyn StagedPut>,
+        hasher: Hasher256,
+    },
+}
+
+// Compile-time assertion: SealedData and PackTail must be Send, to move to
+// an upload thread.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
         _assert_send::<SealedData>();
+        _assert_send::<PackTail>();
     }
 };
+
+/// The trailer frame of a pack: `[u32 LE len][trailer blob]`, the blob
+/// encrypted with `crypto`.
+fn trailer_frame(trailer: &PackTrailer, crypto: &dyn CryptoEngine) -> Result<Vec<u8>> {
+    let blob = trailer.seal_blob(crypto)?;
+    let blob_len = u32::try_from(blob.len())
+        .map_err(|_| VykarError::Other("pack trailer does not fit u32".into()))?;
+    let mut frame = Vec::with_capacity(4 + blob.len());
+    frame.extend_from_slice(&blob_len.to_le_bytes());
+    frame.extend_from_slice(&blob);
+    Ok(frame)
+}
+
+impl PackTail {
+    /// Heap bytes the closed pack holds until its upload releases them:
+    /// `max(capacity, len)` for a heap pack (appending the trailer may grow
+    /// a Vec without room for it), 0 for a staged one.
+    pub fn heap_bytes(&self) -> usize {
+        match &self.buffer {
+            ClosedBuffer::Memory(v) => v
+                .capacity()
+                .max(usize::try_from(self.len).unwrap_or(usize::MAX)),
+            ClosedBuffer::Staged { .. } => 0,
+        }
+    }
+
+    /// Encrypt the trailer with `crypto`, append its frame, and name the
+    /// pack by the hash of all its bytes. Err when the frame's length is
+    /// not the `trailer_len` fixed at close (an engine other than the one
+    /// `close` was told about), or when a staged append fails (the staged
+    /// object is dropped, which removes its temp file; `staged_write_error`).
+    pub fn finish(self, crypto: &dyn CryptoEngine) -> Result<(PackId, SealedData)> {
+        let frame = trailer_frame(&self.trailer, crypto)?;
+        if frame.len() != self.trailer_len as usize {
+            // Dropping `self` discards a staged temp file.
+            return Err(VykarError::Other(format!(
+                "BUG: pack trailer frame is {} bytes, the index records {}",
+                frame.len(),
+                self.trailer_len
+            )));
+        }
+        self.finish_with_frame(frame)
+    }
+
+    /// Append `frame` and compute the pack ID: over the whole Vec for a heap
+    /// pack, from the running hash for a staged one.
+    fn finish_with_frame(self, frame: Vec<u8>) -> Result<(PackId, SealedData)> {
+        match self.buffer {
+            ClosedBuffer::Memory(mut v) => {
+                // A no-op after the crossing blob's reservation.
+                v.reserve_exact(frame.len());
+                v.extend_from_slice(&frame);
+                debug_assert_eq!(v.len() as u64, self.len);
+                Ok((PackId::compute(&v, self.hash_algo), SealedData::Memory(v)))
+            }
+            ClosedBuffer::Staged {
+                mut object,
+                mut hasher,
+            } => {
+                if let Err(e) = object.append(&frame) {
+                    // Drops the staged object, which removes its temp file.
+                    drop(object);
+                    return Err(staged_write_error(e));
+                }
+                hasher.update(&frame);
+                Ok((
+                    PackId::from_bytes(hasher.finalize()),
+                    SealedData::Staged(object),
+                ))
+            }
+        }
+    }
+}
 
 impl SealedData {
     /// The whole pack, when it is heap-buffered (`None` once staged: those
@@ -148,6 +258,12 @@ fn staged_write_error(e: VykarError) -> VykarError {
 /// engine passed to [`Self::seal`] (`repo::pack_trailer`). The trailer is
 /// one more length-framed blob after the last chunk, so the entries, their
 /// offsets and every reader of indexed ranges are unchanged by it.
+///
+/// A pack is finished in one step ([`Self::seal`]) or in two: the writer
+/// closes it ([`Self::close`]: entries, length and the plain trailer), and
+/// another thread encrypts and appends the trailer and computes the pack ID
+/// ([`PackTail::finish`]). The backup uses the second form, so the
+/// consumer does not hash whole heap packs.
 ///
 /// By default the pack is assembled in a heap `Vec<u8>`. When the caller
 /// passes a backend to [`Self::add_blob_to`] that can stage writes (local
@@ -381,14 +497,9 @@ impl PackWriter {
         self.target_size = target;
     }
 
-    /// Seal the pack: append the trailer, encrypted with `crypto`, compute
-    /// the PackId over every byte including it, and return a `SealedPack`
-    /// that can be destructured for upload.
-    ///
-    /// A failure to build the trailer leaves the writer and its blobs as
-    /// they were; a failed staged append of it poisons the writer, as a
-    /// failed blob append does.
-    pub fn seal(&mut self, crypto: &dyn CryptoEngine) -> Result<SealedPack> {
+    /// The pack's entries and trailer, before anything is taken: fails on a
+    /// poisoned or empty writer, or a trailer that cannot be built.
+    fn closing_parts(&self) -> Result<(Vec<PackedChunkEntry>, PackTrailer)> {
         if matches!(self.buffer, Some(PackBuffer::Failed)) {
             return Err(failed_writer_error());
         }
@@ -411,53 +522,23 @@ impl PackWriter {
             self.blob_meta.iter().map(|m| (m.chunk_id, m.stored_size)),
         )?;
         debug_assert!(trailer.offsets().eq(results.iter().map(|r| r.2)));
-        let blob = trailer.seal_blob(crypto)?;
-        let blob_len = u32::try_from(blob.len())
-            .map_err(|_| VykarError::Other("pack trailer does not fit u32".into()))?;
-        let mut frame = Vec::with_capacity(4 + blob.len());
-        frame.extend_from_slice(&blob_len.to_le_bytes());
-        frame.extend_from_slice(&blob);
-        debug_assert_eq!(
-            frame.len(),
-            crate::repo::pack_trailer::trailer_frame_len(
-                self.blob_meta.len(),
-                crypto.is_encrypting()
-            ) as usize,
-            "the trailer frame has the length the index records"
-        );
+        Ok((results, trailer))
+    }
 
-        let (pack_id, sealed_data, len) = match self.buffer.take().expect("buffer was initialized")
-        {
-            PackBuffer::Memory(mut v) => {
-                // A no-op after the crossing blob's reservation.
-                v.reserve_exact(frame.len());
-                v.extend_from_slice(&frame);
-                let len = v.len() as u64;
-                (
-                    PackId::compute(&v, self.hash_algo),
-                    SealedData::Memory(v),
-                    len,
-                )
-            }
-            PackBuffer::Staged {
-                mut object,
-                mut hasher,
-            } => {
-                if let Err(e) = object.append(&frame) {
-                    // Drops the staged object, which removes its temp file.
-                    drop(object);
-                    self.buffer = Some(PackBuffer::Failed);
-                    return Err(staged_write_error(e));
-                }
-                hasher.update(&frame);
-                let len = (PACK_HEADER_SIZE + self.current_size + frame.len()) as u64;
-                (
-                    PackId::from_bytes(hasher.finalize()),
-                    SealedData::Staged(object),
-                    len,
-                )
-            }
-            // Rejected on entry; kept total rather than asserted.
+    /// Take the buffer and reset the writer for the next pack.
+    fn take_closed(
+        &mut self,
+        entries: Vec<PackedChunkEntry>,
+        trailer: PackTrailer,
+        encrypting: bool,
+    ) -> Result<ClosedPack> {
+        let trailer_len =
+            crate::repo::pack_trailer::trailer_frame_len(self.blob_meta.len(), encrypting);
+        let len = (PACK_HEADER_SIZE + self.current_size) as u64 + u64::from(trailer_len);
+        let buffer = match self.buffer.take().expect("buffer was initialized") {
+            PackBuffer::Memory(v) => ClosedBuffer::Memory(v),
+            PackBuffer::Staged { object, hasher } => ClosedBuffer::Staged { object, hasher },
+            // Rejected by `closing_parts`; kept total rather than asserted.
             PackBuffer::Failed => {
                 self.buffer = Some(PackBuffer::Failed);
                 return Err(failed_writer_error());
@@ -470,12 +551,68 @@ impl PackWriter {
         self.pending.clear();
         self.first_blob_time = None;
 
-        Ok(SealedPack {
-            pack_id,
-            entries: results,
-            data: sealed_data,
+        Ok(ClosedPack {
+            entries,
             len,
+            trailer_len,
+            tail: PackTail {
+                trailer,
+                hash_algo: self.hash_algo,
+                trailer_len,
+                len,
+                buffer,
+            },
         })
+    }
+
+    /// Close the pack for an engine that encrypts iff `encrypting`: compute
+    /// the entries, the exact length and the trailer (`PackTrailer::for_blobs`),
+    /// take the buffer and reset the writer for the next pack. Encrypting
+    /// the trailer and hashing the pack are left to `PackTail::finish`.
+    ///
+    /// Fails as `seal` does before it touches the buffer (a poisoned
+    /// writer, an empty writer, a trailer that cannot be built); the writer
+    /// is then unchanged.
+    pub fn close(&mut self, encrypting: bool) -> Result<ClosedPack> {
+        let (entries, trailer) = self.closing_parts()?;
+        self.take_closed(entries, trailer, encrypting)
+    }
+
+    /// Seal the pack: append the trailer, encrypted with `crypto`, compute
+    /// the PackId over every byte including it, and return a `SealedPack`
+    /// that can be destructured for upload.
+    ///
+    /// A failure to build the trailer leaves the writer and its blobs as
+    /// they were; a failed staged append of it poisons the writer, as a
+    /// failed blob append does.
+    pub fn seal(&mut self, crypto: &dyn CryptoEngine) -> Result<SealedPack> {
+        let (entries, trailer) = self.closing_parts()?;
+        let frame = trailer_frame(&trailer, crypto)?;
+        debug_assert_eq!(
+            frame.len(),
+            crate::repo::pack_trailer::trailer_frame_len(
+                self.blob_meta.len(),
+                crypto.is_encrypting()
+            ) as usize,
+            "the trailer frame has the length the index records"
+        );
+        let ClosedPack {
+            entries, len, tail, ..
+        } = self.take_closed(entries, trailer, crypto.is_encrypting())?;
+        match tail.finish_with_frame(frame) {
+            Ok((pack_id, data)) => Ok(SealedPack {
+                pack_id,
+                entries,
+                data,
+                len,
+            }),
+            Err(e) => {
+                // Only a staged append fails here; its blobs can never be
+                // stored, so the writer stays unusable.
+                self.buffer = Some(PackBuffer::Failed);
+                Err(e)
+            }
+        }
     }
 
     /// Flush the buffered blobs into a pack file (seal + upload), the
@@ -844,6 +981,162 @@ mod tests {
             "staged object is discarded on failure"
         );
         assert!(w.seal(&engine()).is_err());
+    }
+
+    /// Fills two writers with the same blobs, staged in `stage` when given.
+    fn twin_writers(
+        algo: HashAlgorithm,
+        target: usize,
+        blobs: &[Vec<u8>],
+        stage: Option<&dyn StorageBackend>,
+    ) -> (PackWriter, PackWriter) {
+        let mut a = PackWriter::new(PackType::Data, target, algo);
+        let mut b = PackWriter::new(PackType::Data, target, algo);
+        for (i, blob) in blobs.iter().enumerate() {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            let id = ChunkId::from_bytes(id);
+            a.add_blob_to(stage, id, blob.clone()).unwrap();
+            b.add_blob_to(stage, id, blob.clone()).unwrap();
+        }
+        (a, b)
+    }
+
+    /// The bytes of a finished pack: from the heap, or committed to `stage`
+    /// and read back.
+    fn finished_bytes(
+        pack_id: PackId,
+        data: SealedData,
+        stage: Option<&dyn StorageBackend>,
+    ) -> Vec<u8> {
+        match (data, stage) {
+            (SealedData::Memory(v), _) => v,
+            (staged @ SealedData::Staged(_), Some(stage)) => {
+                let key = pack_id.storage_key();
+                staged.put_to(stage, &key, || {}).unwrap();
+                stage.get(&key).unwrap().unwrap()
+            }
+            (SealedData::Staged(_), None) => panic!("a staged pack needs its stage"),
+        }
+    }
+
+    /// Close + finish is `seal` in two steps: the same pack ID, bytes,
+    /// entries and length, on the heap and staged, under both algorithms.
+    #[test]
+    fn close_then_finish_matches_seal() {
+        use crate::repo::pack_trailer::{read_trailer_from_pack_bytes, trailer_frame_len};
+        use vykar_storage::local_backend::LocalBackend;
+
+        let target = 1024 * 1024;
+        for algo in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+            for staged in [false, true] {
+                for blobs in blob_sets(target) {
+                    let dir = tempfile::tempdir().unwrap();
+                    let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+                    let stage = staged.then_some(&local as &dyn StorageBackend);
+
+                    let (mut closing, mut sealing) = twin_writers(algo, target, &blobs, stage);
+                    let closed = closing.close(false).unwrap();
+                    assert!(!closing.has_pending());
+                    assert!(closing.buffer.is_none());
+                    assert_eq!(closing.current_size, 0);
+                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), false));
+                    let (pack_id, data) = closed.tail.finish(&engine()).unwrap();
+                    let sealed = sealing.seal(&engine()).unwrap();
+                    assert_eq!(pack_id, sealed.pack_id, "{algo:?} staged={staged}");
+                    assert_eq!(closed.entries, sealed.entries);
+                    assert_eq!(closed.len, sealed.len);
+                    let a = finished_bytes(pack_id, data, stage);
+                    let b = finished_bytes(sealed.pack_id, sealed.data, stage);
+                    assert_eq!(a, b);
+                    assert_eq!(closed.len, a.len() as u64);
+                    assert_eq!(PackId::compute(&a, algo), pack_id);
+
+                    // Encrypting: the trailer's nonce is random, so compare
+                    // the layout, not the bytes.
+                    let dir = tempfile::tempdir().unwrap();
+                    let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+                    let stage = staged.then_some(&local as &dyn StorageBackend);
+                    let (mut w, _) = twin_writers(algo, target, &blobs, stage);
+                    let closed = w.close(true).unwrap();
+                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), true));
+                    let (pack_id, data) = closed.tail.finish(&aes_engine()).unwrap();
+                    let bytes = finished_bytes(pack_id, data, stage);
+                    assert_eq!(closed.len, bytes.len() as u64);
+                    assert_eq!(PackId::compute(&bytes, algo), pack_id);
+                    let trailer = read_trailer_from_pack_bytes(&bytes, &aes_engine())
+                        .unwrap()
+                        .expect("finished pack has a trailer");
+                    assert!(trailer.offsets().eq(closed.entries.iter().map(|e| e.2)));
+                }
+            }
+        }
+    }
+
+    /// A pack closed for an encrypting engine cannot be finished with a
+    /// plaintext one: the frame would not have the length the index
+    /// records. A staged pack's temp file is discarded.
+    #[test]
+    fn finish_refuses_another_engines_trailer() {
+        use vykar_storage::local_backend::LocalBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        for stage in [None, Some(&local as &dyn StorageBackend)] {
+            let mut w = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake3);
+            w.add_blob_to(stage, dummy_chunk_id(1), vec![1; 10])
+                .unwrap();
+            let closed = w.close(true).unwrap();
+            let err = closed
+                .tail
+                .finish(&engine())
+                .err()
+                .expect("length mismatch");
+            assert!(err.to_string().contains("BUG"), "{err}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("packs"))
+            .map(|rd| {
+                rd.map(|e| e.unwrap().path())
+                    .filter(|p| p.is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The trailer append moved to `finish`: `close` succeeds and resets the
+    /// writer, `finish` fails hard and discards the staged object.
+    #[test]
+    fn failed_trailer_append_in_finish_is_hard() {
+        // Header, blob prefix and blob payload succeed; the trailer fails.
+        let backend = FailingStageBackend {
+            ok_appends: 3,
+            dropped: Default::default(),
+        };
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake3);
+        w.add_blob_to(Some(&backend), dummy_chunk_id(1), vec![1; 10])
+            .unwrap();
+        let closed = w.close(false).unwrap();
+        assert!(!w.has_pending());
+        assert!(w.buffer.is_none());
+        assert!(
+            !backend.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the closed pack still holds its staged object"
+        );
+        let err = closed
+            .tail
+            .finish(&engine())
+            .err()
+            .expect("trailer append fails");
+        assert!(!err.is_soft_file_error(), "{err}");
+        assert!(
+            err.to_string().contains("writing pack to repository"),
+            "{err}"
+        );
+        assert!(
+            backend.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "staged object is discarded on failure"
+        );
     }
 
     /// Data and tree writers label their trailers as such; compact's writer

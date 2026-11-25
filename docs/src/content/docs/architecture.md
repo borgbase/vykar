@@ -599,10 +599,13 @@ begin_write_session(session_id) → a WriteSession; journal key = sessions/<sess
         → ByteBudget enforces pipeline_buffer_bytes as a hard in-flight memory cap
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
   → serialize items incrementally into item-stream chunks (tree packs)
-  → throughout: packs are sealed and uploaded in the background when a writer
-    reaches its target size, 10,000 blobs, or 300s age
-  → final flush (unconditional): seal partial pack writers, join all in-flight
-    uploads, write sessions/<id>.index
+  → throughout: packs are closed when a writer reaches its target size,
+    10,000 blobs, or 300s age, and handed to a fixed pool of transfer_width + 2
+    upload threads, which encrypt the pack's trailer, compute its ID and
+    upload it (a pack staged in a local repository is hashed as it is
+    written; only its trailer and the final hash step run there)
+  → final flush (unconditional): close partial pack writers, wait for all
+    queued uploads, write sessions/<id>.index
   → pack SnapshotMeta in memory (do not write snapshots/<id> yet)
 ```
 
@@ -697,7 +700,7 @@ The commit and the index write it ends with (`repo::publish_machine::PublishMach
 
 ```text
   → on VykarError::Interrupted (Ctrl-C):
-    → WriteSession::flush_on_abort(): seal partial packs, join upload threads, write final sessions/<id>.index
+    → WriteSession::flush_on_abort(): seal partial packs, wait for queued uploads, write final sessions/<id>.index
     → deregister_session(), release advisory lock, exit code 130
   → on soft file error (PermissionDenied / NotFound before commit):
     → skip file, increment snapshot.stats.errors, continue
@@ -897,7 +900,7 @@ Two-stage signal handling applies to all commands:
 2. Second signal restores the default handler (immediate kill)
 3. SIGHUP (daemon only): sets a reload flag; the daemon re-reads the config file between backup cycles. Invalid config is logged and ignored — the daemon continues with the previous config.
 4. SIGUSR1 (daemon only): sets a trigger flag; the daemon runs an immediate backup cycle between scheduled runs. The existing schedule is preserved unless the ad-hoc cycle overruns the scheduled slot.
-5. On backup abort: `WriteSession::flush_on_abort()` seals partial packs, joins upload threads, writes final `sessions/<id>.index` journal for recovery
+5. On backup abort: `WriteSession::flush_on_abort()` seals partial packs, waits for queued uploads, writes final `sessions/<id>.index` journal for recovery
 6. Advisory lock is released before exit; CLI exits with code 130
 
 ### Liveness
@@ -1069,7 +1072,7 @@ flowchart LR
 2. N workers (N = effective threads, at least 1) in a crossbeam-channel pipeline read/chunk/hash files and classify chunks (hash-only vs prepacked)
 3. A `ByteBudget` enforces a hard cap on in-flight pipeline bytes (derived from `limits.threads`)
 4. Consumer stage commits chunks and updates dedup/index state sequentially (including segment-order validation for large files)
-5. Pack uploads run in background with bounded in-flight upload concurrency
+5. Pack uploads run on a fixed pool of `transfer_width + 2` threads; the consumer closes a pack, and its upload thread builds the trailer, hashes the pack and uploads it (a pack staged in a local repository is hashed as it is written, so only the trailer and the final hash step run there). The pack's index entries are recorded once its upload is confirmed.
 
 With one thread the walk, the worker and the consumer still run on separate OS threads, but most of the CPU time is spent in the single worker. To lower the CPU impact of a backup, use `limits.nice`.
 

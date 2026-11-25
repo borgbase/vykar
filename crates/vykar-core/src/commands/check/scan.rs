@@ -40,7 +40,7 @@ const BATCH_THRESHOLD: usize = 3;
 /// corruption). Crypto, deserialization, format, and decompression errors are
 /// considered evidence of corruption.
 fn is_transient_io(err: &VykarError) -> bool {
-    matches!(err, VykarError::Io(_))
+    err.io_error().is_some()
 }
 
 // ---------------------------------------------------------------------------

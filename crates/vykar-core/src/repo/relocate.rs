@@ -112,7 +112,7 @@ impl<'a> Relocator<'a> {
     ///
     /// # Errors
     ///
-    /// Today's pack-not-found error (`pack not found: <id>`) when the latest
+    /// The [`VykarError::PackNotFound`] error when the latest
     /// head is not newer than the one the reader planned from (or the one
     /// already loaded here), or still has an ID in `missing` after
     /// [`MAX_RELOCATE_ROUNDS`], and at once for a pack an earlier call found
@@ -209,9 +209,10 @@ impl Repo {
     }
 }
 
-/// Today's error text for a pack that answered 404; shared by every reader.
+/// The `PackNotFound` error for a pack that answered 404; shared by every
+/// reader.
 pub(crate) fn pack_not_found(pack_id: &PackId) -> VykarError {
-    VykarError::Other(format!("pack not found: {pack_id}"))
+    VykarError::PackNotFound(*pack_id)
 }
 
 /// Where `index` stores each of `ids`, or `None` while it still names
@@ -306,7 +307,7 @@ mod tests {
     }
 
     fn is_pack_not_found(e: &VykarError) -> bool {
-        matches!(e, VykarError::Other(m) if m == &format!("pack not found: {}", pack(1)))
+        matches!(e, VykarError::PackNotFound(p) if *p == pack(1))
     }
 
     #[test]

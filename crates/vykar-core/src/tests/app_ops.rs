@@ -8,6 +8,7 @@ use crate::app::operations::{
     run_full_cycle_with_passphrase_source, run_hooked_step,
 };
 use crate::app::preflight::UnavailableRepo;
+use crate::app::{OpsError, OpsResult};
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
 use crate::repo::control::CancelToken;
 use crate::testutil::{cmd_append, cmd_rename, env_word};
@@ -26,7 +27,9 @@ fn run_backup_selection_rejects_empty_sources() {
     let err = run_backup_selection(&repo, &[], None, &CancelToken::new(), false, None)
         .err()
         .unwrap();
-    assert!(matches!(err, VykarError::Config(msg) if msg.contains("no sources configured")));
+    assert!(
+        matches!(err, OpsError::Engine(VykarError::Config(msg)) if msg.contains("no sources configured"))
+    );
 }
 
 #[test]
@@ -351,7 +354,7 @@ fn all_sources_skipped_is_a_repo_level_skip() {
         .unwrap();
 
     match err {
-        VykarError::Skipped(reason) => {
+        OpsError::Skipped(reason) => {
             assert!(
                 reason.contains("'one'") && reason.contains("'two'"),
                 "{reason}"
@@ -427,7 +430,7 @@ fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
         &repo,
         &mut || {
             calls.set(calls.get() + 1);
-            Err(VykarError::Other("no route to host".into()))
+            Err(VykarError::Other("no route to host".into()).into())
         },
         &CancelToken::new(),
         false,
@@ -465,7 +468,7 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
 
     let result = run_full_cycle_with_passphrase_source(
         &repo,
-        &mut || Err(VykarError::Skipped("passphrase prompt canceled".into())),
+        &mut || Err(OpsError::Skipped("passphrase prompt canceled".into())),
         &CancelToken::new(),
         false,
         &[],
@@ -632,7 +635,7 @@ fn break_source(repo: &mut ResolvedRepo, idx: usize) {
 fn run_collecting(
     repo: &ResolvedRepo,
 ) -> (
-    vykar_types::error::Result<crate::app::operations::BackupRunReport>,
+    OpsResult<crate::app::operations::BackupRunReport>,
     Vec<BackupRunEvent>,
 ) {
     let mut events = Vec::new();
@@ -688,7 +691,7 @@ fn sole_failing_source_returns_its_original_error() {
     let (result, _) = run_collecting(&repo);
     let err = result.err().unwrap();
     assert!(
-        matches!(&err, VykarError::Config(msg) if msg.contains("does not exist")),
+        matches!(&err, OpsError::Engine(VykarError::Config(msg)) if msg.contains("does not exist")),
         "{err}"
     );
 }
@@ -703,7 +706,7 @@ fn all_failing_sources_name_each_one() {
     let (result, events) = run_collecting(&repo);
     let err = result.err().unwrap();
     assert!(
-        matches!(&err, VykarError::Other(msg) if msg.contains("'one'") && msg.contains("'two'")),
+        matches!(&err, OpsError::Engine(VykarError::Other(msg)) if msg.contains("'one'") && msg.contains("'two'")),
         "{err}"
     );
     assert_eq!(source_failed_labels(&events), vec!["one", "two"]);
@@ -723,7 +726,7 @@ fn failed_plus_skipped_with_nothing_created_is_an_error() {
 
     let (result, _) = run_collecting(&repo);
     match result {
-        Err(VykarError::Other(msg)) => {
+        Err(OpsError::Engine(VykarError::Other(msg))) => {
             assert!(msg.contains("'gone'") && msg.contains("'gated'"), "{msg}");
         }
         Err(other) => panic!("expected Other, got {other:?}"),
@@ -814,7 +817,10 @@ fn shutdown_before_first_source_is_interrupted() {
     let err = run_backup_selection(&repo, &repo.sources, None, &shutdown, false, None)
         .err()
         .unwrap();
-    assert!(matches!(err, VykarError::Interrupted), "{err:?}");
+    assert!(
+        matches!(err, OpsError::Engine(VykarError::Interrupted)),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -925,5 +931,5 @@ fn command_hooks_wrapper_matches_reporting_variant() {
 
     let result = run_command_with_hooks(&repo, "prune", || Ok(()));
 
-    assert!(matches!(result, Err(VykarError::Skipped(_))), "{result:?}");
+    assert!(matches!(result, Err(OpsError::Skipped(_))), "{result:?}");
 }

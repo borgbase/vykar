@@ -822,8 +822,7 @@ fn parallel_read_returns_the_earliest_failing_group() {
                 .read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
                 .unwrap_err();
             assert!(
-                matches!(&err, VykarError::Other(m)
-                    if m.contains("pack not found") && m.contains(&missing_pack.to_string())),
+                matches!(&err, VykarError::PackNotFound(p) if *p == missing_pack),
                 "width {width}, attempt {attempt}: expected pack 1 not found, got: {err}"
             );
         }

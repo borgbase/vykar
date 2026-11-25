@@ -493,15 +493,17 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
 }
 
 /// Run `action` inside the repo-level hooks for `command`. The CLI error is
-/// flattened to `VykarError::Other` to fit the core signature; only its text
-/// is used downstream, so the lost downcast info is immaterial.
+/// flattened to an engine `VykarError::Other` to fit the core signature; only
+/// its text is used downstream, so the lost downcast info is immaterial.
 fn run_hooked(
     repo: &ResolvedRepo,
     command: &str,
     action: impl FnOnce() -> CliResult<bool>,
 ) -> CliResult<bool> {
     operations::run_command_with_hooks(repo, command, || {
-        action().map_err(|e| vykar_types::error::VykarError::Other(e.to_string()))
+        action().map_err(|e| {
+            vykar_core::app::OpsError::from(vykar_types::error::VykarError::Other(e.to_string()))
+        })
     })
     .map_err(CliError::from)
 }
@@ -570,7 +572,7 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
     };
 
     match result {
-        Err(CliError::Vykar(vykar_types::error::VykarError::Skipped(reason))) => {
+        Err(CliError::Ops(vykar_core::app::OpsError::Skipped(reason))) => {
             eprintln!("Skipped: {reason}");
             Ok(false)
         }

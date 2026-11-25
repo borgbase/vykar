@@ -71,8 +71,9 @@ pub(crate) fn run_default_actions(
     let mut resolve = || {
         if defer {
             get_passphrase(&repo.config, label).map_err(|e| match e {
-                CliError::Vykar(e) => e,
-                e => VykarError::Other(e.to_string()),
+                CliError::Vykar(e) => e.into(),
+                CliError::Ops(e) => e,
+                e => VykarError::Other(e.to_string()).into(),
             })
         } else {
             Ok(early.take())

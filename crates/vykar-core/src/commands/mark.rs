@@ -457,7 +457,7 @@ fn reread_failed_batch(
                         Err(e @ VykarError::Interrupted) => return Err(e),
                         Err(e) => {
                             buf.truncate(from);
-                            let io = matches!(e, VykarError::Io(_));
+                            let io = e.io_error().is_some();
                             let e = Arc::new(e);
                             if io {
                                 for k in j..run.len() {

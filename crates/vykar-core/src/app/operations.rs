@@ -13,11 +13,12 @@ use rand::Rng;
 use zeroize::Zeroizing;
 
 use crate::app::preflight::{self, UnavailableRepo};
+use crate::app::{OpsError, OpsResult};
 use crate::commands;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
 use crate::repo::HostEnv;
 use crate::repo::control::CancelToken;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::VykarError;
 
 #[derive(Debug, Clone)]
 pub struct BackupSourceResult {
@@ -207,19 +208,19 @@ impl FullCycleResult {
 /// Resolves a cycle's passphrase on first use, at most once, so that nothing
 /// (including a prompt or a connection) happens before the `before` hooks pass.
 struct LazyPassphrase<'a> {
-    resolve: &'a mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
+    resolve: &'a mut dyn FnMut() -> OpsResult<Option<Zeroizing<String>>>,
     state: PassphraseState,
 }
 
 enum PassphraseState {
     Unresolved,
     Resolved(Option<Zeroizing<String>>),
-    /// The error went to the step that asked first; `VykarError` is not `Clone`.
+    /// The error went to the step that asked first; `OpsError` is not `Clone`.
     Failed,
 }
 
 impl<'a> LazyPassphrase<'a> {
-    fn new(resolve: &'a mut dyn FnMut() -> Result<Option<Zeroizing<String>>>) -> Self {
+    fn new(resolve: &'a mut dyn FnMut() -> OpsResult<Option<Zeroizing<String>>>) -> Self {
         Self {
             resolve,
             state: PassphraseState::Unresolved,
@@ -230,7 +231,7 @@ impl<'a> LazyPassphrase<'a> {
         matches!(self.state, PassphraseState::Failed)
     }
 
-    fn get(&mut self) -> Result<Option<&str>> {
+    fn get(&mut self) -> OpsResult<Option<&str>> {
         if matches!(self.state, PassphraseState::Unresolved) {
             match (self.resolve)() {
                 Ok(pass) => self.state = PassphraseState::Resolved(pass),
@@ -242,7 +243,7 @@ impl<'a> LazyPassphrase<'a> {
         }
         match &self.state {
             PassphraseState::Resolved(pass) => Ok(pass.as_deref().map(String::as_str)),
-            _ => Err(VykarError::Other("passphrase unavailable".into())),
+            _ => Err(VykarError::Other("passphrase unavailable".into()).into()),
         }
     }
 }
@@ -271,19 +272,17 @@ fn run_backup_sources(
     shutdown: &CancelToken,
     verbose: bool,
     on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
-) -> Result<BackupRunReport> {
+) -> OpsResult<BackupRunReport> {
     use commands::backup::FailureScope;
 
     if sources.is_empty() {
-        return Err(VykarError::Config(
-            "no sources configured for this repository".into(),
-        ));
+        return Err(VykarError::Config("no sources configured for this repository".into()).into());
     }
 
     let compression = config.compression.to_compression();
 
     let mut report = BackupRunReport::default();
-    let mut first_failure: Option<VykarError> = None;
+    let mut first_failure: Option<OpsError> = None;
 
     for (idx, source) in sources.iter().enumerate() {
         let snapshot_name = generate_snapshot_name();
@@ -304,7 +303,7 @@ fn run_backup_sources(
                 verbose,
             };
 
-            if let Some(cb) = on_event {
+            let r = if let Some(cb) = on_event {
                 let mut backup_cb = |bpe| {
                     cb(BackupRunEvent::Backup(bpe));
                 };
@@ -318,11 +317,15 @@ fn run_backup_sources(
                 )
             } else {
                 commands::backup::run_scoped(config, req, None, shutdown, None, HostEnv::system())
-            }
+            };
+            r.map_err(|(scope, e)| (scope, OpsError::from(e)))
         };
 
         let result = if shutdown.is_cancelled() {
-            Err((FailureScope::Repository, VykarError::Interrupted))
+            Err((
+                FailureScope::Repository,
+                OpsError::from(VykarError::Interrupted),
+            ))
         } else if source.hooks.has_any() {
             let mut ctx = crate::hooks::HookContext {
                 command: "backup".to_string(),
@@ -343,7 +346,7 @@ fn run_backup_sources(
                 || run_backup(on_event),
                 |r| match r {
                     Ok(_) => crate::hooks::Verdict::Success,
-                    Err((_, VykarError::Skipped(_))) => crate::hooks::Verdict::Skipped,
+                    Err((_, OpsError::Skipped(_))) => crate::hooks::Verdict::Skipped,
                     Err((_, e)) => crate::hooks::Verdict::Failed(e.to_string()),
                 },
             );
@@ -359,7 +362,7 @@ fn run_backup_sources(
 
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err((_, VykarError::Skipped(reason))) => {
+            Err((_, OpsError::Skipped(reason))) => {
                 report.skipped.push(SkippedSource {
                     label: source.label.clone(),
                     reason,
@@ -393,7 +396,7 @@ fn run_backup_sources(
                 report.aborted = Some(AbortedRun {
                     label: source.label.clone(),
                     error,
-                    interrupted: matches!(e, VykarError::Interrupted),
+                    interrupted: matches!(e, OpsError::Engine(VykarError::Interrupted)),
                     not_attempted: sources
                         .iter()
                         .skip(idx + 1)
@@ -435,7 +438,7 @@ fn run_backup_sources(
                 .iter()
                 .map(|s| format!("source '{}' skipped: {}", s.label, s.reason)),
         );
-        return Err(VykarError::Other(parts.join("; ")));
+        return Err(VykarError::Other(parts.join("; ")).into());
     }
 
     // Only skips: to the repo-level lifecycle this is a skip, not a success.
@@ -445,7 +448,7 @@ fn run_backup_sources(
         .map(|s| format!("source '{}': {}", s.label, s.reason))
         .collect::<Vec<_>>()
         .join("; ");
-    Err(VykarError::Skipped(reasons))
+    Err(OpsError::Skipped(reasons))
 }
 
 /// Drain accumulated warnings from HookContext into BackupRunEvent.
@@ -475,7 +478,7 @@ pub fn run_backup_selection(
     shutdown: &CancelToken,
     verbose: bool,
     on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
-) -> Result<BackupRunReport> {
+) -> OpsResult<BackupRunReport> {
     let config = &repo.config;
     let mut on_event = on_event;
     let mut ctx = crate::hooks::HookContext {
@@ -520,13 +523,9 @@ pub fn run_backup_selection(
 
 /// Wrap an action with repo-level hooks. For CLI standalone commands
 /// (prune, compact, check) that aren't part of the full cycle.
-pub fn run_command_with_hooks<F, T>(
-    repo: &ResolvedRepo,
-    command: &str,
-    action: F,
-) -> vykar_types::error::Result<T>
+pub fn run_command_with_hooks<F, T>(repo: &ResolvedRepo, command: &str, action: F) -> OpsResult<T>
 where
-    F: FnOnce() -> vykar_types::error::Result<T>,
+    F: FnOnce() -> OpsResult<T>,
 {
     run_command_with_hook_warnings(repo, command, &mut |_| {}, action)
 }
@@ -539,9 +538,9 @@ pub fn run_command_with_hook_warnings<F, T>(
     command: &str,
     on_warning: &mut dyn FnMut(String),
     action: F,
-) -> vykar_types::error::Result<T>
+) -> OpsResult<T>
 where
-    F: FnOnce() -> vykar_types::error::Result<T>,
+    F: FnOnce() -> OpsResult<T>,
 {
     let mut ctx = crate::hooks::HookContext {
         command: command.to_string(),
@@ -590,14 +589,14 @@ pub fn run_full_cycle_for_repo(
 /// [`run_full_cycle_for_repo`] for callers whose passphrase step is expensive or
 /// connects to the repository. `resolve` runs inside the first action that needs
 /// it, after that step's `before` hooks pass, and at most once per cycle: a
-/// failure is not retried. Returning `Err(VykarError::Skipped)` skips the step
+/// failure is not retried. Returning `Err(OpsError::Skipped)` skips the step
 /// without reporting an error.
 /// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
 /// once the backup step's `before` hooks have run is skipped like a hook skip:
 /// only `finally` hooks run and nothing is resolved or opened.
 pub fn run_full_cycle_with_passphrase_source(
     repo: &ResolvedRepo,
-    resolve: &mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
+    resolve: &mut dyn FnMut() -> OpsResult<Option<Zeroizing<String>>>,
     shutdown: &CancelToken,
     verbose: bool,
     source_filter: &[String],
@@ -638,7 +637,7 @@ pub fn run_full_cycle_with_passphrase_source(
                             && let Some(reason) = preflight::availability(repo).unavailable_reason()
                         {
                             repo_unavailable = true;
-                            return Err(VykarError::Skipped(reason));
+                            return Err(OpsError::Skipped(reason));
                         }
                         run_backup_sources(
                             config,
@@ -785,10 +784,10 @@ pub fn run_full_cycle_with_passphrase_source(
                 ) {
                     // Compact runs in every cycle; on an append-only server it
                     // belongs to the maintenance window, so the cycle skips it.
-                    Err(VykarError::AppendOnlyServer { .. }) => Err(VykarError::Skipped(
+                    Err(VykarError::AppendOnlyServer { .. }) => Err(OpsError::Skipped(
                         "the server is append-only; compact runs in a maintenance window".into(),
                     )),
-                    other => other,
+                    other => other.map_err(OpsError::from),
                 },
                 |_| StepOutcome::Ok,
             );
@@ -830,6 +829,7 @@ pub fn run_full_cycle_with_passphrase_source(
                         true, // record_state: daemon/GUI updates the full_every timer
                         shutdown,
                     )
+                    .map_err(OpsError::from)
                 },
                 |result| {
                     if result.skipped {
@@ -869,7 +869,7 @@ pub(crate) fn run_hooked_step<T>(
     repo: &ResolvedRepo,
     on_event: &mut dyn FnMut(CycleEvent),
     steps: &mut Vec<(CycleStep, StepOutcome)>,
-    action: impl FnOnce(&mut dyn FnMut(CycleEvent)) -> Result<T>,
+    action: impl FnOnce(&mut dyn FnMut(CycleEvent)) -> OpsResult<T>,
     classify: impl FnOnce(&T) -> StepOutcome,
 ) -> Option<T> {
     let mut ctx = crate::hooks::HookContext {
@@ -895,7 +895,7 @@ pub(crate) fn run_hooked_step<T>(
         &mut ctx,
         || action(on_event).map(|v| (classify(&v), v)),
         |r| match r {
-            Err(VykarError::Skipped(_)) => crate::hooks::Verdict::Skipped,
+            Err(OpsError::Skipped(_)) => crate::hooks::Verdict::Skipped,
             Err(e) => crate::hooks::Verdict::Failed(e.to_string()),
             Ok((o, _)) => match o.error_msg() {
                 Some(msg) => crate::hooks::Verdict::Failed(msg.to_owned()),
@@ -906,7 +906,7 @@ pub(crate) fn run_hooked_step<T>(
     drain_cycle_warnings(&mut ctx, step, on_event);
 
     let (outcome, value) = match result {
-        Err(VykarError::Skipped(reason)) | Ok(Err(VykarError::Skipped(reason))) => {
+        Err(OpsError::Skipped(reason)) | Ok(Err(OpsError::Skipped(reason))) => {
             (StepOutcome::Skipped(reason), None)
         }
         Err(e) | Ok(Err(e)) => (StepOutcome::Failed(e.to_string()), None),

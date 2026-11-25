@@ -369,11 +369,29 @@ fn chunk_decode_error_conversions() {
         VykarError::DecryptionFailed
     ));
     match decrypt().into_located() {
-        VykarError::Other(m) => assert_eq!(
-            m,
+        e @ VykarError::ChunkDecode(_) => assert_eq!(
+            e.to_string(),
             format!(
                 "chunk {id} in pack {pack} (offset 7, size 42): \
                  decryption failed: wrong passphrase or corrupted data"
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    let located_id_mismatch = ChunkDecodeError {
+        stage: ChunkDecodeStage::IdMismatch {
+            actual: ChunkId::from_bytes([0x77; 32]),
+        },
+        at,
+    }
+    .into_located();
+    match located_id_mismatch {
+        e @ VykarError::ChunkDecode(_) => assert_eq!(
+            e.to_string(),
+            format!(
+                "invalid repository format: chunk {id} in pack {pack} (offset 7, size 42) \
+                 hash mismatch after decode: expected {id}, got {}",
+                ChunkId::from_bytes([0x77; 32])
             )
         ),
         other => panic!("{other:?}"),

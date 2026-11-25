@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use vykar_core::app::operations;
 use vykar_core::app::preflight::UnavailableRepo;
+use vykar_core::app::{OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
 use vykar_types::error::VykarError;
@@ -52,15 +52,13 @@ fn resolve_cycle_passphrase(
     repo: &config::ResolvedRepo,
     passphrases: &mut HashMap<String, Zeroizing<String>>,
     ui_tx: &Sender<UiEvent>,
-) -> Result<Option<Zeroizing<String>>, VykarError> {
+) -> OpsResult<Option<Zeroizing<String>>> {
     let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
         vykar_core::commands::info::run(&repo.config, pass)
     });
     match outcome {
         Ok(PassphraseRun::Ran(_)) => Ok(passphrases.get(&repo.config.repository.url).cloned()),
-        Ok(PassphraseRun::Canceled) => {
-            Err(VykarError::Skipped("passphrase prompt canceled".into()))
-        }
+        Ok(PassphraseRun::Canceled) => Err(OpsError::Skipped("passphrase prompt canceled".into())),
         Err(VykarError::RepoNotFound(_)) => {
             let (log, reason) =
                 if classify_init_target(&repo.config.repository.url) == InitTarget::Unavailable {
@@ -72,9 +70,9 @@ fn resolve_cycle_passphrase(
                     ("repository not initialized", "repository not initialized")
                 };
             send_log(ui_tx, format!("[{}] {log}", repo.label_or_url()));
-            Err(VykarError::Other(reason.to_string()))
+            Err(VykarError::Other(reason.to_string()).into())
         }
-        Err(e) => Err(VykarError::Other(format!("failed to open repository: {e}"))),
+        Err(e) => Err(VykarError::Other(format!("failed to open repository: {e}")).into()),
     }
 }
 
@@ -282,7 +280,7 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
                 format!("[{rn}] passphrase prompt canceled; skipping."),
             );
         }
-        Err(VykarError::Skipped(reason)) => {
+        Err(OpsError::Skipped(reason)) => {
             send_log(&ctx.ui_tx, format!("[{rn}] backup skipped: {reason}"));
         }
         Err(e) => {
@@ -366,7 +364,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
                     format!("[{repo_name}] passphrase prompt canceled; skipping."),
                 );
             }
-            Err(VykarError::Skipped(reason)) => {
+            Err(OpsError::Skipped(reason)) => {
                 send_log(
                     &ctx.ui_tx,
                     format!("[{repo_name}] backup skipped: {reason}"),

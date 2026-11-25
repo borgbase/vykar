@@ -58,7 +58,8 @@ pub struct ErrorRecord {
     pub class: ErrorClass,
 }
 
-/// The "index changed" message of `index_write.rs`, matched by substring.
+/// The start of `IndexChanged`'s and `IndexHeadContention`'s text, matched
+/// by substring for wrapped errors.
 pub const INDEX_CHANGED_TEXT: &str = "the index changed on storage after it was loaded";
 
 pub fn classify(err: &VykarError) -> ErrorClass {
@@ -69,6 +70,19 @@ pub fn classify(err: &VykarError) -> ErrorClass {
         VykarError::MarkerLostDuringCommit => Some(AllowedError::MarkerLostDuringCommit),
         VykarError::LockExpired(_) => Some(AllowedError::LockExpired),
         VykarError::Interrupted => Some(AllowedError::Interrupted),
+        VykarError::IndexChanged | VykarError::IndexHeadContention { .. } => {
+            Some(AllowedError::IndexChanged)
+        }
+        // A refused mark whose cause is an index change classifies as the
+        // change, as the substring arm below did before the variant existed.
+        VykarError::MarkRefused(inner) if inner.to_string().contains(INDEX_CHANGED_TEXT) => {
+            Some(AllowedError::IndexChanged)
+        }
+        VykarError::MarkRefused(_) => Some(AllowedError::MarkRefused),
+        VykarError::SlowIndexWrite { .. } => Some(AllowedError::SlowIndexWrite),
+        // Text fallbacks: a wrapper that formats one of these into a new
+        // Other (repair_load_refusal, check's Other(msg.clone()), the CLI's
+        // hooked command) still carries the text.
         VykarError::Other(m) if m.contains(INDEX_CHANGED_TEXT) => Some(AllowedError::IndexChanged),
         VykarError::Other(m) if m.starts_with(crate::commands::compact::MARK_REFUSED) => {
             Some(AllowedError::MarkRefused)

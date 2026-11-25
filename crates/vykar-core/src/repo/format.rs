@@ -2,7 +2,6 @@ use crate::compress;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
-use vykar_types::pack_id::PackId;
 
 /// Domain-separation marker for object identity binding in AEAD AAD.
 // Wire-format constant — DO NOT rename (backward compatibility)
@@ -301,38 +300,7 @@ pub fn unpack_object_expect_with_context_in_place<'a>(
     Ok(plaintext)
 }
 
-/// Where a stored chunk blob sits, and the ID it is stored under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlobLocation {
-    pub chunk_id: ChunkId,
-    pub pack_id: PackId,
-    pub pack_offset: u64,
-    pub stored_size: u32,
-}
-
-/// The decode step that failed, with its cause.
-#[derive(Debug)]
-pub enum ChunkDecodeStage {
-    /// Envelope, AEAD or object-type check. Boxed to keep the error under
-    /// `clippy::result_large_err`.
-    Decrypt(Box<VykarError>),
-    Decompress(Box<VykarError>),
-    /// Only with a size hint: the decoded length differs from it.
-    SizeMismatch {
-        expected: usize,
-        actual: usize,
-    },
-    /// The recomputed chunk ID differs from `BlobLocation::chunk_id`.
-    IdMismatch {
-        actual: ChunkId,
-    },
-}
-
-#[derive(Debug)]
-pub struct ChunkDecodeError {
-    pub stage: ChunkDecodeStage,
-    pub at: BlobLocation,
-}
+pub use vykar_types::chunk_decode::{BlobLocation, ChunkDecodeError, ChunkDecodeStage};
 
 /// Decode one stored chunk blob into `out`: decrypt `raw` in place, one-shot
 /// decompress, check the length against `hint` when one is given, and check
@@ -379,45 +347,4 @@ pub fn decode_chunk_into(
         }
     }
     Ok(())
-}
-
-impl ChunkDecodeError {
-    /// The error with the blob's location in every message (restore's form).
-    pub fn into_located(self) -> VykarError {
-        let at = self.at;
-        match self.stage {
-            ChunkDecodeStage::Decrypt(e) | ChunkDecodeStage::Decompress(e) => {
-                VykarError::Other(format!(
-                    "chunk {} in pack {} (offset {}, size {}): {e}",
-                    at.chunk_id, at.pack_id, at.pack_offset, at.stored_size
-                ))
-            }
-            ChunkDecodeStage::SizeMismatch { expected, actual } => {
-                VykarError::InvalidFormat(format!(
-                    "chunk {} in pack {} (offset {}, size {}) size mismatch after restore decode: \
-                     expected {} bytes, got {} bytes",
-                    at.chunk_id, at.pack_id, at.pack_offset, at.stored_size, expected, actual
-                ))
-            }
-            ChunkDecodeStage::IdMismatch { actual } => {
-                let expected = at.chunk_id;
-                VykarError::InvalidFormat(format!(
-                    "chunk {expected} in pack {} (offset {}, size {}) \
-                     hash mismatch after decode: expected {expected}, got {actual}",
-                    at.pack_id, at.pack_offset, at.stored_size
-                ))
-            }
-        }
-    }
-}
-
-/// Decrypt and decompress failures keep their original error, as the read
-/// paths have always returned them; size and ID mismatches carry the location.
-impl From<ChunkDecodeError> for VykarError {
-    fn from(e: ChunkDecodeError) -> Self {
-        match e.stage {
-            ChunkDecodeStage::Decrypt(inner) | ChunkDecodeStage::Decompress(inner) => *inner,
-            stage => ChunkDecodeError { stage, at: e.at }.into_located(),
-        }
-    }
 }

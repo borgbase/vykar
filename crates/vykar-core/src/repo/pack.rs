@@ -515,12 +515,14 @@ pub fn read_blob_from_pack(
 ) -> Result<Vec<u8>> {
     let data = storage
         .get_range(&pack_id.storage_key(), offset, length as u64)?
-        .ok_or_else(|| VykarError::Other(format!("pack not found: {pack_id}")))?;
+        .ok_or(VykarError::PackNotFound(*pack_id))?;
     if data.len() != length as usize {
-        return Err(VykarError::Other(format!(
-            "short read from pack {pack_id} at offset {offset}: expected {length} bytes, got {}",
-            data.len()
-        )));
+        return Err(VykarError::PackShortRead {
+            pack_id: *pack_id,
+            offset,
+            expected: u64::from(length),
+            actual: data.len() as u64,
+        });
     }
     Ok(data)
 }
@@ -568,7 +570,7 @@ pub fn scan_pack_blobs_bytes(pack_data: &[u8]) -> Result<Vec<(u64, u32)>> {
 pub fn scan_pack_blobs(storage: &dyn StorageBackend, pack_id: &PackId) -> Result<Vec<(u64, u32)>> {
     let pack_data = storage
         .get(&pack_id.storage_key())?
-        .ok_or_else(|| VykarError::Other(format!("pack not found: {pack_id}")))?;
+        .ok_or(VykarError::PackNotFound(*pack_id))?;
     scan_pack_blobs_bytes(&pack_data)
 }
 

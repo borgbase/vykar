@@ -33,9 +33,7 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
-use super::ages::{
-    HEAD_FRESHNESS_LIMIT, HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT, SLOW_INDEX_WRITE_TEXT,
-};
+use super::ages::{HEAD_FRESHNESS_LIMIT, HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT};
 use super::index_store::{self, HeadPut, PackedObject};
 use super::index_write::FoldRequest;
 use super::lock::{self, MarkerStamp, SessionMarker};
@@ -1165,23 +1163,19 @@ fn fresh_generation(
 /// An index write that took longer than `limit` from its first object
 /// upload (`index_store::INDEX_OBJECT_GRACE`).
 fn slow_index_write(limit: std::time::Duration) -> VykarError {
-    let mins = limit.as_secs() / 60;
-    VykarError::Other(format!(
-        "{SLOW_INDEX_WRITE_TEXT} {} h {} min since its first object upload; retry",
-        mins / 60,
-        mins % 60
-    ))
+    VykarError::SlowIndexWrite {
+        limit_mins: limit.as_secs() / 60,
+        head_written: false,
+    }
 }
 
 /// The error of a head create that returned more than `limit` after the
-/// write's first object upload: the refusal's text (the simulator matches
-/// its start), then what happened.
+/// write's first object upload: the refusal's text, then what happened.
 fn slow_index_write_after_create(limit: std::time::Duration) -> VykarError {
-    VykarError::Other(format!(
-        "{}. The index head was written without its snapshot; the next run continues \
-         from it. Run `vykar check` if the repository fails to open",
-        slow_index_write(limit)
-    ))
+    VykarError::SlowIndexWrite {
+        limit_mins: limit.as_secs() / 60,
+        head_written: true,
+    }
 }
 
 /// One storage step of a write. `listed_at`: see

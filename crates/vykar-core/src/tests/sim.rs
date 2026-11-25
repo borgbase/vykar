@@ -241,6 +241,73 @@ fn classify_errors() {
         classify(&VykarError::Other("boom".into())),
         ErrorClass::Disallowed
     );
+
+    // The typed forms classify like their text forms above.
+    allowed(VykarError::IndexChanged, AllowedError::IndexChanged);
+    allowed(
+        crate::repo::index_write::head_contention_error(5, 3),
+        AllowedError::IndexChanged,
+    );
+    allowed(
+        VykarError::MarkRefused(Box::new(VykarError::Other("x".into()))),
+        AllowedError::MarkRefused,
+    );
+    // A refused mark caused by an index change is the change (the text arm
+    // for "index changed" came first before the variant existed).
+    allowed(
+        VykarError::MarkRefused(Box::new(VykarError::IndexChanged)),
+        AllowedError::IndexChanged,
+    );
+    for head_written in [false, true] {
+        allowed(
+            VykarError::SlowIndexWrite {
+                limit_mins: 680,
+                head_written,
+            },
+            AllowedError::SlowIndexWrite,
+        );
+    }
+    allowed(
+        VykarError::Other(format!(
+            "{}, nothing was changed: x. Run `vykar check` for details",
+            crate::commands::compact::MARK_REFUSED
+        )),
+        AllowedError::MarkRefused,
+    );
+    assert_eq!(
+        classify(&VykarError::PackNotFound(
+            vykar_types::pack_id::PackId::from_bytes([1; 32])
+        )),
+        ErrorClass::Disallowed
+    );
+}
+
+#[test]
+fn typed_errors_keep_the_text_prefixes() {
+    let refused = VykarError::MarkRefused(Box::new(VykarError::Other("x".into())));
+    assert!(
+        refused
+            .to_string()
+            .starts_with(crate::commands::compact::MARK_REFUSED),
+        "{refused}"
+    );
+    for head_written in [false, true] {
+        let slow = VykarError::SlowIndexWrite {
+            limit_mins: 680,
+            head_written,
+        };
+        assert!(
+            slow.to_string()
+                .starts_with(crate::repo::ages::SLOW_INDEX_WRITE_TEXT),
+            "{slow}"
+        );
+    }
+    for e in [
+        VykarError::IndexChanged,
+        VykarError::IndexHeadContention { detail: "x".into() },
+    ] {
+        assert!(e.to_string().contains(INDEX_CHANGED_TEXT), "{e}");
+    }
 }
 
 #[test]

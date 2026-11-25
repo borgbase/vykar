@@ -15,6 +15,7 @@ use vykar_core::commands;
 use vykar_core::commands::restore::{RestoreOptions, RestoreStats};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::control::CancelToken;
+use vykar_types::chunk_decode::ChunkDecodeStage;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -294,7 +295,9 @@ fn strict_mode_wraps_source_failure_and_publishes_nothing() {
         panic!("expected RestoreSourceUnreadable, got: {err:?}");
     };
     assert!(
-        matches!(&**inner, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+        matches!(&**inner, VykarError::ChunkDecode(e)
+            if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
+                && e.to_string().contains("hash mismatch")),
         "inner variant must be preserved, got: {inner:?}"
     );
     let source = std::error::Error::source(&err).expect("inner error is the source");

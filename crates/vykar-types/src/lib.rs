@@ -5,6 +5,7 @@
 mod hash_id;
 
 pub mod cancel;
+pub mod chunk_decode;
 pub mod chunk_id;
 pub mod error;
 pub mod hash;

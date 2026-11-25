@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
-use vykar_core::app::operations;
+use vykar_core::app::{OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
 use vykar_core::repo::control::CancelToken;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
 use crate::cancel::CancelSlot;
 use crate::messages::UiEvent;
@@ -241,18 +241,18 @@ pub(super) fn with_hooked_repo_op<T>(
             // A skip, so `finally` hooks run but `after` hooks do not.
             PassphraseRun::Canceled => {
                 canceled = true;
-                Err(VykarError::Skipped(PASSPHRASE_CANCELLED.to_string()))
+                Err(OpsError::Skipped(PASSPHRASE_CANCELLED.to_string()))
             }
         },
     );
 
     match outcome {
         Ok(value) => Ok(value),
-        Err(VykarError::Skipped(_)) if canceled => {
+        Err(OpsError::Skipped(_)) if canceled => {
             send_log(ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
             Err("passphrase required".to_string())
         }
-        Err(VykarError::Skipped(reason)) => {
+        Err(OpsError::Skipped(reason)) => {
             send_log(ui_tx, format!("[{repo_name}] {command} skipped: {reason}"));
             Err(reason)
         }
@@ -269,7 +269,7 @@ pub(super) fn run_selection_with_progress(
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
-) -> Result<operations::BackupRunReport> {
+) -> OpsResult<operations::BackupRunReport> {
     let repo_name = repo.label_or_url().to_string();
     let mut tracker = BackupStatusTracker::new(repo_name.clone());
     let ui_tx_progress = ui_tx.clone();

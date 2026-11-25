@@ -113,8 +113,9 @@ pub enum SweepSkipped {
 /// since the one before (an incremental re-mark).
 pub const COMPACT_MARK_ATTEMPTS: u32 = 3;
 
-/// Prefix of the error a compact returns when the mark fails; matched by
-/// the simulator (`sim/history.rs`).
+/// Prefix of [`VykarError::MarkRefused`]'s text, the error a compact
+/// returns when the mark fails.
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const MARK_REFUSED: &str = "compact refused: the live snapshots could not be marked";
 
 const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -671,21 +672,19 @@ struct Swept {
 
 /// Strict listing, the guards on it, the tree-chunk set, then `mark_live`
 /// with `CacheFirst`, counts and `MissingRefs::Abort`. Read-only. Any error
-/// is framed as [`MARK_REFUSED`], unless [`mark::passes_through`] (cancel,
+/// is framed as [`VykarError::MarkRefused`], unless [`mark::passes_through`] (cancel,
 /// newer vykar). "Nothing was changed" means no object: the stale temp-file
 /// sweep of `take_pack_listing` ran before.
 fn plan_sweep(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
     plan_sweep_inner(repo, shutdown).map_err(mark_refused)
 }
 
-/// `e` framed as [`MARK_REFUSED`], unless [`mark::passes_through`].
+/// `e` framed as [`VykarError::MarkRefused`], unless [`mark::passes_through`].
 fn mark_refused(e: VykarError) -> VykarError {
     if mark::passes_through(&e) {
         e
     } else {
-        VykarError::Other(format!(
-            "{MARK_REFUSED}, nothing was changed: {e}. Run `vykar check` for details"
-        ))
+        VykarError::MarkRefused(Box::new(e))
     }
 }
 
@@ -1656,20 +1655,16 @@ fn compact_packs(
                         break;
                     }
                     None => {
-                        return Err(VykarError::Other(format!(
-                            "pack not found: {}",
-                            analysis.pack_id
-                        )));
+                        return Err(VykarError::PackNotFound(analysis.pack_id));
                     }
                 };
             if combined.len() != read_len as usize {
-                return Err(VykarError::Other(format!(
-                    "short read from pack {} at offset {}: expected {} bytes, got {}",
-                    analysis.pack_id,
-                    prefix_offset,
-                    read_len,
-                    combined.len()
-                )));
+                return Err(VykarError::PackShortRead {
+                    pack_id: analysis.pack_id,
+                    offset: prefix_offset,
+                    expected: read_len,
+                    actual: combined.len() as u64,
+                });
             }
             let (len_bytes, blob_bytes) = combined.split_at(4);
             let on_disk_len = u32::from_le_bytes(
@@ -1857,11 +1852,12 @@ fn persist_batch_lock_free(
             MaintenanceWrite::Moved => {}
         }
     }
-    Err(VykarError::Other(format!(
-        "the index changed on storage after it was loaded: another writer created the \
-         index head on each of {HEAD_CREATE_ATTEMPTS} attempts at a repack batch; retry the \
-         compact"
-    )))
+    Err(VykarError::IndexHeadContention {
+        detail: format!(
+            "another writer created the index head on each of {HEAD_CREATE_ATTEMPTS} attempts \
+             at a repack batch; retry the compact"
+        ),
+    })
 }
 
 /// What persisting one repack batch left for its deletes.
@@ -2508,5 +2504,22 @@ mod repack_chunk_tests {
         assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3, false));
         let err = PlannedOp::new(&a, true).into_request(&plain).unwrap_err();
         assert!(err.to_string().contains("estimate"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod mark_refused_tests {
+    use super::{MARK_REFUSED, mark_refused};
+    use vykar_types::error::VykarError;
+
+    #[test]
+    fn mark_refused_wraps_all_but_pass_through_errors() {
+        let e = mark_refused(VykarError::Other("x".into()));
+        assert!(matches!(e, VykarError::MarkRefused(_)), "{e:?}");
+        assert!(e.to_string().starts_with(MARK_REFUSED), "{e}");
+        assert!(matches!(
+            mark_refused(VykarError::Interrupted),
+            VykarError::Interrupted
+        ));
     }
 }

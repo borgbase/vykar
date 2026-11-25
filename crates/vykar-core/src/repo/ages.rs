@@ -95,8 +95,10 @@ const _: () = assert!(
         > MARGIN.as_secs() + HEAD_LANDING_ALLOWANCE.as_secs()
 );
 
-/// The start of the error an index write refused by [`INDEX_WRITE_LIMIT`]
-/// fails with (the simulator classifies it by this text).
+/// The start of [`vykar_types::error::VykarError::SlowIndexWrite`]'s text, the error an index
+/// write refused by [`INDEX_WRITE_LIMIT`] fails with (the simulator's
+/// fallback for wrapped errors matches it).
+#[cfg(any(test, feature = "sim"))]
 pub(crate) const SLOW_INDEX_WRITE_TEXT: &str = "the index write took longer than";
 
 /// Longest time from the head listing that chose a write's generation to

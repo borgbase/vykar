@@ -229,6 +229,17 @@ pub enum VykarError {
     )]
     IndexHeadUnstable,
 
+    /// The index head moved since the index was loaded, or another writer
+    /// created the generation this write tried. Maintenance writes treat it
+    /// as "moved" (`repo::index_write::is_stale_index_error` in vykar-core).
+    #[error("the index changed on storage after it was loaded; retry the operation")]
+    IndexChanged,
+
+    /// Another writer created the index head on every attempt of a write.
+    /// `detail` says which write and how often. Maintenance does not match it.
+    #[error("the index changed on storage after it was loaded: {detail}")]
+    IndexHeadContention { detail: String },
+
     #[error("unknown object type tag: {0}")]
     UnknownObjectType(u8),
 
@@ -267,11 +278,41 @@ pub enum VykarError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An I/O error with the path it happened at ([`IoContext::ctx`]).
+    /// Classified like `Io` ([`VykarError::io_error`]).
+    #[error("I/O error at {path}: {source}")]
+    IoAt {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     Locked(LockHolder),
 
     #[error("chunk not found in index: {0}")]
     ChunkNotInIndex(crate::chunk_id::ChunkId),
+
+    /// A pack answered 404 to a read, and no newer head relocated its chunks.
+    #[error("pack not found: {0}")]
+    PackNotFound(crate::pack_id::PackId),
+
+    /// A range read of a pack returned fewer bytes than asked.
+    #[error(
+        "short read from pack {pack_id} at offset {offset}: expected {expected} bytes, got {actual}"
+    )]
+    PackShortRead {
+        pack_id: crate::pack_id::PackId,
+        offset: u64,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// A stored chunk failed to decode, with its location (restore's form,
+    /// [`crate::chunk_decode::ChunkDecodeError::into_located`]). Boxed for
+    /// `clippy::result_large_err`.
+    #[error("{0}")]
+    ChunkDecode(Box<crate::chunk_decode::ChunkDecodeError>),
 
     /// A restore aborted because repository data it needed could not be read
     /// or decoded. The inner error is the original failure. Nothing was moved
@@ -281,15 +322,6 @@ pub enum VykarError {
 
     #[error("decompression error: {0}")]
     Decompression(String),
-
-    #[error("hook error: {0}")]
-    Hook(String),
-
-    /// The operation was deliberately not run, e.g. a `before` hook asked for a
-    /// skip or a passphrase prompt was dismissed. Not a failure: callers report
-    /// it without firing `failed` hooks or returning an error status.
-    #[error("skipped: {0}")]
-    Skipped(String),
 
     #[error("operation interrupted by signal")]
     Interrupted,
@@ -307,6 +339,17 @@ pub enum VykarError {
          in the server setup guide)"
     )]
     AppendOnlyServer { command: &'static str },
+
+    /// Compact did not run because the live snapshots could not be marked;
+    /// nothing was changed. The text starts with vykar-core's
+    /// `commands::compact::MARK_REFUSED`; the simulator matches the variant.
+    /// The inner error is in the text and deliberately not a `source`, so a
+    /// chain printer does not print it twice.
+    #[error(
+        "compact refused: the live snapshots could not be marked, nothing was changed: {0}. \
+         Run `vykar check` for details"
+    )]
+    MarkRefused(Box<VykarError>),
 
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
@@ -326,6 +369,18 @@ pub enum VykarError {
          more was written: run the command again (a backup reuses the data it uploaded)"
     )]
     MarkerLostDuringCommit,
+
+    /// An index write refused because its first object upload was longer
+    /// ago than its objects' grace. `head_written`: the refusal came after
+    /// the head create. The text starts with vykar-core's
+    /// `repo::ages::SLOW_INDEX_WRITE_TEXT`; the simulator matches the variant.
+    #[error(
+        "the index write took longer than {} h {} min since its first object upload; retry{}",
+        limit_mins / 60,
+        limit_mins % 60,
+        slow_index_write_suffix(*head_written)
+    )]
+    SlowIndexWrite { limit_mins: u64, head_written: bool },
 
     /// A reader planned a chunk read from a head that a concurrent prune and
     /// compact made obsolete: the pack answered 404 and the latest head has no
@@ -365,6 +420,31 @@ pub enum VykarError {
 
     #[error("{0}")]
     Other(String),
+}
+
+/// The end of [`VykarError::SlowIndexWrite`]'s text.
+fn slow_index_write_suffix(head_written: bool) -> &'static str {
+    if head_written {
+        ". The index head was written without its snapshot; the next run continues from it. \
+         Run `vykar check` if the repository fails to open"
+    } else {
+        ""
+    }
+}
+
+/// Attach the path an I/O error happened at. For new code; the blanket
+/// `#[from] io::Error` stays for `?` without context.
+pub trait IoContext<T> {
+    fn ctx(self, path: impl AsRef<std::path::Path>) -> Result<T>;
+}
+
+impl<T> IoContext<T> for std::result::Result<T, std::io::Error> {
+    fn ctx(self, path: impl AsRef<std::path::Path>) -> Result<T> {
+        self.map_err(|source| VykarError::IoAt {
+            path: path.as_ref().display().to_string(),
+            source,
+        })
+    }
 }
 
 /// On Unix, returns `true` if the raw OS error is EIO (errno 5).
@@ -477,9 +557,17 @@ impl VykarError {
     /// skip for partial-backup support.
     pub fn is_soft_file_error(&self) -> bool {
         match self {
-            VykarError::Io(e) => is_soft_backup_io_error(e),
+            VykarError::Io(e) | VykarError::IoAt { source: e, .. } => is_soft_backup_io_error(e),
             VykarError::FileChangedDuringRead { .. } => true,
             _ => false,
+        }
+    }
+
+    /// The I/O error inside `Io` or `IoAt`.
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::Io(e) | Self::IoAt { source: e, .. } => Some(e),
+            _ => None,
         }
     }
 }
@@ -666,6 +754,91 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/tmp/icloud-doc"), "msg: {msg}");
         assert!(msg.contains("cloud-only file"), "msg: {msg}");
+    }
+
+    /// Each typed variant prints what the `Other` it replaced printed, on
+    /// one line.
+    #[test]
+    fn typed_variants_keep_their_texts() {
+        let p = crate::pack_id::PackId::from_bytes([0x07; 32]);
+        let cases = [
+            (VykarError::PackNotFound(p), format!("pack not found: {p}")),
+            (
+                VykarError::PackShortRead {
+                    pack_id: p,
+                    offset: 7,
+                    expected: 100,
+                    actual: 99,
+                },
+                format!("short read from pack {p} at offset 7: expected 100 bytes, got 99"),
+            ),
+            (
+                VykarError::IndexChanged,
+                "the index changed on storage after it was loaded; retry the operation".into(),
+            ),
+            (
+                VykarError::IndexHeadContention {
+                    detail: "index head 5 was created by another writer on each of 3 attempts; \
+                             retry the backup"
+                        .into(),
+                },
+                "the index changed on storage after it was loaded: index head 5 was created \
+                 by another writer on each of 3 attempts; retry the backup"
+                    .into(),
+            ),
+            (
+                VykarError::MarkRefused(Box::new(VykarError::Other("x".into()))),
+                "compact refused: the live snapshots could not be marked, nothing was changed: \
+                 x. Run `vykar check` for details"
+                    .into(),
+            ),
+            (
+                VykarError::SlowIndexWrite {
+                    limit_mins: 680,
+                    head_written: false,
+                },
+                "the index write took longer than 11 h 20 min since its first object upload; \
+                 retry"
+                    .into(),
+            ),
+            (
+                VykarError::SlowIndexWrite {
+                    limit_mins: 680,
+                    head_written: true,
+                },
+                "the index write took longer than 11 h 20 min since its first object upload; \
+                 retry. The index head was written without its snapshot; the next run \
+                 continues from it. Run `vykar check` if the repository fails to open"
+                    .into(),
+            ),
+        ];
+        for (e, want) in cases {
+            let got = e.to_string();
+            assert_eq!(got, want);
+            assert!(!got.contains('\n'), "{got}");
+        }
+    }
+
+    #[test]
+    fn io_context_keeps_the_io_error() {
+        let r: std::io::Result<()> = Err(std::io::Error::from_raw_os_error(5));
+        let e = r.ctx("/x").unwrap_err();
+        assert!(
+            matches!(&e, VykarError::IoAt { path, .. } if path == "/x"),
+            "{e:?}"
+        );
+        assert!(e.to_string().starts_with("I/O error at /x: "), "{e}");
+        #[cfg(unix)]
+        {
+            assert_eq!(e.io_error().and_then(|io| io.raw_os_error()), Some(5));
+            assert!(e.is_soft_file_error());
+        }
+
+        let r: std::io::Result<()> =
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let e = r.ctx("/y").unwrap_err();
+        assert!(e.io_error().is_some());
+        assert!(!e.is_soft_file_error());
     }
 
     #[test]

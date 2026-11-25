@@ -811,15 +811,13 @@ impl Repo {
 /// The error a write returns when the head moved since the index was loaded,
 /// or another writer created the generation it tried.
 fn stale_index_error() -> VykarError {
-    VykarError::Other(STALE_INDEX_TEXT.into())
+    VykarError::IndexChanged
 }
 
-const STALE_INDEX_TEXT: &str =
-    "the index changed on storage after it was loaded; retry the operation";
-
-/// Whether `e` is [`stale_index_error`].
+/// Whether `e` is [`stale_index_error`]. Not `IndexHeadContention`: a
+/// write that lost its head create on every attempt is a failure, not a move.
 fn is_stale_index_error(e: &VykarError) -> bool {
-    matches!(e, VykarError::Other(m) if m == STALE_INDEX_TEXT)
+    matches!(e, VykarError::IndexChanged)
 }
 
 /// What a lock-free maintenance write found (04 step 9, phase F part 10d).
@@ -844,10 +842,12 @@ pub(crate) enum OnMoved {
 /// The error of a backup commit whose head generation another writer took
 /// on each of its `attempts` (04 "Backup commit" 7).
 pub(crate) fn head_contention_error(generation: u64, attempts: u32) -> VykarError {
-    VykarError::Other(format!(
-        "the index changed on storage after it was loaded: index head {generation} was created \
-         by another writer on each of {attempts} attempts; retry the backup"
-    ))
+    VykarError::IndexHeadContention {
+        detail: format!(
+            "index head {generation} was created by another writer on each of {attempts} \
+             attempts; retry the backup"
+        ),
+    }
 }
 
 /// The error `check --repair` returns when reading the chain fails in a way
@@ -882,6 +882,18 @@ fn rebuild_refusal(e: VykarError) -> VykarError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the stale-index error is a move; contention, and an `Other`
+    /// carrying the same text, are failures.
+    #[test]
+    fn stale_index_error_matches_only_index_changed() {
+        assert!(is_stale_index_error(&VykarError::IndexChanged));
+        assert!(is_stale_index_error(&stale_index_error()));
+        assert!(!is_stale_index_error(&head_contention_error(1, 3)));
+        assert!(!is_stale_index_error(&VykarError::Other(
+            "the index changed on storage after it was loaded; retry the operation".into()
+        )));
+    }
     use crate::index::head::{ObjectName, SegmentKind};
 
     fn seg(byte: u8, size: u64) -> SegmentRef {

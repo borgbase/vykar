@@ -197,10 +197,12 @@ fn try_read_blob(
         return Ok(None);
     };
     if data.len() != length as usize {
-        return Err(VykarError::Other(format!(
-            "short read from pack {pack_id} at offset {offset}: expected {length} bytes, got {}",
-            data.len()
-        )));
+        return Err(VykarError::PackShortRead {
+            pack_id: *pack_id,
+            offset,
+            expected: u64::from(length),
+            actual: data.len() as u64,
+        });
     }
     Ok(Some(data))
 }

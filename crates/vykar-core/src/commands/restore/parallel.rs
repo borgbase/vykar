@@ -814,7 +814,7 @@ mod tests {
         stage_files,
     };
     use crate::compress::Compression;
-    use crate::repo::format::{ObjectType, pack_object_with_context};
+    use crate::repo::format::{ChunkDecodeStage, ObjectType, pack_object_with_context};
     use crate::testutil::{MemoryBackend, test_chunk_hasher};
     use smallvec::SmallVec;
     use std::path::PathBuf;
@@ -1354,7 +1354,9 @@ mod tests {
         stage_files(temp.path(), &files);
         let err = run_group(&group, &files, &storage, &crypto, temp.path(), true).unwrap_err();
         assert!(
-            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+            matches!(&err, VykarError::ChunkDecode(e)
+                if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
+                    && e.to_string().contains("hash mismatch")),
             "expected hash mismatch error, got: {err}"
         );
 
@@ -1412,7 +1414,9 @@ mod tests {
         stage_files(temp.path(), &files);
         let err = run_group(&group, &files, &storage, &crypto, temp.path(), false).unwrap_err();
         assert!(
-            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+            matches!(&err, VykarError::ChunkDecode(e)
+                if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
+                    && e.to_string().contains("hash mismatch")),
             "expected hash mismatch error, got: {err}"
         );
         assert_eq!(
@@ -1758,7 +1762,9 @@ mod tests {
         stage_files(temp.path(), &files);
         let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
         assert!(
-            matches!(&err, ReadError::Source(VykarError::InvalidFormat(m)) if m.contains("hash mismatch")),
+            matches!(&err, ReadError::Source(VykarError::ChunkDecode(e))
+                if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
+                    && e.to_string().contains("hash mismatch")),
             "got: {err:?}"
         );
     }

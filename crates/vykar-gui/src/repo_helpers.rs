@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use vykar_core::app::{operations, passphrase};
+use vykar_core::app::{OpsError, operations, passphrase};
 use vykar_core::commands;
 use vykar_core::config::{self, ResolvedRepo};
 use vykar_types::error::VykarError;
@@ -53,21 +53,41 @@ pub(crate) enum PassphraseRun<T> {
 /// (if any) validated for it — `None` for a plaintext repo.
 pub(crate) type FoundRepo<'a> = (&'a ResolvedRepo, Option<zeroize::Zeroizing<String>>);
 
+/// What [`with_passphrase_retry`] needs of an operation's error.
+pub(crate) trait PassphraseError: From<VykarError> {
+    /// Whether a wrong passphrase could explain this error.
+    fn is_passphrase_failure(&self) -> bool;
+}
+
+impl PassphraseError for VykarError {
+    fn is_passphrase_failure(&self) -> bool {
+        VykarError::is_passphrase_failure(self)
+    }
+}
+
+/// A hook error or a skip is never a passphrase failure, so it never
+/// re-prompts; like any `Err` it leaves the cache untouched.
+impl PassphraseError for OpsError {
+    fn is_passphrase_failure(&self) -> bool {
+        OpsError::is_passphrase_failure(self)
+    }
+}
+
 /// Run `f` with a resolved passphrase, caching it **only on success**.
 ///
 /// A cached (already-validated) passphrase is used directly. Otherwise the
 /// passphrase is resolved and `f` runs; if `f` fails in a way a wrong
-/// passphrase could explain (see [`VykarError::is_passphrase_failure`]) and the
+/// passphrase could explain (see [`PassphraseError::is_passphrase_failure`]) and the
 /// passphrase came from the interactive dialog, the cache stays clean and the
 /// user is re-prompted (up to `attempts` total). A wrong *configured* passphrase fails immediately. If the
 /// user dismisses the prompt for an encrypted repo, returns
 /// [`PassphraseRun::Canceled`].
-pub(crate) fn with_passphrase_retry<T>(
+pub(crate) fn with_passphrase_retry<T, E: PassphraseError>(
     repo: &ResolvedRepo,
     cache: &mut HashMap<String, zeroize::Zeroizing<String>>,
     attempts: usize,
-    f: impl FnMut(Option<&str>) -> Result<T, VykarError>,
-) -> Result<PassphraseRun<T>, VykarError> {
+    f: impl FnMut(Option<&str>) -> Result<T, E>,
+) -> Result<PassphraseRun<T>, E> {
     let key = repo.config.repository.url.clone();
     let encrypted = repo.config.encryption.mode != config::EncryptionModeConfig::None;
     with_passphrase_retry_inner(
@@ -87,14 +107,14 @@ pub(crate) fn with_passphrase_retry<T>(
 /// Testable core of [`with_passphrase_retry`]: the cache / retry / provenance
 /// state machine, with passphrase resolution injected via `resolve` (returns
 /// the passphrase and whether it came from an interactive dialog).
-fn with_passphrase_retry_inner<T>(
+fn with_passphrase_retry_inner<T, E: PassphraseError>(
     key: &str,
     encrypted: bool,
     cache: &mut HashMap<String, zeroize::Zeroizing<String>>,
     attempts: usize,
     mut resolve: impl FnMut(&str) -> Result<(Option<zeroize::Zeroizing<String>>, bool), VykarError>,
-    mut f: impl FnMut(Option<&str>) -> Result<T, VykarError>,
-) -> Result<PassphraseRun<T>, VykarError> {
+    mut f: impl FnMut(Option<&str>) -> Result<T, E>,
+) -> Result<PassphraseRun<T>, E> {
     // A cached passphrase is only ever inserted after a successful op, so it is
     // trusted — use it directly without a re-prompt path. Defense in depth: if a
     // cached value nonetheless fails to decrypt (a misbehaving call site cached a
@@ -111,9 +131,9 @@ fn with_passphrase_retry_inner<T>(
 
     let attempts = attempts.max(1);
     let mut error_line = String::new();
-    let mut last_failure: Option<VykarError> = None;
+    let mut last_failure: Option<E> = None;
     for attempt in 0..attempts {
-        let (pass, from_dialog) = resolve(&error_line)?;
+        let (pass, from_dialog) = resolve(&error_line).map_err(E::from)?;
 
         // Encrypted repo with no passphrase → the user dismissed the prompt.
         if encrypted && pass.is_none() {
@@ -138,7 +158,7 @@ fn with_passphrase_retry_inner<T>(
     // Attempts exhausted after repeated wrong dialog entries. Return the last
     // real failure so its diagnosis (which key copies were consulted, whether
     // they corroborated each other) is not flattened away.
-    Err(last_failure.unwrap_or(VykarError::DecryptionFailed))
+    Err(last_failure.unwrap_or_else(|| E::from(VykarError::DecryptionFailed)))
 }
 
 pub(crate) fn select_repos<'a>(
@@ -638,7 +658,7 @@ mod tests {
         let mut cache = HashMap::new();
         let calls = std::cell::Cell::new(0);
         let responses = [(None, true)];
-        let result: Result<PassphraseRun<()>, _> = with_passphrase_retry_inner(
+        let result: Result<PassphraseRun<()>, VykarError> = with_passphrase_retry_inner(
             KEY,
             true,
             &mut cache,
@@ -654,7 +674,7 @@ mod tests {
     fn cached_passphrase_is_used_without_resolving() {
         let mut cache = HashMap::new();
         cache.insert(KEY.to_string(), zeroize::Zeroizing::new("good".to_string()));
-        let result = with_passphrase_retry_inner(
+        let result: Result<_, VykarError> = with_passphrase_retry_inner(
             KEY,
             true,
             &mut cache,
@@ -722,7 +742,7 @@ mod tests {
         let mut cache = HashMap::new();
         let calls = std::cell::Cell::new(0);
         let responses = [(None, false)];
-        let result = with_passphrase_retry_inner(
+        let result: Result<_, VykarError> = with_passphrase_retry_inner(
             KEY,
             false, // not encrypted
             &mut cache,
@@ -735,5 +755,55 @@ mod tests {
         );
         assert!(matches!(result, Ok(PassphraseRun::Ran("done"))));
         assert!(cache.is_empty(), "None passphrase is never cached");
+    }
+
+    /// A skip from the operation is returned as is: no re-prompt, nothing cached.
+    #[test]
+    fn ops_skip_is_returned_without_caching() {
+        let mut cache = HashMap::new();
+        let calls = std::cell::Cell::new(0);
+        let runs = std::cell::Cell::new(0);
+        let responses = [(Some("a"), true), (Some("b"), true)];
+        let result: Result<PassphraseRun<()>, OpsError> = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            |_pass| {
+                runs.set(runs.get() + 1);
+                Err(OpsError::Skipped("hook".into()))
+            },
+        );
+        assert!(matches!(result, Err(OpsError::Skipped(r)) if r == "hook"));
+        assert_eq!(runs.get(), 1);
+        assert_eq!(calls.get(), 1);
+        assert!(cache.is_empty());
+    }
+
+    /// An engine passphrase failure inside `OpsError` re-prompts, as with
+    /// `VykarError`.
+    #[test]
+    fn ops_passphrase_failure_reprompts() {
+        let mut cache = HashMap::new();
+        let calls = std::cell::Cell::new(0);
+        let responses = [(Some("wrong"), true), (Some("right"), true)];
+        let result: Result<_, OpsError> = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            |pass| {
+                if pass == Some("right") {
+                    Ok("ok")
+                } else {
+                    Err(OpsError::Engine(VykarError::DecryptionFailed))
+                }
+            },
+        );
+        assert!(matches!(result, Ok(PassphraseRun::Ran("ok"))));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(cache.get(KEY).map(|z| z.as_str()), Some("right"));
     }
 }

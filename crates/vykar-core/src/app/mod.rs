@@ -3,11 +3,14 @@ use std::path::Path;
 use crate::config::{self, ConfigSource, ResolvedRepo};
 use vykar_types::error::{Result, VykarError};
 
+pub mod error;
 pub mod operations;
 pub mod passphrase;
 pub mod preflight;
 pub mod scheduler;
 pub mod views;
+
+pub use error::{OpsError, OpsResult};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

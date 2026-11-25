@@ -7,12 +7,17 @@ use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_storage::{ParsedUrl, parse_repo_url};
 
+use serde::Serialize;
+
 use crate::cli::{Commands, KeyCommand};
 use crate::cmd;
-use crate::cmd::backup::BackupRunOpts;
-use crate::cmd::check::{format_check_progress, print_check_summary};
+use crate::cmd::backup::{BackupJson, BackupRunOpts};
+use crate::cmd::check::{CheckJson, format_check_progress, print_check_summary};
+use crate::cmd::compact::CompactJson;
+use crate::cmd::prune::PruneJson;
 use crate::error::{CliError, CliResult};
 use crate::format::print_backup_stats;
+use crate::output::{Output, Report};
 use crate::passphrase::get_passphrase;
 use vykar_common::display::format_duration_seconds;
 use vykar_types::error::VykarError;
@@ -54,6 +59,7 @@ pub(crate) fn run_default_actions(
     verbose: u8,
     source_filter: &[String],
     unavailable: UnavailableRepo,
+    out: &mut Output,
 ) -> CliResult<CycleOutcome> {
     let start = std::time::Instant::now();
     let label = repo.label.as_deref();
@@ -80,7 +86,7 @@ pub(crate) fn run_default_actions(
     };
 
     let is_tty = std::io::stderr().is_terminal();
-    let show_progress = is_tty || verbose > 0;
+    let show_progress = (is_tty && !out.is_json()) || verbose > 0;
     let mut backup_renderer: Option<BackupProgressRenderer> = None;
 
     let result = operations::run_full_cycle_with_passphrase_source(
@@ -135,8 +141,10 @@ pub(crate) fn run_default_actions(
         r.finish();
     }
 
-    print_step_details(&result);
-    print_summary(&result.steps, start);
+    out.emit(&CycleReport {
+        result: &result,
+        elapsed: start.elapsed(),
+    })?;
 
     if result.has_failures() {
         Err(CliError::from("one or more steps failed"))
@@ -146,6 +154,70 @@ pub(crate) fn run_default_actions(
             skipped: result.backup_skipped().map(str::to_owned),
             unavailable: result.repo_unavailable,
         })
+    }
+}
+
+struct CycleReport<'a> {
+    result: &'a FullCycleResult,
+    elapsed: std::time::Duration,
+}
+
+#[derive(Serialize)]
+struct CycleJson<'a> {
+    steps: Vec<StepJson<'a>>,
+    duration_secs: f64,
+    repo_unavailable: bool,
+    backup: Option<BackupJson<'a>>,
+    prune: Option<PruneJson<'a>>,
+    compact: Option<CompactJson>,
+    check: Option<CheckJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct StepJson<'a> {
+    step: &'static str,
+    status: &'static str,
+    message: Option<&'a str>,
+}
+
+impl Report for CycleReport<'_> {
+    const KEY: &'static str = "cycle";
+
+    fn json(&self) -> impl Serialize {
+        let r = self.result;
+        CycleJson {
+            steps: r
+                .steps
+                .iter()
+                .map(|(step, outcome)| {
+                    let (status, message) = match outcome {
+                        StepOutcome::Ok => ("ok", None),
+                        StepOutcome::Partial => ("partial", None),
+                        StepOutcome::Skipped(reason) => ("skipped", Some(reason.as_str())),
+                        StepOutcome::Failed(e) => ("error", Some(e.as_str())),
+                    };
+                    StepJson {
+                        step: step.command_name(),
+                        status,
+                        message,
+                    }
+                })
+                .collect(),
+            duration_secs: self.elapsed.as_secs_f64(),
+            repo_unavailable: r.repo_unavailable,
+            backup: r.backup_report.as_ref().map(BackupJson::from),
+            prune: r.prune_stats.as_ref().map(PruneJson::summary),
+            compact: r
+                .compact_stats
+                .as_ref()
+                .map(|stats| CompactJson::new(stats, false)),
+            check: r.check_result.as_ref().map(CheckJson::from),
+        }
+    }
+
+    fn print_human(&self) {
+        print_step_details(self.result);
+        print_summary(&self.result.steps, self.elapsed);
     }
 }
 
@@ -199,9 +271,7 @@ fn print_step_details(result: &FullCycleResult) {
 }
 
 /// Prints the summary table.
-fn print_summary(steps: &[(CycleStep, StepOutcome)], start: std::time::Instant) {
-    let elapsed = start.elapsed();
-
+fn print_summary(steps: &[(CycleStep, StepOutcome)], elapsed: std::time::Duration) {
     eprintln!();
     eprintln!("=== Summary ===");
     for (step, result) in steps {
@@ -228,13 +298,14 @@ pub(crate) fn dispatch_command(
     repo: &ResolvedRepo,
     shutdown: &CancelToken,
     verbose: u8,
+    out: &mut Output,
 ) -> CliResult<bool> {
     let cfg = &repo.config;
     let label = repo.label.as_deref();
     let sources = &repo.sources;
 
     match command {
-        Commands::Init { .. } => cmd::init::run_init(cfg, label).map(|()| false),
+        Commands::Init { .. } => cmd::init::run_init(cfg, label, out).map(|()| false),
         Commands::Backup {
             label: user_label,
             compression,
@@ -255,12 +326,13 @@ pub(crate) fn dispatch_command(
                 shutdown,
                 verbose,
             },
+            out,
         ),
         Commands::List { source, last, .. } => {
-            cmd::list::run_list(cfg, label, source, *last).map(|()| false)
+            cmd::list::run_list(cfg, label, source, *last, out).map(|()| false)
         }
         Commands::Snapshot { command, .. } => {
-            cmd::snapshot::run_snapshot_command(command, cfg, label, shutdown).map(|()| false)
+            cmd::snapshot::run_snapshot_command(command, cfg, label, shutdown, out).map(|()| false)
         }
         Commands::Restore {
             snapshot,
@@ -278,17 +350,18 @@ pub(crate) fn dispatch_command(
             *verify,
             *continue_on_error,
             shutdown,
+            out,
         ),
         Commands::Delete {
             yes_delete_this_repo,
             ..
-        } => cmd::delete::run_delete_repo(cfg, label, *yes_delete_this_repo).map(|()| false),
+        } => cmd::delete::run_delete_repo(cfg, label, *yes_delete_this_repo, out).map(|()| false),
         Commands::Prune {
             dry_run,
             list,
             source,
             ..
-        } => cmd::prune::run_prune(cfg, label, *dry_run, *list, sources, source, shutdown)
+        } => cmd::prune::run_prune(cfg, label, *dry_run, *list, sources, source, shutdown, out)
             .map(|()| false),
         Commands::Check {
             verify_data,
@@ -306,15 +379,16 @@ pub(crate) fn dispatch_command(
             *dry_run,
             *yes,
             shutdown,
+            out,
         )
         .map(|()| false),
-        Commands::Info { .. } => cmd::info::run_info(cfg, label).map(|()| false),
+        Commands::Info { .. } => cmd::info::run_info(cfg, label, out).map(|()| false),
         Commands::Key { command, .. } => match command {
             KeyCommand::Export { output, .. } => {
-                cmd::key::run_key_export(cfg, label, output.as_deref()).map(|()| false)
+                cmd::key::run_key_export(cfg, label, output.as_deref(), out).map(|()| false)
             }
             KeyCommand::Import { file, force, .. } => {
-                cmd::key::run_key_import(cfg, label, file, *force).map(|()| false)
+                cmd::key::run_key_import(cfg, label, file, *force, out).map(|()| false)
             }
         },
         Commands::Mount {
@@ -333,12 +407,12 @@ pub(crate) fn dispatch_command(
         )
         .map(|()| false),
         Commands::BreakLock { sessions, .. } => {
-            cmd::break_lock::run_break_lock(cfg, label, *sessions).map(|()| false)
+            cmd::break_lock::run_break_lock(cfg, label, *sessions, out).map(|()| false)
         }
         Commands::Compact {
             report_unreferenced: true,
             ..
-        } => cmd::compact::run_report_unreferenced(cfg, label, shutdown).map(|()| false),
+        } => cmd::compact::run_report_unreferenced(cfg, label, shutdown, out).map(|()| false),
         Commands::Compact {
             threshold,
             max_repack_size,
@@ -346,11 +420,19 @@ pub(crate) fn dispatch_command(
             ..
         } => {
             let t = threshold.unwrap_or(cfg.compact.threshold);
-            cmd::compact::run_compact(cfg, label, t, max_repack_size.clone(), *dry_run, shutdown)
-                .map(|()| false)
+            cmd::compact::run_compact(
+                cfg,
+                label,
+                t,
+                max_repack_size.clone(),
+                *dry_run,
+                shutdown,
+                out,
+            )
+            .map(|()| false)
         }
         Commands::Upgrade { yes, .. } => {
-            cmd::upgrade::run_upgrade(cfg, label, *yes).map(|()| false)
+            cmd::upgrade::run_upgrade(cfg, label, *yes, out).map(|()| false)
         }
         Commands::Config { .. } => Err(CliError::from(
             "'config' command should be handled before config resolution",

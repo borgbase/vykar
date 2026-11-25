@@ -21,6 +21,7 @@ use vykar_types::error::VykarError;
 
 use crate::dispatch::{run_default_actions, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
+use crate::output::Output;
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
 use status::SharedStatus;
@@ -392,6 +393,7 @@ fn run_backup_cycle(
             0,
             &[],
             UnavailableRepo::Skip,
+            &mut Output::new(false, "daemon".into()),
         ) {
             Ok(outcome) => {
                 if outcome.partial {

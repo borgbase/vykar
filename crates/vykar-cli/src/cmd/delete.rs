@@ -1,10 +1,13 @@
-use std::io::IsTerminal;
+use serde::Serialize;
 
 use vykar_core::commands;
+use vykar_core::commands::delete::DeleteResult;
+use vykar_core::commands::delete_repo::DeleteRepoStats;
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
+use crate::output::{Output, Report};
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_delete(
@@ -13,6 +16,7 @@ pub(crate) fn run_delete(
     snapshot_names: &[String],
     dry_run: bool,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<()> {
     let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
     let result = with_repo_passphrase(config, label, |passphrase| {
@@ -21,28 +25,62 @@ pub(crate) fn run_delete(
         )?)
     })?;
 
-    for stats in &result.stats {
-        if dry_run {
-            println!("Dry run: would delete snapshot '{}'", stats.snapshot_name);
-        } else {
-            println!("Deleted snapshot '{}'", stats.snapshot_name);
+    out.emit(&SnapshotDeleteReport { result, dry_run })
+}
+
+struct SnapshotDeleteReport {
+    result: DeleteResult,
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct SnapshotDeleteJson<'a> {
+    dry_run: bool,
+    /// Snapshots deleted, or that a dry run would delete.
+    snapshots: Vec<&'a str>,
+    warnings: &'a [String],
+}
+
+impl Report for SnapshotDeleteReport {
+    const KEY: &'static str = "snapshot_delete";
+
+    fn json(&self) -> impl Serialize {
+        SnapshotDeleteJson {
+            dry_run: self.dry_run,
+            snapshots: self
+                .result
+                .stats
+                .iter()
+                .map(|s| s.snapshot_name.as_str())
+                .collect(),
+            warnings: &self.result.warnings,
         }
     }
-    if !dry_run && !result.stats.is_empty() {
-        println!("Run `vykar compact` to reclaim their space.");
-    }
 
-    for w in &result.warnings {
-        eprintln!("warning: {w}");
-    }
+    fn print_human(&self) {
+        let (result, dry_run) = (&self.result, self.dry_run);
+        for stats in &result.stats {
+            if dry_run {
+                println!("Dry run: would delete snapshot '{}'", stats.snapshot_name);
+            } else {
+                println!("Deleted snapshot '{}'", stats.snapshot_name);
+            }
+        }
+        if !dry_run && !result.stats.is_empty() {
+            println!("Run `vykar compact` to reclaim their space.");
+        }
 
-    Ok(())
+        for w in &result.warnings {
+            eprintln!("warning: {w}");
+        }
+    }
 }
 
 pub(crate) fn run_delete_repo(
     config: &VykarConfig,
     label: Option<&str>,
     yes_delete_this_repo: bool,
+    out: &mut Output,
 ) -> CliResult<()> {
     // Verify the repo exists before prompting — use list + is_known_repo_key
     // so we detect partially-deleted repos (e.g. config gone but packs remain).
@@ -65,7 +103,7 @@ pub(crate) fn run_delete_repo(
     drop(backend);
 
     if !yes_delete_this_repo {
-        if !std::io::stdin().is_terminal() {
+        if !out.interactive() {
             return Err(CliError::from(
                 "refusing to delete repository without confirmation in non-interactive mode; \
                  use --yes-delete-this-repo to skip the prompt",
@@ -90,9 +128,44 @@ pub(crate) fn run_delete_repo(
     }
 
     let stats = commands::delete_repo::run(config)?;
+    out.emit(&RepoDeleteReport {
+        repo_name: label.unwrap_or(&config.repository.url),
+        url: &config.repository.url,
+        stats,
+    })
+}
 
-    let repo_name = label.unwrap_or(&config.repository.url);
+struct RepoDeleteReport<'a> {
+    repo_name: &'a str,
+    url: &'a str,
+    stats: DeleteRepoStats,
+}
 
+#[derive(Serialize)]
+struct RepoDeleteJson<'a> {
+    keys_deleted: u64,
+    /// Entries vykar does not manage, left in place.
+    unknown_entries: &'a [String],
+    root_removed: bool,
+}
+
+impl Report for RepoDeleteReport<'_> {
+    const KEY: &'static str = "delete";
+
+    fn json(&self) -> impl Serialize {
+        RepoDeleteJson {
+            keys_deleted: self.stats.keys_deleted,
+            unknown_entries: &self.stats.unknown_entries,
+            root_removed: self.stats.root_removed,
+        }
+    }
+
+    fn print_human(&self) {
+        print_repo_deleted(self.repo_name, self.url, &self.stats);
+    }
+}
+
+fn print_repo_deleted(repo_name: &str, url: &str, stats: &DeleteRepoStats) {
     if stats.unknown_entries.is_empty() {
         println!(
             "Repository '{repo_name}' deleted ({} keys removed).",
@@ -119,9 +192,7 @@ pub(crate) fn run_delete_repo(
             "Note: repository directory '{}' could not be fully removed; \
              it may contain empty directories, other non-file entries, or temp-named \
              files ('.tmp.*') in directories vykar does not manage.",
-            config.repository.url
+            url
         );
     }
-
-    Ok(())
 }

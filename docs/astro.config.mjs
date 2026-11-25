@@ -67,7 +67,7 @@ export default defineConfig({
 					],
 				},
 				{ label: 'Server', items: ['server-setup'] },
-				{ label: 'Reference', items: ['configuration', 'commands'] },
+				{ label: 'Reference', items: ['configuration', 'commands', 'json-output'] },
 				{ label: 'Background', items: ['comparison', 'goals', 'roadmap'] },
 				{
 					label: 'Internals',

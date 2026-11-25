@@ -1,13 +1,16 @@
 use std::io::{self, BufRead, Write};
 
+use serde::Serialize;
+
 use vykar_core::commands;
 use vykar_core::commands::check::{
-    IndexLoss, IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
+    CheckResult, IndexLoss, IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
 };
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
+use crate::output::{Output, Report};
 use crate::passphrase::with_repo_passphrase;
 
 #[allow(clippy::too_many_arguments)]
@@ -20,6 +23,7 @@ pub(crate) fn run_check(
     dry_run: bool,
     yes: bool,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
@@ -27,15 +31,15 @@ pub(crate) fn run_check(
                 "--distrust-server requires --verify-data (flag is meaningless without data verification)",
             ));
         }
-        return run_check_readonly(config, label, verify_data, distrust_server, shutdown);
+        return run_check_readonly(config, label, verify_data, distrust_server, shutdown, out);
     }
 
     // --repair mode
     if dry_run {
         // Plan only: show plan and exit.
         let result = run_repair(config, label, verify_data, RepairMode::PlanOnly, shutdown)?;
-        print_check_summary(&result.check_result);
-        print_repair_plan(&result.plan);
+        out.emit(&CheckReport(&result.check_result))?;
+        out.emit(&RepairReport::plan(&result.plan, true))?;
         eprintln!("Dry run: no changes applied.");
         if !result.check_result.errors.is_empty() {
             return Err(CliError::from(format!(
@@ -49,25 +53,30 @@ pub(crate) fn run_check(
     if yes {
         // --yes: apply directly without confirmation.
         let result = run_repair(config, label, verify_data, RepairMode::Apply, shutdown)?;
-        print_check_summary(&result.check_result);
-        print_repair_plan(&result.plan);
-        print_repair_result(&result);
+        out.emit(&CheckReport(&result.check_result))?;
+        out.emit(&RepairReport::applied(&result, true))?;
         return Ok(());
     }
 
     // Interactive: plan first, then confirm, then apply.
     let plan_result = run_repair(config, label, verify_data, RepairMode::PlanOnly, shutdown)?;
 
-    print_check_summary(&plan_result.check_result);
-    print_repair_plan(&plan_result.plan);
+    out.emit(&CheckReport(&plan_result.check_result))?;
+    out.emit(&RepairReport::plan(&plan_result.plan, false))?;
 
     if !plan_result.plan.has_data_loss && plan_result.plan.actions.iter().all(is_safe_action) {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let mode = apply_mode_after(&plan_result.plan);
         let result = run_repair(config, label, verify_data, mode, shutdown)?;
-        print_repair_result(&result);
+        out.emit(&RepairReport::applied(&result, false))?;
         return Ok(());
+    }
+
+    if plan_result.plan.has_data_loss && out.is_json() {
+        return Err(CliError::from(
+            "the repair plan removes data; pass --yes to apply it with --json",
+        ));
     }
 
     if plan_result.plan.has_data_loss {
@@ -84,7 +93,7 @@ pub(crate) fn run_check(
     // Re-scan and apply under maintenance lock.
     let mode = apply_mode_after(&plan_result.plan);
     let result = run_repair(config, label, verify_data, mode, shutdown)?;
-    print_repair_result(&result);
+    out.emit(&RepairReport::applied(&result, false))?;
 
     Ok(())
 }
@@ -125,6 +134,7 @@ fn run_check_readonly(
     verify_data: bool,
     distrust_server: bool,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<()> {
     let result = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_progress(
@@ -139,7 +149,7 @@ fn run_check_readonly(
         )?)
     })?;
 
-    print_check_summary(&result);
+    out.emit(&CheckReport(&result))?;
 
     if !result.errors.is_empty() {
         return Err(CliError::from(format!(
@@ -191,6 +201,200 @@ pub(crate) fn format_check_progress(event: &commands::check::CheckProgressEvent)
 
 fn make_progress_callback() -> impl FnMut(commands::check::CheckProgressEvent) {
     |event| format_check_progress(&event)
+}
+
+struct CheckReport<'a>(&'a CheckResult);
+
+#[derive(Serialize)]
+pub(crate) struct CheckJson<'a> {
+    /// The check did not run (its schedule said it was not due).
+    skipped: bool,
+    snapshots_checked: usize,
+    key_files_checked: Option<usize>,
+    items_checked: usize,
+    packs_existence_checked: usize,
+    chunks_existence_checked: usize,
+    chunks_data_verified: usize,
+    errors: Vec<CheckErrorJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct CheckErrorJson<'a> {
+    context: &'a str,
+    message: &'a str,
+}
+
+impl<'a> From<&'a CheckResult> for CheckJson<'a> {
+    fn from(result: &'a CheckResult) -> Self {
+        Self {
+            skipped: result.skipped,
+            snapshots_checked: result.snapshots_checked,
+            key_files_checked: result.key_files_checked,
+            items_checked: result.items_checked,
+            packs_existence_checked: result.packs_existence_checked,
+            chunks_existence_checked: result.chunks_existence_checked,
+            chunks_data_verified: result.chunks_data_verified,
+            errors: result
+                .errors
+                .iter()
+                .map(|e| CheckErrorJson {
+                    context: &e.context,
+                    message: &e.message,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Report for CheckReport<'_> {
+    const KEY: &'static str = "check";
+
+    fn json(&self) -> impl Serialize {
+        CheckJson::from(self.0)
+    }
+
+    fn print_human(&self) {
+        print_check_summary(self.0);
+    }
+}
+
+struct RepairReport<'a> {
+    plan: &'a RepairPlan,
+    applied: Option<&'a RepairResult>,
+    dry_run: bool,
+    /// Whether the human output still has to show the plan: the interactive
+    /// flow showed it before asking.
+    show_plan: bool,
+}
+
+impl<'a> RepairReport<'a> {
+    fn plan(plan: &'a RepairPlan, dry_run: bool) -> Self {
+        Self {
+            plan,
+            applied: None,
+            dry_run,
+            show_plan: true,
+        }
+    }
+
+    fn applied(result: &'a RepairResult, show_plan: bool) -> Self {
+        Self {
+            plan: &result.plan,
+            applied: Some(result),
+            dry_run: false,
+            show_plan,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RepairJson<'a> {
+    dry_run: bool,
+    has_data_loss: bool,
+    /// How the index was read; `null` when it was read in full.
+    index_recovery: Option<IndexRecoveryJson>,
+    uncovered_packs: Vec<UncoveredPackJson<'a>>,
+    actions: Vec<RepairActionJson>,
+    /// `null` until the plan was applied.
+    applied: Option<Vec<RepairActionJson>>,
+    repair_errors: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+struct IndexRecoveryJson {
+    cause: &'static str,
+    packs: usize,
+    from_maps: usize,
+    from_trailers: usize,
+    from_local_tables: usize,
+    damaged_maps: usize,
+}
+
+#[derive(Serialize)]
+struct UncoveredPackJson<'a> {
+    pack_id: String,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct RepairActionJson {
+    action: &'static str,
+    description: String,
+    data_loss: bool,
+}
+
+impl From<&RepairAction> for RepairActionJson {
+    fn from(action: &RepairAction) -> Self {
+        Self {
+            action: repair_action_name(action),
+            description: format_repair_action(action),
+            data_loss: !is_safe_action(action),
+        }
+    }
+}
+
+fn repair_action_name(action: &RepairAction) -> &'static str {
+    match action {
+        RepairAction::RestoreKeyCopy { .. } => "restore_key_copy",
+        RepairAction::RemoveCorruptSnapshot { .. } => "remove_corrupt_snapshot",
+        RepairAction::RemoveInvalidSnapshotKey { .. } => "remove_invalid_snapshot_key",
+        RepairAction::RemoveDanglingIndexEntries { .. } => "remove_dangling_index_entries",
+        RepairAction::RemoveCorruptPack { .. } => "remove_corrupt_pack",
+        RepairAction::RemoveCorruptChunks { .. } => "remove_corrupt_chunks",
+        RepairAction::RemoveDanglingSnapshot { .. } => "remove_dangling_snapshot",
+        RepairAction::DropItemsFromSnapshot { .. } => "drop_items_from_snapshot",
+        RepairAction::WritePackMaps { .. } => "write_pack_maps",
+        RepairAction::RemoveUnreferencedEntries => "remove_unreferenced_entries",
+    }
+}
+
+impl Report for RepairReport<'_> {
+    const KEY: &'static str = "repair";
+
+    fn json(&self) -> impl Serialize {
+        let plan = self.plan;
+        RepairJson {
+            dry_run: self.dry_run,
+            has_data_loss: plan.has_data_loss,
+            index_recovery: match plan.index_recovery {
+                IndexRecovery::Complete => None,
+                IndexRecovery::RebuiltFromPacks { cause, counts } => Some(IndexRecoveryJson {
+                    cause: match cause {
+                        IndexLoss::HeadMissing => "head_missing",
+                        IndexLoss::HeadUnreadable => "head_unreadable",
+                        IndexLoss::ChainDamaged => "chain_damaged",
+                    },
+                    packs: counts.packs,
+                    from_maps: counts.from_maps,
+                    from_trailers: counts.from_trailers,
+                    from_local_tables: counts.from_local_tables,
+                    damaged_maps: counts.damaged_maps,
+                }),
+            },
+            uncovered_packs: plan
+                .uncovered_packs
+                .iter()
+                .map(|p| UncoveredPackJson {
+                    pack_id: p.pack_id.to_hex(),
+                    reason: &p.reason,
+                })
+                .collect(),
+            actions: plan.actions.iter().map(RepairActionJson::from).collect(),
+            applied: self
+                .applied
+                .map(|r| r.applied.iter().map(RepairActionJson::from).collect()),
+            repair_errors: self.applied.map(|r| r.repair_errors.as_slice()),
+        }
+    }
+
+    fn print_human(&self) {
+        if self.show_plan {
+            print_repair_plan(self.plan);
+        }
+        if let Some(result) = self.applied {
+            print_repair_result(result);
+        }
+    }
 }
 
 pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {

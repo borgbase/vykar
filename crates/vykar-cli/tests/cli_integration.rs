@@ -3628,3 +3628,161 @@ fn latest_head(repo_dir: &Path) -> std::path::PathBuf {
         .map(|(_, p)| p)
         .expect("an index head")
 }
+
+// ── --json ──────────────────────────────────────────────────────────────────
+
+/// Parse stdout as exactly one JSON document: anything else printed there
+/// breaks every consumer of `--json`.
+fn parse_json_document(stdout: &str) -> serde_json::Value {
+    serde_json::from_str(stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}):\n{stdout}"))
+}
+
+#[test]
+fn cli_json_list_reports_structured_snapshots() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+    std::fs::write(fx.source_a.join("old.txt"), b"old\n").unwrap();
+    let snap = parse_snapshot_name(&fx.run_ok(&["--config", &cfg, "backup", &source]));
+
+    let doc = parse_json_document(&fx.run_ok(&["--config", &cfg, "list", "--json"]));
+    assert_eq!(doc["version"], 1);
+    assert_eq!(doc["command"], "list");
+    assert_eq!(doc["status"], "ok");
+    assert!(doc["error"].is_null());
+    let repo = &doc["repositories"][0];
+    assert_eq!(repo["status"], "ok");
+    let snapshots = repo["result"]["list"]["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    let s = &snapshots[0];
+    assert_eq!(s["name"], snap.as_str());
+    assert_eq!(s["id"].as_str().unwrap().len(), 64);
+    assert!(s["time"].as_str().unwrap().ends_with('Z'), "{s}");
+    assert_eq!(s["source_paths"][0], source.as_str());
+    assert_eq!(s["stats"]["nfiles"], 1);
+    assert_eq!(s["stats"]["original_size"], 4);
+}
+
+/// Each command, run with `--json`, writes one JSON document and nothing else
+/// to stdout, also when the human output of that command is several lines.
+#[test]
+fn cli_json_every_command_writes_one_document() {
+    let fx = CliFixture::new();
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::write(fx.source_a.join("a.txt"), b"a\n").unwrap();
+    std::fs::write(fx.source_b.join("b.txt"), b"b\n").unwrap();
+    let dest = fx._tmp.path().join("restored");
+    let dest = dest.to_string_lossy().to_string();
+    let new_config = fx._tmp.path().join("generated.yaml");
+    let new_config = new_config.to_string_lossy().to_string();
+
+    let commands: &[(&[&str], &str)] = &[
+        (&["init"], "init"),
+        (&["backup"], "backup"),
+        (&["list"], "list"),
+        (&["info"], "info"),
+        (&["snapshot", "info", "latest"], "snapshot_info"),
+        (&["snapshot", "list", "latest"], "snapshot_list"),
+        (&["snapshot", "find", "--name", "*.txt"], "snapshot_find"),
+        (&["restore", "latest", &dest], "restore"),
+        (&["prune", "--dry-run", "--list"], "prune"),
+        (&["compact", "--dry-run"], "compact"),
+        (
+            &["compact", "--report-unreferenced"],
+            "compact_unreferenced",
+        ),
+        (&["check"], "check"),
+        (&["check", "--repair", "--dry-run"], "repair"),
+        (&["break-lock"], "break_lock"),
+        (&["upgrade", "--yes"], "upgrade"),
+        (&[], "cycle"),
+    ];
+    for (args, key) in commands {
+        let mut full = vec!["--config", cfg.as_str(), "--json"];
+        full.extend_from_slice(args);
+        let doc = parse_json_document(&fx.run_ok(&full));
+        assert_eq!(doc["status"], "ok", "{args:?}: {doc}");
+        assert!(
+            doc["repositories"][0]["result"][key].is_object()
+                || doc["repositories"][0]["result"][key].is_array(),
+            "{args:?}: no `{key}` result in {doc}"
+        );
+    }
+
+    let doc = parse_json_document(&fx.run_ok(&["config", "--json", "--dest", &new_config]));
+    assert_eq!(doc["result"]["config"]["path"], new_config.as_str());
+}
+
+#[test]
+fn cli_json_reports_errors_in_the_document() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    // A repository command that fails: the error belongs to the repository.
+    let output = fx.run(&["--config", &cfg, "snapshot", "info", "nope", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let doc = parse_json_document(&stdout(&output));
+    assert_eq!(doc["status"], "error");
+    assert_eq!(doc["repositories"][0]["status"], "error");
+    assert!(
+        doc["repositories"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("nope"),
+        "{doc}"
+    );
+
+    // A failure before any repository is opened: the error is top-level.
+    let output = fx.run(&["--config", &cfg, "list", "-R", "missing", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let doc = parse_json_document(&stdout(&output));
+    assert_eq!(doc["status"], "error");
+    assert!(doc["error"].as_str().unwrap().contains("missing"), "{doc}");
+    assert_eq!(doc["repositories"].as_array().unwrap().len(), 0);
+
+    // Commands that would ask a question refuse instead of prompting.
+    let output = fx.run(&["--config", &cfg, "delete", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let doc = parse_json_document(&stdout(&output));
+    assert_eq!(doc["repositories"][0]["status"], "error");
+    assert!(fx.repo_dir.join("config").exists());
+
+    let output = fx.run(&["--config", &cfg, "daemon", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let doc = parse_json_document(&stdout(&output));
+    assert!(doc["error"].as_str().unwrap().contains("daemon"), "{doc}");
+}
+
+#[test]
+fn cli_json_lists_every_repository() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    write_two_repo_sources_config(
+        &fx.config_path,
+        &fx.repo_dir,
+        &repo_b,
+        &fx.source_a,
+        &fx.source_b,
+    );
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::write(fx.source_a.join("a.txt"), b"a\n").unwrap();
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-a", "-S", "src-a"]);
+
+    let doc = parse_json_document(&fx.run_ok(&["--config", &cfg, "--json", "list"]));
+    let repos = doc["repositories"].as_array().unwrap();
+    assert_eq!(repos.len(), 2, "{doc}");
+    assert_eq!(repos[0]["label"], "repo-a");
+    assert_eq!(repos[1]["label"], "repo-b");
+    let count = |r: &serde_json::Value| r["result"]["list"]["snapshots"].as_array().unwrap().len();
+    assert_eq!(count(&repos[0]), 1);
+    assert_eq!(count(&repos[1]), 0);
+}

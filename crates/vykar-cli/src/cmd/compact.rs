@@ -1,9 +1,13 @@
+use serde::Serialize;
+
 use vykar_core::commands;
+use vykar_core::commands::compact::{CompactStats, SweepSkipped, UnreferencedReport};
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
 use crate::format::{format_bytes, parse_size};
+use crate::output::{Output, Report};
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_compact(
@@ -13,6 +17,7 @@ pub(crate) fn run_compact(
     max_repack_size: Option<String>,
     dry_run: bool,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
@@ -22,31 +27,105 @@ pub(crate) fn run_compact(
         )?)
     })?;
 
-    if dry_run {
-        println!(
-            "Dry run: {} packs total, {} would be repacked, {} would be deleted (empty)",
-            stats.packs_total, stats.packs_repacked, stats.packs_deleted_empty,
-        );
-        println!(
-            "  {} live blobs, {} would be freed",
-            stats.blobs_live,
-            format_bytes(stats.space_freed),
-        );
-        if stats.chunks_unreferenced > 0 {
-            println!(
-                "  {} unreferenced chunks ({}) would be removed from the index",
-                stats.chunks_unreferenced,
-                format_bytes(stats.bytes_unreferenced),
-            );
+    out.emit(&CompactReport { stats, dry_run })
+}
+
+struct CompactReport {
+    stats: CompactStats,
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CompactJson {
+    dry_run: bool,
+    packs_total: u64,
+    packs_repacked: u64,
+    packs_deleted_empty: u64,
+    packs_abandoned: u64,
+    packs_repack_held: u64,
+    packs_corrupt: u64,
+    packs_orphan: u64,
+    packs_orphan_young: u64,
+    packs_orphan_unknown_age: u64,
+    packs_orphan_live: u64,
+    blobs_live: u64,
+    space_freed: u64,
+    snapshots_marked: u64,
+    chunks_unreferenced: u64,
+    bytes_unreferenced: u64,
+    chunks_unreferenced_young: u64,
+    bytes_unreferenced_young: u64,
+    temp_files_removed: u64,
+    /// Why no unreferenced chunk was removed: `committing` or `contention`.
+    sweep_skipped: Option<&'static str>,
+}
+
+impl CompactJson {
+    pub(crate) fn new(stats: &CompactStats, dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            packs_total: stats.packs_total,
+            packs_repacked: stats.packs_repacked,
+            packs_deleted_empty: stats.packs_deleted_empty,
+            packs_abandoned: stats.packs_abandoned,
+            packs_repack_held: stats.packs_repack_held,
+            packs_corrupt: stats.packs_corrupt,
+            packs_orphan: stats.packs_orphan,
+            packs_orphan_young: stats.packs_orphan_young,
+            packs_orphan_unknown_age: stats.packs_orphan_unknown_age,
+            packs_orphan_live: stats.packs_orphan_live,
+            blobs_live: stats.blobs_live,
+            space_freed: stats.space_freed,
+            snapshots_marked: stats.snapshots_marked,
+            chunks_unreferenced: stats.chunks_unreferenced,
+            bytes_unreferenced: stats.bytes_unreferenced,
+            chunks_unreferenced_young: stats.chunks_unreferenced_young,
+            bytes_unreferenced_young: stats.bytes_unreferenced_young,
+            temp_files_removed: stats.temp_files_removed,
+            sweep_skipped: stats.sweep_skipped.map(|s| match s {
+                SweepSkipped::Committing => "committing",
+                SweepSkipped::Contention => "contention",
+            }),
         }
-        print_young_unreferenced(&stats);
-        print_repack_held(&stats);
-        print_compact_warnings(&stats);
-    } else {
-        print_compact_summary(&stats);
+    }
+}
+
+impl Report for CompactReport {
+    const KEY: &'static str = "compact";
+
+    fn json(&self) -> impl Serialize {
+        CompactJson::new(&self.stats, self.dry_run)
     }
 
-    Ok(())
+    fn print_human(&self) {
+        if self.dry_run {
+            print_dry_run(&self.stats);
+        } else {
+            print_compact_summary(&self.stats);
+        }
+    }
+}
+
+fn print_dry_run(stats: &CompactStats) {
+    println!(
+        "Dry run: {} packs total, {} would be repacked, {} would be deleted (empty)",
+        stats.packs_total, stats.packs_repacked, stats.packs_deleted_empty,
+    );
+    println!(
+        "  {} live blobs, {} would be freed",
+        stats.blobs_live,
+        format_bytes(stats.space_freed),
+    );
+    if stats.chunks_unreferenced > 0 {
+        println!(
+            "  {} unreferenced chunks ({}) would be removed from the index",
+            stats.chunks_unreferenced,
+            format_bytes(stats.bytes_unreferenced),
+        );
+    }
+    print_young_unreferenced(stats);
+    print_repack_held(stats);
+    print_compact_warnings(stats);
 }
 
 /// `vykar compact --report-unreferenced`: the counts of a mark, on stdout.
@@ -54,12 +133,61 @@ pub(crate) fn run_report_unreferenced(
     config: &VykarConfig,
     label: Option<&str>,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<()> {
     let report = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::compact::report_unreferenced(
             config, passphrase, shutdown,
         )?)
     })?;
+    out.emit(&UnreferencedOutput(report))
+}
+
+struct UnreferencedOutput(UnreferencedReport);
+
+#[derive(Serialize)]
+struct UnreferencedJson {
+    snapshots: usize,
+    tree_chunks: usize,
+    tree_stored_bytes: u64,
+    items: u64,
+    references: u64,
+    entries: usize,
+    referenced: usize,
+    unreferenced: usize,
+    unreferenced_bytes: u64,
+    packs_with_unreferenced: usize,
+    packs_only_unreferenced: usize,
+    packs_only_unreferenced_bytes: u64,
+}
+
+impl Report for UnreferencedOutput {
+    const KEY: &'static str = "compact_unreferenced";
+
+    fn json(&self) -> impl Serialize {
+        let r = &self.0;
+        UnreferencedJson {
+            snapshots: r.snapshots,
+            tree_chunks: r.tree_chunks,
+            tree_stored_bytes: r.tree_stored_bytes,
+            items: r.items,
+            references: r.references,
+            entries: r.entries,
+            referenced: r.referenced,
+            unreferenced: r.unreferenced.len(),
+            unreferenced_bytes: r.unreferenced_bytes,
+            packs_with_unreferenced: r.packs_with_unreferenced,
+            packs_only_unreferenced: r.packs_only_unreferenced,
+            packs_only_unreferenced_bytes: r.packs_only_unreferenced_bytes,
+        }
+    }
+
+    fn print_human(&self) {
+        print_unreferenced(&self.0);
+    }
+}
+
+fn print_unreferenced(report: &UnreferencedReport) {
     println!(
         "Snapshots: {} ({} distinct tree chunks, {} stored)",
         report.snapshots,
@@ -79,7 +207,6 @@ pub(crate) fn run_report_unreferenced(
         report.packs_only_unreferenced,
         format_bytes(report.packs_only_unreferenced_bytes),
     );
-    Ok(())
 }
 
 /// The completion line plus any pack warnings, shared with the full-cycle

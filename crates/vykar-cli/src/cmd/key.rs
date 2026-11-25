@@ -6,12 +6,14 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
+use serde::Serialize;
 use vykar_core::commands::key::{self, CopyOutcome, ImportReport, KeyExport};
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::identity::KeyProof;
 use vykar_core::repo::{KEY_PRIMARY, KEY_SECONDARY, KeyCopyState};
 
 use crate::error::{CliError, CliResult};
+use crate::output::{Output, Report};
 use crate::passphrase::with_repo_passphrase;
 
 const ARMOR_BEGIN: &str = "-----BEGIN VYKAR REPOSITORY KEY-----";
@@ -91,32 +93,72 @@ pub(crate) fn run_key_export(
     config: &VykarConfig,
     label: Option<&str>,
     output: Option<&str>,
+    out: &mut Output,
 ) -> CliResult<()> {
     let exported = with_repo_passphrase(config, label, |passphrase| {
         Ok(key::export(config, passphrase)?)
     })?;
 
-    eprintln!("{}", describe_selection(exported.copies));
-
     let armor = encode_armor(&exported.export);
-    match output {
-        // The armor is the *result*, so it goes to stdout; status goes to
-        // stderr, per the output-split convention.
-        None => print!("{armor}"),
-        Some(path) => {
-            write_export_file(Path::new(path), &armor)?;
-            eprintln!("Wrote repository key export to {path}");
-        }
+    if let Some(path) = output {
+        write_export_file(Path::new(path), &armor)?;
     }
-    eprintln!(
-        "Store this alongside the repository passphrase. Both are required, and neither \
-         can be recovered from the other."
-    );
-    Ok(())
+    out.emit(&ExportReport {
+        copies: exported.copies,
+        armor,
+        path: output,
+    })
 }
 
-/// Say which copy the export came from, and flag anything the operator should
-/// act on before trusting this repository's redundancy.
+struct ExportReport<'a> {
+    copies: KeyCopyState,
+    armor: String,
+    /// The file the export was written to; `None` means stdout.
+    path: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ExportJson<'a> {
+    /// `matched`, `one_missing`, `divergent` or `not_applicable`.
+    key_copies: &'static str,
+    message: String,
+    /// The armored export, unless it was written to `path`.
+    armor: Option<&'a str>,
+    path: Option<&'a str>,
+}
+
+impl Report for ExportReport<'_> {
+    const KEY: &'static str = "key_export";
+
+    fn json(&self) -> impl Serialize {
+        ExportJson {
+            key_copies: match self.copies {
+                KeyCopyState::Matched => "matched",
+                KeyCopyState::OneMissing { .. } => "one_missing",
+                KeyCopyState::Divergent { .. } => "divergent",
+                KeyCopyState::NotApplicable => "not_applicable",
+            },
+            message: describe_selection(self.copies),
+            armor: self.path.is_none().then_some(self.armor.as_str()),
+            path: self.path,
+        }
+    }
+
+    fn print_human(&self) {
+        eprintln!("{}", describe_selection(self.copies));
+        match self.path {
+            // The armor is the *result*, so it goes to stdout; status goes to
+            // stderr, per the output-split convention.
+            None => print!("{}", self.armor),
+            Some(path) => eprintln!("Wrote repository key export to {path}"),
+        }
+        eprintln!(
+            "Store this alongside the repository passphrase. Both are required, and neither \
+             can be recovered from the other."
+        );
+    }
+}
+
 fn describe_selection(state: KeyCopyState) -> String {
     match state {
         KeyCopyState::Matched => format!(
@@ -166,6 +208,7 @@ pub(crate) fn run_key_import(
     label: Option<&str>,
     source: &str,
     force: bool,
+    out: &mut Output,
 ) -> CliResult<()> {
     let export = parse_armor(&read_source(source)?)?;
 
@@ -180,7 +223,7 @@ pub(crate) fn run_key_import(
              unreadable."
         );
     }
-    report_import(&report)?;
+    report_import(&report, out)?;
     if report.repinned {
         eprintln!(
             "Re-pinned the repository identity for '{}'.",
@@ -192,17 +235,8 @@ pub(crate) fn run_key_import(
 
 /// Report per-copy outcomes. Exits non-zero only if *no* copy ended up
 /// correct.
-fn report_import(report: &ImportReport) -> CliResult<()> {
-    for (storage_key, outcome) in &report.outcomes {
-        match outcome {
-            CopyOutcome::AlreadyCorrect => {
-                println!("{storage_key}: already correct, left untouched");
-            }
-            CopyOutcome::Created => println!("{storage_key}: created"),
-            CopyOutcome::Replaced => println!("{storage_key}: replaced"),
-            CopyOutcome::Refused(reason) => println!("{storage_key}: not written — {reason}"),
-        }
-    }
+fn report_import(report: &ImportReport, out: &mut Output) -> CliResult<()> {
+    out.emit(&ImportOutput(report))?;
     if !report.restored() {
         return Err(CliError::from(
             "no key copy could be written; the repository key was not restored",
@@ -215,6 +249,73 @@ fn report_import(report: &ImportReport) -> CliResult<()> {
         );
     }
     Ok(())
+}
+
+struct ImportOutput<'a>(&'a ImportReport);
+
+#[derive(Serialize)]
+struct ImportJson<'a> {
+    /// `authenticated_data`, `pin_match`, `mismatch` or `unproven`.
+    proof: &'static str,
+    copies: Vec<CopyJson<'a>>,
+    restored: bool,
+    repinned: bool,
+}
+
+#[derive(Serialize)]
+struct CopyJson<'a> {
+    key: &'a str,
+    /// `already_correct`, `created`, `replaced` or `refused`.
+    outcome: &'static str,
+    reason: Option<&'a str>,
+}
+
+impl Report for ImportOutput<'_> {
+    const KEY: &'static str = "key_import";
+
+    fn json(&self) -> impl Serialize {
+        let report = self.0;
+        ImportJson {
+            proof: match report.proof {
+                KeyProof::AuthenticatedData => "authenticated_data",
+                KeyProof::PinMatch => "pin_match",
+                KeyProof::Mismatch => "mismatch",
+                KeyProof::Unproven => "unproven",
+            },
+            copies: report
+                .outcomes
+                .iter()
+                .map(|(key, outcome)| {
+                    let (outcome, reason) = match outcome {
+                        CopyOutcome::AlreadyCorrect => ("already_correct", None),
+                        CopyOutcome::Created => ("created", None),
+                        CopyOutcome::Replaced => ("replaced", None),
+                        CopyOutcome::Refused(reason) => ("refused", Some(reason.as_str())),
+                    };
+                    CopyJson {
+                        key,
+                        outcome,
+                        reason,
+                    }
+                })
+                .collect(),
+            restored: report.restored(),
+            repinned: report.repinned,
+        }
+    }
+
+    fn print_human(&self) {
+        for (storage_key, outcome) in &self.0.outcomes {
+            match outcome {
+                CopyOutcome::AlreadyCorrect => {
+                    println!("{storage_key}: already correct, left untouched");
+                }
+                CopyOutcome::Created => println!("{storage_key}: created"),
+                CopyOutcome::Replaced => println!("{storage_key}: replaced"),
+                CopyOutcome::Refused(reason) => println!("{storage_key}: not written — {reason}"),
+            }
+        }
+    }
 }
 
 fn read_source(source: &str) -> CliResult<String> {

@@ -1,12 +1,17 @@
 use std::io::Write;
 
+use serde::Serialize;
 use vykar_core::config;
 
 use crate::error::{CliError, CliResult};
+use crate::output::{Output, Report};
 
-pub(crate) fn run_config_generate(dest: Option<&str>) -> CliResult<()> {
+pub(crate) fn run_config_generate(dest: Option<&str>, out: &mut Output) -> CliResult<()> {
     let path = match dest {
         Some(d) => std::path::PathBuf::from(d),
+        None if out.is_json() => {
+            return Err(CliError::from("--json requires --dest"));
+        }
         None => pick_config_location()?,
     };
 
@@ -27,9 +32,27 @@ pub(crate) fn run_config_generate(dest: Option<&str>) -> CliResult<()> {
         return Err(err.into());
     }
 
-    println!("Config written to: {}", path.display());
-    println!("Edit it to set your repository path and source directories.");
-    Ok(())
+    out.emit(&ConfigReport {
+        path: path.display().to_string(),
+    })
+}
+
+#[derive(Serialize)]
+struct ConfigReport {
+    path: String,
+}
+
+impl Report for ConfigReport {
+    const KEY: &'static str = "config";
+
+    fn json(&self) -> impl Serialize {
+        self
+    }
+
+    fn print_human(&self) {
+        println!("Config written to: {}", self.path);
+        println!("Edit it to set your repository path and source directories.");
+    }
 }
 
 fn write_config_file(path: &std::path::Path) -> std::io::Result<()> {
@@ -114,7 +137,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vykar.yaml");
 
-        run_config_generate(Some(path.to_str().unwrap())).unwrap();
+        run_config_generate(
+            Some(path.to_str().unwrap()),
+            &mut Output::new(false, "config".into()),
+        )
+        .unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, config::minimal_config_template());
@@ -128,7 +155,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vykar.yaml");
 
-        run_config_generate(Some(path.to_str().unwrap())).unwrap();
+        run_config_generate(
+            Some(path.to_str().unwrap()),
+            &mut Output::new(false, "config".into()),
+        )
+        .unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(

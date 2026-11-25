@@ -1,11 +1,14 @@
+use serde::Serialize;
+
 use vykar_core::commands;
-use vykar_core::commands::restore::RestoreOptions;
+use vykar_core::commands::restore::{RestoreOptions, RestoreStats};
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
+use crate::output::{Output, Report};
 use crate::passphrase::with_repo_passphrase;
 
 #[allow(clippy::too_many_arguments)]
@@ -18,6 +21,7 @@ pub(crate) fn run_restore(
     verify: bool,
     continue_on_error: bool,
     shutdown: &CancelToken,
+    out: &mut Output,
 ) -> CliResult<bool> {
     let opts = RestoreOptions {
         xattrs_enabled: config.xattrs.enabled,
@@ -50,6 +54,67 @@ pub(crate) fn run_restore(
         e => e,
     })?;
 
+    let partial = stats.damaged_total > 0;
+    out.emit(&RestoreReport(stats))?;
+    Ok(partial)
+}
+
+struct RestoreReport(RestoreStats);
+
+#[derive(Serialize)]
+struct RestoreJson<'a> {
+    files: u64,
+    dirs: u64,
+    symlinks: u64,
+    hardlinks: u64,
+    hardlink_copies: u64,
+    total_bytes: u64,
+    warnings: &'a [String],
+    warnings_suppressed: u64,
+    /// Files left out because their data could not be read; capped, see
+    /// `damaged_total` for the exact count.
+    damaged: Vec<DamagedJson<'a>>,
+    damaged_total: u64,
+}
+
+#[derive(Serialize)]
+struct DamagedJson<'a> {
+    path: std::borrow::Cow<'a, str>,
+    reason: &'a str,
+}
+
+impl Report for RestoreReport {
+    const KEY: &'static str = "restore";
+
+    fn json(&self) -> impl Serialize {
+        let stats = &self.0;
+        RestoreJson {
+            files: stats.files,
+            dirs: stats.dirs,
+            symlinks: stats.symlinks,
+            hardlinks: stats.hardlinks,
+            hardlink_copies: stats.hardlink_copies,
+            total_bytes: stats.total_bytes,
+            warnings: &stats.warnings,
+            warnings_suppressed: stats.warnings_suppressed,
+            damaged: stats
+                .damaged
+                .iter()
+                .map(|d| DamagedJson {
+                    path: d.path.to_string_lossy(),
+                    reason: &d.reason,
+                })
+                .collect(),
+            damaged_total: stats.damaged_total,
+        }
+    }
+
+    fn print_human(&self) {
+        print_restore(&self.0);
+    }
+}
+
+fn print_restore(stats: &RestoreStats) {
     // Hard links are only mentioned when present, keeping the common-case
     // summary unchanged.
     let hardlinks = if stats.hardlinks > 0 {
@@ -91,6 +156,4 @@ pub(crate) fn run_restore(
             stats.damaged_total
         );
     }
-
-    Ok(stats.damaged_total > 0)
 }

@@ -17,9 +17,10 @@ use vykar_types::pack_id::PackId;
 
 use super::host_env::Clock;
 use super::journal_recovery::{self, PendingIndexRecovery, RecoveryTarget};
+use super::memory_budget::{HeldBytes, MemoryBudget};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 use super::session_journal::SessionJournal;
-use super::upload_queue::{ConfirmedPack, HeldBytes, PendingUpload, UploadQueue};
+use super::upload_queue::{ConfirmedPack, PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
 
@@ -46,7 +47,7 @@ pub(crate) struct WriteMetricsSnapshot {
     /// Time the sealing thread spent closing packs (`PackWriter::close`);
     /// the upload threads build the trailer and the pack ID (`upload_seal`).
     pub(crate) seal: Duration,
-    /// Time the sealing thread spent in `cap_pending_uploads` (upload backpressure).
+    /// Time the sealing thread spent in `wait_for_pack_room` (upload backpressure).
     pub(crate) upload_cap_wait: Duration,
     /// Time spent joining uploads in `flush_packs*`.
     pub(crate) final_upload_wait: Duration,
@@ -90,10 +91,14 @@ pub struct WriteSession {
     /// `journal`, `index_delta` and `pack_trailers` only after its upload
     /// returns `Ok`.
     pub(crate) uploads: UploadQueue,
+    /// The bytes the backup buffers: its pipeline, open packs and sealed
+    /// packs waiting for upload. Shared with the pipeline's walk thread and
+    /// with the upload threads, which release sealed packs into it.
+    pub(crate) memory: Arc<MemoryBudget>,
     /// Stream data packs into the backend's staging area as they fill
     /// instead of buffering them on the heap, when the backend supports it
     /// (`StorageBackend::begin_staged_put`; local repositories). A staged
-    /// pack holds no heap, so it counts 0 against the upload byte cap.
+    /// pack holds no heap, so it charges nothing to `memory`.
     pub(crate) stream_data_packs: bool,
     /// What lookups and positional reuse resolve against: the repository's
     /// index when the session began, unless it was edited or not loaded
@@ -164,6 +169,7 @@ impl WriteSession {
             data_pack_writer: PackWriter::new(PackType::Data, data_target, hash_algo),
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
             uploads: UploadQueue::new(max_in_flight_uploads),
+            memory: MemoryBudget::new(max_in_flight_uploads, data_target, tree_target),
             stream_data_packs: false,
             view: None,
             pack_trailers: StdHashMap::new(),
@@ -191,19 +197,23 @@ impl WriteSession {
 
     /// Queue `upload` for an upload thread; it returns the ID of the pack
     /// it stored, whose `entries` and `trailer_len` are recorded once it is
-    /// confirmed. `bytes` is the heap the upload holds until it releases it
-    /// or returns. Err only when an upload thread cannot be started.
+    /// confirmed. `held` is the pack's charge to `memory`, released when
+    /// the upload drops it or returns. Err only when an upload thread cannot
+    /// be started.
     pub(crate) fn submit_upload<F>(
         &mut self,
         entries: Vec<PackedChunkEntry>,
         trailer_len: u32,
-        bytes: usize,
+        held: HeldBytes,
         upload: F,
     ) -> Result<()>
     where
         F: FnOnce(HeldBytes) -> Result<PackId> + Send + 'static,
     {
-        self.uploads.submit(entries, trailer_len, bytes, upload)
+        // The queue's slot count is the source (tests change it after
+        // `new`); lending uses the same one.
+        self.memory.set_slots(self.uploads.max_in_flight_uploads);
+        self.uploads.submit(entries, trailer_len, held, upload)
     }
 
     /// Join one upload and record its pack if it succeeded. A failed
@@ -286,10 +296,16 @@ impl WriteSession {
         result
     }
 
-    /// Apply backpressure to keep the number of in-flight uploads bounded.
+    /// Before closing a pack of `incoming` heap bytes: join finished uploads
+    /// (journaling them), wait for an upload slot, then, as the memory
+    /// budget's policy asks (`MemoryBudget::sealed_room`; local
+    /// repositories), join uploads until the sealed packs plus `incoming`
+    /// fit the data-pack target or none is pending. An empty queue never
+    /// blocks, so one upload is always in flight. Never fails because the
+    /// pipeline was poisoned: an aborted backup still closes its packs.
     /// Session-marker refreshes run in a dedicated heartbeat thread owned by
-    /// `SessionGuard`, so this path no longer touches the marker.
-    pub(crate) fn cap_pending_uploads(
+    /// `SessionGuard`, so this path does not touch the marker.
+    pub(crate) fn wait_for_pack_room(
         &mut self,
         storage: &Arc<dyn StorageBackend>,
         crypto: &Arc<dyn CryptoEngine>,
@@ -303,29 +319,32 @@ impl WriteSession {
         );
         if self
             .uploads
-            .wait_below_count_cap(|c| record_confirmed(journal, trailers, delta, c))?
+            .wait_for_slot(|c| record_confirmed(journal, trailers, delta, c))?
         {
             self.maybe_write_pending_index(storage, crypto);
         }
-        let cap = self.data_pack_writer.target_size();
-        let (journal, trailers, delta) = (
-            &mut self.journal.entries,
-            &mut self.pack_trailers,
-            &mut self.index_delta,
-        );
-        if self.uploads.wait_below_byte_cap(incoming, cap, |c| {
-            record_confirmed(journal, trailers, delta, c);
-        })? {
+        // Without it, the slot bound alone allows W + H sealed packs of up
+        // to the 192 MiB target each; when the disk falls behind, they pile
+        // up and peak RSS jumps by one pack per straggler.
+        let mut joined = false;
+        while !self.memory.sealed_room(incoming) {
+            let (journal, trailers, delta) = (
+                &mut self.journal.entries,
+                &mut self.pack_trailers,
+                &mut self.index_delta,
+            );
+            if !self
+                .uploads
+                .join_one(|c| record_confirmed(journal, trailers, delta, c))?
+            {
+                break;
+            }
+            joined = true;
+        }
+        if joined {
             self.maybe_write_pending_index(storage, crypto);
         }
         Ok(())
-    }
-
-    /// Pipeline budget to lend to the upload queue; see
-    /// `UploadQueue::slack_bytes`.
-    pub(crate) fn upload_slack_bytes(&self) -> usize {
-        self.uploads
-            .slack_bytes(self.data_pack_writer.target_size())
     }
 
     /// Start a background journal write once enough new packs are
@@ -786,7 +805,7 @@ pub(super) mod tests {
     fn spawn_upload(ws: &mut WriteSession, storage: &std::sync::Arc<PackUploadBackend>, seed: u8) {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
-        ws.submit_upload(fake_entries(&entry), 0, 0, move |_| {
+        ws.submit_upload(fake_entries(&entry), 0, HeldBytes::none(), move |_| {
             storage.put_owned(&pack_id.storage_key(), data)?;
             Ok(pack_id)
         })
@@ -804,7 +823,8 @@ pub(super) mod tests {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        ws.submit_upload(fake_entries(&entry), 0, bytes, move |_held| {
+        let held = ws.memory.hold_sealed(bytes);
+        ws.submit_upload(fake_entries(&entry), 0, held, move |_held| {
             let _ = gate.recv();
             storage.put_owned(&pack_id.storage_key(), data)?;
             Ok(pack_id)
@@ -815,6 +835,8 @@ pub(super) mod tests {
 
     #[test]
     fn byte_cap_blocks_until_queued_pack_is_written() {
+        use crate::repo::memory_budget::PackPolicy;
+
         let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
             MemoryBackend::new(),
         )));
@@ -824,24 +846,25 @@ pub(super) mod tests {
         let mut ws = journal_session();
         let target = ws.data_pack_writer.target_size();
 
-        // Disabled: a queued pack plus the incoming one may exceed the
-        // target; only the count limit applies.
+        // LendHalf: a queued pack plus the incoming one may exceed the
+        // target; only the slot bound applies.
+        assert_eq!(ws.memory.pack_policy(), PackPolicy::LendHalf);
         let release = gated_upload(&mut ws, &storage, 1, target);
-        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, target)
             .unwrap();
         assert_eq!(ws.uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
 
-        // Enabled: the same call waits for the queued pack to be written.
-        ws.uploads.cap_pending_upload_bytes = true;
+        // CapAtTarget: the same call waits for the queued pack to be written.
+        ws.memory.configure(PackPolicy::CapAtTarget, true);
         let release = gated_upload(&mut ws, &storage, 2, target);
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             release.send(()).unwrap();
         });
         let start = std::time::Instant::now();
-        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, target)
             .unwrap();
         assert!(start.elapsed() >= std::time::Duration::from_millis(100));
         assert!(ws.uploads.is_empty());
@@ -849,19 +872,41 @@ pub(super) mod tests {
 
         // A pack that fits next to the queued one does not block.
         let release = gated_upload(&mut ws, &storage, 3, target / 4);
-        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target / 2)
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, target / 2)
             .unwrap();
         assert_eq!(ws.uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
 
         // An empty queue never blocks, even for an oversized pack.
-        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, 4 * target)
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, 4 * target)
             .unwrap();
+        assert_eq!(ws.memory.snapshot().sealed_packs, 0);
+    }
+
+    /// LendHalf never waits on bytes, however much is sealed.
+    #[test]
+    fn lend_half_never_waits_on_bytes() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let dyn_crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
+        let mut ws = journal_session();
+        let target = ws.data_pack_writer.target_size();
+        let release = gated_upload(&mut ws, &storage, 1, 10 * target);
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, 10 * target)
+            .unwrap();
+        assert_eq!(ws.uploads.len(), 1);
+        release.send(()).unwrap();
+        ws.wait_pending_uploads(&*storage, &crypto).unwrap();
     }
 
     #[test]
-    fn upload_slack_counts_unfinished_packs_beyond_the_slots() {
+    fn lending_counts_unfinished_packs_beyond_the_slots() {
+        use crate::repo::memory_budget::PackPolicy;
+
         let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
             MemoryBackend::new(),
         )));
@@ -873,26 +918,28 @@ pub(super) mod tests {
         // Within the slots: nothing to lend.
         let r1 = gated_upload(&mut ws, &storage, 1, target);
         let r2 = gated_upload(&mut ws, &storage, 2, target);
-        assert_eq!(ws.upload_slack_bytes(), 0);
+        assert_eq!(ws.memory.lent(), 0);
         // Two packs queued behind the slots: half of them is lent.
         let r3 = gated_upload(&mut ws, &storage, 3, target);
         let r4 = gated_upload(&mut ws, &storage, 4, target);
-        assert_eq!(ws.upload_slack_bytes(), target);
+        assert_eq!(ws.memory.lent(), target);
         // A finished (not yet joined) upload no longer counts.
         r1.send(()).unwrap();
         let start = std::time::Instant::now();
-        while ws.upload_slack_bytes() != target / 2 {
+        while ws.memory.lent() != target / 2 {
             assert!(start.elapsed() < std::time::Duration::from_secs(10));
             std::thread::yield_now();
         }
-        // The local byte cap bounds the queue itself: never lend.
-        ws.uploads.cap_pending_upload_bytes = true;
-        assert_eq!(ws.upload_slack_bytes(), 0);
+        assert_eq!(ws.uploads.len(), 4);
+        // The local cap bounds the queue itself: never lend.
+        ws.memory.configure(PackPolicy::CapAtTarget, true);
+        assert_eq!(ws.memory.lent(), 0);
 
         for r in [r2, r3, r4] {
             r.send(()).unwrap();
         }
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
+        assert_eq!(ws.memory.snapshot().sealed_packs, 0);
     }
 
     #[test]
@@ -966,8 +1013,7 @@ pub(super) mod tests {
         });
 
         let start = std::time::Instant::now();
-        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, 0)
-            .unwrap();
+        ws.wait_for_pack_room(&dyn_storage, &dyn_crypto, 0).unwrap();
         returned.send(()).unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(ws.uploads.len(), slots - 1);

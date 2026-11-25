@@ -379,6 +379,7 @@ pub(super) fn phase1_upload(
         final_flush,
         pipeline: pipeline_timings,
         write: ws.write_metrics(),
+        memory: ws.memory.snapshot(),
     };
     instrumentation.emit(&stats);
     shutdown.check()?;

@@ -21,8 +21,9 @@ use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 
+use crate::repo::memory_budget::{MemoryBudget, PipelineGuard};
+
 use super::super::chunk_process::classify_chunk;
-use super::super::concurrency::{BudgetGuard, ByteBudget};
 use super::super::drift::{ReadPlan, open_checked, read_range_drift_checked};
 use super::super::instrument::StageClock;
 use super::super::walk::{WalkEntry, into_lossy_string};
@@ -50,7 +51,7 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
 /// index.
 ///
 /// Budget bytes are pre-acquired by the walk thread; `pre_acquired_bytes`
-/// is wrapped in a [`BudgetGuard`] for error safety (auto-release on `?` bail).
+/// is wrapped in a [`PipelineGuard`] for error safety (auto-release on `?` bail).
 /// Time spent hashing, compressing and encrypting chunks is added to
 /// `transform_clock`.
 #[allow(clippy::too_many_arguments)]
@@ -60,7 +61,7 @@ pub(super) fn process_file_worker(
     crypto: &dyn CryptoEngine,
     compression: Compression,
     chunker_config: &ChunkerParams,
-    budget: &ByteBudget,
+    budget: &MemoryBudget,
     pre_acquired_bytes: usize,
     prefilter: Option<&DedupPrefilter>,
     transform_clock: &StageClock,
@@ -77,7 +78,7 @@ pub(super) fn process_file_worker(
             let work = (|| -> Result<(fs::MetadataSummary, Vec<super::super::chunk_process::WorkerChunk>, usize)> {
                 // Budget was pre-acquired by the walk thread. Wrap in a guard for
                 // error safety — if we `?`-bail, the guard drops and releases bytes.
-                let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
+                let guard = PipelineGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
                 let (mut source, pre_meta) = open_checked(&abs_path, &metadata)?;
 
@@ -144,7 +145,7 @@ pub(super) fn process_file_worker(
             len,
         } => {
             let work = (|| -> Result<(fs::MetadataSummary, Vec<super::super::chunk_process::WorkerChunk>, usize)> {
-                let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
+                let guard = PipelineGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
                 // Segmented reads are a plan driven by walk-time size
                 // (`num_segments`/`offset`/`len`). Any drift — before or

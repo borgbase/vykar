@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::repo::memory_budget::MemorySnapshot;
 use crate::repo::write_session::{WriteMetricsSnapshot, duration_nanos};
 use crate::snapshot::SnapshotStats;
 
@@ -65,6 +66,8 @@ pub(crate) struct BackupInstrumentation {
     pub(crate) final_flush: Duration,
     pub(crate) pipeline: Option<PipelineTimings>,
     pub(crate) write: WriteMetricsSnapshot,
+    /// The write session's memory budget after the final flush.
+    pub(crate) memory: MemorySnapshot,
 }
 
 pub(super) fn ms(d: Duration) -> u64 {
@@ -114,6 +117,13 @@ impl BackupInstrumentation {
             final_upload_wait_ms = ms(w.final_upload_wait),
             upload_put_ms = ms(w.upload_put),
             upload_seal_ms = ms(w.upload_seal),
+            memory_ceiling = self.memory.ceiling,
+            memory_pipeline_cap = self.memory.pipeline_cap,
+            memory_pack_target = self.memory.pack_target,
+            memory_peak_pipeline = self.memory.peak_pipeline,
+            memory_peak_open_packs = self.memory.peak_open_packs,
+            memory_peak_sealed_packs = self.memory.peak_sealed_packs,
+            memory_peak_total = self.memory.peak_total,
             "backup write stats"
         );
     }

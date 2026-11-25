@@ -6,10 +6,10 @@ use tracing::warn;
 
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
+use crate::repo::memory_budget::MemoryBudget;
 use crate::snapshot::item::{Item, ItemRawNames, ItemType};
 use vykar_types::error::{Result, VykarError};
 
-use super::concurrency::ByteBudget;
 use super::source::ResolvedSource;
 
 mod inode_walk;
@@ -390,12 +390,12 @@ pub(super) fn into_lossy_string(path: PathBuf) -> String {
 /// Acquire budget for a walk entry before dispatching to a worker.
 ///
 /// Called by the dedicated walk thread to reserve memory in walk order.
-pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<usize> {
+pub(super) fn reserve_budget(entry: &WalkEntry, budget: &MemoryBudget) -> Result<usize> {
     match entry {
         WalkEntry::File { file_size, .. } => {
-            budget.acquire(usize::try_from(*file_size).unwrap_or(usize::MAX))
+            budget.acquire_pipeline(usize::try_from(*file_size).unwrap_or(usize::MAX))
         }
-        WalkEntry::FileSegment { len, .. } => budget.acquire(*len as usize),
+        WalkEntry::FileSegment { len, .. } => budget.acquire_pipeline(*len as usize),
         WalkEntry::Skipped { .. }
         | WalkEntry::SkippedDataless { .. }
         | WalkEntry::SkippedUnsupported { .. } => Ok(0),

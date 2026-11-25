@@ -12,6 +12,7 @@
 
 use crate::index::table::DedupPrefilter;
 use crate::repo::file_cache::FileCache;
+use crate::repo::memory_budget::MemoryBudget;
 use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use vykar_types::error::{Result, VykarError};
@@ -20,7 +21,6 @@ use super::super::commit::{
     FileCaches, FileKind, FileOutcome, commit_cache_hit, finish_file, process_worker_chunks,
     start_file,
 };
-use super::super::concurrency::ByteBudget;
 use super::super::{BackupProgressEvent, ListingWriter, emit_progress, emit_stats_progress};
 use super::ProcessedEntry;
 use super::segmentation::{LargeFileAccum, validate_segment_accum};
@@ -35,7 +35,7 @@ pub(super) fn consume_processed_entry(
     new_file_cache: &mut FileCache,
     listing: &mut ListingWriter,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    budget: &ByteBudget,
+    memory: &MemoryBudget,
     prefilter: Option<&DedupPrefilter>,
     large_file_accum: &mut Option<LargeFileAccum>,
     old_file_cache: &FileCache,
@@ -54,7 +54,7 @@ pub(super) fn consume_processed_entry(
             process_worker_chunks(repo, ws, &mut item, chunks, stats, prefilter)?;
 
             // Release budget bytes now that chunks are committed.
-            budget.release(acquired_bytes);
+            memory.release_pipeline(acquired_bytes);
 
             finish_file(
                 repo,
@@ -110,7 +110,7 @@ pub(super) fn consume_processed_entry(
                 VykarError::Other("BUG: large_file_accum missing after segment validation".into())
             })?;
             process_worker_chunks(repo, ws, &mut accum.item, chunks, stats, prefilter)?;
-            budget.release(acquired_bytes);
+            memory.release_pipeline(acquired_bytes);
 
             if segment_index < num_segments - 1 {
                 emit_stats_progress(progress, stats, None);

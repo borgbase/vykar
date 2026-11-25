@@ -409,6 +409,7 @@ impl WriteSession {
                 PackType::Tree => (&mut ws.tree_pack_writer, None),
             };
             writer.add_blob_to(stage, chunk_id, packed)?;
+            ws.memory.set_open(pack_type, writer.heap_len());
             writer.should_flush()
         };
 
@@ -434,11 +435,11 @@ impl WriteSession {
     pub(super) fn flush_writer_async(&mut self, repo: &Repo, pack_type: PackType) -> Result<()> {
         // Keep upload fan-out bounded to avoid excessive memory/thread pressure.
         let incoming = match pack_type {
-            PackType::Data => self.data_pack_writer.buffer_capacity(),
-            PackType::Tree => self.tree_pack_writer.buffer_capacity(),
+            PackType::Data => self.data_pack_writer.heap_len(),
+            PackType::Tree => self.tree_pack_writer.heap_len(),
         };
         let cap_start = Instant::now();
-        self.cap_pending_uploads(&repo.storage, &repo.crypto, incoming)?;
+        self.wait_for_pack_room(&repo.storage, &repo.crypto, incoming)?;
         let cap_wait = cap_start.elapsed();
 
         let encrypting = repo.crypto.is_encrypting();
@@ -454,6 +455,7 @@ impl WriteSession {
             PackType::Tree => ws.tree_pack_writer.close(encrypting)?,
         };
         let seal_time = seal_start.elapsed();
+        ws.memory.set_open(pack_type, 0);
 
         let counters = &mut ws.metrics.counters;
         counters.upload_cap_wait += cap_wait;
@@ -479,17 +481,18 @@ impl WriteSession {
                 repo.config.max_pack_size,
             );
             ws.data_pack_writer.set_target_size(new_target);
+            ws.memory.set_pack_target(new_target);
         }
 
         self.record_closed(&entries);
 
-        let bytes = tail.heap_bytes();
+        let held = self.memory.hold_sealed(tail.heap_bytes());
         let crypto = Arc::clone(&repo.crypto);
         let storage = Arc::clone(&repo.storage);
         let put_nanos = Arc::clone(&self.metrics.upload_put_nanos);
         let seal_nanos = Arc::clone(&self.metrics.upload_seal_nanos);
         let existing = self.existing_packs.clone();
-        self.submit_upload(entries, trailer_len, bytes, move |held| {
+        self.submit_upload(entries, trailer_len, held, move |held| {
             let (pack_id, data) = {
                 let _span = tracing::debug_span!("pack_seal").entered();
                 let start = Instant::now();

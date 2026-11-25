@@ -596,7 +596,7 @@ begin_write_session(session_id) → a WriteSession; journal key = sessions/<sess
         → sequential consumer validates segment order, performs dedup checks
           (session-new chunks, recovered chunks, pending pack writers) and
           commits new chunks
-        → ByteBudget enforces pipeline_buffer_bytes as a hard in-flight memory cap
+        → the session's MemoryBudget caps the pipeline at pipeline_buffer_bytes
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
   → serialize items incrementally into item-stream chunks (tree packs)
   → throughout: packs are closed when a writer reaches its target size,
@@ -1064,13 +1064,14 @@ flowchart LR
     walk["Walk<br/>(sequential)"] --> workers["Workers ×N<br/>read / chunk / hash"]
     workers --> consumer["Consumer<br/>(sequential)<br/>dedup + commit"]
     consumer --> uploads["Uploads<br/>bounded concurrency"]
-    budget["ByteBudget"] -. caps in-flight bytes .-> workers
+    budget["MemoryBudget"] -. caps in-flight bytes .-> workers
     budget -. caps in-flight bytes .-> consumer
+    budget -. bounds sealed packs .-> uploads
 ```
 
 1. Sequential walk stage emits file work
 2. N workers (N = effective threads, at least 1) in a crossbeam-channel pipeline read/chunk/hash files and classify chunks (hash-only vs prepacked)
-3. A `ByteBudget` enforces a hard cap on in-flight pipeline bytes (derived from `limits.threads`)
+3. The write session's `MemoryBudget` keeps three accounts: the pipeline (raw bytes read ahead of the consumer), the open packs and the sealed packs waiting for upload. The walk may hold up to the pipeline capacity (derived from `limits.threads`) minus what is lent; an entry is always admitted when the pipeline is empty. On a remote repository sealed packs beyond `transfer_width` data-pack targets lend half their bytes out of the pipeline capacity. On a local repository nothing is lent, and a pack closes only while the sealed packs plus it fit one data-pack target (or nothing is queued). On both, at most `transfer_width + 2` uploads are queued. The debug summary (`vykar::stats`) reports the peaks of each account and the ceiling these rules imply.
 4. Consumer stage commits chunks and updates dedup/index state sequentially (including segment-order validation for large files)
 5. Pack uploads run on a fixed pool of `transfer_width + 2` threads; the consumer closes a pack, and its upload thread builds the trailer, hashes the pack and uploads it (a pack staged in a local repository is hashed as it is written, so only the trailer and the final hash step run there). The pack's index entries are recorded once its upload is confirmed.
 

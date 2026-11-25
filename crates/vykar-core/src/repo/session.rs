@@ -2,6 +2,7 @@ use tracing::warn;
 
 use super::Repo;
 use super::journal_recovery::PendingIndexRecovery;
+use super::memory_budget::PackPolicy;
 use super::pack::{PackType, compute_data_pack_target, compute_tree_pack_target};
 use super::write_session::{DEFAULT_SESSION_ID, SessionView, WriteMetricsSnapshot, WriteSession};
 use crate::index::IndexDelta;
@@ -23,11 +24,11 @@ pub struct WriteSessionOptions {
     /// Bound on in-flight background pack uploads; a backup takes it from
     /// [`BackendProfile::transfer_width`]. The queue admits
     /// `UPLOAD_QUEUE_HEADROOM` more sealed packs before the producer blocks
-    /// (see `UploadQueue::wait_below_count_cap`).
+    /// (see `UploadQueue::wait_for_slot`).
     pub max_in_flight_uploads: usize,
-    /// Also bound sealed-but-unwritten packs by bytes
-    /// (see `UploadQueue::cap_pending_upload_bytes`).
-    pub cap_upload_bytes: bool,
+    /// How sealed-but-unwritten packs share memory with the backup
+    /// pipeline (see [`PackPolicy`]).
+    pub pack_policy: PackPolicy,
     /// Stream data packs to the backend while they fill
     /// (see `WriteSession::stream_data_packs`).
     pub stream_data_packs: bool,
@@ -38,7 +39,8 @@ impl Default for WriteSessionOptions {
         Self {
             session_id: DEFAULT_SESSION_ID.to_string(),
             max_in_flight_uploads: DEFAULT_MAX_IN_FLIGHT_UPLOADS,
-            cap_upload_bytes: false,
+            // Inert without a pipeline.
+            pack_policy: PackPolicy::LendHalf,
             stream_data_packs: false,
         }
     }
@@ -50,7 +52,11 @@ impl WriteSessionOptions {
         Self {
             session_id,
             max_in_flight_uploads: profile.transfer_width,
-            cap_upload_bytes: profile.local,
+            pack_policy: if profile.local {
+                PackPolicy::CapAtTarget
+            } else {
+                PackPolicy::LendHalf
+            },
             // Data packs go straight to a temp file in the repository where the
             // backend can do that (local), instead of holding up to two pack
             // buffers (filling + sealed) on the heap.
@@ -91,10 +97,11 @@ impl Repo {
             opts.max_in_flight_uploads.max(1),
             self.content_hash(),
         );
-        ws.uploads.cap_pending_upload_bytes = opts.cap_upload_bytes;
         ws.persisted_pack_count = num_packs;
         ws.session_id.clone_from(&opts.session_id);
         ws.stream_data_packs = opts.stream_data_packs;
+        ws.memory
+            .configure(opts.pack_policy, !opts.stream_data_packs);
         ws.existing_packs = Some(std::sync::Arc::new(
             super::existing_pack::ExistingPacks::new(self.host_env.clone()),
         ));
@@ -307,6 +314,7 @@ impl WriteSession {
 #[cfg(test)]
 mod tests {
     use super::WriteSessionOptions;
+    use crate::repo::memory_budget::PackPolicy;
     use crate::testutil::test_repo_plaintext_with_session;
     use std::sync::Arc;
     use vykar_storage::{BackendProfile, InnerBackend, StorageBackend, delegate_storage_backend};
@@ -324,7 +332,7 @@ mod tests {
         );
         assert_eq!(local.session_id, "s");
         assert_eq!(local.max_in_flight_uploads, 7);
-        assert!(local.cap_upload_bytes);
+        assert_eq!(local.pack_policy, PackPolicy::CapAtTarget);
         assert!(local.stream_data_packs);
 
         let remote = WriteSessionOptions::for_backup(
@@ -337,7 +345,7 @@ mod tests {
             },
         );
         assert_eq!(remote.max_in_flight_uploads, 3);
-        assert!(!remote.cap_upload_bytes);
+        assert_eq!(remote.pack_policy, PackPolicy::LendHalf);
         assert!(!remote.stream_data_packs);
     }
 
@@ -350,7 +358,7 @@ mod tests {
         let mut opts = WriteSessionOptions {
             session_id: "abc".into(),
             max_in_flight_uploads: 7,
-            cap_upload_bytes: true,
+            pack_policy: PackPolicy::CapAtTarget,
             stream_data_packs: true,
         };
         ws = repo.begin_write_session(&opts);
@@ -358,7 +366,7 @@ mod tests {
             assert_eq!(ws.session_id, "abc");
             assert!(ws.stream_data_packs);
             assert_eq!(ws.uploads.max_in_flight_uploads, 7);
-            assert!(ws.uploads.cap_pending_upload_bytes);
+            assert_eq!(ws.memory.pack_policy(), PackPolicy::CapAtTarget);
         }
 
         drop(ws);
@@ -745,7 +753,7 @@ mod tests {
 
         ws.flush_writer_async(&repo, PackType::Data).unwrap();
         assert_eq!(
-            ws.uploads.pending()[0].bytes,
+            ws.memory.snapshot().peak_sealed_packs,
             0,
             "a staged pack counts no heap bytes"
         );
@@ -842,9 +850,10 @@ mod tests {
             .unwrap();
         {
             let upload = &ws.uploads.pending()[0];
-            assert!(upload.bytes > 0);
+            let memory = ws.memory.snapshot();
+            assert!(memory.peak_sealed_packs > 0);
             assert!(!upload.is_finished());
-            assert_eq!(upload.held_bytes(), 0);
+            assert_eq!(memory.sealed_packs, 0);
         }
 
         gate_tx.send(()).unwrap();

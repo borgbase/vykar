@@ -139,13 +139,12 @@ fn trailer_frame(trailer: &PackTrailer, crypto: &dyn CryptoEngine) -> Result<Vec
 
 impl PackTail {
     /// Heap bytes the closed pack holds until its upload releases them:
-    /// `max(capacity, len)` for a heap pack (appending the trailer may grow
-    /// a Vec without room for it), 0 for a staged one.
+    /// for a heap pack the bytes it will occupy once finished, trailer
+    /// included (capacity beyond them is untouched, so not resident); 0 for
+    /// a staged one.
     pub fn heap_bytes(&self) -> usize {
         match &self.buffer {
-            ClosedBuffer::Memory(v) => v
-                .capacity()
-                .max(usize::try_from(self.len).unwrap_or(usize::MAX)),
+            ClosedBuffer::Memory(_) => usize::try_from(self.len).unwrap_or(usize::MAX),
             ClosedBuffer::Staged { .. } => 0,
         }
     }
@@ -478,7 +477,20 @@ impl PackWriter {
         self.pack_type
     }
 
-    /// Heap bytes held by the in-progress buffer (0 before the first blob,
+    /// Heap bytes the in-progress pack occupies, counting the trailer frame
+    /// it would get if closed now (sized for an encrypting engine): 0 before
+    /// the first blob, and for a staged pack, whose bytes are in the
+    /// backend's temp file.
+    pub fn heap_len(&self) -> usize {
+        match &self.buffer {
+            Some(PackBuffer::Memory(_)) => PACK_HEADER_SIZE
+                .saturating_add(self.current_size)
+                .saturating_add(trailer_frame_len_upper(self.blob_meta.len())),
+            Some(PackBuffer::Staged { .. } | PackBuffer::Failed) | None => 0,
+        }
+    }
+
+    /// Heap capacity of the in-progress buffer (0 before the first blob,
     /// and for a staged pack, whose bytes are in the backend's temp file).
     pub fn buffer_capacity(&self) -> usize {
         match &self.buffer {
@@ -1201,6 +1213,31 @@ mod tests {
                 // writer's algorithm — the invariant the server also relies on.
                 assert_eq!(PackId::compute(&data, algo), sealed.pack_id);
             }
+        }
+    }
+
+    /// The open pack's heap figure is header + blobs + the encrypting
+    /// trailer frame; a closed heap pack is charged its final length, not
+    /// its capacity (here 32 MiB reserved for a pack of a few hundred bytes).
+    #[test]
+    fn heap_len_and_heap_bytes_count_bytes_not_capacity() {
+        let mut w = PackWriter::new(PackType::Data, 32 * 1024 * 1024, HashAlgorithm::Blake3);
+        assert_eq!(w.heap_len(), 0);
+        w.add_blob(dummy_chunk_id(1), vec![1; 100]).unwrap();
+        w.add_blob(dummy_chunk_id(2), vec![2; 50]).unwrap();
+        assert_eq!(
+            w.heap_len(),
+            PACK_HEADER_SIZE + 104 + 54 + trailer_frame_len_upper(2)
+        );
+        assert!(w.buffer_capacity() > w.heap_len());
+        for crypto in [&engine() as &dyn CryptoEngine, &aes_engine()] {
+            let mut w2 = PackWriter::new(PackType::Data, 32 * 1024 * 1024, HashAlgorithm::Blake3);
+            w2.add_blob(dummy_chunk_id(1), vec![1; 100]).unwrap();
+            let open = w2.heap_len();
+            let closed = w2.close(crypto.is_encrypting()).unwrap();
+            assert_eq!(closed.tail.heap_bytes() as u64, closed.len);
+            assert!(closed.tail.heap_bytes() <= open);
+            assert_eq!(w2.heap_len(), 0);
         }
     }
 

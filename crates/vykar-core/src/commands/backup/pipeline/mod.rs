@@ -6,7 +6,7 @@
 //! sends them straight to the result channel in batches.
 //!
 //! This file is the orchestrator: it owns the `thread::scope`, the channels,
-//! the `ByteBudget`, and the reorder buffer / skip-drain state machine that
+//! the write session's `MemoryBudget` for this run, and the reorder buffer / skip-drain state machine that
 //! wraps the consumer call. The three stage-specific submodules are:
 //! - [`worker`] — chunking / hashing / encryption per file or segment.
 //! - [`consumer`] — per-entry commit: pack write, item stream, file cache, stats.
@@ -23,12 +23,12 @@ use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
 use crate::repo::control::CancelToken;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
+use crate::repo::memory_budget::MemoryBudget;
 use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
-use super::concurrency::ByteBudget;
 use super::instrument::{PipelineClocks, PipelineTimings};
 use super::source::ResolvedSource;
 use super::walk::{DatalessKind, WalkEntry, build_walk_iter, reserve_budget};
@@ -56,7 +56,7 @@ pub(super) enum ProcessedEntry {
         /// for item/cache fields so drift-checked values flow to disk.
         pre_meta: fs::MetadataSummary,
         chunks: Vec<super::WorkerChunk>,
-        /// Bytes acquired from ByteBudget; consumer must release after committing.
+        /// Pipeline bytes acquired from the MemoryBudget; consumer must release after committing.
         acquired_bytes: usize,
     },
     /// Segment of a large file: worker processed one fixed-size slice.
@@ -319,12 +319,18 @@ pub(crate) fn run_parallel_pipeline(
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
     let chunk_hasher = crypto.chunk_hasher();
     let chunker_config = repo.config().chunker_params.clone();
-    let budget = ByteBudget::new(pipeline_buffer_bytes);
+    let memory = Arc::clone(&ws.memory);
+    // The largest packed chunk: the compression bound of a maximal chunk
+    // plus the envelope (tag, nonce, AEAD tag).
+    let max_blob =
+        crate::compress::compressed_size_bound(compression, chunker_config.max_size as usize)
+            .saturating_add(1 + 12 + 16);
+    memory.begin_pipeline(pipeline_buffer_bytes, max_blob);
 
     // Channel capacities.
     // work_cap: scheduling slack between walk and workers.
     // result_cap: reorder buffer headroom between workers and consumer.
-    // ByteBudget enforces the byte-level memory cap on top of these.
+    // The MemoryBudget enforces the byte-level memory cap on top of these.
     let work_cap = num_workers * 2;
     let result_cap = num_workers + readahead_depth;
 
@@ -340,8 +346,8 @@ pub(crate) fn run_parallel_pipeline(
         // Stage B → C: workers send ordered results to consumer.
         let (result_tx, result_rx) = crossbeam_channel::bounded::<PipelineResult>(result_cap);
 
-        // Reference so `move` closures capture `&ByteBudget`, not move it.
-        let budget_ref = &budget;
+        // Reference so `move` closures capture `&MemoryBudget`, not the Arc.
+        let budget_ref: &MemoryBudget = &memory;
         let clocks_ref = &clocks;
 
         // --- Stage A: Walk thread — iterate + acquire budget in walk order ---
@@ -420,7 +426,7 @@ pub(crate) fn run_parallel_pipeline(
                         clocks_ref.walk_send_wait.add(t.elapsed());
                         if sent.is_err() {
                             // Workers/consumer gone — release budget and stop.
-                            budget_ref.release(acquired);
+                            budget_ref.release_pipeline(acquired);
                             return;
                         }
                         seq_idx += 1;
@@ -495,7 +501,6 @@ pub(crate) fn run_parallel_pipeline(
         // Reset on SourceStarted; flushed as summary warnings on SourceFinished.
         let mut dataless_files: u64 = 0;
         let mut dataless_dirs: u64 = 0;
-        let mut last_debt: usize = 0;
 
         let consumer_span = tracing::debug_span!("backup_consumer").entered();
         let cap_wait_start = session_cap_wait(ws);
@@ -505,7 +510,7 @@ pub(crate) fn run_parallel_pipeline(
             let Ok(msg) = result_rx.recv() else { break };
             consumer_recv_wait += wait.elapsed();
             if shutdown.is_cancelled() {
-                budget.poison();
+                memory.poison();
                 consume_err = Some(VykarError::Interrupted);
                 break;
             }
@@ -526,7 +531,7 @@ pub(crate) fn run_parallel_pipeline(
                     // consumed. This is fine: the backup will fail, no
                     // snapshot is saved, and in-memory pack buffers are
                     // dropped on return.
-                    budget.poison();
+                    memory.poison();
                     consume_err = Some(e);
                     break;
                 }
@@ -537,7 +542,7 @@ pub(crate) fn run_parallel_pipeline(
                 // Draining remaining segments of a skipped file.
                 if segments_to_skip > 0 {
                     if let Ok(ProcessedEntry::FileSegment { acquired_bytes, .. }) = &result {
-                        budget.release(*acquired_bytes);
+                        memory.release_pipeline(*acquired_bytes);
                     }
                     // SegmentSkipped / errors: budget already released by guard.
                     segments_to_skip -= 1;
@@ -645,20 +650,16 @@ pub(crate) fn run_parallel_pipeline(
                             new_file_cache,
                             listing,
                             progress,
-                            &budget,
+                            &memory,
                             prefilter,
                             &mut large_file_accum,
                             file_cache,
                             verbose,
                         ) {
-                            budget.poison();
+                            memory.poison();
                             consume_err = Some(e);
                             break;
                         }
-                        // Committing may have sealed a pack (and waited in
-                        // `cap_pending_uploads`); re-lend the upload queue's
-                        // slack so the walk does not refill the budget on top.
-                        update_debt(ws, &budget, &mut last_debt);
                     }
                     Err(e) => {
                         if e.is_soft_file_error() {
@@ -684,7 +685,7 @@ pub(crate) fn run_parallel_pipeline(
                             }
                             continue;
                         }
-                        budget.poison();
+                        memory.poison();
                         consume_err = Some(e);
                         break;
                     }
@@ -694,8 +695,6 @@ pub(crate) fn run_parallel_pipeline(
             if consume_err.is_some() {
                 break;
             }
-            // Uploads may also finish while the consumer waits for results.
-            update_debt(ws, &budget, &mut last_debt);
         }
         consumer_wall = loop_start.elapsed();
         consumer_cap_wait = session_cap_wait(ws).saturating_sub(cap_wait_start);
@@ -714,11 +713,10 @@ pub(crate) fn run_parallel_pipeline(
             )));
         }
 
+        let peak_pipeline = memory.snapshot().peak_pipeline;
         debug_assert!(
-            budget.peak_acquired() <= pipeline_buffer_bytes,
-            "pipeline exceeded memory budget: peak {} > cap {}",
-            budget.peak_acquired(),
-            pipeline_buffer_bytes,
+            peak_pipeline <= pipeline_buffer_bytes,
+            "pipeline exceeded memory budget: peak {peak_pipeline} > cap {pipeline_buffer_bytes}",
         );
 
         if let Some(e) = consume_err {
@@ -756,17 +754,6 @@ fn session_cap_wait(ws: &WriteSession) -> Duration {
     ws.write_metrics().upload_cap_wait
 }
 
-/// Lend the upload queue's slack (sealed packs beyond the in-flight slots)
-/// out of the pipeline budget. Remote repositories only: local ones bound
-/// the queue by bytes already, so the slack is always 0 there.
-fn update_debt(ws: &WriteSession, budget: &ByteBudget, last_debt: &mut usize) {
-    let debt = ws.upload_slack_bytes();
-    if debt != *last_debt {
-        budget.set_debt(debt);
-        *last_debt = debt;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,7 +774,7 @@ mod tests {
 
         // Run the pipeline logic in a scoped thread so we can timeout.
         let handle = std::thread::spawn(move || {
-            let budget = ByteBudget::new(200); // Small budget
+            let budget = MemoryBudget::for_pipeline(200); // Small budget
             let num_workers = 4;
             let work_cap = num_workers * 2;
             let result_cap = num_workers + 4;
@@ -796,12 +783,12 @@ mod tests {
             let (result_tx, result_rx) = crossbeam_channel::bounded::<(usize, usize)>(result_cap);
 
             std::thread::scope(|s| {
-                let budget_ref = &budget;
+                let budget_ref = &*budget;
 
                 // Walk thread: send 10 items, each requiring 100 bytes of budget.
                 s.spawn(move || {
                     for i in 0..10 {
-                        let acquired = budget_ref.acquire(100).unwrap();
+                        let acquired = budget_ref.acquire_pipeline(100).unwrap();
                         work_tx.send((i, acquired, i)).unwrap();
                     }
                 });
@@ -832,7 +819,7 @@ mod tests {
                 for (idx, acquired) in &result_rx {
                     pending.insert(idx, acquired);
                     while let Some(acq) = pending.remove(&next_expected) {
-                        budget_ref.release(acq);
+                        budget_ref.release_pipeline(acq);
                         next_expected += 1;
                     }
                 }
@@ -860,12 +847,13 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// A debt set by the consumer (even one at or above the whole capacity,
-    /// and never lowered while workers are busy) must only throttle the
-    /// walk, never deadlock it: with nothing held, the floor admits the
-    /// next item. Same topology as the test above.
+    /// Sealed packs lending pipeline capacity (none, part, more than all of
+    /// it), swapped by an uploader on its own schedule, never synchronised
+    /// with the walk, must only throttle the walk, never deadlock it: with
+    /// nothing held, the floor admits the next item. Same topology as the
+    /// test above.
     #[test]
-    fn pipeline_no_deadlock_with_budget_debt() {
+    fn pipeline_no_deadlock_with_sealed_lending() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
@@ -873,21 +861,38 @@ mod tests {
         let completed2 = Arc::clone(&completed);
 
         let handle = std::thread::spawn(move || {
-            let budget = ByteBudget::new(200);
+            // One slot, target 0: lent = sealed / 2.
+            let budget = MemoryBudget::new(1, 0, 0);
+            budget.begin_pipeline(200, 0);
             let num_workers = 4;
             let (work_tx, work_rx) =
                 crossbeam_channel::bounded::<(usize, usize, usize)>(num_workers * 2);
             let (result_tx, result_rx) =
                 crossbeam_channel::bounded::<(usize, usize)>(num_workers + 4);
+            let stop = AtomicBool::new(false);
 
             std::thread::scope(|s| {
                 let budget_ref = &budget;
-                // Debt larger than the capacity before anything is acquired.
-                budget_ref.set_debt(1000);
+                let stop = &stop;
+                // Lends more than the capacity before anything is acquired.
+                let first = budget_ref.hold_sealed(1000);
+
+                // Uploader: swaps the sealed charge on its own clock.
+                s.spawn(move || {
+                    let mut held = Some(first);
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                        drop(held.take());
+                        held = Some(budget_ref.hold_sealed([0, 150, 1000][i % 3]));
+                        i += 1;
+                    }
+                    drop(held);
+                });
 
                 s.spawn(move || {
                     for i in 0..20 {
-                        let acquired = budget_ref.acquire(70).unwrap();
+                        let acquired = budget_ref.acquire_pipeline(70).unwrap();
                         work_tx.send((i, acquired, i)).unwrap();
                     }
                 });
@@ -912,14 +917,15 @@ mod tests {
                 for (idx, acquired) in &result_rx {
                     pending.insert(idx, acquired);
                     while let Some(acq) = pending.remove(&next_expected) {
-                        budget_ref.release(acq);
-                        // Debt swings between none, partial and total.
-                        budget_ref.set_debt([0, 150, 1000][next_expected % 3]);
+                        budget_ref.release_pipeline(acq);
                         next_expected += 1;
                     }
                 }
                 assert_eq!(next_expected, 20, "all items should be consumed");
+                stop.store(true, Ordering::SeqCst);
             });
+            let s = budget.snapshot();
+            assert_eq!((s.pipeline, s.sealed_packs), (0, 0));
 
             completed2.store(true, Ordering::SeqCst);
         });
@@ -931,7 +937,83 @@ mod tests {
         }
         assert!(
             completed.load(Ordering::SeqCst),
-            "pipeline deadlocked under budget debt within {timeout:?}"
+            "pipeline deadlocked under sealed-pack lending within {timeout:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// threads = 1: one worker, P = 64, items larger than P, and a consumer
+    /// that, after every item, closes a pack and blocks in a pack wait only
+    /// an uploader thread can end (it sleeps, then drops the pack's
+    /// charge). The charges lend more than P. Must complete.
+    #[test]
+    fn pipeline_threads_one_no_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed2 = Arc::clone(&completed);
+
+        let handle = std::thread::spawn(move || {
+            let budget = MemoryBudget::new(1, 10, 0);
+            budget.begin_pipeline(64, 0);
+            let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, usize)>(2);
+            let (result_tx, result_rx) = crossbeam_channel::bounded::<(usize, usize)>(2);
+            let (upload_tx, upload_rx) =
+                crossbeam_channel::unbounded::<crate::repo::memory_budget::HeldBytes>();
+            let (done_tx, done_rx) = crossbeam_channel::unbounded::<()>();
+
+            std::thread::scope(|s| {
+                let budget_ref = &*budget;
+                // Uploader.
+                s.spawn(move || {
+                    for held in upload_rx {
+                        std::thread::sleep(Duration::from_millis(2));
+                        drop(held);
+                        let _ = done_tx.send(());
+                    }
+                });
+                // Walk: items of 100 > P = 64.
+                s.spawn(move || {
+                    for i in 0..20 {
+                        let acquired = budget_ref.acquire_pipeline(100).unwrap();
+                        assert_eq!(acquired, 64, "clamped to P");
+                        work_tx.send((i, acquired)).unwrap();
+                    }
+                });
+                // One worker.
+                s.spawn(move || {
+                    for item in &work_rx {
+                        let _ = result_tx.send(item);
+                    }
+                });
+
+                let mut next_expected = 0usize;
+                for (idx, acquired) in &result_rx {
+                    assert_eq!(idx, next_expected, "one worker keeps order");
+                    // Close a pack: charge it, hand it to the uploader, wait.
+                    upload_tx.send(budget.hold_sealed(1000)).unwrap();
+                    done_rx.recv().unwrap();
+                    budget_ref.release_pipeline(acquired);
+                    next_expected += 1;
+                }
+                assert_eq!(next_expected, 20);
+                drop(upload_tx);
+            });
+            let s = budget.snapshot();
+            assert_eq!((s.pipeline, s.sealed_packs), (0, 0));
+            assert!(s.peak_pipeline <= 64);
+            completed2.store(true, Ordering::SeqCst);
+        });
+
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout && !completed.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "threads = 1 pipeline deadlocked within {timeout:?}"
         );
         handle.join().unwrap();
     }
@@ -939,7 +1021,7 @@ mod tests {
     /// Walk errors must propagate cleanly even when workers are active.
     #[test]
     fn pipeline_walk_error_propagates_cleanly() {
-        let budget = ByteBudget::new(1000);
+        let budget = MemoryBudget::for_pipeline(1000);
         let num_workers = 2;
         let work_cap = num_workers * 2;
         let result_cap = num_workers + 4;
@@ -949,7 +1031,7 @@ mod tests {
             let (result_tx, result_rx) = crossbeam_channel::bounded::<PipelineResult>(result_cap);
 
             let walk_result_tx = result_tx.clone();
-            let budget_ref = &budget;
+            let budget_ref = &*budget;
 
             // Walk thread: send 3 successes, then a walk error.
             s.spawn(move || {
@@ -1021,7 +1103,7 @@ mod tests {
     #[test]
     fn pipeline_consumer_error_releases_budget() {
         let cap = 1000usize;
-        let budget = Arc::new(ByteBudget::new(cap));
+        let budget = MemoryBudget::for_pipeline(cap);
 
         std::thread::scope(|s| {
             let budget_ref = &*budget;
@@ -1033,9 +1115,9 @@ mod tests {
             // Walk thread: send 5 items, each 100 bytes.
             s.spawn(move || {
                 for i in 0..5 {
-                    let acquired = budget_ref.acquire(100).unwrap();
+                    let acquired = budget_ref.acquire_pipeline(100).unwrap();
                     if work_tx.send((i, acquired)).is_err() {
-                        budget_ref.release(acquired);
+                        budget_ref.release_pipeline(acquired);
                         return;
                     }
                 }
@@ -1048,7 +1130,7 @@ mod tests {
                 s.spawn(move || {
                     for (idx, acquired) in rx {
                         if tx.send((idx, acquired)).is_err() {
-                            budget_ref.release(acquired);
+                            budget_ref.release_pipeline(acquired);
                             return;
                         }
                     }
@@ -1067,17 +1149,17 @@ mod tests {
                     if next_expected == 2 {
                         // Simulate consumer error: poison + release this item.
                         budget_ref.poison();
-                        budget_ref.release(acq);
+                        budget_ref.release_pipeline(acq);
                         next_expected += 1;
                         break;
                     }
-                    budget_ref.release(acq);
+                    budget_ref.release_pipeline(acq);
                     next_expected += 1;
                 }
-                if budget_ref.state.lock().unwrap().poisoned {
+                if budget_ref.is_poisoned() {
                     // Release any remaining pending items.
                     for acq in pending.values() {
-                        budget_ref.release(*acq);
+                        budget_ref.release_pipeline(*acq);
                     }
                     pending.clear();
                     break;
@@ -1086,31 +1168,29 @@ mod tests {
 
             // Drain remaining results and release their budget.
             for (_, acquired) in &result_rx {
-                budget_ref.release(acquired);
+                budget_ref.release_pipeline(acquired);
             }
         });
 
-        // After all threads exit, budget should be fully available.
-        let st = budget.state.lock().unwrap();
-        assert_eq!(
-            st.available, st.capacity,
-            "budget leaked: available={}, capacity={}",
-            st.available, st.capacity
-        );
+        // After all threads exit, nothing is held.
+        let held = budget.snapshot().pipeline;
+        assert_eq!(held, 0, "budget leaked: {held} bytes still held");
     }
 
-    /// BudgetGuard must release bytes when a worker panics.
+    /// PipelineGuard must release bytes when a worker panics.
     #[test]
     fn pipeline_budget_guard_releases_on_worker_panic() {
-        use super::super::concurrency::BudgetGuard;
+        use crate::repo::memory_budget::PipelineGuard;
 
-        let budget = ByteBudget::new(200);
+        let budget = MemoryBudget::for_pipeline(200);
+        // What the walk thread does before dispatch.
+        let pre_acquired = budget.acquire_pipeline(100).unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             std::thread::scope(|s| {
-                let budget_ref = &budget;
+                let budget_ref = &*budget;
                 s.spawn(move || {
-                    let _guard = BudgetGuard::from_pre_acquired(budget_ref, 100);
+                    let _guard = PipelineGuard::from_pre_acquired(budget_ref, pre_acquired);
                     panic!("simulated worker panic");
                 });
             });
@@ -1119,12 +1199,12 @@ mod tests {
         assert!(result.is_err(), "scope should propagate panic");
 
         // Guard should have released 100 bytes on drop during unwind.
-        let acquired = budget.acquire(200).unwrap();
+        let acquired = budget.acquire_pipeline(200).unwrap();
         assert_eq!(
             acquired, 200,
             "full budget should be available after panic cleanup"
         );
-        budget.release(200);
+        budget.release_pipeline(200);
     }
 
     fn source_marker(i: usize) -> ProcessedEntry {

@@ -1,10 +1,16 @@
+use chrono::{DateTime, Utc};
 use comfy_table::{Cell, CellAlignment};
+use serde::Serialize;
 
 use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::manifest::SnapshotEntry;
+use vykar_core::repo::snapshot_cache::SkippedSnapshot;
+use vykar_core::snapshot::SnapshotStats;
 
 use crate::error::CliResult;
+use crate::output::{Output, Report, SnapshotStatsJson, non_empty};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::CliTableTheme;
 
@@ -13,6 +19,7 @@ pub(crate) fn run_list(
     label: Option<&str>,
     source_filter: &[String],
     last: Option<usize>,
+    out: &mut Output,
 ) -> CliResult<()> {
     let listing = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::list::list_snapshots_with_stats(
@@ -43,11 +50,89 @@ pub(crate) fn run_list(
             snapshots.drain(..len - n);
         }
     }
-    if snapshots.is_empty() {
-        println!("No snapshots found.");
-        return Ok(());
+    out.emit(&ListReport {
+        snapshots,
+        hidden: listing.hidden,
+        hidden_message: hidden,
+    })
+}
+
+struct ListReport {
+    snapshots: Vec<(SnapshotEntry, Option<SnapshotStats>)>,
+    hidden: Vec<SkippedSnapshot>,
+    hidden_message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ListJson<'a> {
+    snapshots: Vec<SnapshotJson<'a>>,
+    /// Snapshots that exist but could not be read; the list is incomplete.
+    hidden: Vec<HiddenJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct SnapshotJson<'a> {
+    name: &'a str,
+    id: String,
+    time: DateTime<Utc>,
+    hostname: Option<&'a str>,
+    label: Option<&'a str>,
+    source_paths: &'a [String],
+    stats: Option<SnapshotStatsJson>,
+}
+
+#[derive(Serialize)]
+struct HiddenJson<'a> {
+    id: &'a str,
+    reason: String,
+}
+
+impl Report for ListReport {
+    const KEY: &'static str = "list";
+
+    fn json(&self) -> impl Serialize {
+        ListJson {
+            snapshots: self
+                .snapshots
+                .iter()
+                .map(|(entry, stats)| SnapshotJson {
+                    name: &entry.name,
+                    id: entry.id.to_hex(),
+                    time: entry.time,
+                    hostname: non_empty(&entry.hostname),
+                    label: non_empty(SnapshotRowView::effective_label(entry)),
+                    source_paths: &entry.source_paths,
+                    stats: stats.as_ref().map(SnapshotStatsJson::from),
+                })
+                .collect(),
+            hidden: self
+                .hidden
+                .iter()
+                .map(|h| HiddenJson {
+                    id: &h.id_hex,
+                    reason: h.reason.to_string(),
+                })
+                .collect(),
+        }
     }
 
+    fn print_human(&self) {
+        let snapshots = &self.snapshots;
+        if snapshots.is_empty() {
+            println!("No snapshots found.");
+            return;
+        }
+        print_table(snapshots);
+
+        // Repeat under the table: on a long listing the pre-table warning has
+        // usually scrolled out of view by the time the user reads the last row.
+        if let Some(ref msg) = self.hidden_message {
+            eprintln!("warning: {msg}");
+        }
+    }
+}
+
+fn print_table(snapshots: &[(SnapshotEntry, Option<SnapshotStats>)]) {
     let theme = CliTableTheme::detect();
     let mut table = theme.new_data_table(&[
         "ID", "Date", "Host", "Label", "Source", "Files", "Size", "Added",
@@ -63,7 +148,7 @@ pub(crate) fn run_list(
 
     let mut prev_group: Option<(String, String)> = None;
 
-    for (entry, stats) in &snapshots {
+    for (entry, stats) in snapshots {
         let row = SnapshotRowView::new(entry, stats.as_ref());
 
         // Repeated host/label pairs are blanked so a run of snapshots from one
@@ -94,12 +179,4 @@ pub(crate) fn run_list(
         ]);
     }
     println!("{table}");
-
-    // Repeat under the table: on a long listing the pre-table warning has
-    // usually scrolled out of view by the time the user reads the last row.
-    if let Some(ref msg) = hidden {
-        eprintln!("warning: {msg}");
-    }
-
-    Ok(())
 }

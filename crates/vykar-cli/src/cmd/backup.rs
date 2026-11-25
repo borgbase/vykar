@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 
-use vykar_core::app::operations::{self, BackupRunEvent};
+use serde::Serialize;
+
+use vykar_core::app::operations::{self, BackupRunEvent, BackupRunReport};
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 use vykar_core::repo::control::CancelToken;
@@ -8,6 +10,7 @@ use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::{print_backup_stats, print_dataless_summary};
+use crate::output::{Output, Report, SnapshotStatsJson};
 use crate::passphrase::with_repo_passphrase;
 use crate::progress::BackupProgressRenderer;
 
@@ -24,7 +27,11 @@ pub(crate) struct BackupRunOpts<'a> {
 
 /// Returns `Ok(true)` if the backup completed with partial success (some files skipped),
 /// `Ok(false)` for full success.
-pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliResult<bool> {
+pub(crate) fn run_backup(
+    repo: &ResolvedRepo,
+    opts: BackupRunOpts<'_>,
+    out: &mut Output,
+) -> CliResult<bool> {
     let BackupRunOpts {
         user_label,
         compression_override,
@@ -60,7 +67,7 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
 
     with_repo_passphrase(&repo.config, label, |passphrase| {
         let is_tty = std::io::stderr().is_terminal();
-        let show_progress = is_tty || verbose > 0;
+        let show_progress = (is_tty && !out.is_json()) || verbose > 0;
 
         if !source_filter.is_empty() && !paths.is_empty() {
             return Err(CliError::from("cannot combine --source with ad-hoc paths"));
@@ -142,38 +149,12 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
 
         let report = result?;
 
-        let mut had_partial = false;
-        for created in &report.created {
-            let stats = &created.stats;
-            if stats.errors > 0 {
-                had_partial = true;
-                eprintln!(
-                    "Warning: {} file(s) could not be read and were excluded from the snapshot",
-                    stats.errors
-                );
-            }
-            let paths_display = created.source_paths.join(", ");
-            println!("Snapshot created: {}", created.snapshot_name);
-            println!(
-                "  Source: {paths_display} (label: {})",
-                created.source_label
-            );
-            print_backup_stats(stats);
-            // Reported, but deliberately not folded into `had_partial` — see
-            // `print_dataless_summary`.
-            print_dataless_summary(
-                created.dataless_files_skipped,
-                created.dataless_dirs_skipped,
-            );
-        }
-        for skipped in &report.skipped {
-            eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
-        }
-        if let Some(aborted) = &report.aborted {
-            crate::format::print_aborted_run(aborted);
-            if aborted.interrupted {
-                return Err(VykarError::Interrupted.into());
-            }
+        // Dataless (cloud-only) skips are reported, but deliberately not
+        // counted as partial — see `print_dataless_summary`.
+        let had_partial = report.created.iter().any(|c| c.stats.errors > 0);
+        out.emit(&BackupReport(&report))?;
+        if report.aborted.as_ref().is_some_and(|a| a.interrupted) {
+            return Err(VykarError::Interrupted.into());
         }
 
         if report.failure_summary().is_some() {
@@ -186,4 +167,117 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
 
         Ok(had_partial)
     })
+}
+
+struct BackupReport<'a>(&'a BackupRunReport);
+
+#[derive(Serialize)]
+pub(crate) struct BackupJson<'a> {
+    created: Vec<CreatedJson<'a>>,
+    skipped: Vec<SourceReasonJson<'a>>,
+    failed: Vec<SourceReasonJson<'a>>,
+    aborted: Option<AbortedJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct CreatedJson<'a> {
+    snapshot: &'a str,
+    source_label: &'a str,
+    source_paths: &'a [String],
+    stats: SnapshotStatsJson,
+    dataless_files_skipped: u64,
+    dataless_dirs_skipped: u64,
+}
+
+#[derive(Serialize)]
+struct SourceReasonJson<'a> {
+    label: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct AbortedJson<'a> {
+    label: &'a str,
+    error: &'a str,
+    interrupted: bool,
+    not_attempted: &'a [String],
+}
+
+impl<'a> From<&'a BackupRunReport> for BackupJson<'a> {
+    fn from(report: &'a BackupRunReport) -> Self {
+        Self {
+            created: report
+                .created
+                .iter()
+                .map(|c| CreatedJson {
+                    snapshot: &c.snapshot_name,
+                    source_label: &c.source_label,
+                    source_paths: &c.source_paths,
+                    stats: SnapshotStatsJson::from(&c.stats),
+                    dataless_files_skipped: c.dataless_files_skipped,
+                    dataless_dirs_skipped: c.dataless_dirs_skipped,
+                })
+                .collect(),
+            skipped: report
+                .skipped
+                .iter()
+                .map(|s| SourceReasonJson {
+                    label: &s.label,
+                    reason: &s.reason,
+                })
+                .collect(),
+            failed: report
+                .failed
+                .iter()
+                .map(|f| SourceReasonJson {
+                    label: &f.label,
+                    reason: &f.error,
+                })
+                .collect(),
+            aborted: report.aborted.as_ref().map(|a| AbortedJson {
+                label: &a.label,
+                error: &a.error,
+                interrupted: a.interrupted,
+                not_attempted: &a.not_attempted,
+            }),
+        }
+    }
+}
+
+impl Report for BackupReport<'_> {
+    const KEY: &'static str = "backup";
+
+    fn json(&self) -> impl Serialize {
+        BackupJson::from(self.0)
+    }
+
+    fn print_human(&self) {
+        let report = self.0;
+        for created in &report.created {
+            let stats = &created.stats;
+            if stats.errors > 0 {
+                eprintln!(
+                    "Warning: {} file(s) could not be read and were excluded from the snapshot",
+                    stats.errors
+                );
+            }
+            let paths_display = created.source_paths.join(", ");
+            println!("Snapshot created: {}", created.snapshot_name);
+            println!(
+                "  Source: {paths_display} (label: {})",
+                created.source_label
+            );
+            print_backup_stats(stats);
+            print_dataless_summary(
+                created.dataless_files_skipped,
+                created.dataless_dirs_skipped,
+            );
+        }
+        for skipped in &report.skipped {
+            eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
+        }
+        if let Some(aborted) = &report.aborted {
+            crate::format::print_aborted_run(aborted);
+        }
+    }
 }

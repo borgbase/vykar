@@ -38,6 +38,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub trust_repo: bool,
 
+    /// Print the result as one JSON document on stdout (for scripts).
+    /// Never prompts; pass the command's --yes flag where it has one.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Select repository by label or path (bare command only)
     #[arg(short = 'R', long = "repo")]
     pub repo: Option<String>,
@@ -264,6 +269,10 @@ pub(crate) enum Commands {
         /// Also remove all session markers (orphaned by crashed backups)
         #[arg(long)]
         sessions: bool,
+
+        /// Skip interactive confirmation (for scripting)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Run scheduled backups as a foreground daemon
@@ -354,6 +363,13 @@ pub(crate) enum KeyCommand {
 }
 
 impl KeyCommand {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Export { .. } => "export",
+            Self::Import { .. } => "import",
+        }
+    }
+
     pub(crate) fn repo(&self) -> Option<&str> {
         match self {
             Self::Export { repo, .. } | Self::Import { repo, .. } => repo.as_deref(),
@@ -449,6 +465,16 @@ pub(crate) enum SnapshotCommand {
 }
 
 impl SnapshotCommand {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "list",
+            Self::Info { .. } => "info",
+            Self::Diff { .. } => "diff",
+            Self::Delete { .. } => "delete",
+            Self::Find { .. } => "find",
+        }
+    }
+
     pub(crate) fn repo(&self) -> Option<&str> {
         match self {
             Self::List { repo, .. }
@@ -520,6 +546,15 @@ impl Commands {
             Self::Key { .. } => "key",
             Self::Config { .. } => "config",
             Self::Daemon { .. } => "daemon",
+        }
+    }
+
+    /// The full command name, subcommand included (`snapshot list`).
+    pub(crate) fn full_name(&self) -> String {
+        match self {
+            Self::Snapshot { command } => format!("snapshot {}", command.name()),
+            Self::Key { command } => format!("key {}", command.name()),
+            other => other.name().to_string(),
         }
     }
 }

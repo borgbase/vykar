@@ -1,15 +1,19 @@
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 
 use chrono::Utc;
+use serde::Serialize;
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::lock;
 
 use crate::error::{CliError, CliResult};
+use crate::output::{Output, Report};
 
 pub(crate) fn run_break_lock(
     config: &VykarConfig,
     _label: Option<&str>,
     sessions: bool,
+    yes: bool,
+    out: &mut Output,
 ) -> CliResult<()> {
     let storage = vykar_core::storage::backend_from_config(
         &config
@@ -19,26 +23,72 @@ pub(crate) fn run_break_lock(
     )?;
 
     let removed = lock::break_lock(storage.as_ref())?;
-
-    if removed == 0 {
-        println!("No locks found.");
-    } else {
-        println!("Removed {removed} lock(s).");
-    }
+    out.emit(&LocksReport {
+        locks_removed: removed,
+    })?;
 
     if sessions {
-        clear_sessions(storage.as_ref())?;
+        clear_sessions(storage.as_ref(), yes, out)?;
     }
 
     Ok(())
 }
 
-fn clear_sessions(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> {
+#[derive(Serialize)]
+struct LocksReport {
+    locks_removed: usize,
+}
+
+impl Report for LocksReport {
+    const KEY: &'static str = "break_lock";
+
+    fn json(&self) -> impl Serialize {
+        self
+    }
+
+    fn print_human(&self) {
+        if self.locks_removed == 0 {
+            println!("No locks found.");
+        } else {
+            println!("Removed {} lock(s).", self.locks_removed);
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SessionsReport {
+    sessions_found: usize,
+    sessions_removed: usize,
+}
+
+impl Report for SessionsReport {
+    const KEY: &'static str = "sessions";
+
+    fn json(&self) -> impl Serialize {
+        self
+    }
+
+    fn print_human(&self) {
+        if self.sessions_found == 0 {
+            println!("No active sessions found.");
+        } else {
+            println!("Removed {} session file(s).", self.sessions_removed);
+        }
+    }
+}
+
+fn clear_sessions(
+    storage: &dyn vykar_storage::StorageBackend,
+    yes: bool,
+    out: &mut Output,
+) -> CliResult<()> {
     let entries = lock::list_session_entries(storage)?;
 
     if entries.is_empty() {
-        println!("No active sessions found.");
-        return Ok(());
+        return out.emit(&SessionsReport {
+            sessions_found: 0,
+            sessions_removed: 0,
+        });
     }
 
     let now = Utc::now();
@@ -55,22 +105,27 @@ fn clear_sessions(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> 
     eprintln!();
     eprintln!("WARNING: Removing sessions may interrupt live backups on other machines.");
 
-    if !std::io::stdin().is_terminal() {
-        return Err(CliError::from(
-            "refusing to remove sessions without confirmation in non-interactive mode",
-        ));
-    }
+    if !yes {
+        if !out.interactive() {
+            return Err(CliError::from(
+                "refusing to remove sessions without confirmation in non-interactive mode; \
+                 use --yes to skip the prompt",
+            ));
+        }
 
-    eprint!("Remove all sessions? [y/N]: ");
-    std::io::stderr().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if !input.trim().eq_ignore_ascii_case("y") {
-        eprintln!("Aborted.");
-        return Ok(());
+        eprint!("Remove all sessions? [y/N]: ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
     }
 
     let removed = lock::clear_all_sessions(storage)?;
-    println!("Removed {removed} session file(s).");
-    Ok(())
+    out.emit(&SessionsReport {
+        sessions_found: entries.len(),
+        sessions_removed: removed,
+    })
 }

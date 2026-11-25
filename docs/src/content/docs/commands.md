@@ -62,6 +62,7 @@ See [Maintain the Repository](/maintenance).
 | `-R`, `--repo <label or path>` | Select one repository. See below for what happens without it |
 | `-S`, `--source <label>` | Filter by source label, on the commands that work per source (`backup`, `list`, `prune`, `mount`, `snapshot find`) |
 | `-v`, `-vv`, `-vvv` | Increase verbosity |
+| `--json` | Print the result as one JSON document for scripts; see [JSON Output](/json-output) |
 
 With several repositories configured and no `-R`:
 

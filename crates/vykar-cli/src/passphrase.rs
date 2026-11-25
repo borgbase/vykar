@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use zeroize::Zeroizing;
@@ -9,12 +10,29 @@ use vykar_core::app::passphrase::{
     InitPassphrase, InitPromptStage, resolve_init_passphrase, resolve_passphrase,
 };
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
+use vykar_types::error::VykarError;
 
 /// Process-level passphrase cache keyed by repository URL.
 /// Avoids double interactive prompts when probe-then-dispatch opens the same
 /// repo twice (once to check the manifest, once to run the command).
 static PASSPHRASE_CACHE: LazyLock<Mutex<HashMap<String, Option<Zeroizing<String>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Set for `--json`: a missing passphrase is an error instead of a prompt.
+static NON_INTERACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_non_interactive(non_interactive: bool) {
+    NON_INTERACTIVE.store(non_interactive, Ordering::Relaxed);
+}
+
+fn prompt_passphrase(prompt: &str) -> vykar_types::error::Result<Zeroizing<String>> {
+    if NON_INTERACTIVE.load(Ordering::Relaxed) {
+        return Err(VykarError::Other(
+            "a passphrase is required; set VYKAR_PASSPHRASE or encryption.passcommand".into(),
+        ));
+    }
+    Ok(Zeroizing::new(prompt_hidden(prompt)?))
+}
 
 pub(crate) fn with_repo_passphrase<T>(
     config: &VykarConfig,
@@ -51,7 +69,7 @@ pub(crate) fn get_passphrase(
             Some(ref l) => format!("Enter passphrase for '{l}': "),
             None => "Enter passphrase: ".to_string(),
         };
-        Ok(Some(Zeroizing::new(prompt_hidden(&prompt)?)))
+        prompt_passphrase(&prompt).map(Some)
     })?;
 
     PASSPHRASE_CACHE
@@ -90,13 +108,13 @@ pub(crate) fn get_init_passphrase(
             InitPromptStage::Enter => format!("Enter new passphrase{suffix}: "),
             InitPromptStage::Confirm => format!("Confirm passphrase{suffix}: "),
         };
-        Ok(Some(Zeroizing::new(prompt_hidden(&text)?)))
+        prompt_passphrase(&text).map(Some)
     })?;
 
     match outcome {
         InitPassphrase::NotRequired => Ok(None),
         InitPassphrase::Provided(p) => Ok(Some(p)),
-        // Unreachable from a terminal: `prompt_hidden` never reports a
+        // Unreachable from a terminal: `prompt_passphrase` never reports a
         // cancellation (Ctrl-C terminates the process, EOF is an I/O error).
         InitPassphrase::Cancelled => Err(CliError::from("passphrase entry cancelled")),
     }

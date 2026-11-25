@@ -28,7 +28,7 @@ pub(super) fn build_repair_plan(
     let mut has_data_loss = false;
 
     // Repository key copies first. Restoring one is pure gain — `check` runs
-    // only after `Repository::open` succeeded, so a key was established and
+    // only after `Repo::open` succeeded, so a key was established and
     // `key_source` names the stored copy that carries it. Repair therefore
     // never picks between two candidate keys on a guess; the unresolvable case
     // fails at open and never reaches a plan.

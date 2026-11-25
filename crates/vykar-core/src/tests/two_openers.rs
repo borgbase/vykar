@@ -20,7 +20,7 @@ use crate::repo::file_cache::{
 };
 use crate::repo::pack::PackType;
 use crate::repo::{
-    ChunkerParams, EncryptionMode, FileCacheSave, HostEnv, OpenOptions, Repository, SystemClock,
+    ChunkerParams, EncryptionMode, FileCacheSave, HostEnv, OpenOptions, Repo, SystemClock,
     WriteSessionOptions,
 };
 use crate::sim::env::{SimTime, TimeMode};
@@ -44,7 +44,7 @@ impl Env {
         std::fs::create_dir_all(&repo_dir).unwrap();
         let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
         let setup_cache = tmp.path().join("setup-cache");
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(storage),
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -65,7 +65,7 @@ impl Env {
     }
 
     /// A handle opened with the index, and the count of its `index.d/` GETs.
-    fn open(&self) -> (Repository, Arc<AtomicUsize>) {
+    fn open(&self) -> (Repo, Arc<AtomicUsize>) {
         let gets = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&gets);
         let local: Arc<dyn StorageBackend> =
@@ -80,7 +80,7 @@ impl Env {
             },
             usize::MAX,
         );
-        let repo = Repository::open(
+        let repo = Repo::open(
             Box::new(storage),
             None,
             Some(self.cache.clone()),
@@ -91,9 +91,9 @@ impl Env {
     }
 
     /// A handle opened with the file cache (no index).
-    fn open_with_file_cache(&self) -> Repository {
+    fn open_with_file_cache(&self) -> Repo {
         let storage = LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap();
-        Repository::open(
+        Repo::open(
             Box::new(storage),
             None,
             Some(self.cache.clone()),
@@ -102,23 +102,22 @@ impl Env {
         .unwrap()
     }
 
-    fn dir(&self, repo: &Repository) -> PathBuf {
-        crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&self.cache)).unwrap()
+    fn dir(&self, repo: &Repo) -> PathBuf {
+        crate::cache_paths::repo_cache_dir(&repo.config().id, Some(&self.cache)).unwrap()
     }
 }
 
 /// Store chunks `from..from + n` in one session and save; returns their IDs.
-fn store(repo: &mut Repository, from: u8, n: u8) -> Vec<ChunkId> {
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+fn store(repo: &mut Repo, from: u8, n: u8) -> Vec<ChunkId> {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     let ids = (from..from + n)
         .map(|b| {
-            repo.store_chunk(&payload(b), Compression::None, PackType::Data)
+            ws.store_chunk(repo, &payload(b), Compression::None, PackType::Data)
                 .unwrap()
                 .0
         })
         .collect();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     ids
 }
 
@@ -127,12 +126,12 @@ fn payload(b: u8) -> Vec<u8> {
 }
 
 /// Store chunks as a fold: a new base.
-fn store_fold(repo: &mut Repository, from: u8, n: u8) -> Vec<ChunkId> {
+fn store_fold(repo: &mut Repo, from: u8, n: u8) -> Vec<ChunkId> {
     repo.request_index_fold();
     store(repo, from, n)
 }
 
-fn base(repo: &Repository) -> ObjectName {
+fn base(repo: &Repo) -> ObjectName {
     repo.index_head().unwrap().base.as_ref().unwrap().name
 }
 
@@ -189,8 +188,8 @@ fn two_openers_share_one_cache_dir() {
         "B used the cached segment"
     );
     let first = ids[0];
-    b.chunk_index_mut().remove(&first);
-    b.save_state().unwrap();
+    b.unchecked_writer().chunk_index_mut().remove(&first);
+    b.unchecked_writer().save_state().unwrap();
     assert_eq!(b.index_head().unwrap().segments.len(), 2);
 
     let before = a_gets.load(Ordering::SeqCst);
@@ -289,7 +288,7 @@ fn anchor(b: u8) -> SnapshotId {
 
 /// What a backup of `root` anchored at `snapshot` leaves in the handle
 /// (`commit_finalize`'s merge), then the save.
-fn back_up_file_cache(repo: &mut Repository, root: &str, snapshot: SnapshotId) -> FileCacheSave {
+fn back_up_file_cache(repo: &mut Repo, root: &str, snapshot: SnapshotId) -> FileCacheSave {
     let mut write = FileCache::new();
     write.begin_sections(&[root.to_string()], &[0]);
     let chunks = CachedChunks::Single(CachedChunkRef {
@@ -309,7 +308,7 @@ fn back_up_file_cache(repo: &mut Repository, root: &str, snapshot: SnapshotId) -
 }
 
 /// What a backup's start does with sections anchored at a deleted snapshot.
-fn invalidate_file_cache(repo: &mut Repository, gone: SnapshotId) {
+fn invalidate_file_cache(repo: &mut Repo, gone: SnapshotId) {
     let dropped = repo
         .file_cache_mut()
         .invalidate_missing_snapshots_collect(&|id| *id != gone);
@@ -434,7 +433,7 @@ fn file_cache_lock_serialises_saves() {
         let a = env.open_with_file_cache();
         let b = env.open_with_file_cache();
         let barrier = Arc::new(std::sync::Barrier::new(2));
-        let run = |mut repo: Repository, root: String, barrier: Arc<std::sync::Barrier>| {
+        let run = |mut repo: Repo, root: String, barrier: Arc<std::sync::Barrier>| {
             std::thread::spawn(move || {
                 barrier.wait();
                 back_up_file_cache(&mut repo, &root, anchor(i));
@@ -456,9 +455,7 @@ fn file_cache_lock_serialises_saves() {
 
 /// Loads {x, y}, then another binary replaces the file with what `bytes`
 /// makes and the handle backs up x: y survives the save.
-fn file_cache_unmergeable_file_keeps_untouched_sections(
-    bytes: impl FnOnce(&Repository) -> Vec<u8>,
-) {
+fn file_cache_unmergeable_file_keeps_untouched_sections(bytes: impl FnOnce(&Repo) -> Vec<u8>) {
     let (env, _) = Env::new(1);
     let mut setup = env.open_with_file_cache();
     back_up_file_cache(&mut setup, "/x", anchor(1));
@@ -489,7 +486,7 @@ fn file_cache_other_format_keeps_untouched_sections() {
             crate::repo::format::ObjectType::FileCache,
             b"filecache",
             &[0x7F, 1, 2, 3],
-            repo.crypto.as_ref(),
+            repo.crypto().as_ref(),
         )
         .unwrap()
     });

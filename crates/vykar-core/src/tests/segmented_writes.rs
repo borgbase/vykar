@@ -19,7 +19,7 @@ use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
     HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment_v2, object_key, pack_head,
 };
-use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, Fence, OpenOptions, Repo, RepoFormat, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
@@ -40,7 +40,7 @@ fn fixture(format: RepoFormat) -> Fixture {
     let mut config = make_test_config(&repo_dir);
     let cache = tmp.path().join("cache");
     config.cache_dir = Some(cache.to_string_lossy().into_owned());
-    Repository::init_at_format(
+    Repo::init_at_format(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
         config.chunker.params(),
@@ -79,11 +79,11 @@ impl Fixture {
         storage: Box<dyn StorageBackend>,
         cache: &Path,
         opts: OpenOptions,
-    ) -> Result<Repository> {
-        Repository::open(storage, None, Some(cache.to_path_buf()), opts)
+    ) -> Result<Repo> {
+        Repo::open(storage, None, Some(cache.to_path_buf()), opts)
     }
 
-    fn open(&self, cache: &Path, with_index: bool) -> Result<Repository> {
+    fn open(&self, cache: &Path, with_index: bool) -> Result<Repo> {
         let opts = if with_index {
             OpenOptions::new().with_index()
         } else {
@@ -229,7 +229,7 @@ fn backups_append_one_segment_each() {
                 .get(&object_key(&seg_ref.name))
                 .unwrap()
                 .unwrap();
-            let seg = decode_segment_v2(seg_ref, &bytes, repo.crypto.as_ref()).unwrap();
+            let seg = decode_segment_v2(seg_ref, &bytes, repo.crypto().as_ref()).unwrap();
             assert!(seg.removals.is_empty() && seg.relocations.is_empty());
             assert!(!seg.additions.is_empty());
             // BK-6: the recorded trailer length of each new pack is its
@@ -279,7 +279,7 @@ fn backup_leaves_the_local_files_of_the_new_head() {
         let head = fx.head();
         assert!(head.base.is_none());
         assert_eq!(head.segments.len(), 2);
-        let dir = crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&fx.cache())).unwrap();
+        let dir = crate::cache_paths::repo_cache_dir(&repo.config().id, Some(&fx.cache())).unwrap();
         for s in &head.segments {
             assert!(table::read_cached_segment(&dir, s).is_some(), "{s:?}");
         }
@@ -316,14 +316,13 @@ fn an_empty_session_leaves_the_table_as_is() {
             .open_with(Box::new(storage), &cd, OpenOptions::new().with_index())
             .unwrap();
         let generation = repo.index_generation();
-        let dir = crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&cd)).unwrap();
+        let dir = crate::cache_paths::repo_cache_dir(&repo.config().id, Some(&cd)).unwrap();
         let before = local_files(&dir);
         assert!(!before.is_empty());
         fail.store(true, Ordering::SeqCst);
 
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
-        repo.save_state().unwrap();
+        let ws = repo.begin_write_session(&WriteSessionOptions::default());
+        repo.unchecked_writer().save_session(ws).unwrap();
 
         assert_eq!(repo.index_generation(), generation);
         assert_eq!(local_files(&dir), before);
@@ -431,7 +430,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
     let sync = |head: IndexHead| {
         index_store::sync_index(
             &*storage,
-            repo.crypto.as_ref(),
+            repo.crypto().as_ref(),
             head,
             CacheLocation {
                 dir: None,
@@ -458,7 +457,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
 /// An index edit that writes a segment: removes the first entry, or puts
 /// back the one `toggled` holds.
 pub(crate) fn toggle_an_entry(
-    repo: &mut Repository,
+    repo: &mut Repo,
     toggled: &mut Option<(
         vykar_types::chunk_id::ChunkId,
         crate::index::ChunkIndexEntry,
@@ -467,14 +466,15 @@ pub(crate) fn toggle_an_entry(
 ) {
     match toggled.take() {
         Some((id, e, trailer_len)) => {
-            let index = repo.chunk_index_mut();
+            let mut writer = repo.unchecked_writer();
+            let index = writer.chunk_index_mut();
             index.set_pack_trailer(e.pack_id, trailer_len);
             index.add(id, e.stored_size, e.pack_id, e.pack_offset);
         }
         None => {
             let (id, e) = repo.chunk_index().iter().next().unwrap();
             let trailer_len = repo.chunk_index().pack_trailer_len(&e.pack_id).unwrap();
-            repo.chunk_index_mut().remove(&id);
+            repo.unchecked_writer().chunk_index_mut().remove(&id);
             *toggled = Some((id, e, trailer_len));
         }
     }
@@ -505,7 +505,7 @@ fn maintenance_writes_fold_at_the_hard_limit() {
         repo.load_chunk_index_under_lock().unwrap();
         toggle_an_entry(&mut repo, &mut toggled);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         let head = repo.index_head().unwrap().clone();
         assert_eq!(head, fx.head());
         if head.segments.is_empty() {
@@ -536,7 +536,7 @@ fn repeated_plaintext_segment_folds() {
     let mut toggled = None;
     for _ in 0..3 {
         toggle_an_entry(&mut repo, &mut toggled);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
     }
     let head = fx.head();
     assert!(head.segments.is_empty(), "{head:?}");
@@ -558,8 +558,13 @@ fn fence_failure_publishes_nothing() {
     repo.load_chunk_index_under_lock().unwrap();
     let before = sorted_entries(repo.chunk_index());
     toggle_an_entry(&mut repo, &mut None);
-    repo.set_lock_fence(Arc::new(|| Err(VykarError::Other("lock lost".into()))));
-    let err = repo.save_state().unwrap_err().to_string();
+    let err = repo
+        .writer(Fence::lock(Arc::new(|| {
+            Err(VykarError::Other("lock lost".into()))
+        })))
+        .save_state()
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("lock lost"), "{err}");
 
     assert_eq!(fx.head_path(), head_path, "no new head");
@@ -761,7 +766,7 @@ fn repair_load_refuses_on_a_storage_error() {
 #[test]
 fn repair_load_refuses_a_segment_from_a_newer_vykar() {
     let fx = three_backups();
-    let crypto = Arc::clone(&fx.open(&fx.cache(), false).unwrap().crypto);
+    let crypto = Arc::clone(fx.open(&fx.cache(), false).unwrap().crypto());
     let storage = fx.storage();
     let mut head = fx.head();
     let seg = head.segments.last_mut().unwrap();
@@ -1078,7 +1083,7 @@ fn damaged(damage: Damage) -> (Fixture, std::collections::BTreeSet<String>, Vec<
 
 /// Opens the damaged repository through `storage` with a fresh cache
 /// directory and loads the index as repair does.
-fn open_for_repair(fx: &Fixture, storage: Box<dyn StorageBackend>, cache: &str) -> Repository {
+fn open_for_repair(fx: &Fixture, storage: Box<dyn StorageBackend>, cache: &str) -> Repo {
     let mut repo = fx
         .open_with(
             storage,
@@ -1127,10 +1132,11 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
             let mut repo = open_for_repair(&fx, storage, &format!("{case}-cold"));
             let loaded = sorted_entries(repo.chunk_index());
             assert!(!loaded.is_empty(), "{case}");
+            let mut fence = Fence::unchecked();
             if let Failure::SecondFence = failure {
                 let probe: Arc<dyn StorageBackend> = Arc::from(fx.storage());
                 let known = before.clone();
-                repo.set_lock_fence(Arc::new(move || {
+                fence = Fence::lock(Arc::new(move || {
                     if probe
                         .list(INDEX_OBJECT_DIR)?
                         .iter()
@@ -1144,7 +1150,7 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
             }
             repo.request_index_fold();
             let heads_before = fx.storage().list(HEAD_PREFIX).unwrap().len();
-            assert!(repo.save_state().is_err(), "{case}");
+            assert!(repo.writer(fence).save_state().is_err(), "{case}");
             drop(repo);
 
             assert_eq!(fx.storage().list(HEAD_PREFIX).unwrap().len(), heads_before);
@@ -1165,7 +1171,7 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
             let mut repo = open_for_repair(&fx, fx.storage(), &format!("{case}-retry"));
             assert_eq!(sorted_entries(repo.chunk_index()), loaded, "{case}");
             repo.request_index_fold();
-            repo.save_state().unwrap();
+            repo.unchecked_writer().save_state().unwrap();
             drop(repo);
             let head = fx.head();
             assert!(head.base.is_some(), "{case}");
@@ -1190,7 +1196,7 @@ fn fold_without_a_head_deletes_nothing_before_the_head_put() {
         let mut repo = open_for_repair(&fx, storage, "cold");
         ops.lock().unwrap().clear();
         repo.request_index_fold();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         drop(repo);
 
         let new = fx.head();
@@ -1282,7 +1288,7 @@ fn failed_listing_after_the_head_put_of_a_fold_without_a_head_is_logged() {
         let mut repo = open_for_repair(&fx, Box::new(storage), "cold");
         let loaded = sorted_entries(repo.chunk_index());
         repo.request_index_fold();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         drop(repo);
 
         assert_ne!(
@@ -1456,7 +1462,11 @@ fn a_partial_fold_failing_before_its_head_retries_on_the_same_handle() {
         repo.request_index_fold();
         let want = sorted_entries(repo.chunk_index());
         assert_ne!(want, unedited);
-        let err = repo.save_state().unwrap_err().to_string();
+        let err = repo
+            .unchecked_writer()
+            .save_state()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("injected failure"), "{name}: {err}");
         assert_eq!(fx.head(), before, "{name}");
         assert_eq!(
@@ -1466,7 +1476,7 @@ fn a_partial_fold_failing_before_its_head_retries_on_the_same_handle() {
         );
 
         armed.store(false, Ordering::SeqCst);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         assert_eq!(sorted_entries(repo.chunk_index()), want, "{name}");
         let head = fx.head();
         head.validate().unwrap();
@@ -1521,7 +1531,7 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
 /// Two backups over the same cache, then a repository at the second head
 /// loaded under the lock. Returns the fixture, the repo cache dir, the
 /// repository and the head after the first backup.
-fn loaded_after_two_backups() -> (Fixture, PathBuf, Repository, IndexHead) {
+fn loaded_after_two_backups() -> (Fixture, PathBuf, Repo, IndexHead) {
     let fx = fixture(RepoFormat::CURRENT);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
@@ -1530,14 +1540,14 @@ fn loaded_after_two_backups() -> (Fixture, PathBuf, Repository, IndexHead) {
     fx.backup(&fx.config, "s2");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     repo.load_chunk_index_under_lock().unwrap();
-    let dir = crate::cache_paths::repo_cache_dir(&repo.config.id, Some(&fx.cache())).unwrap();
+    let dir = crate::cache_paths::repo_cache_dir(&repo.config().id, Some(&fx.cache())).unwrap();
     (fx, dir, repo, first)
 }
 
 /// An index edit that writes a segment: removes one entry.
-fn remove_one_entry(repo: &mut Repository) {
+fn remove_one_entry(repo: &mut Repo) {
     let id = repo.chunk_index().iter().next().unwrap().0;
-    repo.chunk_index_mut().remove(&id);
+    repo.unchecked_writer().chunk_index_mut().remove(&id);
 }
 
 /// The local index files of `dir` with their bytes, sorted by name.
@@ -1566,7 +1576,7 @@ fn a_write_appends_a_segment_and_rewrites_no_local_file() {
     let files = local_files(&dir);
 
     remove_one_entry(&mut repo);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
 
     let head = repo.index_head().cloned().unwrap();
     assert_eq!(head, fx.head());
@@ -1595,7 +1605,7 @@ fn a_write_does_not_need_the_local_files() {
         }
 
         remove_one_entry(&mut repo);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
 
         let head = fx.head();
         assert_eq!(head.base, before.base, "{garbage}");
@@ -1618,7 +1628,11 @@ fn a_write_after_another_writer_moved_the_head_is_refused() {
     assert_ne!(moved, before);
 
     remove_one_entry(&mut repo);
-    let err = repo.save_state().unwrap_err().to_string();
+    let err = repo
+        .unchecked_writer()
+        .save_state()
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("index changed on storage"), "{err}");
     assert_eq!(fx.head(), moved);
 }
@@ -1863,7 +1877,7 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
     ));
     remove_one_entry(&mut repo);
     repo.request_index_fold();
-    assert!(repo.save_state().is_err());
+    assert!(repo.unchecked_writer().save_state().is_err());
     drop(repo);
     assert_eq!(fx.head_path(), head_path);
     assert_eq!(std::fs::read(&head_path).unwrap(), index_bytes);
@@ -1995,7 +2009,7 @@ fn backup_with(
     fx: &Fixture,
     name: &str,
     wrap: Option<commands::backup::BackendWrapper<'_>>,
-    tweak: impl FnOnce(&mut Repository),
+    tweak: impl FnOnce(&mut Repo),
 ) {
     fn no_events(_: crate::repo::control::CommitEvent) {}
     let source_paths = vec![fx.source.to_string_lossy().into_owned()];
@@ -2034,6 +2048,58 @@ fn backup_with(
         .unwrap();
 }
 
+/// `begin_commit` runs a commit under the commit lock's fence, and a
+/// lock-free one under `Fence::lock_free_backup` (which passes: the commit
+/// machine checks its marker itself).
+#[test]
+fn begin_commit_picks_the_fence_of_its_exclusion() {
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    let source_paths = vec![fx.source.to_string_lossy().into_owned()];
+    let upload = |name: &str| {
+        let req = commands::backup::BackupRequest {
+            snapshot_name: name,
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "src",
+            exclude_patterns: &[],
+            exclude_if_present: &[],
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: crate::compress::Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        };
+        commands::backup::upload(
+            &fx.config,
+            &req,
+            &mut None,
+            &CancelToken::new(),
+            None,
+            crate::repo::HostEnv::system(),
+        )
+        .map_err(|(_, e)| e)
+        .unwrap()
+    };
+
+    let free = upload("free").begin_commit(commands::backup::CommitLock::Free);
+    assert!(free.fence().is_lock_free_backup());
+    let err = free
+        .finish(Err(VykarError::Interrupted), &mut None, &CancelToken::new())
+        .unwrap_err();
+    assert!(matches!(err, VykarError::Interrupted));
+
+    let pending = upload("held");
+    let guard = pending
+        .wait_for_lock(&mut None, &CancelToken::new())
+        .unwrap();
+    let mut held = pending.begin_commit(commands::backup::CommitLock::Held(guard));
+    assert!(!held.fence().is_lock_free_backup());
+    let result = held.drive(&|_: crate::repo::control::CommitEvent| {});
+    held.finish(result, &mut None, &CancelToken::new()).unwrap();
+}
+
 /// A backup whose commit folds (requested: the hard limit's stand-in)
 /// writes into the new base only the old segment s1; s2, young, stays a
 /// segment, and so does the backup's own segment, after it. The head
@@ -2051,7 +2117,7 @@ fn a_backup_fold_keeps_young_segments_and_its_own() {
     age_segment(&fx, &s1);
 
     fx.write("c", "charlie");
-    backup_with(&fx, "s3", None, Repository::request_index_fold);
+    backup_with(&fx, "s3", None, Repo::request_index_fold);
     let head = fx.head();
     head.validate().unwrap();
     assert!(head.base.is_some(), "{head:?}");
@@ -2088,7 +2154,7 @@ fn a_backup_fold_with_nothing_old_writes_a_segment() {
     fx.backup(&fx.config, "s2");
     let before = fx.head();
     fx.write("c", "charlie");
-    backup_with(&fx, "s3", None, Repository::request_index_fold);
+    backup_with(&fx, "s3", None, Repo::request_index_fold);
     let head = fx.head();
     assert!(head.base.is_none(), "{head:?}");
     assert_eq!(head.segments.len(), 3);
@@ -2107,7 +2173,7 @@ fn a_backup_fold_with_nothing_old_writes_a_segment() {
 #[test]
 fn the_hard_limit_counts_only_old_segments() {
     let fx = fixture(RepoFormat::CURRENT);
-    let limits = |repo: &mut Repository| {
+    let limits = |repo: &mut Repo| {
         let mut policy = crate::repo::index_write::FoldPolicy::default();
         policy.hard.segments = 2;
         policy.hard.percent = 100_000;
@@ -2168,7 +2234,7 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
     for _ in 0..2 {
         repo.load_chunk_index_under_lock().unwrap();
         toggle_an_entry(&mut repo, &mut toggled);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
     }
     let head = fx.head();
     assert!(head.base.is_none(), "nothing old to fold: {head:?}");
@@ -2180,7 +2246,7 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
     let mut repo = open(&fx);
     repo.load_chunk_index_under_lock().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
     let head = fx.head();
     assert!(head.base.is_some() && head.segments.is_empty(), "{head:?}");
     assert_eq!(cold_index(&fx, "cold2"), sorted_entries(repo.chunk_index()));
@@ -2199,12 +2265,12 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
     let mut repo = open(&fx);
     repo.load_chunk_index_under_lock().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
     let m1 = fx.head().segments[2].name;
     repo.load_chunk_index_under_lock().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
     repo.request_index_fold();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
     let head = fx.head();
     head.validate().unwrap();
     assert!(head.base.is_some(), "{head:?}");
@@ -2405,7 +2471,7 @@ fn a_failed_segment_listing_never_fails_a_backup() {
     let wrap = |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
         Box::new(FailIndexListing { inner })
     };
-    backup_with(&fx, "s2", Some(&wrap), Repository::request_index_fold);
+    backup_with(&fx, "s2", Some(&wrap), Repo::request_index_fold);
     let head = fx.head();
     assert!(head.base.is_none(), "{head:?}");
     assert_eq!(head.segments.len(), 2);

@@ -3,7 +3,7 @@
 //! This is the single place `keys/repokey` and `keys/repokey.2` are read, so
 //! the corroboration between copies, the corruption diagnosis, divergence
 //! resolution and the backfill of a missing copy all live here — for
-//! `Repository::open` and for `vykar key export`, which works on raw storage.
+//! `Repo::open` and for `vykar key export`, which works on raw storage.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -129,7 +129,7 @@ fn require_passphrase(passphrase: Option<&str>) -> Result<&str> {
 /// Select and unwrap the repository key from **raw storage**, without opening
 /// the repository.
 ///
-/// Exactly the selection `Repository::open` performs — divergence resolution,
+/// Exactly the selection `Repo::open` performs — divergence resolution,
 /// the proof requirement, the corruption diagnosis — so a caller working on raw
 /// storage cannot end up holding a copy the open path would have rejected.
 /// `vykar key export` uses this: picking "the first copy that unwraps" would
@@ -142,7 +142,7 @@ fn require_passphrase(passphrase: Option<&str>) -> Result<&str> {
 /// # Errors
 ///
 /// A missing passphrase, no usable copy, a copy that does not unwrap, or a
-/// divergence that cannot be resolved — the same failures `Repository::open`
+/// divergence that cannot be resolved — the same failures `Repo::open`
 /// reports.
 pub fn select_repository_key(
     storage: &dyn StorageBackend,

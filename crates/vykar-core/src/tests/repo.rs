@@ -4,14 +4,16 @@ use crate::compress::Compression;
 use crate::repo::ChunkerParams;
 use crate::repo::EncryptionMode;
 use crate::repo::pack::PackType;
-use crate::repo::{Repository, WriteSessionOptions};
-use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, test_repo_plaintext};
+use crate::repo::{Repo, WriteSession, WriteSessionOptions};
+use crate::testutil::{
+    MemoryBackend, PutLog, RecordingBackend, test_repo_plaintext, test_repo_plaintext_with_session,
+};
 use vykar_common::paths;
 
 #[test]
 fn init_creates_required_keys() {
     let storage = Box::new(MemoryBackend::new());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -22,17 +24,17 @@ fn init_creates_required_keys() {
     .unwrap();
 
     // config and the first index head exist; no `index` or `index.gen` (FMT-1).
-    assert!(repo.storage.exists("config").unwrap());
-    assert!(repo.storage.exists("index.h/1").unwrap());
-    assert!(!repo.storage.exists("index").unwrap());
-    assert!(!repo.storage.exists("index.gen").unwrap());
+    assert!(repo.storage().exists("config").unwrap());
+    assert!(repo.storage().exists("index.h/1").unwrap());
+    assert!(!repo.storage().exists("index").unwrap());
+    assert!(!repo.storage().exists("index.gen").unwrap());
     assert_eq!(repo.index_head().unwrap().generation, 1);
 }
 
 #[test]
 fn init_twice_fails() {
     let storage = Box::new(MemoryBackend::new());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -43,8 +45,8 @@ fn init_twice_fails() {
     .unwrap();
 
     // Try to init again with the same storage (clone the Arc into a new Box)
-    let result = Repository::init(
-        Box::new(repo.storage.clone()),
+    let result = Repo::init(
+        Box::new(repo.storage().clone()),
         EncryptionMode::None,
         ChunkerParams::default(),
         None,
@@ -58,15 +60,15 @@ fn init_twice_fails() {
 
 #[test]
 fn store_and_read_chunk_roundtrip() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"hello, this is chunk data for testing";
-    let (chunk_id, _stored_size, is_new) = repo
-        .store_chunk(data, Compression::None, PackType::Data)
+    let (chunk_id, _stored_size, is_new) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
     assert!(is_new);
 
     // A session's chunks are readable through the index once it is saved
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let read_back = repo.read_chunk(&chunk_id).unwrap();
     assert_eq!(read_back, data);
@@ -74,22 +76,22 @@ fn store_and_read_chunk_roundtrip() {
 
 #[test]
 fn store_chunk_dedup() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"duplicate chunk data";
 
-    let (id1, _size1, is_new1) = repo
-        .store_chunk(data, Compression::None, PackType::Data)
+    let (id1, _size1, is_new1) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
     assert!(is_new1);
 
-    let (id2, _size2, is_new2) = repo
-        .store_chunk(data, Compression::None, PackType::Data)
+    let (id2, _size2, is_new2) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
     assert!(!is_new2, "second store should be a dedup hit");
     assert_eq!(id1, id2);
 
     // A session's chunks are in the index once it is saved.
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // The chunk is in the index once.
     assert!(repo.chunk_index().contains(&id1));
@@ -98,15 +100,15 @@ fn store_chunk_dedup() {
 
 #[test]
 fn store_chunk_with_compression() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"compressible data that should survive lz4 round-trip";
-    let (chunk_id, _stored_size, is_new) = repo
-        .store_chunk(data, Compression::Lz4, PackType::Data)
+    let (chunk_id, _stored_size, is_new) = ws
+        .store_chunk(&repo, data, Compression::Lz4, PackType::Data)
         .unwrap();
     assert!(is_new);
 
     // A session's chunks are readable through the index once it is saved
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let read_back = repo.read_chunk(&chunk_id).unwrap();
     assert_eq!(read_back, data);
@@ -114,16 +116,16 @@ fn store_chunk_with_compression() {
 
 #[test]
 fn save_state_persists_index() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"persistent chunk";
-    repo.store_chunk(data, Compression::None, PackType::Data)
+    ws.store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
     // Mark index dirty so it gets written (store_chunk only marks index dirty)
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Verify a new head is in storage
-    assert!(repo.storage.exists("index.h/2").unwrap());
+    assert!(repo.storage().exists("index.h/2").unwrap());
 
     // Index should have one entry
     assert_eq!(repo.chunk_index().len(), 1);
@@ -143,18 +145,18 @@ fn read_missing_chunk_fails() {
 /// one; its explicit location still reads.
 #[test]
 fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"chunk read through a handle without the index";
-    let (id, _, _) = repo
-        .store_chunk(data, Compression::None, PackType::Data)
+    let (id, _, _) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
-    repo.flush_packs().unwrap();
-    repo.save_state().unwrap();
+    ws.flush_packs(&repo).unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     let entry = repo.chunk_index().get(&id).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let bare = Repository::open(
-        Box::new(std::sync::Arc::clone(&repo.storage)),
+    let bare = Repo::open(
+        Box::new(std::sync::Arc::clone(repo.storage())),
         None,
         Some(dir.path().to_path_buf()),
         crate::repo::OpenOptions::new(),
@@ -174,12 +176,12 @@ fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
 
 #[test]
 fn read_chunk_at_roundtrip() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
     let data = b"chunk data for read_chunk_at test";
-    let (chunk_id, _stored_size, _) = repo
-        .store_chunk(data, Compression::None, PackType::Data)
+    let (chunk_id, _stored_size, _) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let entry = repo.chunk_index().get(&chunk_id).unwrap();
     let read_back = repo
@@ -197,10 +199,10 @@ fn read_chunk_at_roundtrip() {
 // Dirty tracking tests
 // ---------------------------------------------------------------------------
 
-fn repo_on_recording_backend() -> (Repository, PutLog) {
+fn repo_on_recording_backend() -> (Repo, WriteSession, PutLog) {
     crate::testutil::init_test_environment();
     let (backend, log) = RecordingBackend::new();
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -209,20 +211,19 @@ fn repo_on_recording_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("failed to init test repo");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("failed to begin write session");
-    (repo, log)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
 #[test]
 fn save_state_no_mutations_skips_writes() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, ws, log) = repo_on_recording_backend();
 
     // Clear the put log from init (which writes config, keys and the head)
     log.clear();
 
     // No mutations — save_state should not write index or file cache
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let entries = log.entries();
     assert!(
@@ -233,19 +234,20 @@ fn save_state_no_mutations_skips_writes() {
 
 #[test]
 fn save_state_writes_only_dirty_components() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, ws, log) = repo_on_recording_backend();
     log.clear();
 
     // Edit the index (an unchanged index publishes nothing, dirty or not)
-    repo.chunk_index_mut().add(
+    repo.unchecked_writer().chunk_index_mut().add(
         vykar_types::chunk_id::ChunkId::from_bytes([7; 32]),
         10,
         vykar_types::pack_id::PackId::from_bytes([8; 32]),
         0,
     );
-    repo.chunk_index_mut()
+    repo.unchecked_writer()
+        .chunk_index_mut()
         .set_pack_trailer(vykar_types::pack_id::PackId::from_bytes([8; 32]), 0);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let entries = log.entries();
     assert!(
@@ -256,13 +258,13 @@ fn save_state_writes_only_dirty_components() {
 
 #[test]
 fn store_chunk_marks_index_dirty() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, mut ws, log) = repo_on_recording_backend();
     log.clear();
 
     // Store a chunk — this goes through flush_writer_async (normal mode)
-    repo.store_chunk(b"chunk data", Compression::None, PackType::Data)
+    ws.store_chunk(&repo, b"chunk data", Compression::None, PackType::Data)
         .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let entries = log.entries();
     assert!(
@@ -273,30 +275,29 @@ fn store_chunk_marks_index_dirty() {
 
 #[test]
 fn empty_session_writes_no_index() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, mut ws, log) = repo_on_recording_backend();
 
     // Store some chunks in normal mode
     let data_a = b"chunk data A for dedup test";
-    let (id_a, _, _) = repo
-        .store_chunk(data_a, Compression::None, PackType::Data)
+    let (id_a, _, _) = ws
+        .store_chunk(&repo, data_a, Compression::None, PackType::Data)
         .unwrap();
-    repo.mark_index_dirty();
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Verify chunk is in the index
     assert_eq!(repo.chunk_index().len(), 1);
     let entry_before = repo.chunk_index().get(&id_a).unwrap();
 
     // A new write session keeps the loaded index.
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
     assert_eq!(repo.chunk_index().len(), 1);
 
     log.clear();
 
     // save_state with no new chunks — empty delta
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     assert_eq!(repo.chunk_index().len(), 1);
     let entry_after = repo.chunk_index().get(&id_a).unwrap();
@@ -312,26 +313,35 @@ fn empty_session_writes_no_index() {
 
 #[test]
 fn session_with_new_chunks_writes_a_segment() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, mut ws, log) = repo_on_recording_backend();
 
     // Store initial chunks
-    repo.store_chunk(b"initial chunk data", Compression::None, PackType::Data)
-        .unwrap();
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    ws.store_chunk(
+        &repo,
+        b"initial chunk data",
+        Compression::None,
+        PackType::Data,
+    )
+    .unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
     assert_eq!(repo.chunk_index().len(), 1);
 
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     log.clear();
 
     // Store a new chunk in the session
-    let (new_id, _, is_new) = repo
-        .store_chunk(b"new chunk in a session", Compression::None, PackType::Data)
+    let (new_id, _, is_new) = ws
+        .store_chunk(
+            &repo,
+            b"new chunk in a session",
+            Compression::None,
+            PackType::Data,
+        )
         .unwrap();
     assert!(is_new);
 
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // The head and a segment are written because the delta had new entries
     let entries = log.entries();
@@ -351,17 +361,17 @@ fn session_with_new_chunks_writes_a_segment() {
 
 #[test]
 fn dirty_flags_reset_after_save() {
-    let (mut repo, log) = repo_on_recording_backend();
+    let (mut repo, ws, log) = repo_on_recording_backend();
 
     // Mark everything dirty and save
-    repo.mark_index_dirty();
-    repo.mark_index_dirty();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().mark_index_dirty();
     repo.mark_file_cache_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Clear log and save again — nothing should be written
     log.clear();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
 
     let entries = log.entries();
     assert!(
@@ -395,26 +405,30 @@ fn file_cache_path(repo_id: &[u8]) -> Option<PathBuf> {
 
 #[test]
 fn file_cache_save_error_leaves_the_index_in_place() {
-    let (mut repo, _log) = repo_on_recording_backend();
+    let (mut repo, mut ws, _log) = repo_on_recording_backend();
 
     // Store a chunk so the index has content
-    let (id_a, _, _) = repo
-        .store_chunk(b"hydration test chunk", Compression::None, PackType::Data)
+    let (id_a, _, _) = ws
+        .store_chunk(
+            &repo,
+            b"hydration test chunk",
+            Compression::None,
+            PackType::Data,
+        )
         .unwrap();
-    repo.mark_index_dirty();
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
     assert_eq!(repo.chunk_index().len(), 1);
 
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
 
     // Mark file_cache dirty so save_state() will attempt file_cache.save()
     repo.mark_file_cache_dirty();
 
     // Block the file cache write by placing a directory where the file should go.
     // std::fs::write() will fail with "Is a directory".
-    let cache_path = file_cache_path(&repo.config.id).expect("cache dir available");
+    let cache_path = file_cache_path(&repo.config().id).expect("cache dir available");
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -423,7 +437,7 @@ fn file_cache_save_error_leaves_the_index_in_place() {
     std::fs::create_dir(&cache_path).unwrap();
 
     // save_state should fail (file cache write error)...
-    let result = repo.save_state();
+    let result = repo.unchecked_writer().save_session(ws);
     assert!(
         result.is_err(),
         "save_state should fail when file cache write is blocked"
@@ -459,7 +473,7 @@ fn init_rejects_oversized_max_pack_size() {
         ..Default::default()
     };
 
-    let result = Repository::init(
+    let result = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -481,7 +495,7 @@ fn init_rejects_oversized_max_pack_size() {
         ..Default::default()
     };
 
-    let result = Repository::init(
+    let result = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -510,7 +524,7 @@ fn flush_on_abort_writes_pending_index() {
         max_pack_size: 256,
         ..Default::default()
     };
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -519,44 +533,47 @@ fn flush_on_abort_writes_pending_index() {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
 
     // Store a chunk large enough to exceed the 256-byte pack target.
     // After encryption envelope overhead, this will trigger flush_writer_async.
     let data = vec![0xABu8; 300];
-    repo.store_chunk(&data, Compression::None, PackType::Data)
+    ws.store_chunk(&repo, &data, Compression::None, PackType::Data)
         .unwrap();
 
     // The journal debounce interval is 8 packs, so after 1 pack the
     // pending_index should NOT have been written to storage yet.
     assert!(
-        !repo.storage.exists("sessions/default.index").unwrap(),
+        !repo.storage().exists("sessions/default.index").unwrap(),
         "sessions/default.index should not exist yet (debounce hasn't triggered)"
     );
 
     // Store another small chunk that stays in the pack writer buffer.
     let data2 = vec![0xCDu8; 64];
-    repo.store_chunk(&data2, Compression::None, PackType::Data)
+    ws.store_chunk(&repo, &data2, Compression::None, PackType::Data)
         .unwrap();
 
     // Call flush_on_abort — should seal partial packs, join uploads,
     // and write pending_index.
-    repo.flush_on_abort();
+    ws.flush_on_abort(&repo);
 
     // Verify pending_index now exists.
     assert!(
-        repo.storage.exists("sessions/default.index").unwrap(),
+        repo.storage().exists("sessions/default.index").unwrap(),
         "sessions/default.index should exist after flush_on_abort"
     );
 
     // Decrypt and deserialize to verify contents.
-    let raw = repo.storage.get("sessions/default.index").unwrap().unwrap();
+    let raw = repo
+        .storage()
+        .get("sessions/default.index")
+        .unwrap()
+        .unwrap();
     let compressed = unpack_object_expect_with_context(
         &raw,
         ObjectType::PendingIndex,
         b"pending_index",
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )
     .unwrap();
     let serialized = compress::decompress_metadata(&compressed).unwrap();
@@ -649,7 +666,7 @@ fn flush_on_abort_survives_pack_upload_failure() {
         max_pack_size: 256,
         ..Default::default()
     };
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(FailPackUploadsBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -658,23 +675,22 @@ fn flush_on_abort_survives_pack_upload_failure() {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
 
     // Store a chunk large enough to trigger flush_writer_async.
     // The background upload thread will fail (FailPackUploadsBackend rejects packs/).
     let data = vec![0xABu8; 300];
-    repo.store_chunk(&data, Compression::None, PackType::Data)
+    ws.store_chunk(&repo, &data, Compression::None, PackType::Data)
         .unwrap();
 
     // flush_on_abort should not panic even though upload threads fail.
-    repo.flush_on_abort();
+    ws.flush_on_abort(&repo);
 
     // A pack is journaled only after its upload is confirmed. Every upload
     // failed, so the journal is empty and nothing is written: a journal
     // naming a failed pack would let the next backup adopt a damaged pack.
     assert!(
-        !repo.storage.exists("sessions/default.index").unwrap(),
+        !repo.storage().exists("sessions/default.index").unwrap(),
         "failed pack uploads must not be journaled"
     );
 }
@@ -764,7 +780,7 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
     })
     .expect("REST backend builds");
 
-    let err = Repository::init(
+    let err = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -806,7 +822,7 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
 fn init_creates_the_current_repository_format() {
     crate::testutil::init_test_environment();
 
-    let repo = Repository::init(
+    let repo = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -816,14 +832,14 @@ fn init_creates_the_current_repository_format() {
     )
     .unwrap();
 
-    assert_eq!(repo.config.version, 6);
+    assert_eq!(repo.config().version, 6);
     assert_eq!(repo.format(), crate::repo::RepoFormat::CURRENT);
     assert_eq!(
         repo.content_hash(),
         vykar_types::hash::HashAlgorithm::Blake3
     );
     assert_eq!(
-        repo.crypto.chunk_hasher().algorithm(),
+        repo.crypto().chunk_hasher().algorithm(),
         vykar_types::hash::HashAlgorithm::Blake3
     );
 }
@@ -834,7 +850,7 @@ fn init_creates_the_current_repository_format() {
 fn open_rejects_an_unknown_repository_version() {
     crate::testutil::init_test_environment();
 
-    let repo = Repository::init(
+    let repo = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -844,13 +860,13 @@ fn open_rejects_an_unknown_repository_version() {
     )
     .unwrap();
 
-    let mut tampered_config = repo.config.clone();
+    let mut tampered_config = repo.config().clone();
     tampered_config.version = 8;
     let tampered_data = rmp_serde::to_vec_named(&tampered_config).unwrap();
-    repo.storage.put("config", &tampered_data).unwrap();
+    repo.storage().put("config", &tampered_data).unwrap();
 
-    let result = Repository::open(
-        Box::new(repo.storage.clone()),
+    let result = Repo::open(
+        Box::new(repo.storage().clone()),
         None,
         None,
         crate::repo::OpenOptions::new(),
@@ -870,7 +886,7 @@ fn open_rejects_oversized_max_pack_size() {
 
     // Init a valid repo first.
     let storage = Box::new(MemoryBackend::new());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -881,14 +897,14 @@ fn open_rejects_oversized_max_pack_size() {
     .unwrap();
 
     // Tamper with the stored config: set max_pack_size > 512 MiB.
-    let mut tampered_config = repo.config.clone();
+    let mut tampered_config = repo.config().clone();
     tampered_config.max_pack_size = 513 * 1024 * 1024;
     let tampered_data = tampered_config.encode().unwrap();
-    repo.storage.put("config", &tampered_data).unwrap();
+    repo.storage().put("config", &tampered_data).unwrap();
 
     // Re-open should fail.
-    let result = Repository::open(
-        Box::new(repo.storage.clone()),
+    let result = Repo::open(
+        Box::new(repo.storage().clone()),
         None,
         None,
         crate::repo::OpenOptions::new().with_index(),
@@ -906,7 +922,7 @@ fn open_rejects_oversized_max_pack_size() {
 // ---------------------------------------------------------------------------
 
 /// Helper: create a plaintext repo with tiny pack sizes for testing pack flushes.
-fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
+fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> (Repo, WriteSession) {
     use crate::repo::InitOptions;
 
     crate::testutil::init_test_environment();
@@ -916,7 +932,7 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
         max_pack_size: max_pack,
         ..Default::default()
     };
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -925,27 +941,32 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    repo
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws)
 }
 
 /// Store `count` unique ~1200-byte chunks into `repo`, each with a distinct
 /// 4-byte prefix derived from `start..start+count`.
-fn store_unique_chunks(repo: &mut Repository, start: u32, count: u32, pack_type: PackType) {
+fn store_unique_chunks(
+    repo: &Repo,
+    ws: &mut WriteSession,
+    start: u32,
+    count: u32,
+    pack_type: PackType,
+) {
     for i in start..start + count {
         let mut data = vec![0xABu8; 1200];
         data[..4].copy_from_slice(&i.to_le_bytes());
-        repo.store_chunk(&data, Compression::None, pack_type)
+        ws.store_chunk(repo, &data, Compression::None, pack_type)
             .unwrap();
     }
 }
 
 #[test]
 fn data_pack_flush_grows_target() {
-    let mut repo = repo_with_small_packs(1024, 8192);
+    let (repo, mut ws) = repo_with_small_packs(1024, 8192);
 
-    let initial_target = repo.data_pack_target();
+    let initial_target = ws.data_pack_target();
     assert_eq!(
         initial_target, 1024,
         "initial target should be min_pack_size"
@@ -953,9 +974,9 @@ fn data_pack_flush_grows_target() {
 
     // Each chunk is ~1200 bytes which exceeds the 1024 target after envelope overhead.
     // With divisor=50, need >50 packs before target grows above min.
-    store_unique_chunks(&mut repo, 0, 60, PackType::Data);
+    store_unique_chunks(&repo, &mut ws, 0, 60, PackType::Data);
 
-    let final_target = repo.data_pack_target();
+    let final_target = ws.data_pack_target();
     assert!(
         final_target > initial_target,
         "target should grow after flushing packs: initial={initial_target}, final={final_target}"
@@ -968,17 +989,17 @@ fn data_pack_flush_grows_target() {
 
 #[test]
 fn tree_pack_flush_does_not_change_data_target() {
-    let mut repo = repo_with_small_packs(1024, 8192);
+    let (repo, mut ws) = repo_with_small_packs(1024, 8192);
 
-    let target_before = repo.data_pack_target();
+    let target_before = ws.data_pack_target();
 
     // Store a tree chunk large enough to trigger a tree pack flush.
     let tree_data = vec![0xCDu8; 1200];
-    repo.store_chunk(&tree_data, Compression::None, PackType::Tree)
+    ws.store_chunk(&repo, &tree_data, Compression::None, PackType::Tree)
         .unwrap();
-    repo.flush_packs().unwrap();
+    ws.flush_packs(&repo).unwrap();
 
-    let target_after = repo.data_pack_target();
+    let target_after = ws.data_pack_target();
     assert_eq!(
         target_before, target_after,
         "data pack target should not change after tree pack flush"
@@ -987,22 +1008,21 @@ fn tree_pack_flush_does_not_change_data_target() {
 
 #[test]
 fn load_chunk_index_resets_session_counter() {
-    let mut repo = repo_with_small_packs(1024, 8192);
+    let (mut repo, mut ws) = repo_with_small_packs(1024, 8192);
 
     // With divisor=50, need >50 packs before target grows above min.
-    store_unique_chunks(&mut repo, 0, 60, PackType::Data);
-    assert!(repo.data_pack_target() > 1024);
+    store_unique_chunks(&repo, &mut ws, 0, 60, PackType::Data);
+    assert!(ws.data_pack_target() > 1024);
 
     // Save state to persist the index with current packs.
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Reload the index — session counter should reset to 0, so the target
     // should be based only on persisted packs.
     repo.load_chunk_index().unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let target_after_reload = repo.data_pack_target();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let target_after_reload = ws.data_pack_target();
 
     // Compute the expected target from the reloaded index's pack count.
     let expected = crate::repo::pack::compute_data_pack_target(
@@ -1018,21 +1038,20 @@ fn load_chunk_index_resets_session_counter() {
 
 #[test]
 fn save_state_rebases_pack_counters() {
-    let mut repo = repo_with_small_packs(1024, 8192);
+    let (mut repo, mut ws) = repo_with_small_packs(1024, 8192);
 
     // First session: flush several packs.
-    store_unique_chunks(&mut repo, 0, 20, PackType::Data);
-    let target_before_save = repo.data_pack_target();
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    store_unique_chunks(&repo, &mut ws, 0, 20, PackType::Data);
+    let target_before_save = ws.data_pack_target();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Second session on the same Repository instance: flush more packs.
     // Without rebasing, the session counter would double-count the first
     // session's packs, inflating the target.
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    store_unique_chunks(&mut repo, 100, 20, PackType::Data);
-    let target_second_session = repo.data_pack_target();
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    store_unique_chunks(&repo, &mut ws, 100, 20, PackType::Data);
+    let target_second_session = ws.data_pack_target();
 
     assert!(
         target_second_session >= target_before_save,
@@ -1045,12 +1064,11 @@ fn save_state_rebases_pack_counters() {
 
     // Verify via reload: the target from a fresh index load should match
     // what the reused instance computed.
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
     repo.load_chunk_index().unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let target_after_reload = repo.data_pack_target();
+    ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let target_after_reload = ws.data_pack_target();
 
     // The reload path uses count_distinct_packs() which includes tree packs,
     // matching begin_write_session(). Both paths see the same (slightly inflated)
@@ -1082,7 +1100,7 @@ fn cross_session_pending_index_recovery() {
 
     // Session 1: init repo, store chunks, flush, write pending index, then drop.
     // A store with mtimes: recovery adopts journal packs by their age.
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(MemoryBackend::with_mtimes()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -1091,56 +1109,53 @@ fn cross_session_pending_index_recovery() {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions {
         session_id: "aaa".into(),
         ..Default::default()
-    })
-    .unwrap();
+    });
 
     // Store several chunks large enough to trigger pack flushes.
     let mut chunk_ids = Vec::new();
     for i in 0u32..3 {
         let mut data = vec![0xABu8; 300];
         data[..4].copy_from_slice(&i.to_le_bytes());
-        let (chunk_id, _, _) = repo
-            .store_chunk(&data, Compression::None, PackType::Data)
+        let (chunk_id, _, _) = ws
+            .store_chunk(&repo, &data, Compression::None, PackType::Data)
             .unwrap();
         chunk_ids.push(chunk_id);
     }
 
     // Simulate crash: flush packs and write pending index, but don't commit.
-    repo.flush_on_abort();
+    ws.flush_on_abort(&repo);
 
     // Verify the journal exists under the old session ID.
     assert!(
-        repo.storage.exists("sessions/aaa.index").unwrap(),
+        repo.storage().exists("sessions/aaa.index").unwrap(),
         "sessions/aaa.index should exist after flush_on_abort"
     );
 
     // Save the storage Arc for reuse.
-    let shared_storage = repo.storage.clone();
+    let shared_storage = repo.storage().clone();
     drop(repo);
 
     // Session 2: reopen the same repo with a different session ID.
-    let mut repo2 = Repository::open(
+    let repo2 = Repo::open(
         Box::new(shared_storage),
         None,
         None,
         crate::repo::OpenOptions::new().with_index(),
     )
     .unwrap();
-    repo2
-        .begin_write_session(&WriteSessionOptions {
-            session_id: "bbb".into(),
-            ..Default::default()
-        })
-        .unwrap();
+    let mut ws2 = repo2.begin_write_session(&WriteSessionOptions {
+        session_id: "bbb".into(),
+        ..Default::default()
+    });
     // The recovering session's own marker: its mtime is "now" on the
     // store's clock, which the journal packs' ages are judged against.
-    repo2.storage.put("sessions/bbb.json", b"{}").unwrap();
+    repo2.storage().put("sessions/bbb.json", b"{}").unwrap();
 
-    let recovery = repo2
-        .recover_pending_index(&crate::repo::control::CancelToken::new())
+    let recovery = ws2
+        .recover_pending_index(&repo2, &crate::repo::control::CancelToken::new())
         .unwrap();
     assert_eq!(recovery.packs_too_old, 0);
     assert!(recovery.oldest_pack_age.is_some());
@@ -1166,19 +1181,19 @@ fn cross_session_pending_index_recovery() {
 /// sqrt scaling dampens the inflation further.
 #[test]
 fn initial_session_seed_includes_tree_packs() {
-    let mut repo = repo_with_small_packs(1024, 8192);
+    let (mut repo, mut ws) = repo_with_small_packs(1024, 8192);
 
     // Flush several data packs.
-    store_unique_chunks(&mut repo, 0, 10, PackType::Data);
+    store_unique_chunks(&repo, &mut ws, 0, 10, PackType::Data);
 
     // Flush a tree pack.
     let tree_data = vec![0xCDu8; 1200];
-    repo.store_chunk(&tree_data, Compression::None, PackType::Tree)
+    ws.store_chunk(&repo, &tree_data, Compression::None, PackType::Tree)
         .unwrap();
 
     // Persist everything and consume the session.
-    repo.mark_index_dirty();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().mark_index_dirty();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Count all distinct packs in the index (data + tree).
     let total_packs = repo.chunk_index().count_distinct_packs();
@@ -1188,9 +1203,8 @@ fn initial_session_seed_includes_tree_packs() {
     );
 
     // Start a fresh session — initial seed uses count_distinct_packs().
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let target = repo.data_pack_target();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let target = ws.data_pack_target();
 
     // The target should match compute_data_pack_target(total_packs, ...) —
     // i.e. it includes tree packs in the count. This documents the current
@@ -1210,15 +1224,19 @@ fn initial_session_seed_includes_tree_packs() {
 /// diff an empty index against that state; it is refused instead.
 #[test]
 fn persist_refuses_an_unloaded_index_over_a_non_empty_head() {
-    let mut repo = test_repo_plaintext();
-    repo.store_chunk(b"one chunk", Compression::None, PackType::Data)
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    ws.store_chunk(&repo, b"one chunk", Compression::None, PackType::Data)
         .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     assert!(!repo.index_head().unwrap().is_empty());
 
     repo.clear_chunk_index();
-    repo.mark_index_dirty();
-    let err = repo.save_state().unwrap_err().to_string();
+    repo.unchecked_writer().mark_index_dirty();
+    let err = repo
+        .unchecked_writer()
+        .save_state()
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not loaded before it was written"), "{err}");
 }
 
@@ -1232,7 +1250,7 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
 
     crate::testutil::init_test_environment();
     let mem: Arc<dyn vykar_storage::StorageBackend> = Arc::new(MemoryBackend::new());
-    let mut repo = Repository::init(
+    let mut repo = Repo::init(
         Box::new(Arc::clone(&mem)),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -1241,11 +1259,10 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&repo, b"first chunk", Compression::None, PackType::Data)
         .unwrap();
-    repo.store_chunk(b"first chunk", Compression::None, PackType::Data)
-        .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     drop(repo);
 
     let armed = Arc::new(AtomicBool::new(false));
@@ -1255,7 +1272,7 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
         move |k| fail.load(Ordering::SeqCst) && k.starts_with("index.d/"),
         usize::MAX,
     );
-    let mut repo = Repository::open(
+    let mut repo = Repo::open(
         Box::new(storage),
         None,
         None,
@@ -1266,18 +1283,18 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     armed.store(true, Ordering::SeqCst);
 
     // A write: segment from the live table.
-    repo.begin_write_session(&WriteSessionOptions::default())
+    ws = repo.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&repo, b"second chunk", Compression::None, PackType::Data)
         .unwrap();
-    repo.store_chunk(b"second chunk", Compression::None, PackType::Data)
-        .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     assert_eq!(repo.chunk_index().len(), 2);
 
     // A fold of the same state.
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = 1;
     repo.set_fold_policy(policy);
-    repo.maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
+    repo.unchecked_writer()
+        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
         .unwrap();
     assert!(repo.index_head().unwrap().segments.is_empty(), "folded");
 
@@ -1286,9 +1303,8 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     assert_eq!(repo.chunk_index().len(), 2);
 
     // A backup commit merges against the live table.
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    repo.store_chunk(b"third chunk", Compression::None, PackType::Data)
+    ws = repo.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&repo, b"third chunk", Compression::None, PackType::Data)
         .unwrap();
     let id = vykar_types::snapshot_id::SnapshotId::generate();
     let entry = crate::repo::manifest::SnapshotEntry {
@@ -1302,6 +1318,7 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     };
     let mut file_cache = crate::repo::file_cache::FileCache::new();
     repo.commit_session_blocking(
+        ws,
         entry,
         b"snapshot".to_vec(),
         &mut file_cache,
@@ -1369,7 +1386,7 @@ fn init_refuses_a_server_without_the_v6_key_dirs() {
         std::sync::Arc::new(ServerWithoutV6Dirs {
             inner: MemoryBackend::new(),
         });
-    let err = Repository::init(
+    let err = Repo::init(
         Box::new(std::sync::Arc::clone(&storage)),
         EncryptionMode::None,
         ChunkerParams::default(),

@@ -1028,10 +1028,10 @@ fn other_client(dir: &Path, config: &crate::config::VykarConfig) -> crate::confi
 }
 
 /// The repository as a client with an empty cache dir at `cache` reads it.
-fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::Repository {
+fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::Repo {
     let storage =
         crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-    crate::repo::Repository::open(
+    crate::repo::Repo::open(
         storage,
         None,
         Some(cache.to_path_buf()),

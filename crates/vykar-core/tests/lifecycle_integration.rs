@@ -12,7 +12,7 @@ use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::lock;
-use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repository};
+use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend};
 use vykar_types::error::VykarError;
@@ -264,7 +264,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     config.encryption.mode = mode;
 
     let repo = commands::init::run(&config, Some(passphrase)).unwrap();
-    assert_eq!(repo.config.encryption, expected_mode);
+    assert_eq!(repo.config().encryption, expected_mode);
     drop(repo);
 
     backup_source(
@@ -300,7 +300,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     // unwrap is *weighted* evidence for a wrong passphrase, and the wording
     // must stay hedged — see `key_copies` tests for the full guard.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let wrong_open = Repository::open(storage, Some(wrong_passphrase), None, OpenOptions::new());
+    let wrong_open = Repo::open(storage, Some(wrong_passphrase), None, OpenOptions::new());
     let msg = wrong_open
         .err()
         .expect("wrong passphrase must fail")
@@ -536,7 +536,7 @@ fn restore_downloads_the_index_when_the_local_table_is_gone() {
     );
 
     let repo = open_local_repo(&repo_dir, None);
-    let repo_id = repo.config.id.clone();
+    let repo_id = repo.config().id.clone();
     drop(repo);
     let tables = chunk_tables(&repo_id);
     assert!(!tables.is_empty(), "the backup left a table");
@@ -606,7 +606,7 @@ fn one_file_repo(
     assert_eq!(file.chunks.len(), 1);
     (
         config,
-        repo.config.id.clone(),
+        repo.config().id.clone(),
         repo.index_generation(),
         file.chunks.first().expect("data chunk").id,
     )
@@ -806,18 +806,18 @@ fn two_snapshot_repo(tmp: &std::path::Path) -> (vykar_core::config::VykarConfig,
     );
 
     let repo = open_local_repo(&repo_dir, None);
-    let ids = (repo.config.id.clone(), repo.index_generation());
+    let ids = (repo.config().id.clone(), repo.index_generation());
     drop(repo);
     (config, ids.0, ids.1)
 }
 
-fn open_counting_repo(repo_dir: &std::path::Path) -> (Repository, Arc<AtomicUsize>) {
+fn open_counting_repo(repo_dir: &std::path::Path) -> (Repo, Arc<AtomicUsize>) {
     let index_gets = Arc::new(AtomicUsize::new(0));
     let storage = Box::new(IndexGetCounter {
         inner: LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
         index_gets: index_gets.clone(),
     });
-    let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
+    let repo = Repo::open(storage, None, None, OpenOptions::new()).unwrap();
     (repo, index_gets)
 }
 
@@ -992,7 +992,7 @@ fn parent_fallback_survives_label_rename() {
     // Delete the local file cache to force a cold start (parent fallback path).
     {
         let repo = open_local_repo(&repo_dir, None);
-        let filecache = filecache_path(&repo.config.id);
+        let filecache = filecache_path(&repo.config().id);
         drop(repo);
         let _ = std::fs::remove_file(&filecache);
     }
@@ -1077,7 +1077,7 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
 
     // Step 2: locate the filecache file and snapshot its contents + mtime.
     let repo = open_local_repo(&repo_dir, None);
-    let repo_id_hex = hex::encode(&repo.config.id);
+    let repo_id_hex = hex::encode(&repo.config().id);
     drop(repo);
 
     let filecache_path = cache_dir.join(&repo_id_hex).join("filecache");

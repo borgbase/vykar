@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use crate::compress::Compression;
 use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
-use crate::repo::Repository;
 use crate::repo::control::CancelToken;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
+use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
@@ -283,7 +283,8 @@ pub(crate) struct PipelineBuffers<'a> {
 ///
 /// Returns the run's timings, also logged at debug.
 pub(crate) fn run_parallel_pipeline(
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     ctx: &PipelineCtx<'_>,
     bufs: &mut PipelineBuffers<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
@@ -316,7 +317,7 @@ pub(crate) fn run_parallel_pipeline(
     debug_assert!(segment_size > 0, "segment_size must be non-zero");
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
     let chunk_hasher = crypto.chunk_hasher();
-    let chunker_config = repo.config.chunker_params.clone();
+    let chunker_config = repo.config().chunker_params.clone();
     let budget = ByteBudget::new(pipeline_buffer_bytes);
 
     // Channel capacities.
@@ -496,7 +497,7 @@ pub(crate) fn run_parallel_pipeline(
         let mut last_debt: usize = 0;
 
         let consumer_span = tracing::debug_span!("backup_consumer").entered();
-        let cap_wait_start = session_cap_wait(repo);
+        let cap_wait_start = session_cap_wait(ws);
         let loop_start = Instant::now();
         loop {
             let wait = Instant::now();
@@ -605,7 +606,7 @@ pub(crate) fn run_parallel_pipeline(
                         } else {
                             // Mid-accumulation skip: rollback earlier segments.
                             segments_to_skip = rollback_and_skip_large_file(
-                                repo,
+                                ws,
                                 stats,
                                 &mut large_file_accum,
                                 progress,
@@ -638,6 +639,7 @@ pub(crate) fn run_parallel_pipeline(
                         if let Err(e) = consumer::consume_processed_entry(
                             entry,
                             repo,
+                            ws,
                             stats,
                             new_file_cache,
                             listing,
@@ -655,7 +657,7 @@ pub(crate) fn run_parallel_pipeline(
                         // Committing may have sealed a pack (and waited in
                         // `cap_pending_uploads`); re-lend the upload queue's
                         // slack so the walk does not refill the budget on top.
-                        update_debt(repo, &budget, &mut last_debt);
+                        update_debt(ws, &budget, &mut last_debt);
                     }
                     Err(e) => {
                         if e.is_soft_file_error() {
@@ -669,7 +671,7 @@ pub(crate) fn run_parallel_pipeline(
                                     .map(|a| a.next_expected_index)
                                     .unwrap_or(0);
                                 segments_to_skip = rollback_and_skip_large_file(
-                                    repo,
+                                    ws,
                                     stats,
                                     &mut large_file_accum,
                                     progress,
@@ -692,10 +694,10 @@ pub(crate) fn run_parallel_pipeline(
                 break;
             }
             // Uploads may also finish while the consumer waits for results.
-            update_debt(repo, &budget, &mut last_debt);
+            update_debt(ws, &budget, &mut last_debt);
         }
         consumer_wall = loop_start.elapsed();
-        consumer_cap_wait = session_cap_wait(repo).saturating_sub(cap_wait_start);
+        consumer_cap_wait = session_cap_wait(ws).saturating_sub(cap_wait_start);
         drop(consumer_span);
 
         // Drop receiver to unblock any workers stuck on result_tx.send().
@@ -749,16 +751,15 @@ pub(crate) fn run_parallel_pipeline(
 }
 
 /// The write session's `upload_cap_wait` so far.
-fn session_cap_wait(repo: &Repository) -> Duration {
-    repo.write_metrics()
-        .map_or(Duration::ZERO, |m| m.upload_cap_wait)
+fn session_cap_wait(ws: &WriteSession) -> Duration {
+    ws.write_metrics().upload_cap_wait
 }
 
 /// Lend the upload queue's slack (sealed packs beyond the in-flight slots)
 /// out of the pipeline budget. Remote repositories only: local ones bound
 /// the queue by bytes already, so the slack is always 0 there.
-fn update_debt(repo: &Repository, budget: &ByteBudget, last_debt: &mut usize) {
-    let debt = repo.upload_slack_bytes();
+fn update_debt(ws: &WriteSession, budget: &ByteBudget, last_debt: &mut usize) {
+    let debt = ws.upload_slack_bytes();
     if debt != *last_debt {
         budget.set_debt(debt);
         *last_debt = debt;

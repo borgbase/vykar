@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use vykar_core::commands;
 use vykar_core::index::ChunkIndexEntry;
-use vykar_core::repo::{OpenOptions, RepoConfig, Repository};
+use vykar_core::repo::{OpenOptions, Repo, RepoConfig};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::chunk_id::ChunkId;
@@ -104,7 +104,7 @@ fn upgrade_through(fx: &Fixture, fail_at: usize, applied: bool) -> (Result<()>, 
         count: AtomicUsize::new(0),
         log: Mutex::new(Vec::new()),
     });
-    let mut repo = Repository::open(
+    let mut repo = Repo::open(
         Box::new(Arc::clone(&storage) as Arc<dyn StorageBackend>),
         fx.passphrase(),
         Some(fx.cache_dir()),

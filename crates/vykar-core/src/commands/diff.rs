@@ -12,7 +12,7 @@ use crate::config::VykarConfig;
 use crate::index::hasher::{BuildChunkIdHasher, ChunkIdHashMap};
 use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{OpenOptions, Repository, TreeChunkSource};
+use crate::repo::{OpenOptions, Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{Item, ItemType};
 use crate::snapshot::listing::rel_in;
@@ -155,7 +155,7 @@ pub fn run(
 /// the last file with a path wins, as in a whole-stream diff. A duplicate
 /// with one copy in a shared tree chunk is not detected.
 pub(crate) fn diff_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     base: &SnapshotEntry,
     target: &SnapshotEntry,
     shutdown: &CancelToken,
@@ -286,7 +286,7 @@ fn roots_nested(roots: &[&[u8]]) -> bool {
 /// each chunk, in chunk order. A chunk that does not decode on its own fails
 /// the diff; read errors are returned as the read returned them.
 fn decode_into(
-    repo: &Repository,
+    repo: &Repo,
     ids: &[&[ChunkId]],
     files: &mut DecodedChunks,
     stats: &mut DiffStats,

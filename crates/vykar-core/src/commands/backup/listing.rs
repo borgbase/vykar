@@ -23,8 +23,8 @@ use vykar_types::error::Result;
 
 use super::item_cut::ItemStreamCutter;
 use crate::compress::Compression;
-use crate::repo::Repository;
 use crate::repo::pack::PackType;
+use crate::repo::{Repo, WriteSession};
 use crate::snapshot::item::Item;
 use crate::snapshot::listing::{ListingIndexBuilder, encode_ext};
 
@@ -76,20 +76,25 @@ impl ListingWriter {
     /// Start a listing segment (one per resolved source root, and one for
     /// the command dumps): closes the open tree chunk so the segment begins
     /// at a chunk boundary, and records `root` for the key index.
-    pub(crate) fn begin_segment(&mut self, repo: &mut Repository, root: Vec<u8>) -> Result<()> {
-        self.close_chunk(repo)?;
+    pub(crate) fn begin_segment(
+        &mut self,
+        repo: &Repo,
+        ws: &mut WriteSession,
+        root: Vec<u8>,
+    ) -> Result<()> {
+        self.close_chunk(repo, ws)?;
         self.index.begin_segment(root);
         Ok(())
     }
 
     /// Append `item` to the listing. Closes and stores the open tree
     /// chunk right after it when the cut rule says so.
-    pub(crate) fn push(&mut self, repo: &mut Repository, item: &Item) -> Result<()> {
+    pub(crate) fn push(&mut self, repo: &Repo, ws: &mut WriteSession, item: &Item) -> Result<()> {
         let start = self.buf.len();
         self.index
             .observe(item.path_bytes(), self.item_ptrs.len(), start == 0);
         rmp_serde::encode::write(&mut self.buf, item)?;
-        self.end_entry(repo, &item.path, start)
+        self.end_entry(repo, ws, &item.path, start)
     }
 
     /// `push` for an entry already encoded, for tests that write
@@ -97,7 +102,8 @@ impl ListingWriter {
     #[cfg(test)]
     pub(crate) fn push_encoded(
         &mut self,
-        repo: &mut Repository,
+        repo: &Repo,
+        ws: &mut WriteSession,
         path: &str,
         entry: &[u8],
     ) -> Result<()> {
@@ -105,21 +111,27 @@ impl ListingWriter {
         self.index
             .observe(path.as_bytes(), self.item_ptrs.len(), start == 0);
         self.buf.extend_from_slice(entry);
-        self.end_entry(repo, path, start)
+        self.end_entry(repo, ws, path, start)
     }
 
     /// Cut after the entry that starts at `start` when the rule says so.
-    fn end_entry(&mut self, repo: &mut Repository, path: &str, start: usize) -> Result<()> {
+    fn end_entry(
+        &mut self,
+        repo: &Repo,
+        ws: &mut WriteSession,
+        path: &str,
+        start: usize,
+    ) -> Result<()> {
         let entry_len = self.buf.len() - start;
         if self.cutter.should_cut(path, entry_len, self.buf.len()) {
-            self.close_chunk(repo)?;
+            self.close_chunk(repo, ws)?;
         }
         Ok(())
     }
 
     /// Store the last, partial tree chunk and return the listing.
-    pub(crate) fn finish(mut self, repo: &mut Repository) -> Result<FinishedListing> {
-        self.close_chunk(repo)?;
+    pub(crate) fn finish(mut self, repo: &Repo, ws: &mut WriteSession) -> Result<FinishedListing> {
+        self.close_chunk(repo, ws)?;
         let index = std::mem::replace(&mut self.index, ListingIndexBuilder::new())
             .finish(self.item_ptrs.len());
         Ok(FinishedListing {
@@ -129,13 +141,13 @@ impl ListingWriter {
         })
     }
 
-    fn close_chunk(&mut self, repo: &mut Repository) -> Result<()> {
+    fn close_chunk(&mut self, repo: &Repo, ws: &mut WriteSession) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
         let chunk = std::mem::take(&mut self.buf);
         let (chunk_id, _csize, _is_new) =
-            repo.store_chunk(&chunk, self.compression, PackType::Tree)?;
+            ws.store_chunk(repo, &chunk, self.compression, PackType::Tree)?;
         self.item_ptrs.push(chunk_id);
         Ok(())
     }

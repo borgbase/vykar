@@ -386,7 +386,7 @@ fn old_releases_refuse_upgraded_fixtures_by_version() {
     }
 }
 
-/// OLD-2: the config `Repository::init` writes is refused by version.
+/// OLD-2: the config `Repo::init` writes is refused by version.
 #[test]
 fn old_releases_refuse_a_new_repository_by_version() {
     let dir = tempfile::tempdir().unwrap();

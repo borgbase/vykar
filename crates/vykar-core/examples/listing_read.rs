@@ -22,7 +22,7 @@ use vykar_core::commands::list::{ItemStreamReader, load_snapshot_meta};
 use vykar_core::commands::listing::{ListingRead, ListingView};
 use vykar_core::commands::util::open_repo;
 use vykar_core::config::VykarConfig;
-use vykar_core::repo::Repository;
+use vykar_core::repo::Repo;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_core::snapshot::item::ItemType;
@@ -96,7 +96,7 @@ fn lossy(p: &[u8]) -> String {
 
 /// One query through `view`: the paths, the read statistics and the wall ms.
 fn run(
-    repo: &Repository,
+    repo: &Repo,
     view: &ListingView<'_>,
     dir: &[u8],
     subtree: bool,
@@ -119,7 +119,7 @@ fn run(
 
 /// Up to `n` leaf directories (no directory child), evenly spaced in
 /// stream order, from one scan.
-fn sample_leaves(repo: &Repository, meta: &SnapshotMeta, n: usize) -> Result<Vec<Vec<u8>>, Error> {
+fn sample_leaves(repo: &Repo, meta: &SnapshotMeta, n: usize) -> Result<Vec<Vec<u8>>, Error> {
     let mut dirs: Vec<Vec<u8>> = Vec::new();
     let mut has_dir_child: HashSet<Vec<u8>> = HashSet::new();
     ListingView::ignore_index(meta).subtree(repo, b"", &CancelToken::new(), |i| {

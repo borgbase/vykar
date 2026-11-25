@@ -224,7 +224,7 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
 /// cannot lose data.
 ///
 /// `RestoreKeyCopy` qualifies because `check` only runs after
-/// `Repository::open` succeeded — a key was therefore established, and the
+/// `Repo::open` succeeded — a key was therefore established, and the
 /// action copies it onto a copy that is missing or provably not it. The
 /// unresolvable case, where two candidate keys cannot be told apart, fails at
 /// open and never reaches a repair plan at all.

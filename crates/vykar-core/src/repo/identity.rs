@@ -137,7 +137,7 @@ const MAX_SNAPSHOT_PROOF_ATTEMPTS: usize = 64;
 /// repository; the `index` object for v2/v3), then a bounded number of
 /// snapshot blobs.
 ///
-/// `url` is optional because [`super::Repository::open`] does not always know
+/// `url` is optional because [`super::Repo::open`] does not always know
 /// it; without it the pin cannot be consulted and only data proof is available.
 /// Callers that *can* supply a URL must.
 ///

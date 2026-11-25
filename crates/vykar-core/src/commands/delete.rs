@@ -5,7 +5,7 @@ use vykar_types::error::Result;
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
 use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_exclusion};
 use crate::repo::control::CancelToken;
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::{OpenOptions, Repo};
 
 pub struct DeleteStats {
     pub snapshot_name: String,
@@ -40,7 +40,7 @@ pub fn run(
 /// lock-free, a registered session (`with_snapshot_removal_exclusion`). A
 /// dry run only resolves the names.
 pub(crate) fn run_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_names: &[&str],
     dry_run: bool,
     shutdown: &CancelToken,
@@ -59,7 +59,7 @@ pub(crate) fn run_on_repo(
             targets.into_iter().map(|t| t.snapshot_name).collect()
         } else {
             if !targets.is_empty() {
-                refuse_on_append_only_server(repo.storage.as_ref(), "vykar snapshot delete")?;
+                refuse_on_append_only_server(repo.storage().as_ref(), "vykar snapshot delete")?;
             }
             remove_snapshots(repo, targets, shutdown)?
         };

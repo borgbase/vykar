@@ -10,13 +10,13 @@ use vykar_types::error::{Result, VykarError};
 use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
-use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, Repo, WriteSession, WriteSessionOptions};
 use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, init_test_environment};
 
-fn repo_on_counting_backend() -> (Repository, PutLog) {
+fn repo_on_counting_backend() -> (Repo, WriteSession, PutLog) {
     init_test_environment();
     let (backend, log) = RecordingBackend::new();
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -25,28 +25,31 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    (repo, log)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
 /// Store N distinct chunks, flush packs, and return their IDs.
-fn store_chunks(repo: &mut Repository, count: usize) -> Vec<vykar_types::chunk_id::ChunkId> {
+fn store_chunks(
+    repo: &mut Repo,
+    ws: &mut WriteSession,
+    count: usize,
+) -> Vec<vykar_types::chunk_id::ChunkId> {
     let mut ids = Vec::with_capacity(count);
     for i in 0..count {
         let data = format!("chunk-data-{i:04}-padding-to-make-it-unique");
-        let (id, _, _) = repo
-            .store_chunk(data.as_bytes(), Compression::None, PackType::Tree)
+        let (id, _, _) = ws
+            .store_chunk(repo, data.as_bytes(), Compression::None, PackType::Tree)
             .unwrap();
         ids.push(id);
     }
-    crate::testutil::save_and_resume(repo);
+    crate::testutil::save_and_resume(repo, ws);
     ids
 }
 
 /// Resolve chunk IDs to (ChunkId, PackId, offset, stored_size) tuples via the index.
 fn resolve_chunks(
-    repo: &Repository,
+    repo: &Repo,
     ids: &[vykar_types::chunk_id::ChunkId],
 ) -> Vec<(
     vykar_types::chunk_id::ChunkId,
@@ -64,8 +67,8 @@ fn resolve_chunks(
 
 #[test]
 fn adjacent_blobs_coalesce_into_single_read() {
-    let (mut repo, log) = repo_on_counting_backend();
-    let ids = store_chunks(&mut repo, 3);
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
+    let ids = store_chunks(&mut repo, &mut ws, 3);
     let chunks = resolve_chunks(&repo, &ids);
 
     // All chunks should be in the same pack (small data, one flush).
@@ -100,8 +103,8 @@ fn adjacent_blobs_coalesce_into_single_read() {
 /// just read goes to storage again.
 #[test]
 fn repeat_reads_go_to_storage() {
-    let (mut repo, log) = repo_on_counting_backend();
-    let ids = store_chunks(&mut repo, 3);
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
+    let ids = store_chunks(&mut repo, &mut ws, 3);
     let chunks = resolve_chunks(&repo, &ids);
 
     let mut expected = Vec::new();
@@ -124,21 +127,21 @@ fn repeat_reads_go_to_storage() {
 
 #[test]
 fn cross_pack_grouping() {
-    let (mut repo, log) = repo_on_counting_backend();
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
 
     // Store chunks in separate packs by flushing between each.
     let data_a = b"pack-a-chunk-data-padding-unique-aa";
     let data_b = b"pack-b-chunk-data-padding-unique-bb";
 
-    let (id_a, _, _) = repo
-        .store_chunk(data_a, Compression::None, PackType::Tree)
+    let (id_a, _, _) = ws
+        .store_chunk(&repo, data_a, Compression::None, PackType::Tree)
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
 
-    let (id_b, _, _) = repo
-        .store_chunk(data_b, Compression::None, PackType::Tree)
+    let (id_b, _, _) = ws
+        .store_chunk(&repo, data_b, Compression::None, PackType::Tree)
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
 
     let chunks = resolve_chunks(&repo, &[id_a, id_b]);
 
@@ -172,33 +175,36 @@ fn cross_pack_grouping() {
 
 #[test]
 fn output_order_preserved_across_packs() {
-    let (mut repo, _log) = repo_on_counting_backend();
+    let (mut repo, mut ws, _log) = repo_on_counting_backend();
 
     // Create chunks in two packs, but request them in interleaved order.
-    let (id_a1, _, _) = repo
+    let (id_a1, _, _) = ws
         .store_chunk(
+            &repo,
             b"a1-data-unique-padding-xxxxx",
             Compression::None,
             PackType::Tree,
         )
         .unwrap();
-    let (id_a2, _, _) = repo
+    let (id_a2, _, _) = ws
         .store_chunk(
+            &repo,
             b"a2-data-unique-padding-yyyyy",
             Compression::None,
             PackType::Tree,
         )
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
 
-    let (id_b1, _, _) = repo
+    let (id_b1, _, _) = ws
         .store_chunk(
+            &repo,
             b"b1-data-unique-padding-zzzzz",
             Compression::None,
             PackType::Tree,
         )
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
 
     // Request order: a1, b1, a2 — interleaved across packs.
     let chunks = resolve_chunks(&repo, &[id_a1, id_b1, id_a2]);
@@ -219,7 +225,7 @@ fn output_order_preserved_across_packs() {
 
 #[test]
 fn empty_input_is_noop() {
-    let (repo, log) = repo_on_counting_backend();
+    let (repo, _ws, log) = repo_on_counting_backend();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -232,7 +238,7 @@ fn empty_input_is_noop() {
 
 #[test]
 fn load_item_stream_from_ptrs_reports_chunk_not_in_index() {
-    let (mut repo, _log) = repo_on_counting_backend();
+    let (mut repo, _ws, _log) = repo_on_counting_backend();
     let missing = ChunkId::from_bytes([0xEE; 32]);
     let err = crate::commands::list::load_item_stream_from_ptrs(
         &mut repo,
@@ -248,23 +254,23 @@ fn load_item_stream_from_ptrs_reports_chunk_not_in_index() {
 
 #[test]
 fn large_gap_splits_into_separate_reads() {
-    let (mut repo, log) = repo_on_counting_backend();
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
 
     // Store: small chunk A, large gap chunk (>256 KiB), small chunk B — all in one flush.
     let data_a = b"small-chunk-a-unique-data-xxxxx";
     let gap_data = vec![0x42u8; 300 * 1024]; // 300 KiB — exceeds MAX_COALESCE_GAP
     let data_b = b"small-chunk-b-unique-data-yyyyy";
 
-    let (id_a, _, _) = repo
-        .store_chunk(data_a, Compression::None, PackType::Tree)
+    let (id_a, _, _) = ws
+        .store_chunk(&repo, data_a, Compression::None, PackType::Tree)
         .unwrap();
-    let (id_gap, _, _) = repo
-        .store_chunk(&gap_data, Compression::None, PackType::Tree)
+    let (id_gap, _, _) = ws
+        .store_chunk(&repo, &gap_data, Compression::None, PackType::Tree)
         .unwrap();
-    let (id_b, _, _) = repo
-        .store_chunk(data_b, Compression::None, PackType::Tree)
+    let (id_b, _, _) = ws
+        .store_chunk(&repo, data_b, Compression::None, PackType::Tree)
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
 
     // All three should be in the same pack.
     let all_chunks = resolve_chunks(&repo, &[id_a, id_gap, id_b]);
@@ -309,8 +315,8 @@ fn large_gap_splits_into_separate_reads() {
 
 #[test]
 fn duplicate_chunk_ids_coalesce_into_single_range_read() {
-    let (mut repo, log) = repo_on_counting_backend();
-    let ids = store_chunks(&mut repo, 2);
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
+    let ids = store_chunks(&mut repo, &mut ws, 2);
     let chunks = resolve_chunks(&repo, &ids);
 
     // Build input with duplicates: [chunk0, chunk1, chunk0, chunk1].
@@ -422,7 +428,7 @@ fn repo_with_cancelling_backend(
     packs: usize,
     width: usize,
 ) -> (
-    Repository,
+    Repo,
     CancelToken,
     Arc<AtomicUsize>,
     Vec<vykar_types::chunk_id::ChunkId>,
@@ -436,7 +442,7 @@ fn repo_with_cancelling_backend(
         reads: Arc::clone(&reads),
         width,
     };
-    let mut repo = Repository::init(
+    let mut repo = Repo::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -445,16 +451,15 @@ fn repo_with_cancelling_backend(
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
 
     let mut ids = Vec::with_capacity(packs);
     for i in 0..packs {
         let data = format!("cancel-chunk-{i:04}-padding-to-make-it-unique");
-        let (id, _, _) = repo
-            .store_chunk(data.as_bytes(), Compression::None, PackType::Tree)
+        let (id, _, _) = ws
+            .store_chunk(&repo, data.as_bytes(), Compression::None, PackType::Tree)
             .unwrap();
-        crate::testutil::save_and_resume(&mut repo);
+        crate::testutil::save_and_resume(&mut repo, &mut ws);
         ids.push(id);
     }
     reads.store(0, Ordering::Relaxed);
@@ -549,10 +554,10 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
 /// Flip one byte of `data` inside its stored blob in a plaintext repo. With no
 /// compression and no AEAD the blob stays decodable at the same length, so only
 /// the chunk ID check can notice.
-fn flip_byte_in_stored_chunk(repo: &Repository, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
+fn flip_byte_in_stored_chunk(repo: &Repo, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
     let entry = repo.chunk_index().get(id).unwrap();
     let key = entry.pack_id.storage_key();
-    let mut pack = repo.storage.get(&key).unwrap().unwrap();
+    let mut pack = repo.storage().get(&key).unwrap().unwrap();
     let start = entry.pack_offset as usize;
     let blob = &pack[start..start + entry.stored_size as usize];
     let pos = blob
@@ -560,17 +565,17 @@ fn flip_byte_in_stored_chunk(repo: &Repository, id: &vykar_types::chunk_id::Chun
         .position(|w| w == data)
         .expect("plaintext chunk is stored verbatim");
     pack[start + pos + data.len() / 2] ^= 0x01;
-    repo.storage.put(&key, &pack).unwrap();
+    repo.storage().put(&key, &pack).unwrap();
 }
 
 #[test]
 fn plaintext_read_chunk_rejects_corrupt_blob() {
-    let mut repo = crate::testutil::test_repo_plaintext();
+    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
     let data = b"plaintext-chunk-that-will-be-corrupted-on-disk";
-    let (id, _, _) = repo
-        .store_chunk(data, Compression::None, PackType::Tree)
+    let (id, _, _) = ws
+        .store_chunk(&repo, data, Compression::None, PackType::Tree)
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
     flip_byte_in_stored_chunk(&repo, &id, data);
 
     for attempt in 0..2 {
@@ -584,8 +589,8 @@ fn plaintext_read_chunk_rejects_corrupt_blob() {
 
 #[test]
 fn plaintext_coalesced_read_rejects_corrupt_blob() {
-    let mut repo = crate::testutil::test_repo_plaintext();
-    let ids = store_chunks(&mut repo, 3);
+    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    let ids = store_chunks(&mut repo, &mut ws, 3);
     let corrupt = "chunk-data-0001-padding-to-make-it-unique";
     flip_byte_in_stored_chunk(&repo, &ids[1], corrupt.as_bytes());
 
@@ -677,7 +682,7 @@ delegate_storage_backend! {
     }
 }
 
-fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repository, Arc<Probe>) {
+fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repo, WriteSession, Arc<Probe>) {
     init_test_environment();
     let probe = Arc::new(Probe::default());
     probe.width.store(2, Ordering::SeqCst);
@@ -689,7 +694,7 @@ fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repository, Arc<Probe>) {
         EncryptionMode::None => None,
         _ => Some("test-pass"),
     };
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         mode,
         crate::repo::ChunkerParams::default(),
@@ -698,14 +703,17 @@ fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repository, Arc<Probe>) {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    (repo, probe)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, probe)
 }
 
 /// Store `pack_sizes[p]` chunks in pack `p` (one flush per pack). Returns each
 /// chunk's id and plaintext, pack by pack.
-fn store_packs(repo: &mut Repository, pack_sizes: &[usize]) -> Vec<Vec<(ChunkId, Vec<u8>)>> {
+fn store_packs(
+    repo: &mut Repo,
+    ws: &mut WriteSession,
+    pack_sizes: &[usize],
+) -> Vec<Vec<(ChunkId, Vec<u8>)>> {
     let mut packs = Vec::with_capacity(pack_sizes.len());
     for (p, &n) in pack_sizes.iter().enumerate() {
         let mut chunks = Vec::with_capacity(n);
@@ -717,26 +725,26 @@ fn store_packs(repo: &mut Repository, pack_sizes: &[usize]) -> Vec<Vec<(ChunkId,
                 .into_iter()
                 .chain((0..len).map(|i| (i * 31 + p * 17 + c * 5) as u8))
                 .collect();
-            let (id, _, _) = repo
-                .store_chunk(&data, Compression::None, PackType::Tree)
+            let (id, _, _) = ws
+                .store_chunk(repo, &data, Compression::None, PackType::Tree)
                 .unwrap();
             chunks.push((id, data));
         }
-        crate::testutil::save_and_resume(repo);
+        crate::testutil::save_and_resume(repo, ws);
         packs.push(chunks);
     }
     packs
 }
 
-fn pack_key(repo: &Repository, id: &ChunkId) -> String {
+fn pack_key(repo: &Repo, id: &ChunkId) -> String {
     repo.chunk_index().get(id).unwrap().pack_id.storage_key()
 }
 
 /// Later groups finishing first must not reorder the output.
 #[test]
 fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
-    let packs = store_packs(&mut repo, &[2; 8]);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &mut ws, &[2; 8]);
     // Interleaved across packs: every pack's first chunk, then every second.
     let order: Vec<&(ChunkId, Vec<u8>)> = (0..2)
         .flat_map(|c| packs.iter().map(move |p| &p[c]))
@@ -760,8 +768,8 @@ fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
 
 #[test]
 fn parallel_read_overlaps_range_reads_up_to_width() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
-    let packs = store_packs(&mut repo, &[1; 9]);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &mut ws, &[1; 9]);
     let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
     let expected: Vec<u8> = packs.iter().flat_map(|p| p[0].1.clone()).collect();
     let chunks = resolve_chunks(&repo, &ids);
@@ -791,13 +799,13 @@ fn parallel_read_overlaps_range_reads_up_to_width() {
 /// recorded: group 1's read is slowed so group 4's failure lands first.
 #[test]
 fn parallel_read_returns_the_earliest_failing_group() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
-    let packs = store_packs(&mut repo, &[1; 6]);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &mut ws, &[1; 6]);
     let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
     let chunks = resolve_chunks(&repo, &ids);
     let missing_pack = chunks[1].1;
 
-    repo.storage.delete(&missing_pack.storage_key()).unwrap();
+    repo.storage().delete(&missing_pack.storage_key()).unwrap();
     flip_byte_in_stored_chunk(&repo, &ids[4], &packs[4][0].1);
     probe.delay_ms.store(50, Ordering::SeqCst);
     probe
@@ -826,10 +834,10 @@ fn parallel_read_returns_the_earliest_failing_group() {
 #[test]
 fn item_stream_bytes_identical_across_widths() {
     for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
-        let (mut repo, probe) = repo_on_tuned_backend(mode.clone());
+        let (mut repo, mut ws, probe) = repo_on_tuned_backend(mode.clone());
         // The point is the storage read at each width, not the local cache.
         repo.set_tree_cache(None);
-        let packs = store_packs(&mut repo, &[3, 1, 2, 3, 3]);
+        let packs = store_packs(&mut repo, &mut ws, &[3, 1, 2, 3, 3]);
         let all: Vec<&(ChunkId, Vec<u8>)> = packs.iter().flatten().collect();
         // A fixed permutation that hops between packs, plus one repeat.
         let order: Vec<&(ChunkId, Vec<u8>)> = [7, 0, 11, 3, 5, 9, 1, 4, 10, 2, 8, 6, 0]
@@ -859,8 +867,8 @@ fn item_stream_bytes_identical_across_widths() {
 /// decrypt of the first must not destroy the second.
 #[test]
 fn duplicate_chunk_ids_decode_under_aead() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
-    let ids = store_chunks(&mut repo, 2);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let ids = store_chunks(&mut repo, &mut ws, 2);
     let chunks = resolve_chunks(&repo, &ids);
     let mut dup_chunks = chunks.clone();
     dup_chunks.extend_from_slice(&chunks);
@@ -884,8 +892,8 @@ fn duplicate_chunk_ids_decode_under_aead() {
 /// stream order, with one range read for the pack.
 #[test]
 fn duplicate_ids_non_adjacent_keep_stream_order() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
-    let ids = store_chunks(&mut repo, 3);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let ids = store_chunks(&mut repo, &mut ws, 3);
     let input = [ids[0], ids[1], ids[0], ids[2], ids[0]];
     let chunks = resolve_chunks(&repo, &input);
     let expected: Vec<u8> = input
@@ -908,8 +916,8 @@ fn duplicate_ids_non_adjacent_keep_stream_order() {
 /// offset: every slot gets its own chunk's bytes.
 #[test]
 fn duplicate_sorting_after_its_first_slot_fills_every_slot() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
-    let ids = store_chunks(&mut repo, 3);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let ids = store_chunks(&mut repo, &mut ws, 3);
     let input = [ids[2], ids[0], ids[2], ids[1], ids[0]];
     let chunks = resolve_chunks(&repo, &input);
     assert!(
@@ -941,8 +949,8 @@ fn duplicate_sorting_after_its_first_slot_fills_every_slot() {
 /// an error (the second read overlaps the first), not a panic.
 #[test]
 fn two_ids_at_one_location_is_an_error() {
-    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
-    let packs = store_packs(&mut repo, &[2, 1]);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &mut ws, &[2, 1]);
     let ids = [packs[0][0].0, packs[0][1].0, packs[1][0].0];
     let mut chunks = resolve_chunks(&repo, &ids);
     let (_, pack, offset, size) = chunks[0];
@@ -993,7 +1001,7 @@ fn coalesced_read_on_local_backend() {
             .unwrap(),
         width: Arc::clone(&width),
     };
-    let mut repo = Repository::init(
+    let mut repo = Repo::init(
         Box::new(backend),
         EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
@@ -1002,9 +1010,8 @@ fn coalesced_read_on_local_backend() {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    let packs = store_packs(&mut repo, &[3, 2]);
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let packs = store_packs(&mut repo, &mut ws, &[3, 2]);
     let order = [
         &packs[0][0],
         &packs[1][0],

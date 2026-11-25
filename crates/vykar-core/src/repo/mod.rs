@@ -51,15 +51,17 @@ mod session;
 pub use session::WriteSessionOptions;
 mod upgrade;
 pub use upgrade::UpgradeOutcome;
+mod writer;
+pub use write_session::WriteSession;
+pub(crate) use writer::Fence;
+pub use writer::RepoWriter;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
-use self::write_session::WriteSessionState;
 pub use crate::chunker::ChunkerParams;
 use crate::index::LiveIndex;
 use vykar_crypto::CryptoEngine;
@@ -421,7 +423,7 @@ impl EncryptionMode {
     }
 }
 
-/// What `Repository::init` takes from the client's repository settings.
+/// What `Repo::init` takes from the client's repository settings.
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     /// Repository URL. Names the server in the capability-probe error only.
@@ -461,7 +463,7 @@ pub struct OpenOptions {
     pub load_index: bool,
     pub load_file_cache: bool,
     /// Repository URL, when the caller knows it. Only the identity pin needs
-    /// it, and `Repository::open` itself has no other way to learn it.
+    /// it, and `Repo::open` itself has no other way to learn it.
     pub repo_url: Option<String>,
     /// Accept a key whose fingerprint contradicts the local identity pin.
     /// Mirrors `--trust-repo`, the single deliberate escape hatch.
@@ -530,18 +532,18 @@ impl OpenOptions {
 }
 
 /// A handle to an opened repository.
-pub struct Repository {
-    pub storage: Arc<dyn StorageBackend>,
-    pub crypto: Arc<dyn CryptoEngine>,
+pub struct Repo {
+    storage: Arc<dyn StorageBackend>,
+    crypto: Arc<dyn CryptoEngine>,
     manifest: Manifest,
     /// Snapshots present under `snapshots/` that could not be read into the
     /// manifest. Non-empty means `manifest` is an incomplete view of the
-    /// repository — see [`Repository::skipped_snapshots`].
+    /// repository — see [`Repo::skipped_snapshots`].
     skipped_snapshots: Vec<snapshot_cache::SkippedSnapshot>,
     /// The chunk index: the mapped table of the loaded state plus this
     /// process's edits. Not loaded (empty) until a load or write.
     chunk_index: LiveIndex,
-    pub config: RepoConfig,
+    config: RepoConfig,
     /// Resolved once from `config.version` at init/open. Every downstream
     /// caller asks the repository rather than re-inspecting the integer.
     format: RepoFormat,
@@ -565,12 +567,6 @@ pub struct Repository {
     tree_cache: Option<tree_cache::TreeChunkCache>,
     /// Clock and identity of this client; see [`host_env`].
     host_env: HostEnv,
-    /// Write-path state: pack writers, upload queue, dedup, journal, sizing.
-    /// `None` when no write session is active (read-only operations, compact, delete, prune).
-    /// Activated by `begin_write_session()` before backup.
-    write_session: Option<WriteSessionState>,
-    /// Lock fence: called before persisting index/manifest to verify the lock is still valid.
-    lock_fence: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     /// The key-copy bytes that actually unwrapped at open. `check` compares
     /// the stored objects against these instead of unwrapping again, which
     /// would cost another Argon2id derivation and need the passphrase threaded
@@ -629,7 +625,7 @@ pub(crate) enum CommitMode {
     LockFree,
 }
 
-/// What [`Repository::save_file_cache_cancellable`] did.
+/// What [`Repo::save_file_cache_cancellable`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileCacheSave {
     /// Another process had saved since this handle loaded or saved: the
@@ -639,13 +635,13 @@ pub(crate) struct FileCacheSave {
     pub(crate) locked: bool,
 }
 
-impl Repository {
+impl Repo {
     /// Clock and identity of this client.
     pub fn host_env(&self) -> &HostEnv {
         &self.host_env
     }
 
-    /// Replace the environment, e.g. on a handle from `Repository::init`.
+    /// Replace the environment, e.g. on a handle from `Repo::init`.
     pub fn set_host_env(&mut self, env: HostEnv) {
         self.host_env = env;
     }
@@ -653,11 +649,6 @@ impl Repository {
     /// The key blob that unwrapped at open, if this repository is encrypted.
     pub fn key_blob(&self) -> Option<&[u8]> {
         self.key_blob.as_deref()
-    }
-
-    /// Mark the chunk index as needing persistence on the next `save_state()`.
-    pub fn mark_index_dirty(&mut self) {
-        self.index_dirty = true;
     }
 
     /// Mark the file cache as needing persistence on the next `save_state()`.
@@ -802,6 +793,33 @@ impl Repository {
         self.format
     }
 
+    /// The storage backend of this repository.
+    pub fn storage(&self) -> &Arc<dyn StorageBackend> {
+        &self.storage
+    }
+
+    /// The crypto engine (key material) of this repository.
+    pub fn crypto(&self) -> &Arc<dyn CryptoEngine> {
+        &self.crypto
+    }
+
+    /// The repository's config as opened (or as the upgrade switched it).
+    pub fn config(&self) -> &RepoConfig {
+        &self.config
+    }
+
+    /// Tests: replace the storage (a recorder, a fault injector).
+    #[cfg(test)]
+    pub(crate) fn set_storage_for_test(&mut self, storage: Arc<dyn StorageBackend>) {
+        self.storage = storage;
+    }
+
+    /// Tests: replace the crypto engine.
+    #[cfg(test)]
+    pub(crate) fn set_crypto_for_test(&mut self, crypto: Arc<dyn CryptoEngine>) {
+        self.crypto = crypto;
+    }
+
     /// The content-digest algorithm this repository's chunk IDs and pack IDs
     /// use. Implied by the format version and fixed for the repository's life.
     pub fn content_hash(&self) -> HashAlgorithm {
@@ -822,7 +840,7 @@ impl Repository {
     /// Snapshots that exist under `snapshots/` but could not be read into the
     /// manifest — most commonly because they were written by a newer vykar.
     ///
-    /// A non-empty result means [`Repository::manifest`] is an **incomplete**
+    /// A non-empty result means [`Repo::manifest`] is an **incomplete**
     /// view of the repository. Callers that show a snapshot list to a user must
     /// surface this rather than rendering a silently truncated list.
     pub fn skipped_snapshots(&self) -> &[snapshot_cache::SkippedSnapshot] {
@@ -837,12 +855,6 @@ impl Repository {
     /// Read-only access to the chunk index.
     pub fn chunk_index(&self) -> &LiveIndex {
         &self.chunk_index
-    }
-
-    /// Mutable access to the chunk index. Automatically marks it dirty.
-    pub fn chunk_index_mut(&mut self) -> &mut LiveIndex {
-        self.index_dirty = true;
-        &mut self.chunk_index
     }
 
     /// The local tree-chunk cache, if this host has a cache dir.
@@ -899,15 +911,9 @@ impl Repository {
         self.file_cache_dirty = true;
     }
 
-    /// Install a lock fence that will be checked before persisting index/manifest.
-    pub fn set_lock_fence(&mut self, fence: Arc<dyn Fn() -> Result<()> + Send + Sync>) {
-        self.lock_fence = Some(fence);
-    }
-
-    /// Remove the lock fence, and the lock's reading of the store's clock
-    /// with it.
-    pub fn clear_lock_fence(&mut self) {
-        self.lock_fence = None;
+    /// Forget the lock-hold state: the lock's reading of the store's clock,
+    /// the live sessions it found and the segment ages it listed.
+    pub fn clear_lock_state(&mut self) {
         self.lock_store_time = None;
         self.live_sessions = None;
         self.segment_ages = None;
@@ -1071,30 +1077,23 @@ impl Repository {
     pub(crate) fn is_lock_free(&self) -> bool {
         self.commit_mode == Some(CommitMode::LockFree)
     }
-
-    /// Check the lock fence if one is installed. No-op if no fence is set.
-    pub(crate) fn check_lock_fence(&self) -> Result<()> {
-        if let Some(ref fence) = self.lock_fence {
-            fence()?;
-        }
-        Ok(())
-    }
 }
 
-impl Drop for Repository {
-    fn drop(&mut self) {
-        if self.write_session.is_some() {
-            warn!("Repository dropped with active write session");
-        }
-    }
-}
-
-// Compile-time assertion: reads take `&self`, so `Arc<Repository>` must be
+// Compile-time assertion: reads take `&self`, so `Arc<Repo>` must be
 // shareable across threads (mount serves concurrent reads from one handle).
 const _: () = {
     fn _assert_send_sync<T: Send + Sync>() {}
     fn _check() {
-        _assert_send_sync::<Repository>();
+        _assert_send_sync::<Repo>();
+    }
+};
+
+// Compile-time assertion: `CommitInProgress` owns a write session, and the
+// simulator runs commits on spawned threads.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<WriteSession>();
     }
 };
 

@@ -7,7 +7,7 @@ use crate::compress::Compression;
 use crate::repo::ChunkerParams;
 use crate::repo::InitOptions;
 use crate::repo::pack::PackType;
-use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, Fence, Repo, WriteSessionOptions};
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
@@ -20,6 +20,8 @@ struct AdvisoryLockBackendState {
     data: Mutex<HashMap<String, Vec<u8>>>,
     release_calls: AtomicUsize,
     fail_release: bool,
+    /// The next this many PUTs of a session journal fail.
+    fail_journal_puts: AtomicUsize,
 }
 
 impl AdvisoryLockBackend {
@@ -29,6 +31,7 @@ impl AdvisoryLockBackend {
                 data: Mutex::new(HashMap::new()),
                 release_calls: AtomicUsize::new(0),
                 fail_release,
+                fail_journal_puts: AtomicUsize::new(0),
             }),
         }
     }
@@ -45,6 +48,15 @@ impl StorageBackend for AdvisoryLockBackend {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if key.ends_with(".index")
+            && self
+                .state
+                .fail_journal_puts
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(VykarError::Other("injected journal PUT failure".into()));
+        }
         let mut map = self.state.data.lock().unwrap();
         map.insert(key.to_string(), data.to_vec());
         Ok(())
@@ -113,8 +125,8 @@ impl StorageBackend for AdvisoryLockBackend {
     vykar_storage::unsupported_server_ops!();
 }
 
-fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repository {
-    Repository::init(
+fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repo {
+    Repo::init(
         Box::new(backend),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -155,7 +167,7 @@ fn with_repo_lock_succeeds_when_release_fails_after_successful_action() {
 }
 
 #[test]
-fn with_repo_lock_flushes_pending_state_on_action_error() {
+fn action_flushes_its_session_before_with_repo_lock_releases() {
     crate::testutil::init_test_environment();
 
     let backend = AdvisoryLockBackend::new(false);
@@ -164,7 +176,7 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
         max_pack_size: 256,
         ..Default::default()
     };
-    let mut repo = Repository::init(
+    let mut repo = Repo::init(
         Box::new(backend.clone()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -175,17 +187,66 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
     .unwrap();
 
     let result: Result<()> = with_repo_lock(&mut repo, |repo| {
-        // Begin a write session, store enough to trigger a pack flush, then fail.
-        repo.begin_write_session(&WriteSessionOptions::default())?;
-        repo.store_chunk(&vec![0xABu8; 300], Compression::None, PackType::Data)?;
+        // Begin a write session, store enough to trigger a pack flush, then
+        // fail: the session's owner flushes it on its error path.
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+        ws.store_chunk(repo, &vec![0xABu8; 300], Compression::None, PackType::Data)?;
+        ws.flush_on_abort(repo);
         Err(VykarError::Other("simulated backup failure".into()))
     });
 
     assert!(result.is_err());
-    // flush_on_abort should have written pending_index before releasing the lock.
+    // flush_on_abort wrote pending_index before the lock was released.
     assert!(
-        repo.storage.exists("sessions/default.index").unwrap(),
+        repo.storage().exists("sessions/default.index").unwrap(),
         "sessions/default.index should exist after with_repo_lock error path"
     );
     assert_eq!(backend.release_calls(), 1, "lock should still be released");
+}
+
+/// A failed `save_session` flushes its session before the error returns:
+/// the journal PUT during the session's own flush fails, then the fence
+/// refuses the index write, and only the error arm's rewrite of the journal
+/// (`flush_on_abort`) leaves `sessions/default.index` behind.
+#[test]
+fn a_failed_save_session_writes_the_journal() {
+    crate::testutil::init_test_environment();
+
+    let backend = AdvisoryLockBackend::new(false);
+    let small_config = InitOptions {
+        min_pack_size: 256,
+        max_pack_size: 256,
+        ..Default::default()
+    };
+    let mut repo = Repo::init(
+        Box::new(backend.clone()),
+        EncryptionMode::None,
+        ChunkerParams::default(),
+        None,
+        Some(&small_config),
+        None,
+    )
+    .unwrap();
+
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&repo, &[0xABu8; 300], Compression::None, PackType::Data)
+        .unwrap();
+    backend.state.fail_journal_puts.store(1, Ordering::SeqCst);
+    let err = repo
+        .writer(Fence::lock(Arc::new(|| {
+            Err(VykarError::LockExpired("lost".into()))
+        })))
+        .save_session(ws)
+        .unwrap_err();
+
+    assert!(matches!(err, VykarError::LockExpired(_)), "{err}");
+    assert_eq!(
+        backend.state.fail_journal_puts.load(Ordering::SeqCst),
+        0,
+        "the session's own flush tried the journal first"
+    );
+    assert!(
+        repo.storage().exists("sessions/default.index").unwrap(),
+        "the failed save flushed its session"
+    );
 }

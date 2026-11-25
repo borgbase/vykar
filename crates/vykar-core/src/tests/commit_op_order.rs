@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::compress::Compression;
 use crate::repo::ages::T_PACK;
 use crate::repo::pack::PackType;
-use crate::repo::{OpenOptions, Repository, WriteSessionOptions};
+use crate::repo::{OpenOptions, Repo, RepoWriter, WriteSession, WriteSessionOptions};
 use crate::sim::log::key_class;
 use crate::sim::{OpRecord, RunRecord, Sim, SourceTree};
 
@@ -182,21 +182,21 @@ fn commit_with_no_new_additions_writes_no_index() {
     let other = store.handle(d);
     let cache = tempfile::tempdir().unwrap();
     let mut commit_from = 0;
-    let r = sim.custom(c, "no additions", |repo: &mut Repository| {
+    let r = sim.custom(c, "no additions", |repo: &mut RepoWriter<'_>| {
         let data = b"one chunk both sessions store";
-        repo.begin_write_session(&WriteSessionOptions::default())?;
-        repo.store_chunk(data, Compression::None, PackType::Data)?;
-        let mut first = Repository::open(
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+        ws.store_chunk(repo, data, Compression::None, PackType::Data)?;
+        let mut first = Repo::open(
             Box::new(other),
             None,
             Some(cache.path().to_path_buf()),
             OpenOptions::new().with_index(),
         )?;
-        first.begin_write_session(&WriteSessionOptions::default())?;
-        first.store_chunk(data, Compression::None, PackType::Data)?;
-        commit_as(&mut first, "first")?;
+        let mut first_ws = first.begin_write_session(&WriteSessionOptions::default());
+        first_ws.store_chunk(&first, data, Compression::None, PackType::Data)?;
+        commit_as(&mut first.unchecked_writer(), first_ws, "first")?;
         commit_from = store.log().last().map_or(0, |r| r.step);
-        commit_as(repo, "second")
+        commit_as(repo, ws, "second")
     });
     r.expect_ok();
     let recs: Vec<OpRecord> = run_records(&sim, &r, false)
@@ -228,8 +228,12 @@ fn commit_with_no_new_additions_writes_no_index() {
     );
 }
 
-/// Commit the active session of `repo` as snapshot `name`.
-fn commit_as(repo: &mut Repository, name: &str) -> vykar_types::error::Result<()> {
+/// Commit the session `ws` of `repo` as snapshot `name`.
+fn commit_as(
+    repo: &mut RepoWriter<'_>,
+    ws: WriteSession,
+    name: &str,
+) -> vykar_types::error::Result<()> {
     let entry = crate::repo::manifest::SnapshotEntry {
         name: name.into(),
         id: vykar_types::snapshot_id::SnapshotId::generate(),
@@ -240,6 +244,7 @@ fn commit_as(repo: &mut Repository, name: &str) -> vykar_types::error::Result<()
         hostname: String::new(),
     };
     repo.commit_session_blocking(
+        ws,
         entry,
         b"snapshot".to_vec(),
         &mut crate::repo::file_cache::FileCache::new(),
@@ -344,7 +349,7 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
     // t0's segment is old, so the fold folds it (04 step 7); the
     // fold-prefix step lists index.d/ for its age.
     sim.advance(T_PACK + Duration::from_secs(60));
-    let r = sim.custom(c, "fold", |repo: &mut Repository| {
+    let r = sim.custom(c, "fold", |repo: &mut RepoWriter<'_>| {
         repo.load_chunk_index_under_lock()?;
         repo.request_index_fold();
         repo.mark_index_dirty();

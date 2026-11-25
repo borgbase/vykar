@@ -15,7 +15,7 @@ use crate::commands::list::{
 use crate::commands::listing::{ListingRead, ListingView};
 use crate::config::VykarConfig;
 use crate::platform::fs;
-use crate::repo::Repository;
+use crate::repo::Repo;
 use crate::repo::control::CancelToken;
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
@@ -234,7 +234,7 @@ fn compile_pattern(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>
 /// [`run_with_options`] on an already opened repository.
 #[cfg(any(test, feature = "sim"))]
 pub(crate) fn run_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     dest: &str,
     pattern: Option<&str>,
@@ -267,7 +267,7 @@ pub(crate) enum TestSelection<'s> {
 /// cost (`None`: the lazy whole-listing read).
 #[cfg(test)]
 pub(crate) fn restore_on_repo_for_test(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     dest: &str,
     selection: TestSelection<'_>,
@@ -447,7 +447,7 @@ enum RestoreSource<'a> {
     Subtrees {
         view: ListingView<'a>,
         meta: &'a SnapshotMeta,
-        repo: &'a Repository,
+        repo: &'a Repo,
         dirs: Vec<String>,
         shutdown: &'a CancelToken,
         read: ListingRead,
@@ -489,7 +489,7 @@ impl ItemSource for &mut RestoreSource<'_> {
 /// Every entry under one of `dirs` (raw paths, as `ListingView::subtree`
 /// matches them), by one lazy scan of the whole listing, in stream order.
 fn scan_subtrees(
-    repo: &Repository,
+    repo: &Repo,
     meta: &SnapshotMeta,
     dirs: &[String],
     shutdown: &CancelToken,
@@ -569,7 +569,7 @@ where
 /// compacted before the index load fails as `ChunkRemovedDuringRead`
 /// (`ReadOrigin::explain`).
 fn restore_on_repo_with_filter<F>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     dest: &str,
     opts: RestoreOptions,
@@ -600,7 +600,7 @@ where
 
 /// The body of [`restore_on_repo_with_filter`].
 fn restore_planned<F>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     dest: &str,
     opts: RestoreOptions,
@@ -611,7 +611,7 @@ fn restore_planned<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let readers = restore_readers(repo.storage.profile());
+    let readers = restore_readers(repo.storage().profile());
     let RestoreOptions {
         xattrs_enabled,
         verify_chunks,
@@ -681,7 +681,7 @@ where
     let meta = super::list::load_snapshot_meta(repo, &resolved_name)?;
     items.ensure_index(repo)?;
     // Shared until the source is dropped.
-    let ro: &Repository = repo;
+    let ro: &Repo = repo;
     let view = ListingView::new(&meta);
     let dirs = match (&scope, view.index()) {
         (ReadScope::Subtrees(d), Ok(ix))
@@ -811,8 +811,8 @@ where
             let bytes = parallel::execute_parallel_restore(
                 &batch_files,
                 groups,
-                &ro.storage,
-                ro.crypto.as_ref(),
+                ro.storage(),
+                ro.crypto().as_ref(),
                 &temp_root,
                 readers,
                 verify_chunks,

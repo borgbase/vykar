@@ -3,30 +3,34 @@ use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::pack_trailer::{TrailerPackType, parse_footer, read_trailer_from_pack_bytes};
-use crate::testutil::test_repo_plaintext;
+use crate::testutil::{test_repo_plaintext, test_repo_plaintext_with_session};
 
-/// Helper: store two distinct chunks and flush, returning their chunk IDs.
+/// Helper: store two distinct chunks in a write session of their own and
+/// save it, returning their chunk IDs.
 fn store_two_chunks(
-    repo: &mut crate::repo::Repository,
+    repo: &mut crate::repo::Repo,
 ) -> (
     vykar_types::chunk_id::ChunkId,
     vykar_types::chunk_id::ChunkId,
 ) {
-    let (id_a, _, _) = repo
+    let mut ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+    let (id_a, _, _) = ws
         .store_chunk(
+            repo,
             b"chunk-a-data-for-compact-test",
             Compression::None,
             PackType::Data,
         )
         .unwrap();
-    let (id_b, _, _) = repo
+    let (id_b, _, _) = ws
         .store_chunk(
+            repo,
             b"chunk-b-data-for-compact-test",
             Compression::None,
             PackType::Data,
         )
         .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     (id_a, id_b)
 }
 
@@ -37,8 +41,15 @@ fn compact_clean_repo_no_repacking() {
     // Store chunks — all live, no dead blobs
     store_two_chunks(&mut repo);
 
-    let stats =
-        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        10.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
     assert_eq!(stats.space_freed, 0);
@@ -46,13 +57,9 @@ fn compact_clean_repo_no_repacking() {
 
 /// The trailer of the pack at `key` lists exactly the index entries
 /// that name the pack, under `pack_type`.
-fn assert_trailer_matches_index(
-    repo: &crate::repo::Repository,
-    key: &str,
-    pack_type: TrailerPackType,
-) {
-    let bytes = repo.storage.get(key).unwrap().unwrap();
-    let trailer = read_trailer_from_pack_bytes(&bytes, repo.crypto.as_ref())
+fn assert_trailer_matches_index(repo: &crate::repo::Repo, key: &str, pack_type: TrailerPackType) {
+    let bytes = repo.storage().get(key).unwrap().unwrap();
+    let trailer = read_trailer_from_pack_bytes(&bytes, repo.crypto().as_ref())
         .unwrap()
         .unwrap_or_else(|| panic!("{key} has no trailer"));
     assert_eq!(trailer.pack_type, pack_type);
@@ -78,9 +85,15 @@ fn compact_ignores_trailer_only_overhead() {
     let mut repo = test_repo_plaintext();
     store_two_chunks(&mut repo);
     for threshold in [0.0, 1.0, 10.0] {
-        let stats =
-            compact_repo_without_mark(&mut repo, threshold, None, false, 4, &CancelToken::new())
-                .unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            threshold,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(stats.packs_repacked, 0, "{threshold}");
         assert_eq!(stats.packs_deleted_empty, 0, "{threshold}");
         assert_eq!(stats.space_freed, 0, "{threshold}");
@@ -93,14 +106,28 @@ fn compact_ignores_trailer_only_overhead() {
 fn compact_is_idempotent_after_repack() {
     let mut repo = test_repo_plaintext();
     let (id_a, _id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
-    let first =
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
+    let first = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(first.packs_repacked, 1, "{first:?}");
 
-    let second =
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let second = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(second.packs_repacked, 0, "{second:?}");
     assert_eq!(second.packs_deleted_empty, 0, "{second:?}");
     assert_eq!(second.space_freed, 0, "{second:?}");
@@ -112,9 +139,17 @@ fn compact_is_idempotent_after_repack() {
 fn client_repack_writes_a_trailer() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
-    compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
+    compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     let key = repo.chunk_index().get(&id_b).unwrap().pack_id.storage_key();
     assert_trailer_matches_index(&repo, &key, TrailerPackType::Repacked);
@@ -159,14 +194,20 @@ fn compact_reads_no_pack_footer() {
     let mut repo = test_repo_plaintext();
     store_two_chunks(&mut repo);
     let counting = std::sync::Arc::new(CountingFooterReads {
-        inner: std::sync::Arc::clone(&repo.storage),
+        inner: std::sync::Arc::clone(repo.storage()),
         footer_reads: std::sync::atomic::AtomicUsize::new(0),
     });
-    repo.storage = counting.clone();
+    repo.set_storage_for_test(counting.clone());
     for threshold in [0.0, 10.0] {
-        let stats =
-            compact_repo_without_mark(&mut repo, threshold, None, false, 4, &CancelToken::new())
-                .unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            threshold,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(stats.packs_repacked, 0, "{stats:?}");
         assert_eq!(stats.space_freed, 0, "{stats:?}");
     }
@@ -184,11 +225,19 @@ fn compact_reads_no_pack_footer() {
 fn client_repack_records_the_output_trailer_length() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
-    compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
+    compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let pack = repo.chunk_index().get(&id_b).unwrap().pack_id;
-    let bytes = repo.storage.get(&pack.storage_key()).unwrap().unwrap();
+    let bytes = repo.storage().get(&pack.storage_key()).unwrap().unwrap();
     let blob_len = parse_footer(&bytes).unwrap();
     assert_eq!(
         repo.chunk_index().pack_trailer_len(&pack),
@@ -197,12 +246,12 @@ fn client_repack_records_the_output_trailer_length() {
     // And after a cold load.
     let seg = repo.index_head().unwrap().segments.last().unwrap().clone();
     let stored = repo
-        .storage
+        .storage()
         .get(&crate::repo::index_store::object_key(&seg.name))
         .unwrap()
         .unwrap();
     let seg =
-        crate::repo::index_store::decode_segment_v2(&seg, &stored, repo.crypto.as_ref()).unwrap();
+        crate::repo::index_store::decode_segment_v2(&seg, &stored, repo.crypto().as_ref()).unwrap();
     assert!(seg.pack_trailers.contains(&(pack, 4 + blob_len)), "{seg:?}");
 }
 
@@ -213,13 +262,13 @@ fn client_repack_records_the_output_trailer_length() {
 fn compact_keeps_an_orphan_its_repack_rewrote() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
 
     // PUT the pack the repack of the source will write, as an orphan.
     let src = repo.chunk_index().get(&id_b).unwrap();
     let blob = repo
-        .storage
+        .storage()
         .get_range(
             &src.pack_id.storage_key(),
             src.pack_offset,
@@ -228,28 +277,35 @@ fn compact_keeps_an_orphan_its_repack_rewrote() {
         .unwrap()
         .unwrap();
     let mut writer = crate::repo::pack::PackWriter::new_repack(
-        repo.config.min_pack_size as usize,
+        repo.config().min_pack_size as usize,
         repo.content_hash(),
     );
     writer.add_blob(id_b, blob).unwrap();
     let (orphan, _) = writer
-        .flush(repo.storage.as_ref(), repo.crypto.as_ref())
+        .flush(repo.storage().as_ref(), repo.crypto().as_ref())
         .unwrap();
     assert_ne!(orphan, src.pack_id);
     let key = orphan.storage_key();
-    assert!(repo.storage.exists(&key).unwrap());
+    assert!(repo.storage().exists(&key).unwrap());
 
-    let stats =
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(stats.packs_repacked, 1, "{stats:?}");
     assert_eq!(stats.packs_orphan, 1, "{stats:?}");
 
     assert_eq!(repo.chunk_index().get(&id_b).unwrap().pack_id, orphan);
     assert!(
-        repo.storage.exists(&key).unwrap(),
+        repo.storage().exists(&key).unwrap(),
         "the repack output was deleted"
     );
-    assert!(!repo.storage.exists(&src.pack_id.storage_key()).unwrap());
+    assert!(!repo.storage().exists(&src.pack_id.storage_key()).unwrap());
     assert_eq!(
         repo.read_chunk(&id_b).unwrap(),
         b"chunk-b-data-for-compact-test"
@@ -262,12 +318,19 @@ fn compact_after_delete_repacks() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
     // Remove chunk A from the index (as a sweep does once nothing references it)
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
 
     // Compact should detect the dead blob and repack
-    let stats =
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     // Should have repacked (or deleted) at least one pack
     assert!(
@@ -283,26 +346,33 @@ fn compact_after_delete_repacks() {
 
 #[test]
 fn compact_threshold_filters() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
 
     // Store 10 chunks, then delete 1 — that's ~10% dead
     let mut ids = Vec::new();
     for i in 0..10 {
         let data = format!("chunk-number-{i}-for-threshold-test-padding-data");
-        let (id, _, _) = repo
-            .store_chunk(data.as_bytes(), Compression::None, PackType::Data)
+        let (id, _, _) = ws
+            .store_chunk(&repo, data.as_bytes(), Compression::None, PackType::Data)
             .unwrap();
         ids.push(id);
     }
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Remove one chunk
-    repo.chunk_index_mut().remove(&ids[0]);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&ids[0]);
+    repo.unchecked_writer().save_state().unwrap();
 
     // With a very high threshold (90%), nothing should be repacked
-    let stats =
-        compact_repo_without_mark(&mut repo, 90.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        90.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
 }
@@ -313,14 +383,21 @@ fn compact_dry_run_does_not_modify() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
     // Remove chunk A to create dead blobs
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
 
     // Count packs before
     let packs_before = count_all_packs(&repo);
 
-    let stats =
-        compact_repo_without_mark(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        true,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     // Dry run should report activity
     assert!(stats.packs_repacked > 0 || stats.packs_deleted_empty > 0 || stats.space_freed > 0);
@@ -337,26 +414,34 @@ fn compact_dry_run_does_not_modify() {
 
 #[test]
 fn compact_empty_pack_deleted() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, mut ws) = test_repo_plaintext_with_session();
 
     // Store a single chunk and flush
-    let (id_a, _, _) = repo
+    let (id_a, _, _) = ws
         .store_chunk(
+            &repo,
             b"lone-chunk-data-for-empty-pack-test",
             Compression::None,
             PackType::Data,
         )
         .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     // Remove it — the pack is now entirely dead
-    repo.chunk_index_mut().remove(&id_a);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+    repo.unchecked_writer().save_state().unwrap();
     // Subject: deletion mechanics, not the age guard.
     repo.set_pack_grace(std::time::Duration::ZERO);
 
-    let stats =
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats = compact_repo_without_mark(
+        &mut repo.unchecked_writer(),
+        1.0,
+        None,
+        false,
+        4,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     assert_eq!(stats.packs_deleted_empty, 1);
     assert_eq!(stats.packs_repacked, 0);
@@ -364,11 +449,11 @@ fn compact_empty_pack_deleted() {
 }
 
 /// Count total pack files across all shard dirs.
-fn count_all_packs(repo: &crate::repo::Repository) -> usize {
+fn count_all_packs(repo: &crate::repo::Repo) -> usize {
     let mut count = 0;
     for shard in 0u16..256 {
         let prefix = format!("packs/{:02x}/", shard);
-        if let Ok(keys) = repo.storage.list(&prefix) {
+        if let Ok(keys) = repo.storage().list(&prefix) {
             count += keys.iter().filter(|k| !k.ends_with('/')).count();
         }
     }
@@ -392,7 +477,11 @@ enum Listing {
 
 fn repo_on_recording_backend(
     listing: Listing,
-) -> (crate::repo::Repository, crate::testutil::PutLog) {
+) -> (
+    crate::repo::Repo,
+    crate::repo::WriteSession,
+    crate::testutil::PutLog,
+) {
     use crate::testutil::RecordingBackend;
     crate::testutil::init_test_environment();
     let (backend, log) = match listing {
@@ -402,7 +491,7 @@ fn repo_on_recording_backend(
         Listing::UnsizedTree => RecordingBackend::with_unsized_tree_listing(),
         Listing::FailingTree => RecordingBackend::with_failing_tree_listing(),
     };
-    let mut repo = crate::repo::Repository::init_at_format(
+    let repo = crate::repo::Repo::init_at_format(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -412,9 +501,8 @@ fn repo_on_recording_backend(
         crate::repo::RepoFormat::CURRENT,
     )
     .unwrap();
-    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-        .unwrap();
-    (repo, log)
+    let ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
 /// Compact takes pack sizes from the listing and calls `size()` only for
@@ -432,35 +520,43 @@ fn compact_sizes_packs_from_the_listing() {
             Listing::UnsizedTree,
             Listing::FailingTree,
         ] {
-            let (mut repo, log) = repo_on_recording_backend(listing);
+            let (mut repo, mut ws, log) = repo_on_recording_backend(listing);
             // Subject: the listing, not the age guard (no mtimes here).
             repo.set_pack_grace(std::time::Duration::ZERO);
             // A data and a tree chunk land in two packs.
-            let (data_id, _, _) = repo
+            let (data_id, _, _) = ws
                 .store_chunk(
+                    &repo,
                     b"data-chunk-for-listing-test",
                     Compression::None,
                     PackType::Data,
                 )
                 .unwrap();
-            repo.store_chunk(
+            ws.store_chunk(
+                &repo,
                 b"tree-chunk-for-listing-test",
                 Compression::None,
                 PackType::Tree,
             )
             .unwrap();
-            repo.save_state().unwrap();
+            repo.unchecked_writer().save_session(ws).unwrap();
             if dead {
-                repo.chunk_index_mut().remove(&data_id);
-                repo.save_state().unwrap();
+                repo.unchecked_writer().chunk_index_mut().remove(&data_id);
+                repo.unchecked_writer().save_state().unwrap();
             }
             let packs = count_all_packs(&repo) as u64;
             assert!(packs >= 2, "packs {packs}");
 
             log.reset_metadata_counts();
-            let stats =
-                compact_repo_without_mark(&mut repo, 10.0, None, dead, 4, &CancelToken::new())
-                    .unwrap();
+            let stats = compact_repo_without_mark(
+                &mut repo.unchecked_writer(),
+                10.0,
+                None,
+                dead,
+                4,
+                &CancelToken::new(),
+            )
+            .unwrap();
             let ctx = format!("{listing:?} dead={dead}");
             let (tree_lists, sized_lists, sizes) = match listing {
                 Listing::Plain => (0, 256, packs),
@@ -505,15 +601,22 @@ fn compact_tree_listing_ignores_keys_outside_shards() {
     let stray = format!("packs/{}", hex::encode([0xcd; 32]));
     let mut runs = Vec::new();
     for listing in [Listing::Tree, Listing::Sized] {
-        let (mut repo, _log) = repo_on_recording_backend(listing);
+        let (mut repo, _ws, _log) = repo_on_recording_backend(listing);
         store_two_chunks(&mut repo);
-        repo.storage
+        repo.storage()
             .put(&stray, &[0u8; vykar_protocol::PACK_HEADER_SIZE + 64])
             .unwrap();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 0.0, None, false, 4, &CancelToken::new()).unwrap();
-        assert!(repo.storage.exists(&stray).unwrap(), "{listing:?}");
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            0.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert!(repo.storage().exists(&stray).unwrap(), "{listing:?}");
         runs.push((stats.packs_total, stats.packs_orphan));
     }
     assert_eq!(runs[0], runs[1]);
@@ -536,7 +639,7 @@ mod server_side {
     use crate::repo::pack_trailer::{
         TrailerPackType, framed_offsets, read_trailer_from_pack_bytes,
     };
-    use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
+    use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_protocol::{RepackOperationResult, RepackPlanRequest, RepackResultResponse};
     use vykar_storage::{
@@ -760,7 +863,7 @@ mod server_side {
         }
     }
 
-    fn server_repo(mode: Mode, batch: bool, format: RepoFormat) -> (Repository, Log) {
+    fn server_repo(mode: Mode, batch: bool, format: RepoFormat) -> (Repo, Log) {
         init_test_environment();
         let log = Log::default();
         let storage = Box::new(ServerRepackBackend {
@@ -769,7 +872,7 @@ mod server_side {
             batch,
             log: log.clone(),
         });
-        let mut repo = Repository::init_at_format(
+        let mut repo = Repo::init_at_format(
             storage,
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -779,8 +882,6 @@ mod server_side {
             format,
         )
         .unwrap();
-        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-            .unwrap();
         // Subject: repack and deletion mechanics, not the age guard.
         repo.set_pack_grace(std::time::Duration::ZERO);
         (repo, log)
@@ -788,26 +889,26 @@ mod server_side {
 
     /// One pack with a dead blob (a) and a live one (b), plus one entirely
     /// dead pack (c). Returns (b, partly-dead source key, empty source key).
-    fn setup_dead_packs(repo: &mut Repository) -> (ChunkId, String, String) {
+    fn setup_dead_packs(repo: &mut Repo) -> (ChunkId, String, String) {
         let (id_a, id_b) = store_two_chunks(repo);
-        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-            .unwrap();
-        let (id_c, _, _) = repo
+        let mut ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+        let (id_c, _, _) = ws
             .store_chunk(
+                repo,
                 b"chunk-c-data-for-compact-test",
                 Compression::None,
                 PackType::Data,
             )
             .unwrap();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
 
         let partial = pack_of(repo, &id_b);
         let empty = pack_of(repo, &id_c);
         assert_ne!(partial, empty, "c must land in its own pack");
 
-        repo.chunk_index_mut().remove(&id_a);
-        repo.chunk_index_mut().remove(&id_c);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().chunk_index_mut().remove(&id_a);
+        repo.unchecked_writer().chunk_index_mut().remove(&id_c);
+        repo.unchecked_writer().save_state().unwrap();
         (id_b, partial, empty)
     }
 
@@ -815,31 +916,31 @@ mod server_side {
     /// live and b dies, so the live blobs are a prefix of the source and a
     /// server returning the source names their offsets correctly. Returns
     /// (a, partly-dead source key, empty source key).
-    fn setup_dead_packs_live_first(repo: &mut Repository) -> (ChunkId, String, String) {
+    fn setup_dead_packs_live_first(repo: &mut Repo) -> (ChunkId, String, String) {
         let (id_a, id_b) = store_two_chunks(repo);
-        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-            .unwrap();
-        let (id_c, _, _) = repo
+        let mut ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+        let (id_c, _, _) = ws
             .store_chunk(
+                repo,
                 b"chunk-c-data-for-compact-test",
                 Compression::None,
                 PackType::Data,
             )
             .unwrap();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
 
         let partial = pack_of(repo, &id_a);
         let empty = pack_of(repo, &id_c);
         assert_ne!(partial, empty, "c must land in its own pack");
         assert_eq!(repo.chunk_index().get(&id_a).unwrap().pack_offset, 13);
 
-        repo.chunk_index_mut().remove(&id_b);
-        repo.chunk_index_mut().remove(&id_c);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().chunk_index_mut().remove(&id_b);
+        repo.unchecked_writer().chunk_index_mut().remove(&id_c);
+        repo.unchecked_writer().save_state().unwrap();
         (id_a, partial, empty)
     }
 
-    fn pack_of(repo: &Repository, id: &ChunkId) -> String {
+    fn pack_of(repo: &Repo, id: &ChunkId) -> String {
         repo.chunk_index().get(id).unwrap().pack_id.storage_key()
     }
 
@@ -849,8 +950,15 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
@@ -873,8 +981,8 @@ mod server_side {
         assert!(saved < pos(&format!("delete {partial}")));
         assert!(saved < pos(&format!("delete {empty}")));
 
-        assert!(!repo.storage.exists(&partial).unwrap());
-        assert!(!repo.storage.exists(&empty).unwrap());
+        assert!(!repo.storage().exists(&partial).unwrap());
+        assert!(!repo.storage().exists(&empty).unwrap());
         assert_ne!(pack_of(&repo, &id_b), partial);
         assert_eq!(
             repo.read_chunk(&id_b).unwrap(),
@@ -893,13 +1001,20 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         assert!(log.plans.lock().unwrap().is_empty());
         assert!(!log.events().iter().any(|e| e == "repack"));
-        assert!(!repo.storage.exists(&partial).unwrap());
-        assert!(!repo.storage.exists(&empty).unwrap());
+        assert!(!repo.storage().exists(&partial).unwrap());
+        assert!(!repo.storage().exists(&empty).unwrap());
         assert_ne!(pack_of(&repo, &id_b), partial);
         assert_eq!(
             repo.read_chunk(&id_b).unwrap(),
@@ -916,12 +1031,20 @@ mod server_side {
         let (id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let events = log.events();
         assert!(!events.contains(&format!("delete {partial}")), "{events:?}");
         assert!(events.contains(&format!("delete {empty}")), "{events:?}");
-        assert!(repo.storage.exists(&partial).unwrap());
+        assert!(repo.storage().exists(&partial).unwrap());
         assert_eq!(pack_of(&repo, &id_a), partial);
         assert_eq!(
             repo.read_chunk(&id_a).unwrap(),
@@ -936,7 +1059,15 @@ mod server_side {
         log.events.lock().unwrap().clear();
 
         assert!(
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).is_err()
+            compact_repo_without_mark(
+                &mut repo.unchecked_writer(),
+                1.0,
+                None,
+                false,
+                4,
+                &CancelToken::new()
+            )
+            .is_err()
         );
 
         let events = log.events();
@@ -946,8 +1077,8 @@ mod server_side {
                 && !e.starts_with("put index.d/")),
             "{events:?}"
         );
-        assert!(repo.storage.exists(&partial).unwrap());
-        assert!(repo.storage.exists(&empty).unwrap());
+        assert!(repo.storage().exists(&partial).unwrap());
+        assert!(repo.storage().exists(&empty).unwrap());
         assert_eq!(pack_of(&repo, &id_b), partial);
     }
 
@@ -956,8 +1087,15 @@ mod server_side {
     fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
         let (mut repo, _log) = server_repo(mode, batch, RepoFormat::CURRENT);
         setup_dead_packs(&mut repo);
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         (
             stats.packs_repacked,
             stats.packs_deleted_empty,
@@ -978,8 +1116,15 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
@@ -997,8 +1142,8 @@ mod server_side {
             "{events:?}"
         );
 
-        assert!(!repo.storage.exists(&partial).unwrap());
-        assert!(!repo.storage.exists(&empty).unwrap());
+        assert!(!repo.storage().exists(&partial).unwrap());
+        assert!(!repo.storage().exists(&empty).unwrap());
         assert_eq!(
             repo.read_chunk(&id_b).unwrap(),
             b"chunk-b-data-for-compact-test"
@@ -1019,14 +1164,22 @@ mod server_side {
         let (_id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
         assert_eq!(batches.len(), 1, "{events:?}");
         assert!(batches[0].contains(&empty), "{events:?}");
         assert!(!batches[0].contains(&partial), "{events:?}");
-        assert!(repo.storage.exists(&partial).unwrap());
+        assert!(repo.storage().exists(&partial).unwrap());
     }
 
     #[test]
@@ -1035,8 +1188,15 @@ mod server_side {
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let events = log.events();
         let pos = |e: &str| {
@@ -1048,8 +1208,8 @@ mod server_side {
         let saved = pos("put index.h/");
         assert!(saved < pos(&format!("delete {partial}")));
         assert!(saved < pos(&format!("delete {empty}")));
-        assert!(!repo.storage.exists(&partial).unwrap());
-        assert!(!repo.storage.exists(&empty).unwrap());
+        assert!(!repo.storage().exists(&partial).unwrap());
+        assert!(!repo.storage().exists(&empty).unwrap());
         assert_eq!(
             (
                 stats.packs_repacked,
@@ -1067,7 +1227,15 @@ mod server_side {
     fn server_repack_sends_trailers() {
         let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::CURRENT);
         let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
@@ -1081,7 +1249,7 @@ mod server_side {
                 };
                 kept_ops += 1;
                 let trailer =
-                    crate::repo::pack_trailer::PackTrailer::open_blob(blob, repo.crypto.as_ref())
+                    crate::repo::pack_trailer::PackTrailer::open_blob(blob, repo.crypto().as_ref())
                         .unwrap();
                 assert_eq!(trailer.pack_type, TrailerPackType::Repacked);
                 let lengths: Vec<u32> = op.keep_blobs.iter().map(|b| b.length as u32).collect();
@@ -1094,9 +1262,9 @@ mod server_side {
         assert_eq!(kept_ops, 1);
 
         let new_pack = pack_of(&repo, &id_b);
-        let bytes = repo.storage.get(&new_pack).unwrap().unwrap();
+        let bytes = repo.storage().get(&new_pack).unwrap().unwrap();
         assert!(
-            read_trailer_from_pack_bytes(&bytes, repo.crypto.as_ref())
+            read_trailer_from_pack_bytes(&bytes, repo.crypto().as_ref())
                 .unwrap()
                 .is_some()
         );
@@ -1111,12 +1279,19 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         assert!(log.plans.lock().unwrap().is_empty());
-        assert!(!repo.storage.exists(&partial).unwrap());
-        assert!(!repo.storage.exists(&empty).unwrap());
+        assert!(!repo.storage().exists(&partial).unwrap());
+        assert!(!repo.storage().exists(&empty).unwrap());
         assert_eq!(
             repo.read_chunk(&id_b).unwrap(),
             b"chunk-b-data-for-compact-test"
@@ -1142,10 +1317,17 @@ mod server_side {
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let err = compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new())
-            .unwrap_err();
+        let err = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("differ from the layout"), "{err}");
-        assert!(repo.storage.exists(&partial).unwrap());
+        assert!(repo.storage().exists(&partial).unwrap());
         assert_eq!(pack_of(&repo, &id_b), partial);
         let (_dir, cold) = cold_open(&repo);
         assert_eq!(pack_of(&cold, &id_b), partial);
@@ -1159,10 +1341,10 @@ mod server_side {
     }
 
     /// A second handle on `repo`'s storage with an empty cache directory, index loaded.
-    fn cold_open(repo: &Repository) -> (tempfile::TempDir, Repository) {
+    fn cold_open(repo: &Repo) -> (tempfile::TempDir, Repo) {
         let dir = tempfile::tempdir().unwrap();
-        let cold = Repository::open(
-            Box::new(Arc::clone(&repo.storage)),
+        let cold = Repo::open(
+            Box::new(Arc::clone(repo.storage())),
             None,
             Some(dir.path().to_path_buf()),
             OpenOptions::new().with_index(),
@@ -1171,7 +1353,7 @@ mod server_side {
         (dir, cold)
     }
 
-    fn sorted_entries(repo: &Repository) -> Vec<(ChunkId, ChunkIndexEntry)> {
+    fn sorted_entries(repo: &Repo) -> Vec<(ChunkId, ChunkIndexEntry)> {
         let mut v: Vec<_> = repo.chunk_index().iter().collect();
         v.sort_by_key(|(id, _)| *id.as_bytes());
         v
@@ -1179,7 +1361,7 @@ mod server_side {
 
     /// A cold open equals the warm index, `id_b` reads back from it, and
     /// every pack it names exists.
-    fn assert_cold_open_matches(repo: &Repository, id_b: &ChunkId, ctx: &str) {
+    fn assert_cold_open_matches(repo: &Repo, id_b: &ChunkId, ctx: &str) {
         let (_dir, cold) = cold_open(repo);
         assert_eq!(sorted_entries(&cold), sorted_entries(repo), "{ctx}");
         assert_eq!(
@@ -1189,21 +1371,21 @@ mod server_side {
         );
         for (id, entry) in cold.chunk_index().iter() {
             assert!(
-                repo.storage.exists(&entry.pack_id.storage_key()).unwrap(),
+                repo.storage().exists(&entry.pack_id.storage_key()).unwrap(),
                 "{ctx}: pack of {id} is missing"
             );
         }
     }
 
     /// The last segment the head names, decoded.
-    fn last_segment(repo: &Repository) -> SegmentBody {
+    fn last_segment(repo: &Repo) -> SegmentBody {
         let seg = repo.index_head().unwrap().segments.last().unwrap().clone();
         let bytes = repo
-            .storage
+            .storage()
             .get(&index_store::object_key(&seg.name))
             .unwrap()
             .unwrap();
-        index_store::decode_segment_v2(&seg, &bytes, repo.crypto.as_ref()).unwrap()
+        index_store::decode_segment_v2(&seg, &bytes, repo.crypto().as_ref()).unwrap()
     }
 
     fn is_pack_delete(event: &str) -> bool {
@@ -1223,7 +1405,15 @@ mod server_side {
             let (id_b, partial, empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+            compact_repo_without_mark(
+                &mut repo.unchecked_writer(),
+                1.0,
+                None,
+                false,
+                4,
+                &CancelToken::new(),
+            )
+            .unwrap();
 
             let events = log.events();
             let first_delete = events
@@ -1245,8 +1435,8 @@ mod server_side {
                 "{ctx}: {events:?}"
             );
 
-            assert!(!repo.storage.exists(&partial).unwrap(), "{ctx}");
-            assert!(!repo.storage.exists(&empty).unwrap(), "{ctx}");
+            assert!(!repo.storage().exists(&partial).unwrap(), "{ctx}");
+            assert!(!repo.storage().exists(&empty).unwrap(), "{ctx}");
             assert_cold_open_matches(&repo, &id_b, &ctx);
             let seg = last_segment(&repo);
             assert_eq!(seg.relocations.len(), 1, "{ctx}: {seg:?}");
@@ -1255,7 +1445,7 @@ mod server_side {
             // TRL-2 (server repack): the output pack's recorded trailer
             // length is its real frame.
             let output = seg.relocations[0].1.pack_id;
-            let bytes = repo.storage.get(&output.storage_key()).unwrap().unwrap();
+            let bytes = repo.storage().get(&output.storage_key()).unwrap().unwrap();
             let blob_len = crate::repo::pack_trailer::parse_footer(&bytes).unwrap();
             assert_eq!(seg.pack_trailers, vec![(output, 4 + blob_len)], "{ctx}");
         }
@@ -1268,9 +1458,15 @@ mod server_side {
             let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
-            let err =
-                compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new())
-                    .unwrap_err();
+            let err = compact_repo_without_mark(
+                &mut repo.unchecked_writer(),
+                1.0,
+                None,
+                false,
+                4,
+                &CancelToken::new(),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("append-only"), "{err}");
             // The batch route reports the per-pack error, not its own wrapper.
             assert!(!err.to_string().contains("batch-delete"), "{err}");
@@ -1291,11 +1487,11 @@ mod server_side {
             let (_dir, cold) = cold_open(&repo);
             let new_pack = pack_of(&cold, &id_b);
             assert_ne!(new_pack, partial);
-            assert!(repo.storage.exists(&new_pack).unwrap());
+            assert!(repo.storage().exists(&new_pack).unwrap());
             drop(cold);
             assert_cold_open_matches(&repo, &id_b, &ctx);
             assert!(
-                repo.storage.exists(&partial).unwrap(),
+                repo.storage().exists(&partial).unwrap(),
                 "orphan source stays"
             );
         }
@@ -1310,7 +1506,15 @@ mod server_side {
         repo.set_fold_policy(policy);
         log.events.lock().unwrap().clear();
 
-        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let events = log.events();
         let head = repo.index_head().unwrap().clone();
@@ -1375,14 +1579,20 @@ fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
         let mut repo = test_repo_plaintext();
         store_two_chunks(&mut repo);
         let recorder = std::sync::Arc::new(SweepRecorder {
-            inner: std::sync::Arc::clone(&repo.storage),
+            inner: std::sync::Arc::clone(repo.storage()),
             calls: Default::default(),
         });
-        repo.storage = recorder.clone();
+        repo.set_storage_for_test(recorder.clone());
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 10.0, None, dry_run, 4, &CancelToken::new())
-                .unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            10.0,
+            None,
+            dry_run,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         let calls = recorder.calls.lock().unwrap().clone();
         if dry_run {
             assert!(calls.is_empty(), "dry run must not sweep");
@@ -1424,16 +1634,18 @@ fn compact_honours_shutdown_during_analysis() {
     let mut repo = test_repo_plaintext();
     store_two_chunks(&mut repo);
     let counter = std::sync::Arc::new(SizeCounter {
-        inner: std::sync::Arc::clone(&repo.storage),
+        inner: std::sync::Arc::clone(repo.storage()),
         calls: Default::default(),
     });
-    repo.storage = counter.clone();
+    repo.set_storage_for_test(counter.clone());
     let packs_before = count_all_packs(&repo);
     assert!(packs_before > 0);
 
     let shutdown = CancelToken::new();
     shutdown.cancel();
-    let err = compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &shutdown).unwrap_err();
+    let err =
+        compact_repo_without_mark(&mut repo.unchecked_writer(), 1.0, None, false, 4, &shutdown)
+            .unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::Interrupted),
         "{err:?}"
@@ -1454,7 +1666,7 @@ mod store_clock_ages {
     use crate::compress::Compression;
     use crate::repo::control::CancelToken;
     use crate::repo::pack::PackType;
-    use crate::repo::{ChunkerParams, EncryptionMode, Repository, WriteSessionOptions};
+    use crate::repo::{ChunkerParams, EncryptionMode, Repo, WriteSessionOptions};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_storage::{InnerBackend, StorageBackend, StoreNow, delegate_storage_backend};
     use vykar_types::error::Result;
@@ -1542,19 +1754,18 @@ mod store_clock_ages {
     }
 
     /// Three orphan packs, one chunk each; returns their keys.
-    fn three_orphans(repo: &mut Repository) -> Vec<String> {
+    fn three_orphans(repo: &mut Repo) -> Vec<String> {
         let mut keys = Vec::new();
         for i in 0..3 {
-            repo.begin_write_session(&WriteSessionOptions::default())
-                .unwrap();
+            let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
             let data = format!("orphan-chunk-{i}-for-the-age-guard");
-            let (id, _, _) = repo
-                .store_chunk(data.as_bytes(), Compression::None, PackType::Data)
+            let (id, _, _) = ws
+                .store_chunk(repo, data.as_bytes(), Compression::None, PackType::Data)
                 .unwrap();
-            repo.save_state().unwrap();
+            repo.unchecked_writer().save_session(ws).unwrap();
             keys.push(repo.chunk_index().get(&id).unwrap().pack_id.storage_key());
-            repo.chunk_index_mut().remove(&id);
-            repo.save_state().unwrap();
+            repo.unchecked_writer().chunk_index_mut().remove(&id);
+            repo.unchecked_writer().save_state().unwrap();
         }
         keys.dedup();
         assert_eq!(keys.len(), 3, "one pack per chunk");
@@ -1577,7 +1788,7 @@ mod store_clock_ages {
         init_test_environment();
         let backend = Arc::new(MtimeBackend::new(tree));
         let shared: Arc<dyn StorageBackend> = backend.clone();
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(shared),
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -1593,8 +1804,15 @@ mod store_clock_ages {
         backend.set_age(&keys[2], Duration::from_secs(12 * 3600) + minute);
         repo.set_lock_store_time(Some(StoreNow::at(backend.now)));
 
-        let dry =
-            compact_repo_without_mark(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
+        let dry = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            true,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             (
                 dry.packs_orphan,
@@ -1605,8 +1823,15 @@ mod store_clock_ages {
         );
         assert!(keys.iter().all(|k| backend.exists(k).unwrap()));
 
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             (
                 stats.packs_orphan,
@@ -1629,7 +1854,7 @@ mod store_clock_ages {
     #[test]
     fn orphans_of_unknown_age_are_kept() {
         init_test_environment();
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(MemoryBackend::new()),
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -1639,8 +1864,15 @@ mod store_clock_ages {
         )
         .unwrap();
         let keys = three_orphans(&mut repo);
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             (
                 stats.packs_orphan,
@@ -1650,19 +1882,20 @@ mod store_clock_ages {
             (3, 0, 3)
         );
         assert_eq!(stats.packs_deleted_empty, 0);
-        assert!(keys.iter().all(|k| repo.storage.exists(k).unwrap()));
+        assert!(keys.iter().all(|k| repo.storage().exists(k).unwrap()));
     }
 }
 
 /// A repository on a store with mtimes, and the store.
 fn repo_with_mtimes() -> (
-    crate::repo::Repository,
+    crate::repo::Repo,
+    crate::repo::WriteSession,
     std::sync::Arc<crate::testutil::MemoryBackend>,
 ) {
     crate::testutil::init_test_environment();
     let mem = std::sync::Arc::new(crate::testutil::MemoryBackend::with_mtimes());
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> = mem.clone();
-    let mut repo = crate::repo::Repository::init(
+    let repo = crate::repo::Repo::init(
         Box::new(storage),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -1671,9 +1904,8 @@ fn repo_with_mtimes() -> (
         None,
     )
     .unwrap();
-    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-        .unwrap();
-    (repo, mem)
+    let ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+    (repo, ws, mem)
 }
 
 /// 04 "Compact" 3: an orphan pack goes only before every live session's
@@ -1685,18 +1917,19 @@ fn orphans_inside_a_live_horizon_are_kept() {
     use crate::repo::lock::{LiveSession, SessionEntry};
     let now = std::time::SystemTime::now();
     for (elapsed_hours, kept) in [(2u64, true), (0, false)] {
-        let (mut repo, mem) = repo_with_mtimes();
-        let (id, _, _) = repo
+        let (mut repo, mut ws, mem) = repo_with_mtimes();
+        let (id, _, _) = ws
             .store_chunk(
+                &repo,
                 b"an orphan of a live backup",
                 Compression::None,
                 PackType::Data,
             )
             .unwrap();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
         let pack = repo.chunk_index().get(&id).unwrap().pack_id;
-        repo.chunk_index_mut().remove(&id);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().chunk_index_mut().remove(&id);
+        repo.unchecked_writer().save_state().unwrap();
         repo.set_pack_grace(std::time::Duration::ZERO);
         mem.set_mtime(
             &pack.storage_key(),
@@ -1719,17 +1952,24 @@ fn orphans_inside_a_live_horizon_are_kept() {
             }),
             mtime: Some(now),
         }]));
-        let stats =
-            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats = compact_repo_without_mark(
+            &mut repo.unchecked_writer(),
+            1.0,
+            None,
+            false,
+            4,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(stats.packs_orphan, 1);
         if kept {
             assert_eq!(stats.packs_orphan_live, 1);
             assert_eq!(stats.packs_deleted_empty, 0);
-            assert!(repo.storage.exists(&pack.storage_key()).unwrap());
+            assert!(repo.storage().exists(&pack.storage_key()).unwrap());
         } else {
             assert_eq!(stats.packs_orphan_live, 0);
             assert_eq!(stats.packs_deleted_empty, 1);
-            assert!(!repo.storage.exists(&pack.storage_key()).unwrap());
+            assert!(!repo.storage().exists(&pack.storage_key()).unwrap());
         }
     }
 }
@@ -1843,7 +2083,7 @@ fn a_pack_uploaded_during_the_mark_is_not_analysed() {
         old,
     });
     let storage: Arc<dyn StorageBackend> = wrapped.clone();
-    let mut repo = crate::repo::Repository::init(
+    let mut repo = crate::repo::Repo::init(
         Box::new(storage),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),

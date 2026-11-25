@@ -1,11 +1,11 @@
 use crate::config::{EncryptionModeConfig, VykarConfig};
-use crate::repo::{EncryptionMode, RepoFormat, Repository, identity};
+use crate::repo::{EncryptionMode, Repo, RepoFormat, identity};
 use crate::storage;
 use vykar_crypto::select::{self, AutoAeadMode};
 use vykar_types::error::Result;
 
 /// Run `vykar init`.
-pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repository> {
+pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repo> {
     run_at_format(config, passphrase, RepoFormat::CURRENT)
 }
 
@@ -15,7 +15,7 @@ pub fn run_at_format(
     config: &VykarConfig,
     passphrase: Option<&str>,
     format: RepoFormat,
-) -> Result<Repository> {
+) -> Result<Repo> {
     let backend =
         storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
 
@@ -29,7 +29,7 @@ pub fn run_at_format(
         EncryptionModeConfig::Chacha20Poly1305 => EncryptionMode::Chacha20Poly1305,
     };
 
-    let repo = Repository::init_at_format(
+    let repo = Repo::init_at_format(
         backend,
         encryption,
         config.chunker.params(),
@@ -43,8 +43,8 @@ pub fn run_at_format(
     // Failure is non-fatal: the repo already exists on storage.
     if let Err(e) = identity::verify_or_pin(
         &config.repository.url,
-        &repo.config.id,
-        repo.crypto.chunk_hasher().key(),
+        &repo.config().id,
+        repo.crypto().chunk_hasher().key(),
         super::util::cache_dir_from_config(config).as_deref(),
         true, // always pin at init (no pre-existing pin to conflict with)
     ) {

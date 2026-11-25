@@ -15,7 +15,7 @@ use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::ChunkerParams;
 use crate::repo::index_write::FoldPolicy;
 use crate::repo::pack::PackType;
-use crate::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, OpenOptions, Repo, WriteSessionOptions};
 use crate::testutil::init_test_environment;
 
 #[derive(Debug, Clone)]
@@ -58,15 +58,15 @@ fn payload(b: u8) -> Vec<u8> {
 
 struct Fixture {
     scratch: PathBuf,
-    repo: Repository,
+    repo: Repo,
     repo_dir: PathBuf,
     // Last, so the repository's mapped caches are dropped first.
     _dir: tempfile::TempDir,
 }
 
-fn open(repo_dir: &Path, cache: &Path, opts: OpenOptions) -> Repository {
+fn open(repo_dir: &Path, cache: &Path, opts: OpenOptions) -> Repo {
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
-    Repository::open(Box::new(storage), None, Some(cache.to_path_buf()), opts).unwrap()
+    Repo::open(Box::new(storage), None, Some(cache.to_path_buf()), opts).unwrap()
 }
 
 /// A v6 repository with the hard fold limit at `hard_segments` segments.
@@ -77,7 +77,7 @@ fn fixture(hard_segments: usize) -> Fixture {
     let scratch = dir.path().join("scratch");
     fs::create_dir_all(&repo_dir).unwrap();
     fs::create_dir_all(&scratch).unwrap();
-    Repository::init(
+    Repo::init(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -124,30 +124,28 @@ fn sorted_entries(index: &LiveIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
 }
 
 /// Store each `payload(b)` in one write session; returns the IDs.
-fn store(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+fn store(repo: &mut Repo, bs: &[u8]) -> Vec<ChunkId> {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     let ids = bs
         .iter()
         .map(|&b| {
-            repo.store_chunk(&payload(b), Compression::None, PackType::Data)
+            ws.store_chunk(repo, &payload(b), Compression::None, PackType::Data)
                 .unwrap()
                 .0
         })
         .collect();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     ids
 }
 
 /// Store each `payload(b)` in one write session and commit it as a backup
 /// (a backup segment and a snapshot); returns the IDs.
-fn backup(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+fn backup(repo: &mut Repo, bs: &[u8]) -> Vec<ChunkId> {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     let ids = bs
         .iter()
         .map(|&b| {
-            repo.store_chunk(&payload(b), Compression::None, PackType::Data)
+            ws.store_chunk(repo, &payload(b), Compression::None, PackType::Data)
                 .unwrap()
                 .0
         })
@@ -163,6 +161,7 @@ fn backup(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
         hostname: String::new(),
     };
     repo.commit_session_blocking(
+        ws,
         entry,
         b"snapshot".to_vec(),
         &mut crate::repo::file_cache::FileCache::new(),
@@ -174,7 +173,7 @@ fn backup(repo: &mut Repository, bs: &[u8]) -> Vec<ChunkId> {
 
 /// Move the mtime of the head's k-th segment (mod the count) back past
 /// T_pack.
-fn age(repo: &Repository, repo_dir: &Path, k: usize) {
+fn age(repo: &Repo, repo_dir: &Path, k: usize) {
     let segments = &repo.index_head().unwrap().segments;
     if segments.is_empty() {
         return;
@@ -210,7 +209,7 @@ fn removed_by(op: &Op, ids: &[ChunkId]) -> Vec<ChunkId> {
 }
 
 /// Apply a non-session op to `repo`. Returns false when it had nothing to pick.
-fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
+fn apply_maintenance(repo: &mut Repo, op: &Op) -> bool {
     let ids = sorted_ids(repo.chunk_index());
     if ids.is_empty() {
         return false;
@@ -218,15 +217,17 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
     match *op {
         Op::Store(..) | Op::Backup(..) | Op::Age(..) => unreachable!(),
         Op::Remove(..) | Op::Sweep(..) => {
-            let index = repo.chunk_index_mut();
+            let mut writer = repo.unchecked_writer();
+            let index = writer.chunk_index_mut();
             for id in removed_by(op, &ids) {
                 index.remove(&id);
             }
         }
         Op::Relocate(i, p, size) => {
-            repo.chunk_index_mut()
+            repo.unchecked_writer()
+                .chunk_index_mut()
                 .set_pack_trailer(PackId::from_bytes([p; 32]), 0);
-            let moved = repo.chunk_index_mut().update_location(
+            let moved = repo.unchecked_writer().chunk_index_mut().update_location(
                 &ids[i % ids.len()],
                 PackId::from_bytes([p; 32]),
                 u64::from(size) * 7,
@@ -236,10 +237,10 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
         }
         Op::Fold => {
             repo.request_index_fold();
-            repo.mark_index_dirty();
+            repo.unchecked_writer().mark_index_dirty();
         }
     }
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
     true
 }
 
@@ -259,7 +260,7 @@ proptest! {
         for op in &ops {
             // A fresh reading of "now" for every write, as a new lock hold
             // takes one: the ages are listed again.
-            t.repo.clear_lock_fence();
+            t.repo.clear_lock_state();
             super::helpers::set_store_now(&mut t.repo);
             // The entries before the op: a fold (or a fold that both the
             // warm and the cold reader build from the same wrong base) must

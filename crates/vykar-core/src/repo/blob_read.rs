@@ -5,7 +5,7 @@
 //! plaintext, belong to the caller.
 //!
 //! Users: restore's file-data reads and
-//! `Repository::read_chunks_coalesced_into` (whole item-stream loads).
+//! `Repo::read_chunks_coalesced_into` (whole item-stream loads).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -64,8 +64,8 @@ pub(crate) enum Published {
 
 /// One index write, from the state to publish to the head that names it.
 /// Built by [`PublishMachine::publish`] (what
-/// `Repository::publish_index_state` does) or [`PublishMachine::base`]
-/// (`Repository::put_base`); its output is the head written, or the
+/// `Repo::publish_index_state` does) or [`PublishMachine::base`]
+/// (`Repo::put_base`); its output is the head written, or the
 /// previous head when nothing was, or [`Published::Taken`].
 pub(crate) struct PublishMachine {
     /// `Some(request)`: a publish, which took `request` from the
@@ -105,7 +105,7 @@ impl HeadCheck {
     /// fence is the last step before the head PUT on every path.
     ///
     /// [`HEAD_LANDING_ALLOWANCE`]: super::ages::HEAD_LANDING_ALLOWANCE
-    fn run(&self, repo: &super::Repository) -> Result<()> {
+    fn run(&self, repo: &super::Repo) -> Result<()> {
         let clock = repo.host_env().clock.as_ref();
         lock::head_landing_check(
             &self.session_id,
@@ -247,10 +247,10 @@ impl PublishMachine {
     /// repeat); a fold of the foldable prefix when a fold was requested or
     /// the foldable prefix (with the write's own segment, when foldable)
     /// reaches the hard limit, and there is something to fold. Takes
-    /// `repo.fold_requested`. See `Repository::publish_index_state` for
+    /// `repo.fold_requested`. See `Repo::publish_index_state` for
     /// `backup` and the errors.
     pub(crate) fn publish(
-        repo: &mut super::Repository,
+        repo: &mut super::Repo,
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
         backup: bool,
@@ -270,7 +270,7 @@ impl PublishMachine {
         }
     }
 
-    /// A fold of the index's current state (`Repository::put_base`):
+    /// A fold of the index's current state (`Repo::put_base`):
     /// `Full` (or no `prev`) folds every segment, `Eligible` the foldable
     /// prefix of `prev`'s chain; with nothing foldable it writes nothing
     /// and outputs `prev`.
@@ -351,6 +351,7 @@ impl PublishMachine {
                 Some(kind) => {
                     write_step(
                         repo,
+                        cx.fence,
                         &mut w,
                         kind,
                         self.head_check.as_ref(),
@@ -378,7 +379,7 @@ impl PublishMachine {
 
     fn start(
         &mut self,
-        repo: &mut super::Repository,
+        repo: &mut super::Repo,
         prev: Option<IndexHead>,
         seg: Option<SegmentBody>,
     ) -> Result<State> {
@@ -476,7 +477,7 @@ impl PublishMachine {
     /// The fold-prefix step: the segments' ages (one listing per lock
     /// hold; a failed listing means unknown, so young), the decision, and
     /// the bytes a partial fold needs that the local cache lacks.
-    fn fold_prefix(&mut self, repo: &mut super::Repository, prep: PrefixPrep) -> Result<State> {
+    fn fold_prefix(&mut self, repo: &mut super::Repo, prep: PrefixPrep) -> Result<State> {
         if repo.needs_segment_ages(&prep.prev.segments)
             && let Err(e) = repo.load_segment_ages()
         {
@@ -570,12 +571,7 @@ impl PublishMachine {
     /// Fold the first `k` (foldable) segments of `prep.prev`, when that
     /// folds something and the fold was asked for or the prefix reaches the
     /// hard limit; otherwise the write's own segment, or nothing.
-    fn decide(
-        &mut self,
-        repo: &mut super::Repository,
-        prep: PrefixPrep,
-        k: usize,
-    ) -> Result<State> {
+    fn decide(&mut self, repo: &mut super::Repo, prep: PrefixPrep, k: usize) -> Result<State> {
         let PrefixPrep {
             prev,
             own,
@@ -630,7 +626,7 @@ impl PublishMachine {
     /// An empty change: nothing to write, or a head only when a sweep is
     /// pending or the head is forced (the same state, a new generation and
     /// the sweep).
-    fn unchanged(&mut self, repo: &mut super::Repository, prev: IndexHead) -> Result<State> {
+    fn unchanged(&mut self, repo: &mut super::Repo, prev: IndexHead) -> Result<State> {
         if repo.pending_sweep.is_none() && !self.force_head {
             debug!("index unchanged, nothing to write");
             return Ok(State::Done(Some(self.bookkeeping(repo, prev, true))));
@@ -651,7 +647,7 @@ impl PublishMachine {
     /// index's state; a partial fold writes the index's loaded state (the
     /// whole chain) or the table plus the foldable prefix, and leaves the
     /// index untouched until the finish.
-    fn fold_body(&mut self, repo: &mut super::Repository, prep: FoldPrep) -> Result<State> {
+    fn fold_body(&mut self, repo: &mut super::Repo, prep: FoldPrep) -> Result<State> {
         let FoldPrep {
             prev,
             seg,
@@ -748,7 +744,7 @@ impl PublishMachine {
     /// bookkeeping. Nothing here fails the write: the head is published. (A
     /// kept segment whose cached copy does not verify is fetched again; if
     /// that fails the index is emptied with a warning and reloads.)
-    fn finish(&mut self, repo: &mut super::Repository, w: Writes) -> IndexHead {
+    fn finish(&mut self, repo: &mut super::Repo, w: Writes) -> IndexHead {
         let Writes { head, finish, .. } = w;
         match finish {
             Finish::Unchanged => {
@@ -831,12 +827,7 @@ impl PublishMachine {
 
     /// A publish's head bookkeeping (and, for an unchanged state, dropping
     /// the edits); a base write alone leaves both to its caller.
-    fn bookkeeping(
-        &self,
-        repo: &mut super::Repository,
-        head: IndexHead,
-        unchanged: bool,
-    ) -> IndexHead {
+    fn bookkeeping(&self, repo: &mut super::Repo, head: IndexHead, unchanged: bool) -> IndexHead {
         if self.publish.is_some() {
             if unchanged {
                 repo.chunk_index.discard_edits();
@@ -850,7 +841,7 @@ impl PublishMachine {
 
     /// The head create found the generation taken: undo as after an error
     /// and keep a backup's own segment for its retry.
-    fn lost(&mut self, repo: &mut super::Repository, w: Writes) -> State {
+    fn lost(&mut self, repo: &mut super::Repo, w: Writes) -> State {
         let generation = w.head.generation;
         self.on_error(repo);
         tracing::info!(
@@ -873,7 +864,7 @@ impl PublishMachine {
 
     /// Undo what an error leaves behind: a fold's backup additions, and a
     /// publish's fold request.
-    fn on_error(&mut self, repo: &mut super::Repository) {
+    fn on_error(&mut self, repo: &mut super::Repo) {
         if self.added {
             // The index is replaced only after the head PUT; the backup's
             // additions were its only edits.
@@ -928,7 +919,7 @@ impl Writes {
 
 /// The segment path: `seg` as one more segment after `prev`'s chain.
 fn segment_writes(
-    repo: &mut super::Repository,
+    repo: &mut super::Repo,
     prev: IndexHead,
     seg: SegmentBody,
     obj: PackedObject,
@@ -961,7 +952,7 @@ fn segment_writes(
 
 /// Whether the write's own segment can go into a base: a maintenance
 /// segment, or any at zero grace (a backup's own segment is age 0).
-fn own_foldable(repo: &super::Repository, seg: &SegmentBody) -> bool {
+fn own_foldable(repo: &super::Repo, seg: &SegmentBody) -> bool {
     seg.kind == SegmentKind::Maintenance || repo.segment_grace().is_zero()
 }
 
@@ -974,7 +965,7 @@ fn own_foldable(repo: &super::Repository, seg: &SegmentBody) -> bool {
 /// Under the lock a named object is never deleted, so an absent one is
 /// damage.
 fn segment_bytes(
-    repo: &super::Repository,
+    repo: &super::Repo,
     segments: &[SegmentRef],
     k: usize,
 ) -> Result<Vec<Option<Vec<u8>>>> {
@@ -1026,7 +1017,7 @@ fn segment_bytes(
 /// verified copy, else (a cached file that [`segment_bytes`] saw but that
 /// does not verify, or went since) one GET from the store.
 fn segment_body(
-    repo: &super::Repository,
+    repo: &super::Repo,
     dir: Option<&std::path::Path>,
     r: &SegmentRef,
     bytes: Option<&[u8]>,
@@ -1056,7 +1047,7 @@ fn segment_body(
 /// Fold: the sweep, the head naming the base, the kept segments and the
 /// appended one, with `prev`'s other live objects as retired, and its
 /// bytes.
-fn fold_head(repo: &mut super::Repository, base: FoldBase, generation: u64) -> Result<State> {
+fn fold_head(repo: &mut super::Repo, base: FoldBase, generation: u64) -> Result<State> {
     let FoldBase {
         prev,
         removes,
@@ -1196,7 +1187,8 @@ fn slow_index_write_after_create(limit: std::time::Duration) -> VykarError {
 /// One storage step of a write. `listed_at`: see
 /// [`PublishMachine::listed_at`].
 fn write_step(
-    repo: &mut super::Repository,
+    repo: &mut super::Repo,
+    fence: &super::writer::Fence,
     w: &mut Writes,
     kind: StepKind,
     head_check: Option<&HeadCheck>,
@@ -1207,7 +1199,7 @@ fn write_step(
             "BUG: index write step {kind:?} has nothing to write"
         ))
     };
-    let stamp = |repo: &super::Repository| MarkerStamp::now(repo.host_env().clock.as_ref());
+    let stamp = |repo: &super::Repo| MarkerStamp::now(repo.host_env().clock.as_ref());
     match kind {
         StepKind::PutBase => {
             let obj = w.base.take().ok_or_else(missing)?;
@@ -1259,7 +1251,7 @@ fn write_step(
                     index_store::note_fallback(&mut repo.head_fallback, None);
                 }
             }
-            repo.check_lock_fence()?;
+            fence.check()?;
             match head_check {
                 Some(check) => check.run(repo),
                 None => Ok(()),
@@ -1330,9 +1322,9 @@ fn write_step(
             // A lock-free maintenance run's marker check (04 step 9) guards
             // its deletes: when it fails the collection is skipped (the
             // head has landed; the run's next check ends it). A lock-free
-            // backup's handle has no fence; under the lock nothing changes.
+            // backup's fence passes; under the lock nothing changes.
             if repo.is_lock_free()
-                && let Err(e) = repo.check_lock_fence()
+                && let Err(e) = fence.check()
             {
                 warn!("index garbage collection skipped: {e}");
                 return Ok(());

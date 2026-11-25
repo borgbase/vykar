@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use vykar_core::repo::{OpenOptions, Repository};
+use vykar_core::repo::{OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
 
 struct CliFixture {
@@ -23,8 +23,8 @@ struct CliFixture {
 }
 
 /// Point this test process's own per-user directories at a per-process temp
-/// directory: some tests open repositories in-process (`Repository::open`,
-/// `Repository::init`), which read the installation ID from the config
+/// directory: some tests open repositories in-process (`Repo::open`,
+/// `Repo::init`), which read the installation ID from the config
 /// directory and write identity pins into the cache directory. The child
 /// processes get the fixture's own dirs through `CliFixture::test_env`.
 #[allow(unsafe_code)]
@@ -247,7 +247,7 @@ fn parse_snapshot_name(output: &str) -> String {
 
 fn delete_pack_for_first_chunk(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
+    let repo = Repo::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
     let (_chunk_id, entry) = repo
         .chunk_index()
         .iter()
@@ -263,7 +263,7 @@ fn delete_pack_for_first_chunk(repo_dir: &Path) {
 
 fn corrupt_first_snapshot(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
+    let repo = Repo::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
     let entry = repo
         .manifest()
         .snapshots
@@ -357,7 +357,7 @@ fn init_empty_v3(repo_dir: &Path) {
 
     std::fs::create_dir_all(repo_dir).unwrap();
     let storage = || Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repository::init(
+    Repo::init(
         storage(),
         vykar_core::repo::EncryptionMode::None,
         vykar_core::repo::ChunkerParams::default(),
@@ -367,7 +367,7 @@ fn init_empty_v3(repo_dir: &Path) {
     )
     .unwrap();
     let cache = TempDir::new().unwrap();
-    let repo = Repository::open(
+    let repo = Repo::open(
         storage(),
         None,
         Some(cache.path().to_path_buf()),
@@ -382,7 +382,7 @@ fn init_empty_v3(repo_dir: &Path) {
         ObjectType::ChunkIndex,
         b"index",
         64,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
         |buf| {
             vykar_core::compress::compress_stream_zstd(buf, 3, |encoder| {
                 rmp_serde::encode::write(encoder, &blob)?;

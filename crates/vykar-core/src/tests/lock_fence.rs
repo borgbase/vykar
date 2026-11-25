@@ -5,7 +5,7 @@ use chrono::Utc;
 use crate::compress::Compression;
 use crate::repo::lock::{acquire_lock, build_lock_fence, release_lock, verify_lock_validity};
 use crate::repo::pack::PackType;
-use crate::repo::{HostEnv, SystemClock};
+use crate::repo::{Fence, HostEnv, SystemClock};
 use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
 use vykar_storage::StorageBackend;
@@ -140,19 +140,21 @@ fn fence_refreshes_lock_file() {
 fn fence_blocks_persist_index() {
     crate::testutil::init_test_environment();
 
-    let mut repo = crate::testutil::test_repo_plaintext();
+    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
 
     // Store a chunk to dirty the index.
-    repo.store_chunk(b"hello world", Compression::None, PackType::Data)
+    ws.store_chunk(&repo, b"hello world", Compression::None, PackType::Data)
         .unwrap();
 
-    // Install an always-fail fence.
+    // An always-fail fence.
     let fail_fence: Arc<dyn Fn() -> vykar_types::error::Result<()> + Send + Sync> =
         Arc::new(|| Err(VykarError::LockExpired("test fence".into())));
-    repo.set_lock_fence(fail_fence);
 
-    // save_state should fail due to the fence.
-    let err = repo.save_state().unwrap_err();
+    // save_session should fail due to the fence.
+    let err = repo
+        .writer(Fence::lock(fail_fence))
+        .save_session(ws)
+        .unwrap_err();
     assert!(
         matches!(err, VykarError::LockExpired(_)),
         "expected LockExpired, got: {err}"
@@ -166,22 +168,25 @@ fn fence_blocks_persist_index_via_mark_dirty() {
     let mut repo = crate::testutil::test_repo_plaintext();
 
     // Edit the index so save_state will try to persist it.
-    repo.chunk_index_mut().add(
+    repo.unchecked_writer().chunk_index_mut().add(
         vykar_types::chunk_id::ChunkId::from_bytes([7; 32]),
         10,
         vykar_types::pack_id::PackId::from_bytes([8; 32]),
         0,
     );
-    repo.chunk_index_mut()
+    repo.unchecked_writer()
+        .chunk_index_mut()
         .set_pack_trailer(vykar_types::pack_id::PackId::from_bytes([8; 32]), 0);
 
-    // Install an always-fail fence.
+    // An always-fail fence.
     let fail_fence: Arc<dyn Fn() -> vykar_types::error::Result<()> + Send + Sync> =
         Arc::new(|| Err(VykarError::LockExpired("test fence".into())));
-    repo.set_lock_fence(fail_fence);
 
     // save_state should fail due to the fence.
-    let err = repo.save_state().unwrap_err();
+    let err = repo
+        .writer(Fence::lock(fail_fence))
+        .save_state()
+        .unwrap_err();
     assert!(
         matches!(err, VykarError::LockExpired(_)),
         "expected LockExpired, got: {err}"
@@ -192,14 +197,14 @@ fn fence_blocks_persist_index_via_mark_dirty() {
 fn fence_none_allows_writes() {
     crate::testutil::init_test_environment();
 
-    let mut repo = crate::testutil::test_repo_plaintext();
+    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
 
     // Store a chunk.
-    repo.store_chunk(b"hello world", Compression::None, PackType::Data)
+    ws.store_chunk(&repo, b"hello world", Compression::None, PackType::Data)
         .unwrap();
 
-    // No fence installed — save_state should succeed.
-    repo.save_state().unwrap();
+    // An unchecked fence — save_session succeeds.
+    repo.unchecked_writer().save_session(ws).unwrap();
 }
 
 #[test]
@@ -208,10 +213,10 @@ fn maintenance_lock_fence_blocks_stale_write() {
 
     use crate::commands::util::with_maintenance_lock;
     use crate::repo::ChunkerParams;
-    use crate::repo::{EncryptionMode, Repository};
+    use crate::repo::{EncryptionMode, Repo};
 
     let storage = MemoryBackend::new();
-    let mut repo = Repository::init(
+    let mut repo = Repo::init(
         Box::new(storage),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -223,19 +228,19 @@ fn maintenance_lock_fence_blocks_stale_write() {
 
     let result = with_maintenance_lock(&mut repo, |repo| {
         // Begin a write session so save_state has something to write.
-        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())?;
-        repo.store_chunk(b"data", Compression::None, PackType::Data)?;
+        let mut ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+        ws.store_chunk(repo, b"data", Compression::None, PackType::Data)?;
 
         // Delete the lock file to simulate suspension/expiry.
-        let lock_keys = repo.storage.list("locks/").unwrap();
+        let lock_keys = repo.storage().list("locks/").unwrap();
         for key in &lock_keys {
             if key.ends_with(".json") {
-                repo.storage.delete(key).unwrap();
+                repo.storage().delete(key).unwrap();
             }
         }
 
         // save_state should fail because the fence detects the deleted lock.
-        repo.save_state()
+        repo.save_session(ws)
     });
 
     let err = result.unwrap_err();

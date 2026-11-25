@@ -23,7 +23,7 @@ use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::tree_cache::TreeChunkCache;
 use crate::repo::{
-    ChunkerParams, EncryptionMode, OpenOptions, Repository, TreeChunkSource, WriteSessionOptions,
+    ChunkerParams, EncryptionMode, OpenOptions, Repo, TreeChunkSource, WriteSessionOptions,
 };
 use crate::testutil::{PutLog, RecordingBackend, init_test_environment};
 
@@ -56,7 +56,7 @@ fn cached_ids(root: &Path) -> HashSet<ChunkId> {
     ids
 }
 
-fn cache_of(repo: &Repository) -> &TreeChunkCache {
+fn cache_of(repo: &Repo) -> &TreeChunkCache {
     repo.tree_cache()
         .expect("test repositories have a cache dir")
 }
@@ -65,14 +65,14 @@ fn cache_of(repo: &Repository) -> &TreeChunkCache {
 // Reads over explicit chunk lists (in-memory repository)
 // ---------------------------------------------------------------------------
 
-fn memory_repo(mode: EncryptionMode) -> (Repository, PutLog) {
+fn memory_repo(mode: EncryptionMode) -> (Repo, crate::repo::WriteSession, PutLog) {
     init_test_environment();
     let (backend, log) = RecordingBackend::new();
     let pass = match mode {
         EncryptionMode::None => None,
         _ => Some(PASS),
     };
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         mode,
         ChunkerParams::default(),
@@ -81,26 +81,29 @@ fn memory_repo(mode: EncryptionMode) -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    (repo, log)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
 /// Store `n` distinct tree chunks (one pack) and return their concatenation
 /// and their locations, in store order.
-fn store_tree_chunks(repo: &mut Repository, n: usize) -> (Vec<u8>, Vec<Loc>) {
+fn store_tree_chunks(
+    repo: &mut Repo,
+    ws: &mut crate::repo::WriteSession,
+    n: usize,
+) -> (Vec<u8>, Vec<Loc>) {
     let mut stream = Vec::new();
     let mut ids = Vec::new();
     for i in 0..n {
         let data = format!("tree-cache-chunk-{i:04}-{}", "y".repeat(i * 13)).into_bytes();
         ids.push(
-            repo.store_chunk(&data, Compression::None, PackType::Tree)
+            ws.store_chunk(repo, &data, Compression::None, PackType::Tree)
                 .unwrap()
                 .0,
         );
         stream.extend_from_slice(&data);
     }
-    crate::testutil::save_and_resume(repo);
+    crate::testutil::save_and_resume(repo, ws);
     let locs = ids
         .iter()
         .map(|id| {
@@ -111,7 +114,7 @@ fn store_tree_chunks(repo: &mut Repository, n: usize) -> (Vec<u8>, Vec<Loc>) {
     (stream, locs)
 }
 
-fn read(repo: &Repository, locs: &[Loc], source: TreeChunkSource) -> Vec<u8> {
+fn read(repo: &Repo, locs: &[Loc], source: TreeChunkSource) -> Vec<u8> {
     let mut out = Vec::new();
     repo.read_tree_chunks_into(locs, &mut out, &CancelToken::new(), source)
         .unwrap();
@@ -119,8 +122,8 @@ fn read(repo: &Repository, locs: &[Loc], source: TreeChunkSource) -> Vec<u8> {
 }
 
 /// The stored bytes of `loc` in its pack (one range read).
-fn pack_bytes(repo: &Repository, loc: &Loc) -> Vec<u8> {
-    repo.storage
+fn pack_bytes(repo: &Repo, loc: &Loc) -> Vec<u8> {
+    repo.storage()
         .get_range(&loc.1.storage_key(), loc.2, u64::from(loc.3))
         .unwrap()
         .unwrap()
@@ -133,12 +136,12 @@ fn clear(cache: &TreeChunkCache) {
 #[test]
 fn store_caches_new_tree_chunks_as_stored_bytes_only() {
     for mode in modes() {
-        let (mut repo, _log) = memory_repo(mode.clone());
-        let (_, locs) = store_tree_chunks(&mut repo, 3);
-        let (data_id, _, _) = repo
-            .store_chunk(b"a data chunk", Compression::None, PackType::Data)
+        let (mut repo, mut ws, _log) = memory_repo(mode.clone());
+        let (_, locs) = store_tree_chunks(&mut repo, &mut ws, 3);
+        let (data_id, _, _) = ws
+            .store_chunk(&repo, b"a data chunk", Compression::None, PackType::Data)
             .unwrap();
-        crate::testutil::save_and_resume(&mut repo);
+        crate::testutil::save_and_resume(&mut repo, &mut ws);
         let cache = cache_of(&repo);
         for loc in &locs {
             assert_eq!(
@@ -154,8 +157,8 @@ fn store_caches_new_tree_chunks_as_stored_bytes_only() {
 #[test]
 fn cached_item_stream_reads_no_tree_pack() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 5);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 5);
         log.reset_get_range_count();
         assert_eq!(read(&repo, &locs, TreeChunkSource::CacheFirst), stream);
         assert_eq!(log.get_range_count(), 0, "{mode:?}");
@@ -166,8 +169,8 @@ fn cached_item_stream_reads_no_tree_pack() {
 
 #[test]
 fn a_storage_read_neither_reads_nor_fills_the_cache() {
-    let (mut repo, log) = memory_repo(EncryptionMode::Aes256Gcm);
-    let (stream, locs) = store_tree_chunks(&mut repo, 4);
+    let (mut repo, mut ws, log) = memory_repo(EncryptionMode::Aes256Gcm);
+    let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 4);
     clear(cache_of(&repo));
     log.reset_get_range_count();
     assert_eq!(read(&repo, &locs, TreeChunkSource::Storage), stream);
@@ -178,8 +181,8 @@ fn a_storage_read_neither_reads_nor_fills_the_cache() {
 #[test]
 fn a_miss_downloads_and_fills() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 5);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 5);
         clear(cache_of(&repo));
         log.reset_get_range_count();
         assert_eq!(read(&repo, &locs, TreeChunkSource::CacheFirst), stream);
@@ -196,8 +199,8 @@ fn a_miss_downloads_and_fills() {
 #[test]
 fn a_corrupt_entry_is_replaced_from_storage() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 5);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 5);
         let path = cache_of(&repo).entry_path(&locs[2].0);
         let mut bytes = std::fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 0x01;
@@ -225,8 +228,8 @@ fn a_corrupt_entry_is_replaced_from_storage() {
 #[test]
 fn an_entry_under_the_wrong_name_is_rejected() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 3);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 3);
         let cache = cache_of(&repo);
         std::fs::copy(cache.entry_path(&locs[0].0), cache.entry_path(&locs[1].0)).unwrap();
 
@@ -238,10 +241,10 @@ fn an_entry_under_the_wrong_name_is_rejected() {
 
 #[test]
 fn a_pointer_missing_from_the_index_fails_even_when_cached() {
-    let (mut repo, _log) = memory_repo(EncryptionMode::None);
-    let (_, locs) = store_tree_chunks(&mut repo, 3);
+    let (mut repo, mut ws, _log) = memory_repo(EncryptionMode::None);
+    let (_, locs) = store_tree_chunks(&mut repo, &mut ws, 3);
     let ids: Vec<ChunkId> = locs.iter().map(|l| l.0).collect();
-    repo.chunk_index_mut().remove(&ids[1]);
+    repo.unchecked_writer().chunk_index_mut().remove(&ids[1]);
     assert!(cache_of(&repo).contains(&ids[1]));
     let err = commands::list::load_item_stream_from_ptrs(&mut repo, &ids, &CancelToken::new())
         .unwrap_err();
@@ -254,7 +257,7 @@ fn a_pointer_missing_from_the_index_fails_even_when_cached() {
 #[test]
 fn read_tree_chunks_split_bounds_match_per_chunk_reads() {
     for mode in modes() {
-        let (mut repo, _log) = memory_repo(mode.clone());
+        let (mut repo, mut ws, _log) = memory_repo(mode.clone());
         // 20 tree chunks in 3 packs.
         let mut locs: Vec<Loc> = Vec::new();
         for pack in 0..3 {
@@ -263,13 +266,13 @@ fn read_tree_chunks_split_bounds_match_per_chunk_reads() {
                     break;
                 }
                 let data = format!("split-{pack}-{i:02}-{}", "q".repeat(i * 31)).into_bytes();
-                let id = repo
-                    .store_chunk(&data, Compression::None, PackType::Tree)
+                let id = ws
+                    .store_chunk(&repo, &data, Compression::None, PackType::Tree)
                     .unwrap()
                     .0;
                 locs.push((id, PackId::from_bytes([0; 32]), 0, 0));
             }
-            crate::testutil::save_and_resume(&mut repo);
+            crate::testutil::save_and_resume(&mut repo, &mut ws);
         }
         for loc in &mut locs {
             let e = repo.chunk_index().get(&loc.0).unwrap();
@@ -318,7 +321,7 @@ fn read_tree_chunks_split_bounds_match_per_chunk_reads() {
 // Lazy stream (restore)
 // ---------------------------------------------------------------------------
 
-fn read_lazy(repo: &Repository, locs: &[Loc], log: &PutLog) -> (Vec<u8>, u64) {
+fn read_lazy(repo: &Repo, locs: &[Loc], log: &PutLog) -> (Vec<u8>, u64) {
     let shutdown = CancelToken::new();
     let mut stream =
         LazyItemStream::for_test_with_cache(repo, locs.to_vec(), false, 1 << 20, &shutdown);
@@ -331,8 +334,8 @@ fn read_lazy(repo: &Repository, locs: &[Loc], log: &PutLog) -> (Vec<u8>, u64) {
 #[test]
 fn lazy_stream_reads_cached_chunks_without_range_reads() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 6);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 6);
         let (out, reads) = read_lazy(&repo, &locs, &log);
         assert_eq!(out, stream, "{mode:?}");
         assert_eq!(reads, 0, "{mode:?}");
@@ -342,8 +345,8 @@ fn lazy_stream_reads_cached_chunks_without_range_reads() {
 #[test]
 fn lazy_stream_mixes_cached_and_uncached_chunks() {
     for mode in modes() {
-        let (mut repo, log) = memory_repo(mode.clone());
-        let (stream, locs) = store_tree_chunks(&mut repo, 11);
+        let (mut repo, mut ws, log) = memory_repo(mode.clone());
+        let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 11);
         let cache = cache_of(&repo);
         // Uncached: 0, 3, 6, 9 and the run 10..; chunks are in one pack in
         // stream order, so each maximal uncached run is one range read.
@@ -365,8 +368,8 @@ fn lazy_stream_mixes_cached_and_uncached_chunks() {
 
 #[test]
 fn lazy_stream_fills_the_cache_on_miss() {
-    let (mut repo, log) = memory_repo(EncryptionMode::Aes256Gcm);
-    let (stream, locs) = store_tree_chunks(&mut repo, 6);
+    let (mut repo, mut ws, log) = memory_repo(EncryptionMode::Aes256Gcm);
+    let (stream, locs) = store_tree_chunks(&mut repo, &mut ws, 6);
     clear(cache_of(&repo));
     let (out, reads) = read_lazy(&repo, &locs, &log);
     assert_eq!(out, stream);
@@ -467,13 +470,13 @@ impl Host {
 
     /// A handle that records range reads, on this host's cache dir (or
     /// `cache_dir`).
-    fn open_with_cache(&self, cache_dir: Option<PathBuf>) -> (Repository, Reads) {
+    fn open_with_cache(&self, cache_dir: Option<PathBuf>) -> (Repo, Reads) {
         let reads = Reads::default();
         let backend = CountingBackend {
             inner: LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap(),
             reads: Arc::clone(&reads),
         };
-        let repo = Repository::open(
+        let repo = Repo::open(
             Box::new(backend),
             self.pass,
             cache_dir,
@@ -483,7 +486,7 @@ impl Host {
         (repo, reads)
     }
 
-    fn open(&self) -> (Repository, Reads) {
+    fn open(&self) -> (Repo, Reads) {
         self.open_with_cache(None)
     }
 
@@ -508,7 +511,7 @@ impl Host {
 }
 
 /// The storage keys of the packs that hold `ids`, by the index of `repo`.
-fn pack_keys(repo: &Repository, ids: &[ChunkId]) -> HashSet<String> {
+fn pack_keys(repo: &Repo, ids: &[ChunkId]) -> HashSet<String> {
     ids.iter()
         .map(|id| repo.chunk_index().get(id).unwrap().pack_id.storage_key())
         .collect()

@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::index::{IndexBlob, LegacyChunkIndex};
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
-use crate::repo::{OpenOptions, RepoConfig, RepoFormat, Repository};
+use crate::repo::{OpenOptions, Repo, RepoConfig, RepoFormat};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
 
@@ -77,7 +77,7 @@ pub(crate) fn downgrade_to_legacy(
     let scratch = tempfile::tempdir().unwrap();
     let storage =
         vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
-    let repo = Repository::open(
+    let repo = Repo::open(
         Box::new(storage),
         passphrase,
         Some(scratch.path().to_path_buf()),
@@ -92,9 +92,9 @@ pub(crate) fn downgrade_to_legacy(
     let blob = legacy_index_blob(
         &(&repo.chunk_index().to_chunk_index()).into(),
         GENERATION,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     );
-    let repo_id = repo.config.id.clone();
+    let repo_id = repo.config().id.clone();
     drop(repo);
 
     std::fs::write(repo_dir.join("index"), blob).unwrap();
@@ -152,12 +152,12 @@ pub fn resolved_repo(config: VykarConfig, sources: Vec<SourceEntry>) -> Resolved
     }
 }
 
-pub fn open_local_repo(repo_dir: &Path) -> Repository {
+pub fn open_local_repo(repo_dir: &Path) -> Repo {
     init_test_environment();
     let storage = Box::new(
         vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
     );
-    Repository::open(
+    Repo::open(
         storage,
         None,
         None,
@@ -185,7 +185,7 @@ pub fn clear_tree_cache(repo_dir: &Path) {
 }
 
 /// Load the on-disk `SnapshotListCache` for an unencrypted local repo without
-/// going through `Repository::open` (which would heal the cache against the
+/// going through `Repo::open` (which would heal the cache against the
 /// remote `snapshots/` listing). Lets tests observe what delete/prune persisted
 /// to the cache before any reopen.
 pub fn load_snapshot_cache_from_disk(
@@ -552,7 +552,7 @@ pub(crate) const PAST_T_PACK: std::time::Duration = std::time::Duration::from_se
 /// "Now" on the store's clock for a handle that holds no lock (tests that
 /// call compact or a fold directly): the local clock, which is a
 /// LocalBackend's.
-pub(crate) fn set_store_now(repo: &mut Repository) {
+pub(crate) fn set_store_now(repo: &mut Repo) {
     repo.set_lock_store_time(Some(vykar_storage::StoreNow::at(
         std::time::SystemTime::now(),
     )));

@@ -50,7 +50,8 @@ use crate::config::{
 };
 use crate::repo::control::CancelToken;
 use crate::repo::{
-    ChunkerParams, EncryptionMode, HostEnv, HostIdentity, OpenOptions, Repository, identity, lock,
+    ChunkerParams, EncryptionMode, HostEnv, HostIdentity, OpenOptions, Repo, RepoWriter, identity,
+    lock,
 };
 
 /// A source directory's regular files, by `/`-separated relative path.
@@ -143,7 +144,7 @@ pub(super) type RunResult = Result<(Vec<String>, String)>;
 type Body = Box<dyn FnOnce(&SimStore, VykarConfig, &Path, usize, HostEnv) -> RunResult + Send>;
 
 /// A body run under the repo lock by [`Call::Custom`].
-pub type CustomFn = Box<dyn FnOnce(&mut Repository) -> Result<()> + Send + 'static>;
+pub type CustomFn = Box<dyn FnOnce(&mut RepoWriter<'_>) -> Result<()> + Send + 'static>;
 
 /// One client command, owned so it can run on its own thread.
 pub enum Call {
@@ -318,7 +319,7 @@ impl Sim {
                 EncryptionMode::None
             };
             let repo = crate::repo::with_cheap_kdf(|| {
-                Repository::init(
+                Repo::init(
                     Box::new(store.handle(init)),
                     mode,
                     ChunkerParams::default(),
@@ -330,8 +331,8 @@ impl Sim {
             // As `commands::init`: pin at once, with the init client's cache.
             identity::verify_or_pin(
                 &cfg.repository.url,
-                &repo.config.id,
-                repo.crypto.chunk_hasher().key(),
+                &repo.config().id,
+                repo.crypto().chunk_hasher().key(),
                 util::cache_dir_from_config(&cfg).as_deref(),
                 true,
             )?;
@@ -584,7 +585,7 @@ impl Sim {
         &mut self,
         c: ClientId,
         label: &str,
-        f: impl FnOnce(&mut Repository) -> Result<()>,
+        f: impl FnOnce(&mut RepoWriter<'_>) -> Result<()>,
     ) -> RunRecord {
         self.assert_inline_ok(c);
         let op = ClientOp::Custom {
@@ -606,7 +607,7 @@ impl Sim {
         c: ClientId,
         label: &str,
         flags: crate::repo::lock::MarkerFlags,
-        f: impl FnOnce(&mut Repository) -> Result<()>,
+        f: impl FnOnce(&mut RepoWriter<'_>) -> Result<()>,
     ) -> RunRecord {
         self.assert_inline_ok(c);
         let op = ClientOp::Custom {
@@ -1363,7 +1364,7 @@ impl Sim {
 }
 
 /// Open the repository as delete, prune and compact do.
-fn open_for(store: &SimStore, c: ClientId, cfg: &VykarConfig, env: HostEnv) -> Result<Repository> {
+fn open_for(store: &SimStore, c: ClientId, cfg: &VykarConfig, env: HostEnv) -> Result<Repo> {
     util::open_repo_on(
         Box::new(store.handle(c)),
         &util::open_request(cfg),
@@ -1377,7 +1378,7 @@ fn custom_body(
     c: ClientId,
     cfg: VykarConfig,
     env: HostEnv,
-    f: impl FnOnce(&mut Repository) -> Result<()>,
+    f: impl FnOnce(&mut RepoWriter<'_>) -> Result<()>,
 ) -> RunResult {
     let mut repo = open_for(store, c, &cfg, env)?;
     util::with_repo_lock(&mut repo, f)?;
@@ -1425,7 +1426,7 @@ fn finish_run(
 /// open. A failing open is a harness failure.
 fn observe_store(store: &SimStore, cause: ObservationCause) -> Observation {
     let cache = tempfile::tempdir().expect("observer cache");
-    let repo = Repository::open(
+    let repo = Repo::open(
         Box::new(store.observer()),
         store.passphrase(),
         Some(cache.path().to_path_buf()),

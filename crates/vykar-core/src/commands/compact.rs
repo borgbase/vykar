@@ -24,7 +24,9 @@ use crate::repo::pack_listing::{ListedPack, list_packs};
 use crate::repo::pack_trailer::{
     PackTrailer, TrailerPackType, framed_offsets, trailer_blob_len, trailer_frame_len,
 };
-use crate::repo::{CommitMode, HEAD_CREATE_ATTEMPTS, Repository, TreeChunkSource, retry_delay};
+use crate::repo::{
+    CommitMode, HEAD_CREATE_ATTEMPTS, Repo, RepoWriter, TreeChunkSource, retry_delay,
+};
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::{
     MAX_KEEP_BLOBS_PER_OP, MAX_REPACK_OPS, MAX_REPACK_OUTPUT_BYTES, MAX_REPACK_PLAN_JSON_BYTES,
@@ -248,7 +250,7 @@ pub fn report_unreferenced(
 /// committed between the head read and the snapshot listing (a moved head)
 /// is retried on the latest head, at most [`COMPACT_MARK_ATTEMPTS`] times.
 pub(crate) fn report_unreferenced_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     shutdown: &CancelToken,
 ) -> Result<UnreferencedReport> {
     let frame = |e: VykarError| {
@@ -289,13 +291,13 @@ pub(crate) fn report_unreferenced_on_repo(
 
 /// Whether the latest head on storage is not the one the index was loaded
 /// at (a lock-free compact's or report's mark, 04 step 9).
-fn head_moved(repo: &Repository) -> Result<bool> {
-    let latest = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())?;
+fn head_moved(repo: &Repo) -> Result<bool> {
+    let latest = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())?;
     Ok(repo.index_head() != Some(&latest))
 }
 
 /// The report of [`report_unreferenced_on_repo`] over the loaded index.
-fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<UnreferencedReport> {
+fn report_under_lock(repo: &mut Repo, shutdown: &CancelToken) -> Result<UnreferencedReport> {
     let snaps = mark::load_snapshots_strict(repo, shutdown)?;
     let names: Vec<String> = snaps.iter().map(mark::LiveSnapshot::label).collect();
     let ptrs: Vec<&[ChunkId]> = snaps.iter().map(|s| s.meta.item_ptrs.as_slice()).collect();
@@ -391,7 +393,7 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
 ///
 /// The same order holds for a lock-free compact (04 step 9: an encrypted
 /// repository whose storage passed the put-if-absent check, see
-/// [`Repository::commit_mode`]), which registers a session marker
+/// [`Repo::commit_mode`]), which registers a session marker
 /// (`writes_heads`) instead of taking the lock, and reads "now" from its
 /// own marker key in the session listing. The argument above needs no lock
 /// once its conditions hold: object names a writer cannot re-create after
@@ -406,16 +408,16 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
 /// second session listing, the re-read head, the incremental re-mark) and
 /// [`persist_batch_lock_free`] (the relocation rebase).
 pub(crate) fn run_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
     shutdown: &CancelToken,
 ) -> Result<CompactStats> {
     if !dry_run {
-        refuse_on_append_only_server(repo.storage.as_ref(), "vykar compact")?;
+        refuse_on_append_only_server(repo.storage().as_ref(), "vykar compact")?;
     }
-    let concurrency = repo.storage.profile().request_width;
+    let concurrency = repo.storage().profile().request_width;
     let opts = CompactOpts {
         threshold,
         max_repack_size,
@@ -469,17 +471,17 @@ pub(crate) struct PackListing {
 /// The sweep runs before the session listing and the mark, so a compact that
 /// then refuses ("nothing was changed") has already removed the temp files
 /// older than `STALE_TEMP_FILE_AGE`: upload debris only, never an object.
-fn take_pack_listing(repo: &Repository, dry_run: bool, concurrency: usize) -> Result<PackListing> {
+fn take_pack_listing(repo: &Repo, dry_run: bool, concurrency: usize) -> Result<PackListing> {
     // Sweep upload debris once, from the root, before listing shards. Temp
     // files younger than this may belong to a live upload.
     let mut temp_files_removed = 0;
     if !dry_run {
-        match repo.storage.remove_stale_temp_files(STALE_TEMP_FILE_AGE) {
+        match repo.storage().remove_stale_temp_files(STALE_TEMP_FILE_AGE) {
             Ok(n) => temp_files_removed = n as u64,
             Err(e) => tracing::warn!("compact: failed to sweep stale temp files: {e}"),
         }
     }
-    let discovered = list_packs(repo.storage.as_ref(), concurrency)?;
+    let discovered = list_packs(repo.storage().as_ref(), concurrency)?;
     Ok(PackListing {
         discovered,
         temp_files_removed,
@@ -504,7 +506,7 @@ fn take_pack_listing(repo: &Repository, dry_run: bool, concurrency: usize) -> Re
 /// get head, then packs. Production goes through `run_on_repo`, which
 /// lists in 04's order.
 pub fn compact_repo(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
@@ -524,7 +526,7 @@ pub fn compact_repo(
 /// [`compact_repo`] over a pack listing its caller took; `free`: the
 /// lock-free run's session (04 step 9), `None` under the lock.
 fn compact_repo_listed(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     free: Option<&MaintenanceSession>,
     listing: PackListing,
     opts: CompactOpts,
@@ -555,7 +557,7 @@ fn compact_repo_listed(
 /// Production code always marks first.
 #[cfg(test)]
 pub(crate) fn compact_repo_without_mark(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
@@ -575,7 +577,7 @@ pub(crate) fn compact_repo_without_mark(
 /// Everything [`compact_repo`] does after the mark-and-sweep; `free`: the
 /// lock-free run's session ID.
 fn compact_after_mark(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     free: Option<&str>,
     listing: PackListing,
     opts: CompactOpts,
@@ -618,11 +620,11 @@ fn compact_after_mark(
         let alive =
             |p: &PackId| (listed.contains(p) && !deleted.contains(p)) || written.contains(p);
         if free.is_some() {
-            repo.check_lock_fence()?;
+            repo.check_fence()?;
         }
         match crate::repo::pack_map::delete_dead_pack_maps(
-            repo.storage.as_ref(),
-            repo.crypto.as_ref(),
+            repo.storage().as_ref(),
+            repo.crypto().as_ref(),
             concurrency,
             &alive,
             shutdown,
@@ -672,7 +674,7 @@ struct Swept {
 /// is framed as [`MARK_REFUSED`], unless [`mark::passes_through`] (cancel,
 /// newer vykar). "Nothing was changed" means no object: the stale temp-file
 /// sweep of `take_pack_listing` ran before.
-fn plan_sweep(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPlan> {
+fn plan_sweep(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
     plan_sweep_inner(repo, shutdown).map_err(mark_refused)
 }
 
@@ -688,7 +690,7 @@ fn mark_refused(e: VykarError) -> VykarError {
 }
 
 /// The guards on a strict listing before a sweep may delete by it.
-fn check_sweep_listing(repo: &Repository, snaps: &[mark::LiveSnapshot]) -> Result<()> {
+fn check_sweep_listing(repo: &Repo, snaps: &[mark::LiveSnapshot]) -> Result<()> {
     let entries = repo.chunk_index().len();
     // The storage contract allows a stale or empty listing; a sweep deletes
     // by it, so a listing that looks incomplete refuses.
@@ -702,7 +704,7 @@ fn check_sweep_listing(repo: &Repository, snaps: &[mark::LiveSnapshot]) -> Resul
     check_listing_against_last_sweep(repo, snaps)
 }
 
-fn plan_sweep_inner(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPlan> {
+fn plan_sweep_inner(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
     let snaps = mark::load_snapshots_strict(repo, shutdown)?;
     check_sweep_listing(repo, &snaps)?;
 
@@ -767,10 +769,7 @@ fn plan_sweep_inner(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPl
 /// each is one merge pass. Nothing is read when `unreferenced` is empty.
 ///
 /// [`ages::foldable`]: crate::repo::ages::foldable
-fn keep_young_additions(
-    repo: &Repository,
-    unreferenced: &mut Vec<(ChunkId, u32)>,
-) -> Result<(u64, u64)> {
+fn keep_young_additions(repo: &Repo, unreferenced: &mut Vec<(ChunkId, u32)>) -> Result<(u64, u64)> {
     let Some(head) = repo.index_head() else {
         return Ok((0, 0));
     };
@@ -795,7 +794,7 @@ fn keep_young_additions(
             Some(b) => b,
             None => {
                 let key = index_store::object_key(&r.name);
-                repo.storage
+                repo.storage()
                     .get(&key)?
                     .ok_or(VykarError::IndexObjectMissing {
                         kind: "segment",
@@ -803,7 +802,7 @@ fn keep_young_additions(
                     })?
             }
         };
-        let body = index_store::decode_segment_v2(r, &bytes, repo.crypto.as_ref())?;
+        let body = index_store::decode_segment_v2(r, &bytes, repo.crypto().as_ref())?;
         drop(bytes);
         // Both sorted by chunk ID: one merge pass.
         let mut adds = body.additions.iter().map(|(id, _)| id).peekable();
@@ -828,13 +827,13 @@ fn keep_young_additions(
 /// ([`index_store::is_object_damage`]) skips the check with a warning (the
 /// check can only refuse more). Any other error on it (storage, a record of
 /// a newer version) is returned, and [`plan_sweep`] refuses.
-fn check_listing_against_last_sweep(repo: &Repository, snaps: &[mark::LiveSnapshot]) -> Result<()> {
+fn check_listing_against_last_sweep(repo: &Repo, snaps: &[mark::LiveSnapshot]) -> Result<()> {
     let Some(head) = repo.index_head() else {
         return Ok(());
     };
     let record = match index_store::fetch_sweep_record(
-        repo.storage.as_ref(),
-        repo.crypto.as_ref(),
+        repo.storage().as_ref(),
+        repo.crypto().as_ref(),
         head,
     ) {
         Ok(Some(r)) => r,
@@ -856,7 +855,7 @@ fn check_listing_against_last_sweep(repo: &Repository, snaps: &[mark::LiveSnapsh
             continue;
         }
         let key = vykar_types::snapshot_id::SnapshotId::from_bytes(bytes).storage_key();
-        if repo.storage.exists(&key)? {
+        if repo.storage().exists(&key)? {
             return Err(VykarError::Other(format!(
                 "{key} exists but the listing of snapshots/ did not return it; the \
                  listing is stale or incomplete"
@@ -871,7 +870,7 @@ fn check_listing_against_last_sweep(repo: &Repository, snaps: &[mark::LiveSnapsh
 /// `sweep {gen: its own generation, record}`; with nothing to remove, the
 /// record and a head only. Then drop the tree-chunk cache entries the mark
 /// did not reach. Not called in a dry run.
-fn apply_sweep(repo: &mut Repository, plan: &SweepPlan) -> Result<()> {
+fn apply_sweep(repo: &mut RepoWriter<'_>, plan: &SweepPlan) -> Result<()> {
     stage_sweep(repo, plan);
     repo.save_state()?;
     trim_tree_cache(repo, plan);
@@ -880,7 +879,7 @@ fn apply_sweep(repo: &mut Repository, plan: &SweepPlan) -> Result<()> {
 
 /// [`apply_sweep`]'s edits: the removals and the pending sweep record,
 /// not yet persisted.
-fn stage_sweep(repo: &mut Repository, plan: &SweepPlan) {
+fn stage_sweep(repo: &mut RepoWriter<'_>, plan: &SweepPlan) {
     let index = repo.chunk_index_mut();
     for (id, _) in &plan.unreferenced {
         index.remove(id);
@@ -908,7 +907,7 @@ fn stage_sweep(repo: &mut Repository, plan: &SweepPlan) {
 
 /// Drop the tree-chunk cache entries the mark did not reach (after a
 /// persisted sweep).
-fn trim_tree_cache(repo: &Repository, plan: &SweepPlan) {
+fn trim_tree_cache(repo: &Repo, plan: &SweepPlan) {
     if let Some(cache) = repo.tree_cache() {
         let kept = cache.retain(|id| plan.tree_set.contains(id));
         debug!(?kept, "tree-chunk cache trimmed to the marked tree chunks");
@@ -919,7 +918,11 @@ fn trim_tree_cache(repo: &Repository, plan: &SweepPlan) {
 /// dry run removes the unreferenced entries from the in-memory index only,
 /// so that the analysis after it shows what a real run would free; the
 /// caller discards those edits.
-fn mark_and_sweep(repo: &mut Repository, dry_run: bool, shutdown: &CancelToken) -> Result<Swept> {
+fn mark_and_sweep(
+    repo: &mut RepoWriter<'_>,
+    dry_run: bool,
+    shutdown: &CancelToken,
+) -> Result<Swept> {
     // The ages of the head's backup segments (04 step 7), one listing per
     // lock hold; a failed listing returns before anything changed.
     if let Some(head) = repo.index_head()
@@ -972,7 +975,7 @@ struct MarkSoFar {
 
 /// Drop the index edits and load the index at the latest head (a lock-free
 /// mark that found the head moved).
-fn reload_index(repo: &mut Repository) -> Result<()> {
+fn reload_index(repo: &mut Repo) -> Result<()> {
     repo.discard_index_edits();
     repo.load_chunk_index_under_lock().map_err(mark_refused)
 }
@@ -996,7 +999,7 @@ fn reload_index(repo: &mut Repository) -> Result<()> {
 ///    candidates (and are young backup additions anyway). A mark that fails
 ///    on a moved head (a chunk not in the index) is a moved head too.
 /// 6. the sweep head, created with put-if-absent at the loaded head's
-///    generation + 1 ([`Repository::persist_maintenance`]): a moved head
+///    generation + 1 ([`RepoWriter::persist_maintenance`]): a moved head
 ///    or a taken generation discards the edits and goes to 4 again.
 ///
 /// After [`COMPACT_MARK_ATTEMPTS`] the run removes nothing
@@ -1019,7 +1022,7 @@ fn reload_index(repo: &mut Repository) -> Result<()> {
 /// committed a reuse-only snapshot without a head that this mark did not
 /// see; only a stall inside that create remains (`AgedSessionReaped`).
 fn mark_and_sweep_lock_free(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     own: &MaintenanceSession,
     dry_run: bool,
     shutdown: &CancelToken,
@@ -1036,7 +1039,7 @@ fn mark_and_sweep_lock_free(
         shutdown.check()?;
         // 4. Sessions #2.
         let committing =
-            lock::committing_sessions(repo.storage.as_ref(), own.id()).map_err(mark_refused)?;
+            lock::committing_sessions(repo.storage().as_ref(), own.id()).map_err(mark_refused)?;
         if !committing.is_empty() {
             info!(
                 sessions = ?committing,
@@ -1223,7 +1226,7 @@ struct PackRun {
 }
 
 fn compact_packs(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     free: Option<&str>,
     listing: PackListing,
     opts: CompactOpts,
@@ -1316,7 +1319,7 @@ fn compact_packs(
         );
     }
 
-    let storage = repo.storage.as_ref();
+    let storage = repo.storage().as_ref();
     crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |p: &ListedPack| {
         packs_total.fetch_add(1, Ordering::Relaxed);
         let (key, pack_id) = (&p.key, &p.pack_id);
@@ -1565,13 +1568,13 @@ fn compact_packs(
     }
 
     // Proactive fence check at Phase 1→Phase 2 boundary.
-    repo.check_lock_fence()?;
+    repo.check_fence()?;
 
     // Phase 2: Repack. Source packs, including empty ones, are deleted per
     // batch, after the index naming their replacements is persisted, so no
     // pack is deleted while the index on storage still references it.
     let mut total_repacked_bytes: u64 = 0;
-    let pack_target = repo.config.min_pack_size as usize;
+    let pack_target = repo.config().min_pack_size as usize;
     let mut batch: Vec<&PackAnalysis> = Vec::new();
     let mut batch_bytes: u64 = 0;
     for analysis in &selected {
@@ -1603,7 +1606,7 @@ fn compact_packs(
         // checked the file size, so a corrupt/truncated pack could slip through.
         let header =
             match repo
-                .storage
+                .storage()
                 .get_range(&analysis.storage_key, 0, PACK_HEADER_SIZE as u64)?
             {
                 Some(header) => header,
@@ -1644,7 +1647,7 @@ fn compact_packs(
             let read_len = 4u64 + entry.length as u64;
             let combined =
                 match repo
-                    .storage
+                    .storage()
                     .get_range(&analysis.storage_key, prefix_offset, read_len)?
                 {
                     Some(c) => c,
@@ -1692,9 +1695,9 @@ fn compact_packs(
         }
 
         let (new_pack_id, new_entries) =
-            writer.flush(repo.storage.as_ref(), repo.crypto.as_ref())?;
+            writer.flush(repo.storage().as_ref(), repo.crypto().as_ref())?;
         written.insert(new_pack_id);
-        let trailer_len = trailer_frame_len(new_entries.len(), repo.crypto.is_encrypting());
+        let trailer_len = trailer_frame_len(new_entries.len(), repo.crypto().is_encrypting());
         repo.chunk_index_mut()
             .set_pack_trailer(new_pack_id, trailer_len);
 
@@ -1738,7 +1741,7 @@ fn vanished_during_repack(analysis: &PackAnalysis) {
 /// Whether the index still holds `chunk` in `pack` (a lock-free repack
 /// relocates a chunk only from where the index has it: another compact may
 /// have moved it, or swept it, since the analysis).
-fn still_in(repo: &Repository, chunk: &ChunkId, pack: &PackId) -> bool {
+fn still_in(repo: &Repo, chunk: &ChunkId, pack: &PackId) -> bool {
     repo.chunk_index()
         .get(chunk)
         .is_some_and(|e| e.pack_id == *pack)
@@ -1748,7 +1751,7 @@ fn still_in(repo: &Repository, chunk: &ChunkId, pack: &PackId) -> bool {
 /// source packs, except those this run wrote (`written`) and, lock-free,
 /// those the persisted index still names, and empty the batch.
 fn persist_and_delete(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     free: Option<&str>,
     batch: &mut Vec<&PackAnalysis>,
     written: &HashSet<PackId>,
@@ -1786,15 +1789,15 @@ fn persist_and_delete(
         }
         !keep
     });
-    let credit = credited_sources(repo.storage.as_ref(), batch, kept_from.as_ref());
+    let credit = credited_sources(repo.storage().as_ref(), batch, kept_from.as_ref());
     if free.is_some() && !batch.is_empty() {
         // Lock-free: the run's marker still guards its decisions (the
         // persist checked it before the head create, this right before the
         // deletes, after the stats' presence checks).
-        repo.check_lock_fence()?;
+        repo.check_fence()?;
     }
     let err = delete_sources(
-        repo.storage.as_ref(),
+        repo.storage().as_ref(),
         batch,
         stats,
         deleted,
@@ -1807,10 +1810,10 @@ fn persist_and_delete(
 
 /// A lock-free compact's persist of one repack batch (04 step 9): the
 /// batch's relocations as a maintenance segment and a head created with
-/// put-if-absent ([`Repository::persist_maintenance`]). When the head
+/// put-if-absent ([`RepoWriter::persist_maintenance`]). When the head
 /// moved (a backup or another compact wrote one), wait
 /// ([`retry_delay`]), rebase the relocations onto the latest head
-/// ([`Repository::rebase_relocations`]: only chunks the latest index still
+/// ([`RepoWriter::rebase_relocations`]: only chunks the latest index still
 /// holds in one of `sources`) and create again, at most
 /// [`HEAD_CREATE_ATTEMPTS`] times, then the "index changed" error. Returns
 /// the sources the written index still names after a rebase (one scan of
@@ -1820,7 +1823,7 @@ fn persist_and_delete(
 /// run whose marker was reaped stops, since another compact may have
 /// deleted this batch's outputs as old orphans meanwhile.
 fn persist_batch_lock_free(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     session: &str,
     sources: &HashSet<PackId>,
 ) -> Result<BatchPersisted> {
@@ -1927,7 +1930,7 @@ fn select_analyses_by_cap(
 }
 
 fn try_server_side_repack(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     free: Option<&str>,
     analyses: &[&PackAnalysis],
     stats: &mut CompactStats,
@@ -1944,7 +1947,7 @@ fn try_server_side_repack(
     // operation here carries the output pack's trailer, which such a server
     // would refuse (0.8 to 0.24) or that the REST backend refuses to send.
     // The clone lets `server` outlive the `&mut repo` borrows below.
-    let storage = Arc::clone(&repo.storage);
+    let storage = Arc::clone(repo.storage());
     let Some(server) = storage.server_ops() else {
         return Ok(false);
     };
@@ -1966,7 +1969,7 @@ fn try_server_side_repack(
     // The server never deletes: sources are removed below, after the index
     // pointing at their replacements is persisted. A lost or timed-out
     // response therefore leaves only unreferenced new packs behind.
-    let encrypting = repo.crypto.is_encrypting();
+    let encrypting = repo.crypto().is_encrypting();
     let operations: Vec<PlannedOp<'_>> = analyses
         .iter()
         .map(|analysis| PlannedOp::new(analysis, encrypting))
@@ -1995,7 +1998,7 @@ fn try_server_side_repack(
         let mut requests = Vec::with_capacity(batch.len());
         for op in batch {
             batch_analyses.push(op.analysis);
-            requests.push(op.into_request(repo.crypto.as_ref())?);
+            requests.push(op.into_request(repo.crypto().as_ref())?);
         }
         // The constructor derives `protocol_version` from the algorithm and
         // the trailers, so an old server rejects a BLAKE3 or trailer plan
@@ -2063,12 +2066,12 @@ fn try_server_side_repack(
             .filter(|a| !result_packs.contains(&a.storage_key))
             .filter(|a| !named.contains(&a.pack_id))
             .collect();
-        let credit = credited_sources(repo.storage.as_ref(), &sources, kept_from.as_ref());
+        let credit = credited_sources(repo.storage().as_ref(), &sources, kept_from.as_ref());
         if free.is_some() && !sources.is_empty() {
-            repo.check_lock_fence()?;
+            repo.check_fence()?;
         }
         let delete_err = delete_sources(
-            repo.storage.as_ref(),
+            repo.storage().as_ref(),
             &sources,
             stats,
             deleted,
@@ -2163,7 +2166,7 @@ fn record_deleted(
 /// and stats. Errors (missing/invalid new pack, offsets mismatch) leave the
 /// index untouched for this operation. Source deletion is the caller's job.
 fn apply_repack_result(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     lock_free: bool,
     analysis: &PackAnalysis,
     result: &vykar_protocol::RepackOperationResult,
@@ -2207,7 +2210,7 @@ fn apply_repack_result(
     }
 
     // The operation carried the trailer of its live blobs.
-    let trailer_len = trailer_frame_len(analysis.live_entries.len(), repo.crypto.is_encrypting());
+    let trailer_len = trailer_frame_len(analysis.live_entries.len(), repo.crypto().is_encrypting());
     repo.chunk_index_mut()
         .set_pack_trailer(new_pack_id, trailer_len);
     for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {

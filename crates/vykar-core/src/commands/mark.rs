@@ -44,7 +44,7 @@ use crate::index::hasher::ChunkIdHashMap;
 use crate::index::table::IndexPositions;
 use crate::repo::bounded::try_for_each_bounded;
 use crate::repo::control::CancelToken;
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::ItemType;
 use vykar_types::chunk_id::ChunkId;
@@ -109,12 +109,12 @@ impl LiveSnapshot {
 /// is neither read nor written. Objects are fetched at the backend's
 /// request width.
 pub(crate) fn load_snapshots_strict(
-    repo: &Repository,
+    repo: &Repo,
     shutdown: &CancelToken,
 ) -> Result<Vec<LiveSnapshot>> {
     shutdown.check()?;
     let started = Instant::now();
-    let keys = repo.storage.list("snapshots/")?;
+    let keys = repo.storage().list("snapshots/")?;
     let mut listed: Vec<(String, SnapshotId)> = Vec::with_capacity(keys.len());
     for key in keys {
         let Some(hex) = key.strip_prefix("snapshots/") else {
@@ -133,7 +133,7 @@ pub(crate) fn load_snapshots_strict(
 
     let loaded: Mutex<Vec<LiveSnapshot>> = Mutex::new(Vec::with_capacity(listed.len()));
     let gone: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let width = repo.storage.profile().request_width;
+    let width = repo.storage().profile().request_width;
     try_for_each_bounded(width, &listed, |(key, id)| {
         shutdown.check()?;
         let frame = |e: VykarError| {
@@ -150,13 +150,13 @@ pub(crate) fn load_snapshots_strict(
         // snapshot may be live. It is skipped only after a second listing,
         // taken after every GET, no longer shows it; a key still listed with
         // a not-found fails closed.
-        let Some(blob) = repo.storage.get(key).map_err(frame)? else {
+        let Some(blob) = repo.storage().get(key).map_err(frame)? else {
             gone.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(key.clone());
             return Ok(());
         };
-        let meta = decode_snapshot_meta(id, &blob, repo.crypto.as_ref()).map_err(frame)?;
+        let meta = decode_snapshot_meta(id, &blob, repo.crypto().as_ref()).map_err(frame)?;
         loaded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -167,7 +167,7 @@ pub(crate) fn load_snapshots_strict(
     if !gone.is_empty() {
         shutdown.check()?;
         let again: std::collections::HashSet<String> =
-            repo.storage.list("snapshots/")?.into_iter().collect();
+            repo.storage().list("snapshots/")?.into_iter().collect();
         for key in &gone {
             if again.contains(key) {
                 return Err(VykarError::Other(format!("{key} was listed but is gone")));
@@ -337,7 +337,7 @@ fn cut_batches(located: &[Located]) -> Vec<&[Located]> {
 /// Record the plaintext ranges of a split read of `expected` chunks that
 /// appended to the buffer from `from` on (now `buf_len` bytes long), the
 /// first chunk at batch position `first`. `ends` is what
-/// [`Repository::read_tree_chunks_split`] returned. An internal error
+/// [`Repo::read_tree_chunks_split`] returned. An internal error
 /// unless there is one end per chunk, non-decreasing and inside
 /// `from..=buf_len`, so the ranges index the buffer safely.
 pub(crate) fn push_spans(
@@ -415,7 +415,7 @@ fn batch_outcomes<T>(
 /// `failed` with (batch position, error).
 #[allow(clippy::too_many_arguments)]
 fn reread_failed_batch(
-    repo: &Repository,
+    repo: &Repo,
     batch: &[Located],
     batch_error: &VykarError,
     source: TreeChunkSource,
@@ -563,7 +563,7 @@ where
 /// batch whose read fails are re-read to attribute the failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn walk_tree_chunks<T, D, C>(
-    repo: &Repository,
+    repo: &Repo,
     set: &TreeChunkSet,
     source: TreeChunkSource,
     on_error: OnChunkError,
@@ -730,7 +730,7 @@ fn add_count(counts: Option<&[AtomicU32]>, position: u32, n: u32) {
 /// bytes): each tree chunk counts its occurrences in `item_ptrs`, and each
 /// `RegularFile` chunk reference counts as often as its tree chunk occurs.
 pub(crate) fn mark_live(
-    repo: &Repository,
+    repo: &Repo,
     set: &TreeChunkSet,
     names: &[String],
     positions: &IndexPositions<'_>,

@@ -9,7 +9,7 @@ use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
 use crate::repo::ChunkerParams;
-use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, Repo, WriteSession, WriteSessionOptions};
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
@@ -284,10 +284,10 @@ impl StorageBackend for MemoryBackend {
 }
 
 /// Create a plaintext repository backed by MemoryBackend.
-pub fn test_repo_plaintext() -> Repository {
+pub fn test_repo_plaintext() -> Repo {
     init_test_environment();
     let storage = Box::new(MemoryBackend::new());
-    let mut repo = Repository::init(
+    Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -295,10 +295,14 @@ pub fn test_repo_plaintext() -> Repository {
         None,
         None,
     )
-    .expect("failed to init test repo");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("failed to begin write session");
-    repo
+    .expect("failed to init test repo")
+}
+
+/// [`test_repo_plaintext`] with a write session begun over it.
+pub fn test_repo_plaintext_with_session() -> (Repo, WriteSession) {
+    let repo = test_repo_plaintext();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws)
 }
 
 /// Fixed chunk hasher for deterministic tests.
@@ -818,12 +822,18 @@ pub(crate) fn prefilter_of(
     crate::index::table::DedupPrefilter::new(live.view().unwrap())
 }
 
-/// Save the active write session (its chunks enter the index) and begin a
-/// new one, for tests that read their own chunks through the index.
-pub(crate) fn save_and_resume(repo: &mut Repository) {
-    repo.save_state().expect("save_state");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
+/// Save the write session `ws` (its chunks enter the index) and begin a
+/// new one in its place, for tests that read their own chunks through the
+/// index.
+pub(crate) fn save_and_resume(repo: &mut Repo, ws: &mut WriteSession) {
+    // An empty placeholder until the save, so that the next session begins
+    // over the saved index.
+    let placeholder = WriteSession::new(1, 1, 1, repo.content_hash());
+    let saved = std::mem::replace(ws, placeholder);
+    repo.unchecked_writer()
+        .save_session(saved)
+        .expect("save_session");
+    *ws = repo.begin_write_session(&WriteSessionOptions::default());
 }
 
 #[cfg(test)]

@@ -458,7 +458,7 @@ mod tests {
     use crate::repo::format::pack_object_with_context;
     use crate::repo::host_env::SystemClock;
     use crate::repo::lock::{session_marker_key, session_marker_key_at};
-    use crate::repo::write_session::WriteSessionState;
+    use crate::repo::write_session::WriteSession;
     use crate::repo::write_session::tests::{fake_pack, test_crypto};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_types::hash::HashAlgorithm;
@@ -529,13 +529,13 @@ mod tests {
     /// Recover as session "current", whose marker is written first: its
     /// mtime is "now" on the store's clock, without which no pack is old
     /// enough to judge and none is adopted.
-    fn recover_from(storage: &dyn StorageBackend) -> (WriteSessionState, PendingIndexRecovery) {
+    fn recover_from(storage: &dyn StorageBackend) -> (WriteSession, PendingIndexRecovery) {
         own_marker(storage, "current");
         let crypto = test_crypto();
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 storage,
                 &crypto,
                 &LiveIndex::empty(),
@@ -602,12 +602,12 @@ mod tests {
         let index_key = session_index_key("old");
         let (_pack_id, _chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
 
-        // Create a WriteSessionState with a different session ID.
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        // Create a WriteSession with a different session ID.
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "new".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -642,11 +642,11 @@ mod tests {
         let index_key = session_index_key("stale");
         write_valid_journal(&storage, &crypto, &index_key);
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -682,11 +682,11 @@ mod tests {
         let index_key = session_index_key("active");
         write_valid_journal(&storage, &crypto, &index_key);
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -717,11 +717,11 @@ mod tests {
         let index_key = session_index_key("bad");
         write_valid_journal(&storage, &crypto, &index_key);
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -860,11 +860,11 @@ mod tests {
         let corrupt_key = session_index_key("corrupt");
         storage.put(&corrupt_key, b"random garbage").unwrap();
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -903,11 +903,11 @@ mod tests {
         let index_key = session_index_key("old");
         storage.put(&index_key, b"corrupt data").unwrap();
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let _recovered = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -943,11 +943,11 @@ mod tests {
         let mut chunk_index = LiveIndex::empty();
         chunk_index.add(chunk_id, 100, PackId::from_bytes([0x11; 32]), 0);
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &chunk_index,
@@ -981,7 +981,7 @@ mod tests {
         storage.put(&stale_index, b"data").unwrap();
         storage.put(&stale_json, b"data").unwrap();
 
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.recovered_index_keys = vec![orphan_index.clone(), stale_index.clone()];
 
         ws.cleanup_recovered_indices(&storage);
@@ -1266,11 +1266,11 @@ mod tests {
             );
 
             own_marker(&storage, "current");
-            let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+            let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
             ws.session_id = "current".to_string();
             ws.persisted_pack_count = persisted;
             let recovery = ws
-                .recover_pending_index(
+                .recover_pending_index_from(
                     &storage,
                     &crypto,
                     &LiveIndex::empty(),
@@ -1397,10 +1397,10 @@ mod tests {
         // Mtimes, but no own marker.
         let storage = MemoryBackend::with_mtimes();
         write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(
+            .recover_pending_index_from(
                 &storage,
                 &crypto,
                 &LiveIndex::empty(),

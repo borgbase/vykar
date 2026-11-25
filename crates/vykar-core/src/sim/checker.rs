@@ -1,6 +1,6 @@
 //! Invariant checker over the store's current visible state and the history.
 //!
-//! The checker reads through production code (`Repository::open`, the index
+//! The checker reads through production code (`Repo::open`, the index
 //! loader, snapshot and chunk reads, restore) on the read-only observer
 //! handle, but takes object presence and sizes from the store map and
 //! compares restore output with the harness's own record of each source.
@@ -32,7 +32,7 @@ use super::store::SimStore;
 use crate::commands::list;
 use crate::commands::restore::{self, RestoreOptions};
 use crate::repo::control::CancelToken;
-use crate::repo::{OpenOptions, Repository, index_store};
+use crate::repo::{OpenOptions, Repo, index_store};
 use crate::snapshot::item::ItemType;
 use chrono::{DateTime, Utc};
 
@@ -342,8 +342,8 @@ impl fmt::Display for Report {
 pub(crate) fn open_observer(
     store: &SimStore,
     cache: &std::path::Path,
-) -> vykar_types::error::Result<Repository> {
-    Repository::open(
+) -> vykar_types::error::Result<Repo> {
+    Repo::open(
         Box::new(store.observer()),
         store.passphrase(),
         Some(cache.to_path_buf()),
@@ -358,7 +358,7 @@ pub(crate) fn open_observer(
 pub fn head_object_keys(store: &SimStore) -> std::result::Result<BTreeSet<String>, String> {
     let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
     let repo = open_observer(store, tmp.path()).map_err(|e| e.to_string())?;
-    let head = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())
+    let head = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())
         .map_err(|e| e.to_string())?;
     Ok(head
         .live_objects()
@@ -377,7 +377,7 @@ enum ChunkFault {
 /// Present in the index, pack present, and readable (`read_chunk` verifies
 /// the plaintext chunk ID on an unencrypted repository).
 fn chunk_fault(
-    repo: &mut Repository,
+    repo: &mut Repo,
     store: &SimStore,
     memo: &mut HashMap<ChunkId, Option<ChunkFault>>,
     id: &ChunkId,
@@ -436,8 +436,8 @@ fn report_chunk(
 }
 
 /// Invariant 4. Returns whether the index chain loaded.
-fn check_index(store: &SimStore, repo: &mut Repository, report: &mut Report) -> bool {
-    match index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref()) {
+fn check_index(store: &SimStore, repo: &mut Repo, report: &mut Report) -> bool {
+    match index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref()) {
         Err(e) => report.add(
             ViolationKind::HeadUndecodable,
             "index",
@@ -495,10 +495,7 @@ fn check_index(store: &SimStore, repo: &mut Repository, report: &mut Report) -> 
 
 /// The retained heads (latest − `HEADS_KEPT` and newer) that decode, by
 /// generation, read from the store map.
-fn retained_heads(
-    store: &SimStore,
-    repo: &Repository,
-) -> BTreeMap<u64, crate::index::head::IndexHead> {
+fn retained_heads(store: &SimStore, repo: &Repo) -> BTreeMap<u64, crate::index::head::IndexHead> {
     let gens: Vec<u64> = store
         .keys(index_store::HEAD_PREFIX)
         .iter()
@@ -512,7 +509,7 @@ fn retained_heads(
         .filter(|g| *g >= floor)
         .filter_map(|g| {
             let data = store.object(&index_store::head_key(g))?.data;
-            index_store::classify_head(g, &data, repo.crypto.as_ref())
+            index_store::classify_head(g, &data, repo.crypto().as_ref())
                 .into_head()
                 .ok()
                 .map(|h| (g, h))
@@ -522,7 +519,7 @@ fn retained_heads(
 
 /// Invariant 4 for the retained heads other than the latest (04 I2): each
 /// names only objects that exist.
-fn check_retained_heads(store: &SimStore, repo: &Repository, report: &mut Report) {
+fn check_retained_heads(store: &SimStore, repo: &Repo, report: &mut Report) {
     let heads = retained_heads(store, repo);
     let latest = heads.keys().max().copied();
     for (g, head) in &heads {
@@ -547,12 +544,7 @@ fn check_retained_heads(store: &SimStore, repo: &Repository, report: &mut Report
 /// head one generation below it. A head written by `check --repair`, the
 /// upgrade or init (a write without a previous head) is exempt from the
 /// second part.
-fn check_heads_immutable(
-    store: &SimStore,
-    history: &History,
-    repo: &Repository,
-    report: &mut Report,
-) {
+fn check_heads_immutable(store: &SimStore, history: &History, repo: &Repo, report: &mut Report) {
     for (key, step, writer) in store.head_overwrites() {
         report.add_at(
             ViolationKind::HeadOverwritten,
@@ -606,7 +598,7 @@ fn check_heads_immutable(
 fn check_snapshots(
     store: &SimStore,
     history: &History,
-    repo: &mut Repository,
+    repo: &mut Repo,
     scratch: &std::path::Path,
     want_restore: bool,
     report: &mut Report,
@@ -831,7 +823,7 @@ fn is_lock_key(key: &str) -> bool {
 /// lock keys exist and which (client, run) last wrote each, and judge every
 /// applied protected write against the keys present just before it. Late
 /// effects count at the step they land. The tamper client, the Init run
-/// (`Repository::init` writes `index.h/1` with no lock) and lock-free runs
+/// (`Repo::init` writes `index.h/1` with no lock) and lock-free runs
 /// (`RunRecord::lock_free`, 04 step 9: they write heads with put-if-absent
 /// and no lock) are exempt; every lock-mode run is judged, beside lock-free
 /// ones too.

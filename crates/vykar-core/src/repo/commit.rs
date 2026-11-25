@@ -1,7 +1,7 @@
 use chrono::Utc;
 use tracing::{debug, warn};
 
-use super::Repository;
+use super::Repo;
 #[cfg(test)]
 use super::commit_machine::BackupCommit;
 use super::commit_machine::Committed;
@@ -13,7 +13,7 @@ use super::machine::log_stage_elapsed;
 use super::machine::{StepCx, drive_blocking};
 use super::manifest::Manifest;
 use super::snapshot_cache;
-use super::write_session::SessionView;
+use super::write_session::{SessionView, WriteSession};
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::Location;
 use crate::index::table::IndexState;
@@ -32,7 +32,7 @@ fn post_commit_warning(events: &dyn EventSink<CommitEvent>, message: String) {
     events.emit(CommitEvent::Warning { message });
 }
 
-impl Repository {
+impl Repo {
     /// Load the chunk index from storage on demand: GET the head and bring
     /// a local chunk table to it. Can be called after opening without
     /// `load_index` to lazily load the index. Also recalculates the data pack
@@ -66,10 +66,10 @@ impl Repository {
     /// operations: under the repository lock nothing else changes it until
     /// the lock is released; in a lock-free maintenance session (04 step 9)
     /// other writers may move the head, and every write of the session
-    /// checks for that (`Repository::persist_maintenance`). Replaces any
+    /// checks for that (`RepoWriter::persist_maintenance`). Replaces any
     /// index loaded at open.
     pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
-        debug_assert!(self.write_session.is_none() && !self.index_dirty);
+        debug_assert!(!self.index_dirty);
         let start = std::time::Instant::now();
         let synced = self.sync_index(None, true)?;
         let source = synced.source;
@@ -136,83 +136,11 @@ impl Repository {
         self.relocation.clear();
         self.index_generation = synced.head.generation;
         self.index_head = Some(synced.head);
-        self.rebase_pack_target_from_index();
-    }
-
-    /// Flush pending packs and wait for uploads, then take the session's
-    /// `IndexDelta` (with the trailer lengths of the session's packs) and
-    /// its view out for processing, and drop its lookup state. The delta's
-    /// positional reuse record keeps the session's table mapped until it is
-    /// checked.
-    ///
-    /// On the concurrent backup path Phase 1 has normally drained uploads
-    /// already, so the flush here is a no-op safety net; for
-    /// `apply_write_session` it is the real flush.
-    ///
-    /// Must only be called when `write_session` is `Some`. The session itself
-    /// stays active: on failure the caller can still run `flush_on_abort()`,
-    /// which does not need the structures taken here.
-    pub(super) fn flush_and_take_session_delta(
-        &mut self,
-    ) -> Result<(Option<IndexDelta>, Option<SessionView>)> {
-        self.flush_packs()?;
-
-        let ws = self.ws_mut();
-        let mut delta = ws.index_delta.take();
-        if let Some(delta) = delta.as_mut() {
-            delta.pack_trailers = std::mem::take(&mut ws.pack_trailers);
-        }
-        let view = ws.view.take();
-        ws.session_new = Default::default();
-        Ok((delta, view))
-    }
-
-    /// Flush pending packs, wait for uploads, and apply the session's delta
-    /// to the in-memory index. Must only be called when `write_session` is
-    /// `Some`.
-    ///
-    /// The delta is applied to the index as loaded: the write that follows
-    /// refuses a head that moved since. On failure, the session remains
-    /// active (not consumed) so the caller can invoke `flush_on_abort()` for
-    /// best-effort journal persistence; the delta may already be taken out
-    /// of the session at that point, which `flush_on_abort` does not need.
-    fn apply_write_session(&mut self) -> Result<()> {
-        if let (Some(delta), _) = self.flush_and_take_session_delta()?
-            && !delta.is_empty()
-        {
-            delta.apply_to(&mut self.chunk_index);
-            self.index_dirty = true;
-        }
-        Ok(())
-    }
-
-    /// Save the chunk index back to storage.
-    /// When a write session is active: flushes pending packs, applies its delta.
-    /// When no session is active: just persists dirty index/file_cache.
-    /// Only writes components that have been marked dirty.
-    pub fn save_state(&mut self) -> Result<()> {
-        if self.write_session.is_some() {
-            self.apply_write_session()?;
-        }
-
-        // An index write leaves the repository's table at the new state.
-        if self.index_dirty {
-            self.persist_segmented_index()?;
-        }
-
-        self.save_file_cache_if_dirty()?;
-
-        // Consume the write session on success — all entries are now in the
-        // persisted index. The pending_index file itself is deleted later by
-        // clear_pending_index() from the backup command.
-        self.write_session = None;
-
-        Ok(())
     }
 
     /// After a [`BackupCommit`] wrote the snapshot (the commit point): join
-    /// the journal write, run `on_commit_point`, update the manifest and the
-    /// snapshot cache, then save the file cache and consume the write
+    /// `ws`'s journal write, run `on_commit_point`, update the manifest and
+    /// the snapshot cache, then save the file cache and consume the write
     /// session. Returns nothing: no error may escape after the commit point.
     ///
     /// `on_commit_point` runs before that local post-commit work, so the
@@ -222,6 +150,7 @@ impl Repository {
     pub(crate) fn finish_backup_commit(
         &mut self,
         committed: Committed,
+        mut ws: WriteSession,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
         cancel: &CancelToken,
@@ -229,9 +158,7 @@ impl Repository {
     ) {
         // A journal PUT landing after the caller deleted the journal would
         // resurrect it, so none may still be running.
-        if let Some(ws) = self.write_session.as_mut() {
-            ws.join_journal_write();
-        }
+        ws.join_journal_write();
         on_commit_point();
 
         // Manifest update is a post-commit in-memory op. Keeping it inline keeps
@@ -243,24 +170,50 @@ impl Repository {
         // the cache is pruned against `snapshots/` on every open.
         self.persist_snapshot_cache_from_manifest();
 
-        self.commit_finalize(new_file_cache, events, cancel);
+        self.commit_finalize(ws, new_file_cache, events, cancel);
     }
 
-    /// Commit the active session as `entry` with no lock and no fence: the
-    /// backup commit driven to the end, then [`Self::finish_backup_commit`]
-    /// (tests that commit at repository level).
+    /// Commit `ws` as `entry` with no lock (an unchecked fence): the backup
+    /// commit driven to the end, then [`Self::finish_backup_commit`] (tests
+    /// that commit at repository level). `RepoWriter::commit_session_blocking`
+    /// runs it under the writer's fence.
     #[cfg(test)]
     pub(crate) fn commit_session_blocking(
         &mut self,
+        ws: WriteSession,
         entry: super::manifest::SnapshotEntry,
         packed: Vec<u8>,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
-        let mut m = BackupCommit::new(self, entry, packed, None, super::CommitMode::Lock);
-        let committed = drive_blocking(&mut m, &mut StepCx { repo: self, events })?;
+        let fence = super::Fence::unchecked();
+        self.commit_session_blocking_under(&fence, ws, entry, packed, new_file_cache, events)
+    }
+
+    /// [`Self::commit_session_blocking`] under `fence`.
+    #[cfg(test)]
+    pub(super) fn commit_session_blocking_under(
+        &mut self,
+        fence: &super::Fence,
+        ws: WriteSession,
+        entry: super::manifest::SnapshotEntry,
+        packed: Vec<u8>,
+        new_file_cache: &mut file_cache::FileCache,
+        events: &dyn EventSink<CommitEvent>,
+    ) -> Result<()> {
+        let mut m = BackupCommit::new(ws, entry, packed, None, super::CommitMode::Lock);
+        let result = drive_blocking(
+            &mut m,
+            &mut StepCx {
+                repo: self,
+                fence,
+                events,
+            },
+        );
+        let ws = m.into_write_session();
         self.finish_backup_commit(
-            committed,
+            result?,
+            ws,
             new_file_cache,
             events,
             &CancelToken::new(),
@@ -276,6 +229,7 @@ impl Repository {
     /// `cancel` only shortens the wait for the local file-cache lock.
     fn commit_finalize(
         &mut self,
+        mut ws: WriteSession,
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
         cancel: &CancelToken,
@@ -309,19 +263,10 @@ impl Repository {
         log_stage_elapsed(ctx);
 
         // Clean up recovered index journals from previous interrupted sessions.
-        if let Some(ws) = self.write_session.as_mut() {
-            ws.cleanup_recovered_indices(&*self.storage);
-        }
+        ws.cleanup_recovered_indices(&*self.storage);
 
-        // Consume write session.
-        self.write_session = None;
-    }
-
-    /// Packs already in the repository, a cost hint for `pack_lookup`.
-    pub(super) fn persisted_pack_count(&self) -> usize {
-        self.write_session
-            .as_ref()
-            .map_or(0, |ws| ws.persisted_pack_count)
+        // Consume the write session.
+        ws.finished = true;
     }
 
     /// Persist the local snapshot list cache from the current in-memory
@@ -389,6 +334,34 @@ impl Repository {
         let width = storage.profile().request_width.max(1);
         let synced = index_store::sync_index(storage, crypto, head, location, width)?;
         Ok(synced.index)
+    }
+}
+
+impl WriteSession {
+    /// Flush pending packs and wait for uploads, then take the session's
+    /// `IndexDelta` (with the trailer lengths of the session's packs) and
+    /// its view out for processing, and drop its lookup state. The delta's
+    /// positional reuse record keeps the session's table mapped until it is
+    /// checked.
+    ///
+    /// On the concurrent backup path Phase 1 has normally drained uploads
+    /// already, so the flush here is a no-op safety net; for
+    /// `RepoWriter::save_session` it is the real flush. On failure the
+    /// caller can still run [`Self::flush_on_abort`], which does not need
+    /// the structures taken here.
+    pub(super) fn flush_and_take_delta(
+        &mut self,
+        repo: &Repo,
+    ) -> Result<(Option<IndexDelta>, Option<SessionView>)> {
+        self.flush_packs(repo)?;
+
+        let mut delta = self.index_delta.take();
+        if let Some(delta) = delta.as_mut() {
+            delta.pack_trailers = std::mem::take(&mut self.pack_trailers);
+        }
+        let view = self.view.take();
+        self.session_new = Default::default();
+        Ok((delta, view))
     }
 }
 

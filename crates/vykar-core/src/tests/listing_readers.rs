@@ -19,7 +19,7 @@ use crate::commands::list::{
 };
 use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::item::{Item, ItemType};
 use crate::snapshot::listing::{ListingIndex, decode_ext, encode_ext};
 
@@ -38,7 +38,7 @@ fn items_of(fx: &Fx, name: &str) -> Vec<Item> {
     load_snapshot_items(&mut fx.open(), name, &CancelToken::new()).unwrap()
 }
 
-fn entry(repo: &Repository, name: &str) -> SnapshotEntry {
+fn entry(repo: &Repo, name: &str) -> SnapshotEntry {
     repo.manifest().find_snapshot(name).unwrap().clone()
 }
 
@@ -315,7 +315,10 @@ fn list_refuses_a_dangling_pointer_even_when_cached() {
     let fx = four_chunks(false);
     let id = fx.item_ptrs("s1")[0];
     fx.edit_index(|repo| {
-        repo.chunk_index_mut().remove(&id).unwrap();
+        repo.unchecked_writer()
+            .chunk_index_mut()
+            .remove(&id)
+            .unwrap();
     });
     assert!(fx.cached().contains(&id), "the chunk stays cached");
     let err = list_snapshot_items(&fx.config, fx.pass, "s1").unwrap_err();
@@ -369,7 +372,10 @@ fn diff_refuses_a_dangling_pointer_in_a_shared_chunk() {
         .find(|id| p2.contains(id))
         .expect("a shared tree chunk");
     fx.edit_index(|repo| {
-        repo.chunk_index_mut().remove(&id).unwrap();
+        repo.unchecked_writer()
+            .chunk_index_mut()
+            .remove(&id)
+            .unwrap();
     });
     let err = diff_err(&fx, "s1", "s2");
     assert!(

@@ -90,10 +90,10 @@ pub(crate) fn duration_nanos(d: Duration) -> u64 {
 /// journal, the dedup / index-delta / rollback state and the chunks recovered
 /// from interrupted sessions — all transient state that only exists while
 /// chunks are being written. It wires each confirmed upload into the journal.
-pub(crate) struct WriteSessionState {
+pub struct WriteSession {
     /// Crash-recovery journal of confirmed packs and its writes. Declared
     /// first so its `Drop` (joining a background write) runs before any other
-    /// field is dropped, as `WriteSessionState`'s own `Drop` used to.
+    /// field is dropped.
     pub(crate) journal: SessionJournal,
     /// Pack writer for file content chunks.
     pub(crate) data_pack_writer: PackWriter,
@@ -143,6 +143,17 @@ pub(crate) struct WriteSessionState {
     /// Accepts a pack upload an append-only server refused because the pack
     /// is stored already; set by `begin_write_session`.
     pub(crate) existing_packs: Option<std::sync::Arc<super::existing_pack::ExistingPacks>>,
+    /// Set by the methods that consume the session (a save, a commit, an
+    /// abort flush): its `Drop` no longer warns.
+    pub(crate) finished: bool,
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        if !self.finished && self.holds_unflushed_work() {
+            tracing::warn!("write session dropped with unflushed packs or journal entries");
+        }
+    }
 }
 
 /// The index state a write session dedups against, captured at its begin
@@ -155,19 +166,7 @@ pub(crate) struct SessionView {
     pub(crate) sweep_gen: u64,
 }
 
-/// Borrow the active write session from the `Repository::write_session` field.
-#[track_caller]
-pub(super) fn active(ws: &Option<WriteSessionState>) -> &WriteSessionState {
-    ws.as_ref().expect("no active write session")
-}
-
-/// Mutably borrow the active write session from the `Repository::write_session` field.
-#[track_caller]
-pub(super) fn active_mut(ws: &mut Option<WriteSessionState>) -> &mut WriteSessionState {
-    ws.as_mut().expect("no active write session")
-}
-
-impl WriteSessionState {
+impl WriteSession {
     /// Create a new write session state with the given pack writer targets.
     pub(crate) fn new(
         data_target: usize,
@@ -193,7 +192,17 @@ impl WriteSessionState {
             rollback_tracker: None,
             metrics: WriteMetrics::default(),
             existing_packs: None,
+            finished: false,
         }
+    }
+
+    /// Partial packs, queued uploads, or journal entries not yet written:
+    /// work a drop of the session would lose.
+    pub(crate) fn holds_unflushed_work(&self) -> bool {
+        self.data_pack_writer.has_pending()
+            || self.tree_pack_writer.has_pending()
+            || !self.uploads.is_empty()
+            || self.journal.needs_write()
     }
 
     /// Run `upload` on a background thread and queue it for joining.
@@ -371,7 +380,7 @@ impl WriteSessionState {
 
     /// Recover chunk→pack mappings from interrupted sessions' journals into
     /// this session; see `journal_recovery::recover_pending_index`.
-    pub(crate) fn recover_pending_index(
+    pub(crate) fn recover_pending_index_from(
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
@@ -542,9 +551,9 @@ pub(super) mod tests {
         }
     }
 
-    fn journal_session() -> WriteSessionState {
+    fn journal_session() -> WriteSession {
         init_test_environment();
-        let mut ws = WriteSessionState::new(1 << 20, 1 << 20, 2, HashAlgorithm::Blake2b);
+        let mut ws = WriteSession::new(1 << 20, 1 << 20, 2, HashAlgorithm::Blake2b);
         ws.session_id = "s1".to_string();
         ws
     }
@@ -671,7 +680,7 @@ pub(super) mod tests {
         );
     }
 
-    fn record_packs(ws: &mut WriteSessionState, seeds: std::ops::Range<u8>) {
+    fn record_packs(ws: &mut WriteSession, seeds: std::ops::Range<u8>) {
         for b in seeds {
             ws.journal
                 .entries
@@ -752,11 +761,7 @@ pub(super) mod tests {
 
     // ── Upload confirmation ──────────────────────────────────────────────
 
-    fn spawn_upload(
-        ws: &mut WriteSessionState,
-        storage: &std::sync::Arc<PackUploadBackend>,
-        seed: u8,
-    ) {
+    fn spawn_upload(ws: &mut WriteSession, storage: &std::sync::Arc<PackUploadBackend>, seed: u8) {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
         ws.spawn_upload(pack_id, entry.chunks, 0, move |_| {
@@ -767,7 +772,7 @@ pub(super) mod tests {
     /// Queue an upload that holds `bytes` and completes only when the
     /// returned sender fires.
     fn gated_upload(
-        ws: &mut WriteSessionState,
+        ws: &mut WriteSession,
         storage: &std::sync::Arc<PackUploadBackend>,
         seed: u8,
         bytes: usize,

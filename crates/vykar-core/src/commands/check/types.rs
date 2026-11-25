@@ -375,7 +375,7 @@ pub enum RepairAction {
         missing_chunks: usize,
     },
     /// Rewrite one key copy from the other. Never data-loss: `check` only runs
-    /// after `Repository::open` succeeded, so a key was established and `from`
+    /// after `Repo::open` succeeded, so a key was established and `from`
     /// is the copy that carries it.
     RestoreKeyCopy {
         from: String,

@@ -21,7 +21,7 @@ use crate::repo::machine::{Machine, StepKind};
 use crate::repo::machine::{StepCx, drive_blocking};
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{
-    BackupCommit, CommitMode, Committed, EncryptionMode, HostEnv, Repository, WriteSessionOptions,
+    BackupCommit, CommitMode, Committed, EncryptionMode, Fence, HostEnv, Repo, WriteSession,
 };
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_common::display::{format_bytes, format_count};
@@ -75,16 +75,19 @@ pub(super) struct Phase1Output {
     pub(super) instrumentation: BackupInstrumentation,
 }
 
-/// Phase 1: prepare the write session, run command dumps and the walk, and
-/// upload every pack (no lock). Returns the packed snapshot for Phase 2.
+/// Phase 1: prepare the write session `ws` (begun with the backup's options:
+/// per-session `pending_index`, upload limits, staging, so command dumps
+/// already run under the backup's upload limits), run command dumps and the
+/// walk, and upload every pack (no lock). Returns the packed snapshot for
+/// Phase 2.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn phase1_upload(
-    repo: &mut Repository,
+    repo: &mut Repo,
+    ws: &mut WriteSession,
     config: &VykarConfig,
     req: &BackupRequest<'_>,
     prepared: &Prepared<'_>,
     num_workers: usize,
-    session_opts: &WriteSessionOptions,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     dataless: &mut DatalessTally,
@@ -112,31 +115,30 @@ pub(super) fn phase1_upload(
     // parameters from before FastCDC 5, or anything at all if `config` was
     // tampered with (it is unauthenticated). Check before any upload or dump
     // execution, while retaining the normal session cleanup on failure.
-    // Do not reject these in Repository::open: restore must remain usable.
-    repo.config.chunker_params.validate_stored().map_err(|e| {
-        VykarError::Config(format!(
-            "cannot back up with stored repository chunker parameters: {e}; \
+    // Do not reject these in `Repo::open`: restore must remain usable.
+    repo.config()
+        .chunker_params
+        .validate_stored()
+        .map_err(|e| {
+            VykarError::Config(format!(
+                "cannot back up with stored repository chunker parameters: {e}; \
              changing YAML does not change stored parameters. Existing snapshots \
              can still be restored; initialize a new repository with even \
              chunker sizes for future backups"
-        ))
-    })?;
+            ))
+        })?;
 
     // Check snapshot name is unique (best-effort, re-checked at commit).
     if repo.manifest().find_snapshot(snapshot_name).is_some() {
         return Err(VykarError::SnapshotAlreadyExists(snapshot_name.into()));
     }
 
-    // Activate the write session with the backup's options (per-session
-    // `pending_index`, upload limits, staging), so command dumps already run
-    // under the backup's upload limits.
-    repo.begin_write_session(session_opts)?;
     if let Some(m) = &marker {
-        repo.attach_session_marker(Arc::clone(m));
+        ws.attach_session_marker(Arc::clone(m));
     }
 
     // Recover chunk→pack mappings from a previous interrupted session.
-    match repo.recover_pending_index(shutdown) {
+    match ws.recover_pending_index(repo, shutdown) {
         Ok(recovery) => {
             if recovery.recovered_chunks > 0 {
                 info!(
@@ -257,11 +259,11 @@ pub(super) fn phase1_upload(
     }
 
     // Workers confirm dedup hits against the session's table themselves.
-    let prefilter = repo.dedup_prefilter();
+    let prefilter = ws.dedup_prefilter();
 
     let time_start = clock.now_utc();
     let mut stats = SnapshotStats::default();
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), compression);
     let mut new_file_cache = FileCache::new();
 
     // Prepare write cache: the loaded sections' sizes pre-size the
@@ -278,6 +280,7 @@ pub(super) fn phase1_upload(
     let walk_start = clock.monotonic();
     command_dump::process_command_dumps(
         repo,
+        ws,
         command_dumps,
         compression,
         &mut listing,
@@ -292,7 +295,7 @@ pub(super) fn phase1_upload(
     let mut pipeline_timings: Option<PipelineTimings> = None;
     if !source_paths.is_empty() {
         let file_cache_snapshot = repo.take_file_cache();
-        let crypto = std::sync::Arc::clone(&repo.crypto);
+        let crypto = std::sync::Arc::clone(repo.crypto());
         let segment_size = config
             .limits
             .segment_size_bytes()
@@ -324,7 +327,7 @@ pub(super) fn phase1_upload(
             dataless,
         };
         let pipeline_result =
-            pipeline::run_parallel_pipeline(repo, &pipeline_ctx, &mut pipeline_bufs, progress);
+            pipeline::run_parallel_pipeline(repo, ws, &pipeline_ctx, &mut pipeline_bufs, progress);
         // Always restore before propagating — keeps repo.file_cache valid
         // for commit-time merge.
         repo.restore_file_cache(file_cache_snapshot);
@@ -353,7 +356,7 @@ pub(super) fn phase1_upload(
     // Bail before committing if shutdown was requested during the walk.
     shutdown.check()?;
 
-    let listing = listing.finish(repo)?;
+    let listing = listing.finish(repo, ws)?;
 
     // Seal partial packs and wait for every upload here, without the lock,
     // so Phase 2 holds it only for the index/snapshot writes. The final
@@ -367,7 +370,7 @@ pub(super) fn phase1_upload(
         },
     );
     let flush_start = clock.monotonic();
-    repo.flush_packs_journal_in_background()?;
+    ws.flush_packs_journal_in_background(repo)?;
     let final_flush = clock.elapsed(flush_start);
     let instrumentation = BackupInstrumentation {
         threads: num_workers,
@@ -375,7 +378,7 @@ pub(super) fn phase1_upload(
         walk,
         final_flush,
         pipeline: pipeline_timings,
-        write: repo.write_metrics().unwrap_or_default(),
+        write: ws.write_metrics(),
     };
     instrumentation.emit(&stats);
     shutdown.check()?;
@@ -398,7 +401,7 @@ pub(super) fn phase1_upload(
         username,
         time: time_start,
         time_end,
-        chunker_params: repo.config.chunker_params.clone(),
+        chunker_params: repo.config().chunker_params.clone(),
         comment: String::new(),
         item_ptrs: listing.item_ptrs,
         stats: stats.clone(),
@@ -422,7 +425,7 @@ pub(super) fn phase1_upload(
         ObjectType::SnapshotMeta,
         snapshot_id.as_bytes(),
         &meta_bytes,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )?;
 
     let snapshot_entry = SnapshotEntry {
@@ -455,10 +458,12 @@ pub(super) struct RunReport {
 
 /// A backup between its phases: session registered, packs uploaded,
 /// snapshot packed, no lock held. `session` is the first field so it drops
-/// (and deregisters) before `repo`, as the locals of the upload did.
+/// (and deregisters) before `repo` and `write` (whose journal joins its
+/// background write on drop), as the locals of the upload did.
 pub(crate) struct PendingCommit {
     pub(super) session: BackupSession,
-    pub(super) repo: Repository,
+    pub(super) repo: Repo,
+    pub(super) write: WriteSession,
     pub(super) snapshot_entry: SnapshotEntry,
     pub(super) snapshot_packed: Vec<u8>,
     pub(super) report: RunReport,
@@ -472,7 +477,7 @@ pub(crate) enum CommitLock {
     Free,
 }
 
-/// Phase 2 in progress: the commit lock held and its fence installed (lock
+/// Phase 2 in progress: the commit lock held and its fence built (lock
 /// mode) or the marker flagged (lock-free), and the commit machine.
 /// Production drives it with [`Self::drive`], the simulator one step at a
 /// time with [`Self::step`]; either way [`Self::finish`] ends it. Dropped
@@ -480,7 +485,10 @@ pub(crate) enum CommitLock {
 /// deregisters and a lock stays.
 pub(crate) struct CommitInProgress {
     session: BackupSession,
-    repo: Repository,
+    repo: Repo,
+    /// The exclusion the commit's steps run under: the commit lock's fence,
+    /// or `Fence::lock_free_backup`.
+    fence: Fence,
     guard: Option<lock::LockGuard>,
     machine: BackupCommit,
     report: RunReport,
@@ -488,11 +496,11 @@ pub(crate) struct CommitInProgress {
 
 impl PendingCommit {
     #[cfg(any(test, feature = "sim"))]
-    pub(crate) fn repo_mut(&mut self) -> &mut Repository {
+    pub(crate) fn repo_mut(&mut self) -> &mut Repo {
         &mut self.repo
     }
 
-    /// The handle's commit mode ([`Repository::commit_mode`]), decided after
+    /// The handle's commit mode ([`Repo::commit_mode`]), decided after
     /// the upload and before any commit write; `Lock` for a session whose
     /// marker record is already not [continuous](lock::MarkerReport::continuous)
     /// here (a machine suspended over `MARKER_GAP_LIMIT`, marker writes
@@ -529,7 +537,7 @@ impl PendingCommit {
     /// Whether lock holders run the marker handshake's yield here: only an
     /// encrypted repository can have lock-free writers.
     fn yields_to_flagged(&self) -> bool {
-        self.repo.config.encryption != EncryptionMode::None
+        self.repo.config().encryption != EncryptionMode::None
     }
 
     /// Production, lock mode: wait for the commit lock
@@ -544,7 +552,7 @@ impl PendingCommit {
     ) -> Result<lock::LockGuard> {
         let env = self.repo.host_env().clone();
         lock::acquire_commit_lock(
-            self.repo.storage.as_ref(),
+            self.repo.storage().as_ref(),
             &env,
             lock::COMMIT_LOCK_MAX_WAIT,
             500,
@@ -570,7 +578,7 @@ impl PendingCommit {
         &self,
         store_clock: &mut crate::repo::ages::StoreClock,
     ) -> Result<lock::LockGuard> {
-        let storage = self.repo.storage.as_ref();
+        let storage = self.repo.storage().as_ref();
         let env = self.repo.host_env();
         let guard = lock::acquire_lock_reading(storage, env, store_clock)?;
         lock::commit_lock_yield(
@@ -621,7 +629,7 @@ impl PendingCommit {
     pub(crate) fn mark_committing(&mut self) -> Result<()> {
         let marker = self.marker()?;
         let key = marker.mark(
-            self.repo.storage.as_ref(),
+            self.repo.storage().as_ref(),
             self.repo.host_env().clock.as_ref(),
             lock::MarkerFlags {
                 committing: true,
@@ -638,7 +646,8 @@ impl PendingCommit {
     /// held.
     pub(crate) fn try_probe(&mut self) -> Result<()> {
         let (_, key) = self.marker()?.current();
-        let now = lock::probe_unlocked_at(self.repo.storage.as_ref(), self.repo.host_env(), &key)?;
+        let now =
+            lock::probe_unlocked_at(self.repo.storage().as_ref(), self.repo.host_env(), &key)?;
         self.repo.set_lock_store_time(now);
         Ok(())
     }
@@ -654,37 +663,39 @@ impl PendingCommit {
     /// production joins it in the commit's flush).
     #[cfg(any(test, feature = "sim"))]
     pub(crate) fn join_background_writes(&mut self) {
-        self.repo.join_journal_write();
+        self.write.join_journal_write();
     }
 
-    /// Build the commit machine; under a held lock, install its fence first.
+    /// Build the commit machine and its fence: the held lock's, or the
+    /// lock-free backup's.
     /// No storage access.
     pub(crate) fn begin_commit(self, lock: CommitLock) -> CommitInProgress {
         let Self {
             session,
             mut repo,
+            write,
             snapshot_entry,
             snapshot_packed,
             report,
         } = self;
-        let (guard, mode) = match lock {
+        let (guard, mode, fence) = match lock {
             CommitLock::Held(guard) => {
-                let fence = lock::build_lock_fence(
+                let fence = Fence::lock(lock::build_lock_fence(
                     &guard,
-                    Arc::clone(&repo.storage),
+                    Arc::clone(repo.storage()),
                     repo.host_env().clone(),
-                );
-                repo.set_lock_fence(fence);
+                ));
                 // "Now" for the backup fold's segment ages (04 step 7): the
-                // commit lock key's mtime; cleared with the fence at release.
+                // commit lock key's mtime; cleared with the lock state at
+                // release.
                 repo.set_lock_store_time(guard.store_time());
-                (Some(guard), CommitMode::Lock)
+                (Some(guard), CommitMode::Lock, fence)
             }
             // "Now" is the marked key's mtime, recorded by the probe.
-            CommitLock::Free => (None, CommitMode::LockFree),
+            CommitLock::Free => (None, CommitMode::LockFree, Fence::lock_free_backup()),
         };
         let machine = BackupCommit::new(
-            &repo,
+            write,
             snapshot_entry,
             snapshot_packed,
             session.marker(),
@@ -693,6 +704,7 @@ impl PendingCommit {
         CommitInProgress {
             session,
             repo,
+            fence,
             guard,
             machine,
             report,
@@ -702,10 +714,18 @@ impl PendingCommit {
     /// The lock was not acquired (or the lock-free probe gave up): flush the packs (`flush_on_abort` writes
     /// the journal, so the next run's recovery can find them), then drop,
     /// which deregisters the session.
-    pub(crate) fn abandon(mut self) {
+    pub(crate) fn abandon(self) {
+        let Self {
+            session,
+            repo,
+            write,
+            ..
+        } = self;
         // flush_on_abort writes the remote sessions/<id>.index so the next
         // run's recover_pending_index() can discover our packs.
-        self.repo.flush_on_abort();
+        write.flush_on_abort(&repo);
+        // Deregisters the session.
+        drop(session);
     }
 }
 
@@ -722,10 +742,17 @@ impl CommitInProgress {
         self.machine.step(
             &mut StepCx {
                 repo: &mut self.repo,
+                fence: &self.fence,
                 events,
             },
             pick,
         )
+    }
+
+    /// Tests: the fence the commit's steps run under.
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> &Fence {
+        &self.fence
     }
 
     /// The machine's output once it finished without error.
@@ -740,6 +767,7 @@ impl CommitInProgress {
             &mut self.machine,
             &mut StepCx {
                 repo: &mut self.repo,
+                fence: &self.fence,
                 events,
             },
         )
@@ -759,10 +787,13 @@ impl CommitInProgress {
         let Self {
             mut session,
             mut repo,
+            fence: _,
             guard,
-            machine: _,
+            machine,
             mut report,
         } = self;
+        // Handed to the post-commit work on success, flushed on failure.
+        let mut write = Some(machine.into_write_session());
 
         // Once the snapshot is committed, deregister the session and delete
         // its journal on a helper thread while the commit finishes its local
@@ -776,13 +807,15 @@ impl CommitInProgress {
         // so no concurrent refresh call can race with this delete. This
         // sequencing is why the commit path releases the lock itself instead
         // of running under `with_repo_lock`.
-        let repo_storage = Arc::clone(&repo.storage);
+        let repo_storage = Arc::clone(repo.storage());
         let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
         let ok = result.is_ok();
         let result = result.map(|committed| {
             let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
+            let write = write.take().expect("the session is taken once");
             repo.finish_backup_commit(
                 committed,
+                write,
                 &mut report.new_file_cache,
                 &events,
                 shutdown,
@@ -827,7 +860,7 @@ impl CommitInProgress {
                 &mut |msg| emit_post_commit_warning(progress, msg),
             ),
             // Lock-free: the store time, live sessions and segment ages.
-            None => repo.clear_lock_fence(),
+            None => repo.clear_lock_state(),
         }
 
         if let Err(e) = result {
@@ -835,7 +868,9 @@ impl CommitInProgress {
             // run's recover_pending_index() can discover our packs. A failed
             // commit has deregistered the session and released the lock
             // first; `session` drops after this flush.
-            repo.flush_on_abort();
+            if let Some(write) = write.take() {
+                write.flush_on_abort(&repo);
+            }
             return Err(e);
         }
         if !journal_cleared {

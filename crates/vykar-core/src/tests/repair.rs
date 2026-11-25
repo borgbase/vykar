@@ -870,9 +870,13 @@ fn repair_reclaims_crash_orphan_index_entries() {
         repo.load_chunk_index_uncached().unwrap();
         // Point the orphan at a real, valid blob location so no structural check
         // flags it — the only thing wrong is that no snapshot references it.
-        repo.chunk_index_mut()
-            .add(orphan_id, existing_size, existing_pack, existing_offset);
-        repo.save_state().unwrap();
+        repo.unchecked_writer().chunk_index_mut().add(
+            orphan_id,
+            existing_size,
+            existing_pack,
+            existing_offset,
+        );
+        repo.unchecked_writer().save_state().unwrap();
     }
 
     // Confirm the corrupted state actually persisted.

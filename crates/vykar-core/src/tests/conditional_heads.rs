@@ -14,7 +14,7 @@ use crate::repo::host_env::{Clock, HostEnv, StopSignal};
 use crate::repo::index_store;
 use crate::repo::machine::{Machine, StepCx, StepKind};
 use crate::repo::pack::PackType;
-use crate::repo::{BackupCommit, OpenOptions, Repository, WriteSessionOptions};
+use crate::repo::{BackupCommit, Fence, OpenOptions, Repo, WriteSessionOptions};
 use crate::sim::checker::open_observer;
 use crate::sim::history::{AllowedError, ErrorClass};
 use crate::sim::{
@@ -67,7 +67,7 @@ fn head_creates(records: &[OpRecord]) -> Vec<&OpRecord> {
 fn latest_head(sim: &Sim) -> IndexHead {
     let tmp = tempfile::tempdir().unwrap();
     let repo = open_observer(sim.store(), tmp.path()).unwrap();
-    index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref()).unwrap()
+    index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref()).unwrap()
 }
 
 /// `head`'s state at generation `generation`, packed: a valid head another
@@ -77,7 +77,7 @@ fn planted(sim: &Sim, head: &IndexHead, generation: u64) -> Vec<u8> {
     let repo = open_observer(sim.store(), tmp.path()).unwrap();
     let mut h = head.clone();
     h.generation = generation;
-    index_store::pack_head(&h, repo.crypto.as_ref()).unwrap()
+    index_store::pack_head(&h, repo.crypto().as_ref()).unwrap()
 }
 
 // ── The create ──────────────────────────────────────────────────────────
@@ -417,8 +417,8 @@ impl Clock for Suspendable {
 
 /// A handle of `c` on the simulator's store, with the index loaded, outside
 /// any run (no lock, no session marker).
-fn open(sim: &Sim, c: ClientId, env: HostEnv) -> Repository {
-    Repository::open(
+fn open(sim: &Sim, c: ClientId, env: HostEnv) -> Repo {
+    Repo::open(
         Box::new(sim.store().handle(c)),
         None,
         Some(sim.client_dir(c).join("repo-cache")),
@@ -440,15 +440,14 @@ fn entry(name: &str) -> crate::repo::manifest::SnapshotEntry {
 }
 
 /// A session of `repo` storing `chunks`, and its commit machine.
-fn session(repo: &mut Repository, name: &str, chunks: &[&[u8]]) -> BackupCommit {
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+fn session(repo: &mut Repo, name: &str, chunks: &[&[u8]]) -> BackupCommit {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     for c in chunks {
-        repo.store_chunk(c, Compression::None, PackType::Data)
+        ws.store_chunk(repo, c, Compression::None, PackType::Data)
             .unwrap();
     }
     BackupCommit::new(
-        repo,
+        ws,
         entry(name),
         b"snapshot".to_vec(),
         None,
@@ -461,7 +460,7 @@ fn no_events(_: CommitEvent) {}
 /// Step `m` (pick 0) until `stop` accepts its enabled steps or it ends;
 /// returns the steps taken.
 fn step_until(
-    repo: &mut Repository,
+    repo: &mut Repo,
     m: &mut BackupCommit,
     stop: impl Fn(&[StepKind]) -> bool,
 ) -> vykar_types::error::Result<Vec<StepKind>> {
@@ -475,6 +474,7 @@ fn step_until(
         m.step(
             &mut StepCx {
                 repo,
+                fence: &Fence::unchecked(),
                 events: &no_events,
             },
             0,
@@ -487,15 +487,15 @@ fn at_put_head(enabled: &[StepKind]) -> bool {
 }
 
 /// Commit a whole session of `repo` (no lock), finishing it.
-fn commit_whole(repo: &mut Repository, name: &str, chunks: &[&[u8]]) {
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+fn commit_whole(repo: &mut Repo, name: &str, chunks: &[&[u8]]) {
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     for c in chunks {
-        repo.store_chunk(c, Compression::None, PackType::Data)
+        ws.store_chunk(repo, c, Compression::None, PackType::Data)
             .unwrap();
     }
     let mut file_cache = crate::repo::file_cache::FileCache::new();
     repo.commit_session_blocking(
+        ws,
         entry(name),
         b"snapshot".to_vec(),
         &mut file_cache,
@@ -584,9 +584,14 @@ fn taken_generation_after_a_sweep_rechecks_reuse() {
     step_until(&mut ra, &mut ma, at_put_head).unwrap();
     // b removes the shared chunk and publishes a maintenance segment.
     let mut rb = open(&sim, b, sim.host_env(b));
-    let id = vykar_types::chunk_id::ChunkId::compute(rb.crypto.chunk_hasher(), b"shared chunk");
-    assert!(rb.chunk_index_mut().remove(&id).is_some());
-    rb.save_state().unwrap();
+    let id = vykar_types::chunk_id::ChunkId::compute(rb.crypto().chunk_hasher(), b"shared chunk");
+    assert!(
+        rb.unchecked_writer()
+            .chunk_index_mut()
+            .remove(&id)
+            .is_some()
+    );
+    rb.unchecked_writer().save_state().unwrap();
     let generation = latest_head(&sim).generation;
     let snapshots = sim.store().keys("snapshots/");
     let err = step_until(&mut ra, &mut ma, |_| false).unwrap_err();
@@ -616,6 +621,7 @@ fn contention_gives_up_after_eight_attempts() {
         if let Err(e) = ma.step(
             &mut StepCx {
                 repo: &mut ra,
+                fence: &Fence::unchecked(),
                 events: &no_events,
             },
             0,
@@ -861,15 +867,16 @@ fn gc_needs_the_callers_own_head() {
     sim.tamper_put(&junk, b"unreferenced");
     sim.advance(index_store::INDEX_OBJECT_GRACE + Duration::from_secs(60));
     let mut ra = open(&sim, a, sim.host_env(a));
-    ra.maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
+    ra.unchecked_writer()
+        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
         .unwrap();
     assert!(sim.store().object(&junk).is_some(), "no head of its own");
-    ra.begin_write_session(&WriteSessionOptions::default())
+    let mut ws = ra.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&ra, b"chunk of a", Compression::None, PackType::Data)
         .unwrap();
-    ra.store_chunk(b"chunk of a", Compression::None, PackType::Data)
-        .unwrap();
-    ra.save_state().unwrap();
-    ra.maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
+    ra.unchecked_writer().save_session(ws).unwrap();
+    ra.unchecked_writer()
+        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
         .unwrap();
     assert!(
         sim.store().object(&junk).is_none(),
@@ -911,11 +918,11 @@ fn the_fallback_is_noted_once_per_handle() {
 /// and a cold open (an empty one) agree on the latest head and the chunk
 /// index, and each chunk of `chunks` reads back through the warm and the
 /// cold handle.
-fn index_agrees(sim: &Sim, c: ClientId, handle: &Repository, chunks: &[&[u8]]) {
+fn index_agrees(sim: &Sim, c: ClientId, handle: &Repo, chunks: &[&[u8]]) {
     let head = latest_head(sim);
     let warm = open(sim, c, sim.host_env(c));
     let cold_dir = tempfile::tempdir().unwrap();
-    let cold = Repository::open(
+    let cold = Repo::open(
         Box::new(sim.store().handle(c)),
         None,
         Some(cold_dir.path().to_path_buf()),
@@ -927,7 +934,7 @@ fn index_agrees(sim: &Sim, c: ClientId, handle: &Repository, chunks: &[&[u8]]) {
         assert_eq!(r.chunk_index().len(), handle.chunk_index().len(), "{what}");
     }
     for chunk in chunks {
-        let id = vykar_types::chunk_id::ChunkId::compute(handle.crypto.chunk_hasher(), chunk);
+        let id = vykar_types::chunk_id::ChunkId::compute(handle.crypto().chunk_hasher(), chunk);
         let entry = handle.chunk_index().get(&id).expect("indexed");
         for (what, r) in [("warm", &warm), ("cold", &cold)] {
             assert_eq!(r.chunk_index().get(&id), Some(entry), "{what}");
@@ -1015,7 +1022,7 @@ fn head_at(sim: &Sim, generation: u64) -> IndexHead {
         .object(&index_store::head_key(generation))
         .unwrap()
         .data;
-    index_store::classify_head(generation, &data, repo.crypto.as_ref())
+    index_store::classify_head(generation, &data, repo.crypto().as_ref())
         .into_head()
         .unwrap()
 }
@@ -1163,7 +1170,7 @@ fn a_refusal_after_a_passed_check_fails_the_commit() {
     });
     let a = sim.client("a");
     let before = sim.store().step();
-    let mut repo = Repository::open(
+    let mut repo = Repo::open(
         Box::new(RefusesAfterCheck {
             inner: Arc::new(sim.store().handle(a)),
         }),
@@ -1176,12 +1183,11 @@ fn a_refusal_after_a_passed_check_fails_the_commit() {
         repo.commit_mode().unwrap(),
         crate::repo::CommitMode::LockFree
     );
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    repo.store_chunk(b"chunk of a", Compression::None, PackType::Data)
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    ws.store_chunk(&repo, b"chunk of a", Compression::None, PackType::Data)
         .unwrap();
     let mut m = BackupCommit::new(
-        &repo,
+        ws,
         entry("a1"),
         b"snapshot".to_vec(),
         None,
@@ -1189,7 +1195,7 @@ fn a_refusal_after_a_passed_check_fails_the_commit() {
     );
     let err = step_until(&mut repo, &mut m, |_| false).unwrap_err();
     assert!(err.to_string().contains("never writes"), "{err}");
-    repo.flush_on_abort();
+    m.into_write_session().flush_on_abort(&repo);
     let ops = ops_after(&sim, a, before);
     assert!(
         !ops.iter()

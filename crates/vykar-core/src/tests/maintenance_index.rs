@@ -21,7 +21,7 @@ use crate::index::head::IndexHead;
 use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::format::ObjectType;
-use crate::repo::{OpenOptions, RepoFormat, Repository};
+use crate::repo::{OpenOptions, Repo, RepoFormat, RepoWriter};
 
 use super::helpers::{
     PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, source_entry,
@@ -265,15 +265,15 @@ impl Env {
     }
 
     /// Open over `storage` with this client's cache dir.
-    fn open(&self, storage: Box<dyn StorageBackend>, opts: OpenOptions) -> Repository {
-        Repository::open(storage, None, Some(self.cache_dir.clone()), opts).unwrap()
+    fn open(&self, storage: Box<dyn StorageBackend>, opts: OpenOptions) -> Repo {
+        Repo::open(storage, None, Some(self.cache_dir.clone()), opts).unwrap()
     }
 
     /// Open with the index over plain local storage and a throwaway cache
     /// dir, so the index is decoded from storage.
-    fn open_fresh(&self) -> Repository {
+    fn open_fresh(&self) -> Repo {
         let cache = tempfile::tempdir_in(self.dir.path()).unwrap();
-        Repository::open(
+        Repo::open(
             self.local(),
             None,
             Some(cache.path().to_path_buf()),
@@ -299,7 +299,7 @@ impl Env {
     }
 }
 
-fn entries(repo: &Repository) -> HashMap<ChunkId, ChunkIndexEntry> {
+fn entries(repo: &Repo) -> HashMap<ChunkId, ChunkIndexEntry> {
     repo.chunk_index().iter().collect()
 }
 
@@ -377,7 +377,7 @@ fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast(
             &before,
             "compact wrote a head"
         );
-        let id = remote.config.id.clone();
+        let id = remote.config().id.clone();
         assert!(
             table_at(&id, &env.cache_dir, remote.index_head().unwrap()),
             "{format:?}"
@@ -411,7 +411,7 @@ fn compact_leaves_the_table_at_the_new_state() {
 
         let remote = env.open_fresh();
         assert_ne!(remote.index_generation(), before, "compact wrote the index");
-        let id = remote.config.id.clone();
+        let id = remote.config().id.clone();
         assert!(
             table_at(&id, &env.cache_dir, remote.index_head().unwrap()),
             "{format:?}"
@@ -461,7 +461,7 @@ fn maintenance_on_a_host_without_caches_segmented() {
     assert_eq!(head_after.base, head_before.base);
     assert_eq!(head_after.segments.len(), head_before.segments.len() + 1);
 
-    let id = remote.config.id.clone();
+    let id = remote.config().id.clone();
     assert!(table_at(&id, &other_cache, &head_after));
 }
 
@@ -490,7 +490,7 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         // The pruned snapshot's segment is old, so its entries are swept.
         age_repo_objects(&env.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let remote = env.open_fresh();
-        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
+        let (id, generation) = (remote.config().id.clone(), remote.index_generation());
         let head = remote.index_head().unwrap().clone();
         assert!(table_at(&id, &env.cache_dir, &head));
         let index_before = env.index_bytes();
@@ -553,7 +553,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         let src = env.source("a", &[("one.bin", 0x11)]);
         env.backup(&src, "a", "s1");
         let remote = env.open_fresh();
-        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
+        let (id, generation) = (remote.config().id.clone(), remote.index_generation());
         let head = remote.index_head().unwrap().clone();
         assert!(table_at(&id, &env.cache_dir, &head));
         let index_before = env.index_bytes();
@@ -564,9 +564,9 @@ fn lock_lost_before_save_leaves_caches_untouched() {
             repo.load_chunk_index_under_lock()?;
             repo.mark_index_dirty();
             repo.request_full_index_fold();
-            for key in repo.storage.list("locks/").unwrap() {
+            for key in repo.storage().list("locks/").unwrap() {
                 if key.ends_with(".json") {
-                    repo.storage.delete(&key).unwrap();
+                    repo.storage().delete(&key).unwrap();
                 }
             }
             repo.save_state()
@@ -588,17 +588,17 @@ fn lock_lost_before_save_leaves_caches_untouched() {
 
 /// Persists the index as a full fold (a new base and head); call under the
 /// maintenance lock.
-fn fold_and_save(repo: &mut Repository) -> Result<()> {
+fn fold_and_save(repo: &mut RepoWriter<'_>) -> Result<()> {
     repo.load_chunk_index_under_lock()?;
     repo.mark_index_dirty();
     repo.request_full_index_fold();
     repo.save_state()
 }
 
-fn delete_locks(repo: &Repository) {
-    for key in repo.storage.list("locks/").unwrap() {
+fn delete_locks(repo: &Repo) {
+    for key in repo.storage().list("locks/").unwrap() {
         if key.ends_with(".json") {
-            repo.storage.delete(&key).unwrap();
+            repo.storage().delete(&key).unwrap();
         }
     }
 }
@@ -623,7 +623,7 @@ fn lock_lost_after_save_still_installs_the_table_segmented() {
     let env = Env::new(RepoFormat::CURRENT);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
-    let id = env.open_fresh().config.id.clone();
+    let id = env.open_fresh().config().id.clone();
 
     let (before, after) = save_then_lose_lock(&env);
     assert_ne!(before, after);
@@ -661,7 +661,7 @@ fn takeover_keeps_the_newer_table_segmented() {
     let ours = save_then_get_taken_over(&env);
 
     let remote = env.open_fresh();
-    let id = remote.config.id.clone();
+    let id = remote.config().id.clone();
     assert_ne!(ours.generation, remote.index_generation());
     assert!(table_at(&id, &env.cache_dir, &ours));
     assert!(table_at(&id, &env.cache_dir, remote.index_head().unwrap()));

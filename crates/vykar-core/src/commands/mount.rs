@@ -28,7 +28,7 @@ use crate::commands::list as list_cmd;
 use crate::commands::listing::ListingView;
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
@@ -78,7 +78,7 @@ enum DirChildren {
 /// What a lazy directory reads its children from.
 enum DirLoader {
     /// The root of a snapshot not opened yet.
-    Snapshot { repo: Arc<Repository>, name: String },
+    Snapshot { repo: Arc<Repo>, name: String },
     /// A directory of a snapshot with a usable key index: its raw paths
     /// (several when non-UTF-8 names share a display name; an empty path is
     /// the snapshot root) and its display path from the snapshot root.
@@ -128,7 +128,7 @@ impl<T> LoadOnce<T> {
 
 /// An opened snapshot whose key index is usable.
 struct IndexedSnapshot {
-    repo: Arc<Repository>,
+    repo: Arc<Repo>,
     meta: SnapshotMeta,
     /// Non-empty segment roots of the index (implicit ancestors come from
     /// them).
@@ -258,7 +258,7 @@ fn indexed_roots(meta: &SnapshotMeta) -> Option<Vec<Vec<u8>>> {
 /// directory at a time when it has a usable one (the root's children are
 /// read here), else its whole tree (built here); the item count is returned
 /// for a whole build. A pointer the chunk index lacks is refused up front.
-fn open_snapshot(repo: &Arc<Repository>, name: &str) -> Result<(VfsNode, Option<usize>)> {
+fn open_snapshot(repo: &Arc<Repo>, name: &str) -> Result<(VfsNode, Option<usize>)> {
     let meta = list_cmd::load_snapshot_meta(repo, name)?;
     list_cmd::resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
     match indexed_roots(&meta) {
@@ -287,7 +287,7 @@ fn open_snapshot(repo: &Arc<Repository>, name: &str) -> Result<(VfsNode, Option<
 }
 
 /// The children of snapshot `name`'s root directory.
-fn load_snapshot_root(repo: &Arc<Repository>, name: &str) -> Result<Children> {
+fn load_snapshot_root(repo: &Arc<Repo>, name: &str) -> Result<Children> {
     match open_snapshot(repo, name)?.0 {
         VfsNode::Dir(d) => Ok(d.children_if_loaded().unwrap_or_default()),
         _ => Ok(Children::default()),
@@ -532,7 +532,7 @@ fn insert_item(root: &mut HashMap<String, BuildNode>, item: &Item) {
 
 /// Snapshot `meta`'s whole tree with every directory known, read a batch of
 /// tree chunks at a time; also returns the item count.
-fn build_whole(repo: &Repository, meta: &SnapshotMeta) -> Result<(VfsNode, usize)> {
+fn build_whole(repo: &Repo, meta: &SnapshotMeta) -> Result<(VfsNode, usize)> {
     let mut root = HashMap::new();
     let mut count = 0usize;
     list_cmd::for_each_item_by_chunk(
@@ -1057,7 +1057,7 @@ impl DavDirEntry for VykarDirEntry {
 #[derive(Clone)]
 struct VykarDavFs {
     root: VfsNode,
-    repo: Arc<Repository>,
+    repo: Arc<Repo>,
     cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 }
 
@@ -1148,7 +1148,7 @@ struct VykarDavFile {
     chunks: Arc<Vec<ChunkRef>>,
     meta: VfsMeta,
     pos: u64,
-    repo: Arc<Repository>,
+    repo: Arc<Repo>,
     cache: ChunkCache,
 }
 
@@ -1166,7 +1166,7 @@ impl fmt::Debug for VykarDavFile {
 /// lock is held across the storage read, so concurrent misses read in
 /// parallel (and two misses on the same chunk both read it).
 fn read_chunk_cached(
-    repo: &Repository,
+    repo: &Repo,
     cache: &ChunkCache,
     chunk_id: &ChunkId,
 ) -> FsResult<Arc<Vec<u8>>> {
@@ -1422,7 +1422,7 @@ pub fn run_with_progress(
 /// The root of a multi-snapshot mount: one directory per snapshot of
 /// `entries`, each read on first access. Reads nothing.
 fn multi_snapshot_root(
-    repo: &Arc<Repository>,
+    repo: &Arc<Repo>,
     entries: &[crate::repo::manifest::SnapshotEntry],
 ) -> VfsNode {
     let children = entries
@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     /// The eager tree of snapshot `name`, the oracle.
-    fn eager_tree(repo: &mut Repository, name: &str) -> VfsNode {
+    fn eager_tree(repo: &mut Repo, name: &str) -> VfsNode {
         build_vfs_tree(&list_cmd::load_snapshot_items(repo, name, &CancelToken::new()).unwrap())
     }
 
@@ -1879,7 +1879,7 @@ mod tests {
         let entries = repo.manifest().snapshots.clone();
         let root = multi_snapshot_root(&repo, &entries);
         let bad = repo.manifest().find_snapshot("s1").unwrap().id;
-        repo.storage.delete(&bad.storage_key()).unwrap();
+        repo.storage().delete(&bad.storage_key()).unwrap();
         assert!(lookup(&root, b"/s1/a").is_err());
         assert!(lookup(&root, b"/s2/a/b/c/f").unwrap().is_some());
         let mut names: Vec<String> = dir_of(&root).children().unwrap().keys().cloned().collect();
@@ -1999,7 +1999,7 @@ mod tests {
         }
     }
 
-    /// Two uncached reads through one `Repository` reach storage at the same
+    /// Two uncached reads through one `Repo` reach storage at the same
     /// time. Guards against a lock held across the storage read in
     /// `read_chunk_cached`: with one, the second read cannot enter `get_range`
     /// while the first waits, the first times out and `max` stays 1.
@@ -2015,7 +2015,7 @@ mod tests {
             inner: crate::testutil::MemoryBackend::new(),
             rv: Arc::clone(&rv),
         };
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(backend),
             EncryptionMode::None,
             crate::repo::ChunkerParams::default(),
@@ -2024,18 +2024,17 @@ mod tests {
             None,
         )
         .unwrap();
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
         let data_a = b"mount chunk a".repeat(100);
         let data_b = b"mount chunk b".repeat(100);
-        let (id_a, _, _) = repo
-            .store_chunk(&data_a, Compression::None, PackType::Data)
+        let (id_a, _, _) = ws
+            .store_chunk(&repo, &data_a, Compression::None, PackType::Data)
             .unwrap();
-        let (id_b, _, _) = repo
-            .store_chunk(&data_b, Compression::None, PackType::Data)
+        let (id_b, _, _) = ws
+            .store_chunk(&repo, &data_b, Compression::None, PackType::Data)
             .unwrap();
         // A session's chunks are in the index once it is saved.
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
         rv.armed.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let repo = Arc::new(repo);

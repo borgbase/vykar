@@ -197,7 +197,7 @@ pub(crate) enum HeadPut {
 
 /// The notice a repository handle logged when its heads fell back to plain
 /// PUTs under the lock (04 "Fallback"). Kept on the handle
-/// (`Repository::head_fallback`), so every opened repository logs once: the
+/// (`Repo::head_fallback`), so every opened repository logs once: the
 /// backend's verdict holds for the backend instance, which the handle owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeadFallback {

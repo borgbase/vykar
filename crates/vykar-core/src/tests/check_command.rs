@@ -1099,10 +1099,12 @@ fn bump_snapshot_version_on_disk(repo_dir: &std::path::Path, snapshot_name: &str
         ObjectType::SnapshotMeta,
         entry.id.as_bytes(),
         &bytes,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )
     .unwrap();
-    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+    repo.storage()
+        .put(&entry.id.storage_key(), &packed)
+        .unwrap();
 }
 
 /// A snapshot written by a newer format version is classified as *unsupported*
@@ -1193,10 +1195,12 @@ fn extend_snapshot_envelope_on_disk(repo_dir: &std::path::Path, snapshot_name: &
         ObjectType::SnapshotMeta,
         entry.id.as_bytes(),
         &bytes,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )
     .unwrap();
-    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+    repo.storage()
+        .put(&entry.id.storage_key(), &packed)
+        .unwrap();
 }
 
 /// Set up a repo holding exactly one snapshot, whose envelope is one field
@@ -1857,7 +1861,7 @@ fn sorted_dir_listing(dir: &std::path::Path) -> Vec<String> {
 #[test]
 fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
     init_test_environment();
-    let mut repo = crate::repo::Repository::init(
+    let mut repo = crate::repo::Repo::init(
         Box::new(crate::testutil::MemoryBackend::new()),
         crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
@@ -1866,22 +1870,22 @@ fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
-        .unwrap();
-    let (id, _, _) = repo
+    let mut ws = repo.begin_write_session(&crate::repo::WriteSessionOptions::default());
+    let (id, _, _) = ws
         .store_chunk(
+            &repo,
             b"repeated entry payload",
             crate::compress::Compression::Lz4,
             crate::repo::pack::PackType::Data,
         )
         .unwrap();
-    crate::testutil::save_and_resume(&mut repo);
+    crate::testutil::save_and_resume(&mut repo, &mut ws);
     let entry = repo.chunk_index().get(&id).unwrap();
 
     let mut issues: Vec<IntegrityIssue> = Vec::new();
     let count = verify_pack_full(
-        repo.storage.as_ref(),
-        repo.crypto.as_ref(),
+        repo.storage().as_ref(),
+        repo.crypto().as_ref(),
         &entry.pack_id,
         &[(id, entry), (id, entry), (id, entry)],
         &mut issues,

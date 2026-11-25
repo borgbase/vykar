@@ -1,5 +1,5 @@
-use crate::repo::Repository;
 use crate::repo::control::CancelToken;
+use crate::repo::{Repo, RepoWriter};
 use vykar_types::error::{Result, VykarError};
 
 /// A snapshot resolved for removal. Only constructed by
@@ -13,7 +13,7 @@ pub struct RemovalTarget {
 /// Resolve every name against the manifest. No storage access, no mutation:
 /// an unknown name fails with `SnapshotNotFound` before anything is deleted.
 pub fn prepare_removal_targets<S: AsRef<str>>(
-    repo: &Repository,
+    repo: &Repo,
     names: &[S],
 ) -> Result<Vec<RemovalTarget>> {
     names
@@ -37,7 +37,7 @@ pub fn prepare_removal_targets<S: AsRef<str>>(
 /// Returns the removed names. The index is not read or written: the chunks
 /// only these snapshots referenced stay until `vykar compact` sweeps them.
 pub fn remove_snapshots(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     targets: Vec<RemovalTarget>,
     shutdown: &CancelToken,
 ) -> Result<Vec<String>> {
@@ -45,8 +45,8 @@ pub fn remove_snapshots(
     let result = (|| {
         for target in targets {
             shutdown.check()?;
-            repo.check_lock_fence()?;
-            repo.storage.delete(&target.snapshot_key).map_err(|e| {
+            repo.check_fence()?;
+            repo.storage().delete(&target.snapshot_key).map_err(|e| {
                 VykarError::Other(format!(
                     "failed to delete snapshot object {}: {e}",
                     target.snapshot_name

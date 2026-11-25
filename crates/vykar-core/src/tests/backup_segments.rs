@@ -12,14 +12,16 @@ use crate::index::segment_v2::SegmentBody;
 use crate::index::table::PrefilterVerdict;
 use crate::repo::index_store;
 use crate::repo::pack::PackType;
-use crate::repo::{ChunkerParams, EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
+use crate::repo::{
+    ChunkerParams, EncryptionMode, OpenOptions, Repo, WriteSession, WriteSessionOptions,
+};
 use crate::testutil::MemoryBackend;
 
 use super::helpers::{backup_single_source, make_test_config};
 
-fn init(mem: &Arc<dyn StorageBackend>) -> Repository {
+fn init(mem: &Arc<dyn StorageBackend>) -> Repo {
     crate::testutil::init_test_environment();
-    Repository::init(
+    Repo::init(
         Box::new(Arc::clone(mem)),
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -31,8 +33,8 @@ fn init(mem: &Arc<dyn StorageBackend>) -> Repository {
 }
 
 /// A handle on `mem` with the index loaded and no cache dir.
-fn open(mem: &Arc<dyn StorageBackend>) -> Repository {
-    Repository::open(
+fn open(mem: &Arc<dyn StorageBackend>) -> Repo {
+    Repo::open(
         Box::new(Arc::clone(mem)),
         None,
         None,
@@ -41,8 +43,8 @@ fn open(mem: &Arc<dyn StorageBackend>) -> Repository {
     .unwrap()
 }
 
-/// Commit the active session as a backup snapshot `name`.
-fn commit(repo: &mut Repository, name: &str) {
+/// Commit `ws` as a backup snapshot `name`.
+fn commit(repo: &mut Repo, ws: WriteSession, name: &str) {
     let entry = crate::repo::manifest::SnapshotEntry {
         name: name.into(),
         id: vykar_types::snapshot_id::SnapshotId::generate(),
@@ -54,6 +56,7 @@ fn commit(repo: &mut Repository, name: &str) {
     };
     let mut file_cache = crate::repo::file_cache::FileCache::new();
     repo.commit_session_blocking(
+        ws,
         entry,
         b"snapshot".to_vec(),
         &mut file_cache,
@@ -62,27 +65,27 @@ fn commit(repo: &mut Repository, name: &str) {
     .unwrap();
 }
 
-fn store(repo: &mut Repository, data: &[u8]) -> ChunkId {
-    repo.store_chunk(data, Compression::None, PackType::Data)
+fn store(repo: &Repo, ws: &mut WriteSession, data: &[u8]) -> ChunkId {
+    ws.store_chunk(repo, data, Compression::None, PackType::Data)
         .unwrap()
         .0
 }
 
 /// The last segment the latest head names, decoded.
-fn last_segment(repo: &Repository) -> SegmentBody {
-    let head = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref()).unwrap();
+fn last_segment(repo: &Repo) -> SegmentBody {
+    let head = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref()).unwrap();
     let r = head.segments.last().unwrap();
     let bytes = repo
-        .storage
+        .storage()
         .get(&index_store::object_key(&r.name))
         .unwrap()
         .unwrap();
-    index_store::decode_segment_v2(r, &bytes, repo.crypto.as_ref()).unwrap()
+    index_store::decode_segment_v2(r, &bytes, repo.crypto().as_ref()).unwrap()
 }
 
 /// The real trailer frame length of `pack`.
-fn frame_len(repo: &Repository, pack: &vykar_types::pack_id::PackId) -> u32 {
-    let bytes = repo.storage.get(&pack.storage_key()).unwrap().unwrap();
+fn frame_len(repo: &Repo, pack: &vykar_types::pack_id::PackId) -> u32 {
+    let bytes = repo.storage().get(&pack.storage_key()).unwrap().unwrap();
     4 + crate::repo::pack_trailer::parse_footer(&bytes).unwrap()
 }
 
@@ -93,19 +96,17 @@ fn frame_len(repo: &Repository, pack: &vykar_types::pack_id::PackId) -> u32 {
 fn a_chunk_in_an_applied_segment_is_deduplicated() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut repo = init(&mem);
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let a = store(&mut repo, b"chunk added by the first backup");
-    commit(&mut repo, "s1");
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let a = store(&repo, &mut ws, b"chunk added by the first backup");
+    commit(&mut repo, ws, "s1");
     drop(repo);
 
     let mut repo = open(&mem);
     let head = repo.index_head().unwrap().clone();
     assert!(head.base.is_none() && head.segments.len() == 1, "{head:?}");
     let packs_before = mem.list("packs/").unwrap().len();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let prefilter = repo
+    ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let prefilter = ws
         .dedup_prefilter()
         .expect("a prefilter over a segments-only index");
     let size = repo.chunk_index().get(&a).unwrap().stored_size;
@@ -114,7 +115,8 @@ fn a_chunk_in_an_applied_segment_is_deduplicated() {
         PrefilterVerdict::PresentAdded { stored_size: size }
     );
     assert_eq!(
-        repo.store_chunk(
+        ws.store_chunk(
+            &repo,
             b"chunk added by the first backup",
             Compression::None,
             PackType::Data
@@ -122,8 +124,8 @@ fn a_chunk_in_an_applied_segment_is_deduplicated() {
         .unwrap(),
         (a, size, false)
     );
-    assert!(repo.delta_reuses(&a));
-    commit(&mut repo, "s2");
+    assert!(ws.delta_reuses(&a));
+    commit(&mut repo, ws, "s2");
     assert_eq!(
         mem.list("packs/").unwrap().len(),
         packs_before,
@@ -168,23 +170,20 @@ fn a_first_backup_into_an_empty_repository_dedups_within_itself() {
 fn the_second_session_omits_chunks_the_first_committed() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut repo = init(&mem);
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    store(&mut repo, b"an older chunk");
-    commit(&mut repo, "s0");
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    store(&repo, &mut ws, b"an older chunk");
+    commit(&mut repo, ws, "s0");
     drop(repo);
 
     let mut a = open(&mem);
     let mut b = open(&mem);
-    a.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    b.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let shared = store(&mut a, b"a chunk both sessions store");
-    a.flush_packs().unwrap();
-    let only_a = store(&mut a, b"a chunk only the first stores");
-    assert_eq!(store(&mut b, b"a chunk both sessions store"), shared);
-    commit(&mut b, "b");
+    let mut wa = a.begin_write_session(&WriteSessionOptions::default());
+    let mut wb = b.begin_write_session(&WriteSessionOptions::default());
+    let shared = store(&a, &mut wa, b"a chunk both sessions store");
+    wa.flush_packs(&a).unwrap();
+    let only_a = store(&a, &mut wa, b"a chunk only the first stores");
+    assert_eq!(store(&b, &mut wb, b"a chunk both sessions store"), shared);
+    commit(&mut b, wb, "b");
     let b_seg = last_segment(&b);
     assert_eq!(
         b_seg
@@ -195,7 +194,7 @@ fn the_second_session_omits_chunks_the_first_committed() {
         vec![shared]
     );
 
-    commit(&mut a, "a");
+    commit(&mut a, wa, "a");
     let a_seg = last_segment(&a);
     assert_eq!(
         a_seg
@@ -224,22 +223,19 @@ fn a_recovered_pack_that_is_not_used_stays_out_of_the_segment() {
     // A store with mtimes: recovery adopts journal packs by their age.
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::with_mtimes());
     let mut repo = init(&mem);
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    store(&mut repo, b"committed first");
-    commit(&mut repo, "s0");
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    store(&repo, &mut ws, b"committed first");
+    commit(&mut repo, ws, "s0");
     drop(repo);
 
-    let mut interrupted = open(&mem);
-    interrupted
-        .begin_write_session(&WriteSessionOptions {
-            session_id: "interrupted".into(),
-            ..WriteSessionOptions::default()
-        })
-        .unwrap();
-    store(&mut interrupted, b"stored by the interrupted session");
-    interrupted.flush_packs().unwrap();
-    interrupted.flush_on_abort();
+    let interrupted = open(&mem);
+    let mut wi = interrupted.begin_write_session(&WriteSessionOptions {
+        session_id: "interrupted".into(),
+        ..WriteSessionOptions::default()
+    });
+    store(&interrupted, &mut wi, b"stored by the interrupted session");
+    wi.flush_packs(&interrupted).unwrap();
+    wi.flush_on_abort(&interrupted);
     drop(interrupted);
     assert!(
         mem.list("sessions/")
@@ -250,19 +246,18 @@ fn a_recovered_pack_that_is_not_used_stays_out_of_the_segment() {
     );
 
     let mut repo = open(&mem);
-    repo.begin_write_session(&WriteSessionOptions {
+    ws = repo.begin_write_session(&WriteSessionOptions {
         session_id: "recovering".into(),
         ..WriteSessionOptions::default()
-    })
-    .unwrap();
+    });
     // The recovering session's own marker gives recovery "now".
     mem.put("sessions/recovering.json", b"{}").unwrap();
-    let recovered = repo
-        .recover_pending_index(&crate::repo::control::CancelToken::new())
+    let recovered = ws
+        .recover_pending_index(&repo, &crate::repo::control::CancelToken::new())
         .unwrap();
     assert_eq!(recovered.recovered_chunks, 1);
-    let new = store(&mut repo, b"a chunk of this session");
-    commit(&mut repo, "s1");
+    let new = store(&repo, &mut ws, b"a chunk of this session");
+    commit(&mut repo, ws, "s1");
     let seg = last_segment(&repo);
     assert_eq!(
         seg.additions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),

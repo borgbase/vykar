@@ -219,8 +219,11 @@ fn chunk_missing_from_index_is_damage() {
     let (b_rel, b_chunk) = fx.file_chunk("b.bin");
     {
         let mut repo = open_local_repo(&fx.repo_dir, None);
-        repo.chunk_index_mut().remove(&b_chunk).unwrap();
-        repo.save_state().unwrap();
+        vykar_core::commands::util::with_maintenance_lock(&mut repo, |w| {
+            w.chunk_index_mut().remove(&b_chunk).unwrap();
+            w.save_state()
+        })
+        .unwrap();
     }
 
     // Strict: aborts, keeping the original variant inside the wrapper.

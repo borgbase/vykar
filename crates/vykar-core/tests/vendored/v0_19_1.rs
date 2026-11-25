@@ -73,7 +73,7 @@ fn default_max_pack_size() -> u32 {
 }
 // END
 
-/// `Repository::open` (open.rs:217-225) at v0.19.1: decode, then
+/// `Repo::open` (open.rs:217-225) at v0.19.1: decode, then
 /// `version != 2`.
 pub fn open_gate(bytes: &[u8]) -> Result<RepoConfig, super::Refusal> {
     let config: RepoConfig =

@@ -16,7 +16,7 @@ use crate::repo::format::ObjectType;
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::pack_map::{PackMap, PackMapEntry, pack_map_key};
 use crate::repo::pack_trailer::{parse_footer, read_trailer_from_pack_bytes, trailer_frame_start};
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::{OpenOptions, Repo};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 use vykar_types::pack_id::PackId;
@@ -78,7 +78,7 @@ impl Fx {
         PathBuf::from(self.config.cache_dir.as_ref().unwrap())
     }
 
-    fn open(&self) -> Repository {
+    fn open(&self) -> Repo {
         commands::util::open_repo(
             &self.config,
             pass(&self.config),
@@ -155,7 +155,7 @@ impl Fx {
 
     /// Store a pack map of `packs` as the repository's crypto seals it.
     fn put_pack_map(&self, packs: Vec<(PackId, Vec<PackMapEntry>)>) {
-        let crypto = std::sync::Arc::clone(&self.open().crypto);
+        let crypto = std::sync::Arc::clone(self.open().crypto());
         let (name, stored) = PackMap { packs }.seal(crypto.as_ref()).unwrap();
         let path = self.repo_dir.join(pack_map_key(&name));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -459,7 +459,7 @@ fn verify_data_reports_a_trailer_that_disagrees_with_the_index() {
     fx.write("a.bin", &data(1, 200_000));
     fx.backup("s1");
     let pack = fx.pack_of_largest();
-    let crypto = std::sync::Arc::clone(&fx.open().crypto);
+    let crypto = std::sync::Arc::clone(fx.open().crypto());
     let mut bytes = std::fs::read(&pack).unwrap();
     let start = frame_start(&bytes);
     let mut trailer = read_trailer_from_pack_bytes(&bytes, crypto.as_ref())

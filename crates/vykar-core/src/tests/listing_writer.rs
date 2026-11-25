@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::commands::backup::ListingWriter;
 use crate::commands::list::for_each_decoded_item;
 use crate::compress::Compression;
-use crate::repo::Repository;
+use crate::repo::{Repo, WriteSession, WriteSessionOptions};
 use crate::snapshot::CURRENT_FORMAT_VERSION;
 use crate::snapshot::item::{ChunkRef, Item, ItemType, v1_wire};
 use crate::testutil::{test_chunk_hasher, test_repo_plaintext};
@@ -34,10 +34,13 @@ const KNOWN_V1: &[&str] = &[
 
 /// A plaintext in-memory repository whose chunk-ID key (and so the cut
 /// key) is fixed: `test_repo_plaintext` draws a fresh key per init.
-fn fixed_key_repo() -> Repository {
+fn fixed_key_repo() -> (Repo, WriteSession) {
     let mut repo = test_repo_plaintext();
-    repo.crypto = Arc::new(vykar_crypto::PlaintextEngine::new(test_chunk_hasher()));
-    repo
+    repo.set_crypto_for_test(Arc::new(vykar_crypto::PlaintextEngine::new(
+        test_chunk_hasher(),
+    )));
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws)
 }
 
 fn item(path: String, entry_type: ItemType, mode: u32, chunks: Vec<ChunkRef>) -> Item {
@@ -134,12 +137,17 @@ const KNOWN_V2: &[&str] = &[
 ];
 
 /// The writer under test, applied to `items`.
-fn write_listing(repo: &mut Repository, items: &[Item], compression: Compression) -> Vec<ChunkId> {
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
+fn write_listing(
+    repo: &Repo,
+    ws: &mut WriteSession,
+    items: &[Item],
+    compression: Compression,
+) -> Vec<ChunkId> {
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), compression);
     for item in items {
-        listing.push(repo, item).unwrap();
+        listing.push(repo, ws, item).unwrap();
     }
-    let finished = listing.finish(repo).unwrap();
+    let finished = listing.finish(repo, ws).unwrap();
     assert_eq!(finished.format_version, CURRENT_FORMAT_VERSION);
     finished.item_ptrs
 }
@@ -147,18 +155,19 @@ fn write_listing(repo: &mut Repository, items: &[Item], compression: Compression
 /// The writer fed format-1 entries (`v1_wire`): what the pre-6a writer
 /// produced.
 fn write_listing_v1(
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     items: &[Item],
     compression: Compression,
 ) -> Vec<ChunkId> {
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), compression);
     let mut entry = Vec::new();
     for item in items {
         entry.clear();
         v1_wire::encode_item(item, &mut entry).unwrap();
-        listing.push_encoded(repo, &item.path, &entry).unwrap();
+        listing.push_encoded(repo, ws, &item.path, &entry).unwrap();
     }
-    listing.finish(repo).unwrap().item_ptrs
+    listing.finish(repo, ws).unwrap().item_ptrs
 }
 
 fn hex(ptrs: &[ChunkId]) -> Vec<String> {
@@ -169,11 +178,8 @@ fn hex(ptrs: &[ChunkId]) -> Vec<String> {
 fn known_item_ptrs_v1() {
     let items = fixed_items();
     for compression in [Compression::None, Compression::default()] {
-        let ptrs = hex(&write_listing_v1(
-            &mut fixed_key_repo(),
-            &items,
-            compression,
-        ));
+        let (repo, mut ws) = fixed_key_repo();
+        let ptrs = hex(&write_listing_v1(&repo, &mut ws, &items, compression));
         assert_eq!(ptrs, KNOWN_V1, "{compression:?}");
     }
 }
@@ -182,17 +188,16 @@ fn known_item_ptrs_v1() {
 fn known_item_ptrs() {
     assert_eq!(CURRENT_FORMAT_VERSION, 2);
     let items = fixed_items();
-    let ptrs = hex(&write_listing(
-        &mut fixed_key_repo(),
-        &items,
-        Compression::None,
-    ));
+    let (repo, mut ws) = fixed_key_repo();
+    let ptrs = hex(&write_listing(&repo, &mut ws, &items, Compression::None));
     assert!(ptrs.len() >= 8, "only {} tree chunks", ptrs.len());
     assert_eq!(ptrs, KNOWN_V2);
     // The ID is over the plaintext. A fresh repository, because a dedup hit
     // returns before compressing.
+    let (repo, mut ws) = fixed_key_repo();
     let compressed = hex(&write_listing(
-        &mut fixed_key_repo(),
+        &repo,
+        &mut ws,
         &items,
         Compression::default(),
     ));
@@ -205,10 +210,10 @@ const MIN_CHUNK: usize = 8 * 1024;
 #[test]
 fn every_chunk_holds_whole_entries_and_concatenates() {
     let items = fixed_items();
-    let mut repo = fixed_key_repo();
-    let ptrs = write_listing(&mut repo, &items, Compression::None);
-    repo.flush_packs().unwrap();
-    repo.save_state().unwrap();
+    let (mut repo, mut ws) = fixed_key_repo();
+    let ptrs = write_listing(&repo, &mut ws, &items, Compression::None);
+    ws.flush_packs(&repo).unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
 
     let mut paths = Vec::new();
     let mut huge_ends_chunk = false;
@@ -240,22 +245,23 @@ fn every_chunk_holds_whole_entries_and_concatenates() {
 
 #[test]
 fn empty_listing_has_no_item_ptrs() {
-    let mut repo = fixed_key_repo();
-    let listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::None);
-    assert!(listing.finish(&mut repo).unwrap().item_ptrs.is_empty());
+    let (repo, mut ws) = fixed_key_repo();
+    let listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
+    assert!(listing.finish(&repo, &mut ws).unwrap().item_ptrs.is_empty());
 }
 
 #[test]
 fn one_small_entry_is_one_chunk() {
     let items = &fixed_items()[..1];
     let bytes = rmp_serde::to_vec(&items[0]).unwrap();
-    let ptrs = write_listing(&mut fixed_key_repo(), items, Compression::None);
+    let (repo, mut ws) = fixed_key_repo();
+    let ptrs = write_listing(&repo, &mut ws, items, Compression::None);
     assert_eq!(ptrs, [ChunkId::compute(&test_chunk_hasher(), &bytes)]);
 }
 
 /// Decode each chunk of `ptrs` alone; the items of all chunks in order and
 /// the plaintext bytes they took.
-fn read_listing(repo: &mut Repository, ptrs: &[ChunkId]) -> (Vec<Item>, usize) {
+fn read_listing(repo: &mut Repo, ptrs: &[ChunkId]) -> (Vec<Item>, usize) {
     let mut items = Vec::new();
     let mut bytes = 0;
     for (i, id) in ptrs.iter().enumerate() {
@@ -273,11 +279,11 @@ fn read_listing(repo: &mut Repository, ptrs: &[ChunkId]) -> (Vec<Item>, usize) {
 #[test]
 fn v1_and_v2_listings_decode_to_the_same_items() {
     let items = fixed_items();
-    let mut repo = fixed_key_repo();
-    let v1 = write_listing_v1(&mut repo, &items, Compression::None);
-    let v2 = write_listing(&mut repo, &items, Compression::None);
-    repo.flush_packs().unwrap();
-    repo.save_state().unwrap();
+    let (mut repo, mut ws) = fixed_key_repo();
+    let v1 = write_listing_v1(&repo, &mut ws, &items, Compression::None);
+    let v2 = write_listing(&repo, &mut ws, &items, Compression::None);
+    ws.flush_packs(&repo).unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     assert_ne!(v1, v2);
 
     let (from_v1, v1_bytes) = read_listing(&mut repo, &v1);
@@ -299,24 +305,26 @@ fn begin_segment_cuts_and_records_segments() {
     use crate::commands::backup::item_cut::ItemStreamCutter;
     use crate::snapshot::listing::{NoIndex, ORDER_DFS_NAME, decode_ext};
 
-    let mut repo = fixed_key_repo();
+    let (repo, mut ws) = fixed_key_repo();
     // Never cuts on its own.
     let cutter = ItemStreamCutter::with_params([1; 32], usize::MAX, u64::MAX, usize::MAX);
     let mut listing = ListingWriter::with_cutter(cutter, Compression::None);
     let at = |path: &str| item(path.into(), ItemType::RegularFile, 0o644, Vec::new());
     listing
-        .begin_segment(&mut repo, b"vykar-dumps".to_vec())
+        .begin_segment(&repo, &mut ws, b"vykar-dumps".to_vec())
         .unwrap();
-    listing.push(&mut repo, &at("vykar-dumps")).unwrap();
-    listing.push(&mut repo, &at("vykar-dumps/a")).unwrap();
-    listing.begin_segment(&mut repo, b"r".to_vec()).unwrap();
+    listing.push(&repo, &mut ws, &at("vykar-dumps")).unwrap();
+    listing.push(&repo, &mut ws, &at("vykar-dumps/a")).unwrap();
+    listing
+        .begin_segment(&repo, &mut ws, b"r".to_vec())
+        .unwrap();
     // A second start on the now empty buffer adds no chunk and replaces the root.
     listing
-        .begin_segment(&mut repo, b"home/u".to_vec())
+        .begin_segment(&repo, &mut ws, b"home/u".to_vec())
         .unwrap();
-    listing.push(&mut repo, &at("home/u")).unwrap();
-    listing.push(&mut repo, &at("home/u/x")).unwrap();
-    let finished = listing.finish(&mut repo).unwrap();
+    listing.push(&repo, &mut ws, &at("home/u")).unwrap();
+    listing.push(&repo, &mut ws, &at("home/u/x")).unwrap();
+    let finished = listing.finish(&repo, &mut ws).unwrap();
     assert_eq!(finished.item_ptrs.len(), 2);
     let index = decode_ext(finished.ext.as_deref(), 2).unwrap();
     assert_eq!(index.order, ORDER_DFS_NAME);
@@ -331,24 +339,24 @@ fn begin_segment_cuts_and_records_segments() {
     );
 
     // No begin_segment: one implicit segment rooted at "".
-    let mut repo = fixed_key_repo();
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::None);
+    let (repo, mut ws) = fixed_key_repo();
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
     for path in ["a", "b", "a/x"] {
-        listing.push(&mut repo, &at(path)).unwrap();
+        listing.push(&repo, &mut ws, &at(path)).unwrap();
     }
-    let finished = listing.finish(&mut repo).unwrap();
+    let finished = listing.finish(&repo, &mut ws).unwrap();
     let index = decode_ext(finished.ext.as_deref(), finished.item_ptrs.len()).unwrap();
     assert_eq!(index.segments.len(), 1);
     assert!(index.segments[0].root.is_empty());
 
     // The pinned listing is not in walker order ("dir-01" after
     // "dir-00/..."): order 0.
-    let mut repo = fixed_key_repo();
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::None);
+    let (repo, mut ws) = fixed_key_repo();
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
     for item in &fixed_items() {
-        listing.push(&mut repo, item).unwrap();
+        listing.push(&repo, &mut ws, item).unwrap();
     }
-    let finished = listing.finish(&mut repo).unwrap();
+    let finished = listing.finish(&repo, &mut ws).unwrap();
     assert_eq!(
         decode_ext(finished.ext.as_deref(), finished.item_ptrs.len()),
         Err(NoIndex::Unordered)

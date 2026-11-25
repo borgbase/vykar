@@ -16,7 +16,7 @@ use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
-    DecodedConfig, EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, UpgradeOutcome,
+    DecodedConfig, EncryptionMode, OpenOptions, Repo, RepoConfig, RepoFormat, UpgradeOutcome,
 };
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
@@ -43,7 +43,7 @@ fn fixture(legacy: RepoFormat) -> Fixture {
     let mut config = make_test_config(&repo_dir);
     let cache = tmp.path().join("cache");
     config.cache_dir = Some(cache.to_string_lossy().into_owned());
-    Repository::init_at_format(
+    Repo::init_at_format(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
         config.chunker.params(),
@@ -77,18 +77,18 @@ impl Fixture {
         assert_eq!(format, self.legacy);
     }
 
-    fn open(&self, cache: &Path, with_index: bool) -> Result<Repository> {
+    fn open(&self, cache: &Path, with_index: bool) -> Result<Repo> {
         let opts = if with_index {
             OpenOptions::new().with_index()
         } else {
             OpenOptions::new()
         };
-        Repository::open(self.storage(), None, Some(cache.to_path_buf()), opts)
+        Repo::open(self.storage(), None, Some(cache.to_path_buf()), opts)
     }
 
     /// The open `vykar upgrade` does: any format, without the index.
-    fn open_legacy(&self, cache: &Path) -> Result<Repository> {
-        Repository::open(
+    fn open_legacy(&self, cache: &Path) -> Result<Repo> {
+        Repo::open(
             self.storage(),
             None,
             Some(cache.to_path_buf()),
@@ -97,7 +97,7 @@ impl Fixture {
     }
 
     fn repo_id(&self) -> Vec<u8> {
-        self.open_legacy(&self.cache()).unwrap().config.id.clone()
+        self.open_legacy(&self.cache()).unwrap().config().id.clone()
     }
 
     /// This machine's copy of the legacy index blob, planted as 0.24 leaves it.
@@ -434,7 +434,7 @@ fn a_resume_keeps_what_an_old_client_wrote_in_between() {
     // fewer, as after its prune).
     let repo = fx.open_legacy(&fx.cache()).unwrap();
     let mut index = repo.legacy_index().unwrap();
-    let crypto = Arc::clone(&repo.crypto);
+    let crypto = Arc::clone(repo.crypto());
     drop(repo);
     let gone = *index.iter().next().unwrap().0;
     index.remove(&gone);
@@ -458,7 +458,7 @@ fn upgrade_drops_legacy_entries_at_refcount_zero() {
     fx.downgrade();
     let repo = fx.open_legacy(&fx.cache()).unwrap();
     let mut index = repo.legacy_index().unwrap();
-    let crypto = Arc::clone(&repo.crypto);
+    let crypto = Arc::clone(repo.crypto());
     drop(repo);
     let expected = sorted_entries(&index.to_live_index());
     let (_, e) = index.iter().map(|(id, e)| (*id, *e)).next().unwrap();
@@ -584,7 +584,7 @@ fn upgrade_through(
         fail: Box::new(fail),
         ops: Arc::clone(&ops),
     });
-    let mut repo = Repository::open(
+    let mut repo = Repo::open(
         storage,
         None,
         Some(fx.cache()),
@@ -675,7 +675,7 @@ fn upgrade_with_fence(
 ) -> Result<UpgradeOutcome> {
     let mut repo = fx.open_legacy(&fx.cache()).unwrap();
     commands::util::with_maintenance_lock(&mut repo, |repo| {
-        repo.set_lock_fence(fence);
+        repo.replace_fence_for_test(crate::repo::Fence::lock(fence));
         repo.upgrade_index_layout()
     })
 }
@@ -903,7 +903,7 @@ fn upgrade_probes_the_server_before_writing() {
             inner: Arc::new(logged),
             answer,
         });
-        let mut repo = Repository::open(
+        let mut repo = Repo::open(
             storage,
             None,
             Some(fx.cache()),
@@ -1184,7 +1184,7 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
 fn legacy_open_rejects_load_index() {
     let fx = fixture(RepoFormat::V3);
     fx.downgrade();
-    let err = Repository::open(
+    let err = Repo::open(
         fx.storage(),
         None,
         Some(fx.cache()),
@@ -1200,7 +1200,7 @@ fn legacy_open_rejects_load_index() {
 fn init_refuses_legacy_formats() {
     for format in [RepoFormat::V2, RepoFormat::V3] {
         let tmp = tempfile::tempdir().unwrap();
-        let err = Repository::init_at_format(
+        let err = Repo::init_at_format(
             Box::new(LocalBackend::new(tmp.path().to_str().unwrap()).unwrap()),
             EncryptionMode::None,
             crate::repo::ChunkerParams::default(),
@@ -1257,7 +1257,7 @@ fn upgrade_reads_the_index_with_a_plain_get() {
         gets: Arc::clone(&gets),
     });
     let cache = fx.tmp.path().join("empty-cache");
-    let mut repo = Repository::open(
+    let mut repo = Repo::open(
         storage,
         None,
         Some(cache),
@@ -1330,7 +1330,7 @@ fn upgrade_stops_on_a_pack_the_legacy_index_describes_inconsistently() {
         },
     );
     let _ = first;
-    let blob = super::helpers::legacy_index_blob(&index, 0x24, repo.crypto.as_ref());
+    let blob = super::helpers::legacy_index_blob(&index, 0x24, repo.crypto().as_ref());
     drop(repo);
     std::fs::write(fx.repo_dir.join("index"), &blob).unwrap();
 
@@ -1361,8 +1361,8 @@ fn garbage_collection_after_a_resumed_upgrade_keeps_the_latest_objects() {
     let repo = fx.open(&fx.cache(), false).unwrap();
     let latest = repo.index_head().unwrap().clone();
     let stats = index_store::collect_index_garbage(
-        repo.storage.as_ref(),
-        repo.crypto.as_ref(),
+        repo.storage().as_ref(),
+        repo.crypto().as_ref(),
         &latest,
         index_store::IndexGcGrace::both(std::time::Duration::ZERO),
     )
@@ -1411,7 +1411,11 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
     let repo = fx.open(&fx.cache(), true).unwrap();
     for (_, e) in repo.chunk_index().iter() {
         let recorded = repo.chunk_index().pack_trailer_len(&e.pack_id).unwrap();
-        let bytes = repo.storage.get(&e.pack_id.storage_key()).unwrap().unwrap();
+        let bytes = repo
+            .storage()
+            .get(&e.pack_id.storage_key())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             recorded,
             4 + crate::repo::pack_trailer::parse_footer(&bytes).unwrap()

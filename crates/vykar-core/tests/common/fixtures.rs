@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
-use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
+use vykar_core::repo::{EncryptionMode, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
 
 use super::{init_test_environment, make_test_config};
@@ -69,20 +69,20 @@ impl Fixture {
     }
 
     /// Open with the index and the fixture's cache dir.
-    pub fn open(&self) -> Repository {
+    pub fn open(&self) -> Repo {
         self.open_with_cache(self.cache_dir())
     }
 
     /// Open with the index and a fresh cache dir `root/name`.
-    pub fn open_cold(&self, name: &str) -> Repository {
+    pub fn open_cold(&self, name: &str) -> Repo {
         self.open_with_cache(self.root.join(name))
     }
 
     /// Open a v2/v3 fixture as `vykar upgrade` does: without the index, with
     /// the fixture's cache dir.
-    pub fn open_legacy(&self) -> Repository {
+    pub fn open_legacy(&self) -> Repo {
         let storage = Box::new(LocalBackend::new(self.repo_dir().to_str().unwrap()).unwrap());
-        Repository::open(
+        Repo::open(
             storage,
             self.passphrase(),
             Some(self.cache_dir()),
@@ -91,9 +91,9 @@ impl Fixture {
         .unwrap()
     }
 
-    fn open_with_cache(&self, cache: PathBuf) -> Repository {
+    fn open_with_cache(&self, cache: PathBuf) -> Repo {
         let storage = Box::new(LocalBackend::new(self.repo_dir().to_str().unwrap()).unwrap());
-        Repository::open(
+        Repo::open(
             storage,
             self.passphrase(),
             Some(cache),

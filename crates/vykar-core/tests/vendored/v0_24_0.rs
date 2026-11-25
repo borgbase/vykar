@@ -76,7 +76,7 @@ fn default_max_pack_size() -> u32 {
 }
 // END
 
-/// `Repository::open_inner` (open.rs:316-324) and `commands::key::open_raw`
+/// `Repo::open_inner` (open.rs:316-324) and `commands::key::open_raw`
 /// (key.rs:85-92) at v0.24.0: decode, then `RepoFormat::from_version`
 /// (repo/mod.rs:94-100).
 pub fn open_gate(bytes: &[u8]) -> Result<RepoConfig, super::Refusal> {

@@ -17,7 +17,7 @@ use crate::commands::find::FindFilter;
 use crate::commands::list::{ItemStreamReader, LISTING_BATCH_CHUNKS, LISTING_BATCH_STORED_BYTES};
 use crate::commands::restore::RestoreOptions;
 use crate::repo::control::CancelToken;
-use crate::repo::{OpenOptions, Repository, TreeChunkSource};
+use crate::repo::{OpenOptions, Repo, TreeChunkSource};
 
 /// Refuses (and counts) every write: PUTs of any kind, staged writes,
 /// deletes, directory creation and the temp-file sweep.
@@ -107,7 +107,7 @@ fn fixture() -> Fx {
     fx
 }
 
-fn open_read_only(fx: &Fx, writes: &Arc<AtomicUsize>) -> Repository {
+fn open_read_only(fx: &Fx, writes: &Arc<AtomicUsize>) -> Repo {
     let backend = RefuseWrites {
         inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
         writes: Arc::clone(writes),

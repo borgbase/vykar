@@ -1,7 +1,7 @@
 //! The backup commit as a steppable machine: [`BackupCommit`], from the
 //! final flush through the PUT of `snapshots/<id>`, the commit point. The
 //! work after it, which no error may escape, is
-//! [`Repository::finish_backup_commit`].
+//! [`Repo::finish_backup_commit`].
 //!
 //! The steps, in order:
 //!
@@ -52,8 +52,8 @@ use super::machine::{
 use super::manifest::SnapshotEntry;
 use super::publish_machine::{HeadCheck, PublishMachine, Published};
 use super::snapshot_cache::{self, SnapshotRefresh};
-use super::write_session::SessionView;
-use super::{CommitMode, Repository};
+use super::write_session::{SessionView, WriteSession};
+use super::{CommitMode, Repo};
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::{Location, SegmentBody};
 use crate::index::table::IndexState;
@@ -131,6 +131,10 @@ pub(crate) struct BackupCommit {
     /// added).
     head_only: bool,
     state: CommitState,
+    /// The session being committed; handed back by
+    /// [`Self::into_write_session`] for the post-commit work or the abort
+    /// flush.
+    write: WriteSession,
 }
 
 enum CommitState {
@@ -235,7 +239,7 @@ impl Read {
 
 /// Strict I/O: fail on GET errors so a transient failure can't hide an
 /// existing snapshot name and allow a duplicate during commit.
-fn refresh_snapshots(repo: &Repository) -> Result<SnapshotRefresh> {
+fn refresh_snapshots(repo: &Repo) -> Result<SnapshotRefresh> {
     snapshot_cache::refresh_snapshot_cache(
         repo.storage.as_ref(),
         repo.crypto.as_ref(),
@@ -246,11 +250,10 @@ fn refresh_snapshots(repo: &Repository) -> Result<SnapshotRefresh> {
 }
 
 impl BackupCommit {
-    /// The commit of the active write session as `entry` (`packed`: its
+    /// The commit of the write session `write` as `entry` (`packed`: its
     /// snapshot blob), whose marker record is `marker`. No storage access.
-    /// Panics when no write session is active.
     pub(crate) fn new(
-        repo: &Repository,
+        write: WriteSession,
         entry: SnapshotEntry,
         packed: Vec<u8>,
         marker: Option<Arc<SessionMarker>>,
@@ -260,7 +263,7 @@ impl BackupCommit {
             lock_free: mode == CommitMode::LockFree,
             entry: Some(entry),
             packed,
-            session_id: repo.ws().session_id.clone(),
+            session_id: write.session_id.clone(),
             marker,
             stage: None,
             wrote_head: false,
@@ -272,7 +275,14 @@ impl BackupCommit {
             listed_at: None,
             head_only: false,
             state: CommitState::Flush,
+            write,
         }
+    }
+
+    /// The committed (or failed) session, for `Repo::finish_backup_commit`
+    /// or `WriteSession::flush_on_abort`.
+    pub(crate) fn into_write_session(self) -> WriteSession {
+        self.write
     }
 
     fn open_stage(&mut self, cx: &StepCx<'_>, stage: &'static str) {
@@ -363,12 +373,12 @@ impl BackupCommit {
             CommitState::PersistIndex => {
                 // Unreachable today (a backup session records every change
                 // in its delta); guards future callers.
-                cx.repo.persist_segmented_index()?;
+                cx.repo.persist_segmented_index(cx.fence)?;
                 CommitState::Fence
             }
             CommitState::Fence => {
                 self.open_stage(cx, "write snapshot");
-                cx.repo.check_lock_fence()?;
+                cx.fence.check()?;
                 self.check_landed_head(cx.repo)?;
                 self.check_marker_before_snapshot(cx.repo)?;
                 CommitState::PutSnapshot
@@ -440,7 +450,7 @@ impl BackupCommit {
     /// The head stays without its snapshot, the state of a commit whose
     /// snapshot PUT failed: the error is `StaleChunksDuringCommit`, and a
     /// retry deduplicates against that head (it indexes this run's chunks).
-    fn check_landed_head(&self, repo: &Repository) -> Result<()> {
+    fn check_landed_head(&self, repo: &Repo) -> Result<()> {
         let (true, Some(m)) = (self.wrote_head, &self.marker) else {
             return Ok(());
         };
@@ -473,7 +483,7 @@ impl BackupCommit {
     /// (`PendingCommit::commit_mode`), so this refusal catches only a
     /// discontinuity that arose while committing. A failed probe fails the
     /// commit with its error.
-    fn check_marker_before_snapshot(&self, repo: &Repository) -> Result<()> {
+    fn check_marker_before_snapshot(&self, repo: &Repo) -> Result<()> {
         let (true, Some(m)) = (self.lock_free, &self.marker) else {
             return Ok(());
         };
@@ -504,7 +514,7 @@ impl BackupCommit {
     /// Step 1. The "refresh snapshots" stage starts whether or not the
     /// flush failed; on failure no read runs and the flush error returns.
     fn flush(&mut self, cx: &mut StepCx<'_>) -> Result<CommitState> {
-        let taken = cx.repo.flush_and_take_session_delta();
+        let taken = self.write.flush_and_take_delta(cx.repo);
         self.open_stage(cx, "refresh snapshots");
         let (delta, view) = match taken {
             Ok(t) => t,
@@ -523,7 +533,7 @@ impl BackupCommit {
         })))
     }
 
-    fn read_one(&mut self, repo: &Repository, reads: &mut StartReads, read: Read) {
+    fn read_one(&mut self, repo: &Repo, reads: &mut StartReads, read: Read) {
         match read {
             Read::Refresh => reads.refresh = Slot::Done(refresh_snapshots(repo)),
             Read::Marker => {
@@ -545,7 +555,7 @@ impl BackupCommit {
     /// refreshes the snapshot list and then probes the marker, while this
     /// thread fetches the head. All are reads under the commit lock; every
     /// write follows them.
-    fn read_all(&mut self, repo: &Repository, reads: &mut StartReads) {
+    fn read_all(&mut self, repo: &Repo, reads: &mut StartReads) {
         let do_refresh = reads.refresh.pending();
         let marker = reads
             .marker
@@ -591,7 +601,7 @@ impl BackupCommit {
     }
 
     /// Step 3: probe, snapshot list and name check, index head.
-    fn judge(&mut self, repo: &mut Repository, reads: StartReads) -> Result<CommitState> {
+    fn judge(&mut self, repo: &mut Repo, reads: StartReads) -> Result<CommitState> {
         let StartReads {
             delta,
             view,
@@ -699,7 +709,8 @@ impl BackupCommit {
             recheck,
         } = v;
         let repo = &mut *cx.repo;
-        let persisted_packs = repo.persisted_pack_count();
+        // Packs already in the repository, a cost hint for `pack_lookup`.
+        let persisted_packs = self.write.persisted_pack_count;
         let width = repo.request_width();
         let storage = repo.storage.as_ref();
         // A retry verifies only the packs an earlier attempt did not.
@@ -833,7 +844,7 @@ fn dropped_entries(
 
 /// After the index write (or none): the defensive persist of a dirty index,
 /// else the fence.
-fn after_index(repo: &Repository) -> CommitState {
+fn after_index(repo: &Repo) -> CommitState {
     if repo.index_dirty {
         CommitState::PersistIndex
     } else {

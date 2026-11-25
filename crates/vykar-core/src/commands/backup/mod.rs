@@ -37,7 +37,7 @@ use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
-use crate::repo::{CommitMode, HostEnv, Repository, WriteSessionOptions};
+use crate::repo::{CommitMode, HostEnv, Repo, WriteSession, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
@@ -327,23 +327,24 @@ pub(crate) fn skip_reason(e: &VykarError) -> String {
 /// promotion, and partial pack writer state) and the stats byte counters
 /// are restored to their pre-scope values.
 ///
-/// Closure form because a drop-guard holding `&mut Repository` + `&mut
+/// Closure form because a drop-guard holding `&mut Repo` + `&mut
 /// SnapshotStats` can't compose with bodies that need to pass those same
 /// mutable references to helpers (the command-dump stream loop).
 pub(crate) fn with_rollback_checkpoint<R>(
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     stats: &mut SnapshotStats,
-    body: impl FnOnce(&mut Repository, &mut SnapshotStats) -> Result<R>,
+    body: impl FnOnce(&Repo, &mut WriteSession, &mut SnapshotStats) -> Result<R>,
 ) -> Result<R> {
     let stats_snap = stats.snapshot_byte_counters();
-    repo.begin_rollback_checkpoint()?;
-    match body(repo, stats) {
+    ws.begin_rollback_checkpoint(repo)?;
+    match body(repo, ws, stats) {
         Ok(r) => {
-            repo.commit_rollback_checkpoint();
+            ws.commit_rollback_checkpoint();
             Ok(r)
         }
         Err(e) => {
-            repo.abort_rollback_checkpoint();
+            ws.abort_rollback_checkpoint();
             stats.restore_byte_counters(stats_snap);
             Err(e)
         }
@@ -487,7 +488,7 @@ pub(crate) fn run_scoped(
 }
 
 /// A backup's first half: `prepare` (failures are `FailureScope::Source`),
-/// then session registration, open and Phase 1 (`Repository`). On a Phase 1
+/// then session registration, open and Phase 1 (`Repo`). On a Phase 1
 /// failure the packs are flushed (`flush_on_abort`) and the session
 /// deregistered. The commit is [`PendingCommit`]'s.
 pub(crate) fn upload(
@@ -635,7 +636,7 @@ fn upload_prepared(
             .host_env(host_env.clone())
     };
     let opts = super::util::with_identity_context(opts, &open_req);
-    let open_result = Repository::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
+    let open_result = Repo::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(&open_req, &r) {
@@ -658,11 +659,15 @@ fn upload_prepared(
     // deregister). Error returns rely on `session` dropping at the return,
     // after `flush_on_abort`; Phase 2 ends it explicitly where it must precede
     // the lock release, or hands it to the cleanup thread at the commit point.
-    // `session` is declared after `repo` so it drops before `Repository::drop`;
-    // those error returns depend on that order, and so does `PendingCommit`'s
+    // `session` is declared after `repo` so it drops before `repo`; those
+    // error returns depend on that order, and so does `PendingCommit`'s
     // field order.
     let session =
-        phases::BackupSession::adopt(&repo.storage, registration, repo.host_env().clone())?;
+        phases::BackupSession::adopt(repo.storage(), registration, repo.host_env().clone())?;
+
+    // The write session, with the backup's options (no I/O). Every error
+    // return below consumes it with `flush_on_abort` first.
+    let mut ws = repo.begin_write_session(&session_opts);
 
     // Run-local tally of unreachable cloud-only content. Declared here because
     // Phase 1 below borrows it while `BackupOutcome` is built after the
@@ -672,11 +677,11 @@ fn upload_prepared(
     // Write session, command dumps, walk and uploads (no lock).
     let phase1_result = phases::phase1_upload(
         &mut repo,
+        &mut ws,
         config,
         req,
         prepared,
         num_workers,
-        &session_opts,
         progress,
         shutdown,
         &mut dataless,
@@ -693,7 +698,7 @@ fn upload_prepared(
     } = match phase1_result {
         Ok(result) => result,
         Err(e) => {
-            repo.flush_on_abort();
+            ws.flush_on_abort(&repo);
             // Do NOT save file cache on abort — the on-disk cache from the last
             // successful run is still valid. Saving here would persist the
             // depleted (invalidated) cache and destroy future cache hits.
@@ -704,6 +709,7 @@ fn upload_prepared(
     Ok(PendingCommit {
         session,
         repo,
+        write: ws,
         snapshot_entry,
         snapshot_packed,
         report: phases::RunReport {

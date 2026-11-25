@@ -12,8 +12,8 @@
 use tracing::debug;
 
 use crate::index::table::DedupPrefilter;
-use crate::repo::Repository;
 use crate::repo::file_cache::{CachedChunks, FileCache};
+use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use vykar_types::error::{Result, VykarError};
 
@@ -30,7 +30,8 @@ use super::segmentation::{LargeFileAccum, validate_segment_accum};
 #[allow(clippy::too_many_arguments)]
 pub(super) fn consume_processed_entry(
     entry: ProcessedEntry,
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
     listing: &mut ListingWriter,
@@ -57,7 +58,7 @@ pub(super) fn consume_processed_entry(
 
             let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
 
-            process_worker_chunks(repo, &mut item, chunks, stats, prefilter)?;
+            process_worker_chunks(repo, ws, &mut item, chunks, stats, prefilter)?;
 
             // Release budget bytes now that chunks are committed.
             budget.release(acquired_bytes);
@@ -83,7 +84,7 @@ pub(super) fn consume_processed_entry(
                 );
             }
 
-            listing.push(repo, &item)?;
+            listing.push(repo, ws, &item)?;
 
             new_file_cache.insert(
                 &abs_path,
@@ -131,6 +132,7 @@ pub(super) fn consume_processed_entry(
                 num_segments,
                 dedup_baseline,
                 repo,
+                ws,
                 stats,
             )?;
 
@@ -138,7 +140,7 @@ pub(super) fn consume_processed_entry(
             let accum = large_file_accum.as_mut().ok_or_else(|| {
                 VykarError::Other("BUG: large_file_accum missing after segment validation".into())
             })?;
-            process_worker_chunks(repo, &mut accum.item, chunks, stats, prefilter)?;
+            process_worker_chunks(repo, ws, &mut accum.item, chunks, stats, prefilter)?;
             budget.release(acquired_bytes);
 
             if segment_index < num_segments - 1 {
@@ -155,7 +157,7 @@ pub(super) fn consume_processed_entry(
                 stats.nfiles += 1;
 
                 // Commit the checkpoint — all segments landed successfully.
-                repo.commit_rollback_checkpoint();
+                ws.commit_rollback_checkpoint();
 
                 // Segment 0's pre_meta is canonical: it matches the chunks
                 // committed across all segments.
@@ -179,7 +181,7 @@ pub(super) fn consume_processed_entry(
                     );
                 }
 
-                listing.push(repo, &accum.item)?;
+                listing.push(repo, ws, &accum.item)?;
 
                 new_file_cache.insert(
                     &accum.abs_path,
@@ -208,7 +210,7 @@ pub(super) fn consume_processed_entry(
                 });
             }
 
-            commit_cache_hit(repo, &mut item, &cached_refs, stats)?;
+            commit_cache_hit(repo, ws, &mut item, &cached_refs, stats)?;
 
             if verbose {
                 emit_progress(
@@ -221,7 +223,7 @@ pub(super) fn consume_processed_entry(
                 );
             }
 
-            listing.push(repo, &item)?;
+            listing.push(repo, ws, &item)?;
 
             new_file_cache.insert_cache_hit(
                 &abs_path,
@@ -239,11 +241,11 @@ pub(super) fn consume_processed_entry(
         }
 
         ProcessedEntry::NonFile { item } => {
-            listing.push(repo, &item)?;
+            listing.push(repo, ws, &item)?;
         }
 
         ProcessedEntry::SourceStarted { path, root } => {
-            listing.begin_segment(repo, root)?;
+            listing.begin_segment(repo, ws, root)?;
             emit_progress(
                 progress,
                 BackupProgressEvent::SourceStarted { source_path: path },

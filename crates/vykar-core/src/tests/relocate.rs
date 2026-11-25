@@ -19,7 +19,7 @@ use super::mark::Fx;
 use crate::commands;
 use crate::commands::restore::RestoreOptions;
 use crate::repo::control::CancelToken;
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::{OpenOptions, Repo};
 
 /// A hook run once, before the first range read of a pack.
 type Hook = Box<dyn FnOnce() + Send>;
@@ -119,7 +119,7 @@ fn fixture() -> Fx {
 }
 
 /// A handle on `fx` with the index loaded, through a counting backend.
-fn open_counting(fx: &Fx, hook: Option<Hook>) -> (Repository, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+fn open_counting(fx: &Fx, hook: Option<Hook>) -> (Repo, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let (lists, gets) = (Arc::default(), Arc::default());
     let backend = Counting {
         inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
@@ -153,7 +153,7 @@ fn file_chunks(fx: &Fx, name: &str, path: &str) -> Vec<ChunkId> {
 }
 
 /// Their locations in `repo`'s index.
-fn located(repo: &Repository, ids: &[ChunkId]) -> Vec<(ChunkId, PackId, u64, u32)> {
+fn located(repo: &Repo, ids: &[ChunkId]) -> Vec<(ChunkId, PackId, u64, u32)> {
     ids.iter()
         .map(|id| {
             let e = repo.chunk_index().get(id).expect("indexed");
@@ -250,7 +250,7 @@ fn a_lost_pack_under_an_unmoved_head_keeps_the_old_error() {
 /// Restore `name` on `repo` into a fresh directory under `fx`.
 fn restore(
     fx: &Fx,
-    repo: &mut Repository,
+    repo: &mut Repo,
     name: &str,
     dest: &str,
     continue_on_error: bool,

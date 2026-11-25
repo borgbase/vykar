@@ -12,7 +12,7 @@ use crate::repo::format::{
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::relocate::{self, MAX_RELOCATE_ROUNDS, RelocationSource, pack_not_found};
 use crate::repo::tree_cache::TreeChunkCache;
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
 use vykar_crypto::CryptoEngine;
@@ -112,7 +112,7 @@ fn open_listing(
     config: &VykarConfig,
     passphrase: Option<&str>,
     snapshot_name: &str,
-) -> Result<(Repository, SnapshotMeta, ReadOrigin)> {
+) -> Result<(Repo, SnapshotMeta, ReadOrigin)> {
     let mut repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
 
     let resolved_name = repo
@@ -167,7 +167,7 @@ pub(crate) struct ReadOrigin {
 impl ReadOrigin {
     /// Before the index load: the handle's head generation and the
     /// snapshot `snapshot_name` names.
-    pub(crate) fn of(repo: &Repository, snapshot_name: &str) -> Result<Self> {
+    pub(crate) fn of(repo: &Repo, snapshot_name: &str) -> Result<Self> {
         let entry = repo
             .manifest()
             .find_snapshot(snapshot_name)
@@ -183,7 +183,7 @@ impl ReadOrigin {
     /// was loaded at a head newer than the open one, and the snapshot is no
     /// longer stored (one existence probe). Otherwise it is damage and `e`
     /// stays.
-    pub(crate) fn explain(&self, repo: &Repository, e: VykarError) -> VykarError {
+    pub(crate) fn explain(&self, repo: &Repo, e: VykarError) -> VykarError {
         let chunk_id = match &e {
             VykarError::ChunkNotInIndex(id) => *id,
             VykarError::RestoreSourceUnreadable(inner) => match **inner {
@@ -193,7 +193,10 @@ impl ReadOrigin {
             _ => return e,
         };
         if repo.index_generation() <= self.opened_at
-            || !matches!(repo.storage.exists(&self.snapshot.storage_key()), Ok(false))
+            || !matches!(
+                repo.storage().exists(&self.snapshot.storage_key()),
+                Ok(false)
+            )
         {
             return e;
         }
@@ -236,7 +239,7 @@ pub(crate) fn display_path_under(path: &str, dir: &str) -> bool {
 /// index lacks fails with [`VykarError::ChunkNotInIndex`] even where the
 /// subtree read would not reach it.
 pub(crate) fn list_under_on_repo(
-    repo: &Repository,
+    repo: &Repo,
     meta: &SnapshotMeta,
     dir: &str,
     shutdown: &CancelToken,
@@ -304,12 +307,12 @@ pub(crate) struct ChunkedListingStats {
 /// even when its chunk is cached (as [`load_item_stream_from_ptrs`]).
 /// A batch is at most `max_chunks` chunks and `max_stored` stored bytes
 /// ([`LISTING_BATCH_CHUNKS`], [`LISTING_BATCH_STORED_BYTES`] outside
-/// tests), read through [`Repository::read_tree_chunks_split`] from `source`.
+/// tests), read through [`Repo::read_tree_chunks_split`] from `source`.
 /// Read errors are returned as the read returned them. A tree chunk that
 /// does not decode on its own (one that ends inside an entry included) is
 /// an error naming the chunk; errors from `visit` are returned unchanged.
 pub(crate) fn for_each_item_by_chunk(
-    repo: &Repository,
+    repo: &Repo,
     item_ptrs: &[ChunkId],
     source: TreeChunkSource,
     max_chunks: usize,
@@ -424,17 +427,17 @@ pub fn get_snapshot_meta(
 }
 
 /// Load the SnapshotMeta for a snapshot by name.
-pub fn load_snapshot_meta(repo: &Repository, snapshot_name: &str) -> Result<SnapshotMeta> {
+pub fn load_snapshot_meta(repo: &Repo, snapshot_name: &str) -> Result<SnapshotMeta> {
     let entry = repo
         .manifest()
         .find_snapshot(snapshot_name)
         .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
 
     let meta_data = repo
-        .storage
+        .storage()
         .get(&entry.id.storage_key())?
         .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
-    decode_snapshot_meta(&entry.id, &meta_data, repo.crypto.as_ref())
+    decode_snapshot_meta(&entry.id, &meta_data, repo.crypto().as_ref())
 }
 
 /// Authenticate and decode the stored object of snapshot `id`, refusing a
@@ -470,7 +473,7 @@ pub(crate) fn decode_snapshot_meta(
 
 /// Load and deserialize all items from a snapshot.
 pub fn load_snapshot_items(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     shutdown: &CancelToken,
 ) -> Result<Vec<Item>> {
@@ -481,7 +484,7 @@ pub fn load_snapshot_items(
 /// Load the raw concatenated item stream bytes for a snapshot, reading tree
 /// chunks from the local tree-chunk cache first.
 pub fn load_snapshot_item_stream(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     shutdown: &CancelToken,
 ) -> Result<Vec<u8>> {
@@ -493,7 +496,7 @@ pub fn load_snapshot_item_stream(
 /// the local tree-chunk cache, which is not filled either). For commands that
 /// verify the repository.
 pub fn load_snapshot_item_stream_from_storage(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     shutdown: &CancelToken,
 ) -> Result<Vec<u8>> {
@@ -516,7 +519,7 @@ pub struct ItemStreamReader {
 }
 
 impl ItemStreamReader {
-    pub fn new(_repo: &Repository) -> Self {
+    pub fn new(_repo: &Repo) -> Self {
         Self {
             index_loaded: false,
         }
@@ -525,7 +528,7 @@ impl ItemStreamReader {
     /// Load the raw item stream bytes for `snapshot_name`.
     pub fn load(
         &mut self,
-        repo: &mut Repository,
+        repo: &mut Repo,
         snapshot_name: &str,
         shutdown: &CancelToken,
     ) -> Result<Vec<u8>> {
@@ -546,7 +549,7 @@ impl ItemStreamReader {
     /// destination is prepared.)
     pub fn open_lazy<'a>(
         &mut self,
-        repo: &mut Repository,
+        repo: &mut Repo,
         snapshot_name: &str,
         shutdown: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
@@ -559,7 +562,7 @@ impl ItemStreamReader {
     /// already holds).
     pub fn open_lazy_ptrs<'a>(
         &mut self,
-        repo: &mut Repository,
+        repo: &mut Repo,
         item_ptrs: &[ChunkId],
         shutdown: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
@@ -569,7 +572,7 @@ impl ItemStreamReader {
     }
 
     /// Load the full chunk index unless this reader already did.
-    pub fn ensure_index(&mut self, repo: &mut Repository) -> Result<()> {
+    pub fn ensure_index(&mut self, repo: &mut Repo) -> Result<()> {
         if !self.index_loaded {
             repo.load_chunk_index_for_snapshot_view()?;
             self.index_loaded = true;
@@ -579,7 +582,7 @@ impl ItemStreamReader {
 
     /// Resolve a chunk to `(pack_id, pack_offset, stored_size)` through the
     /// chunk index, which must be loaded ([`Self::ensure_index`]).
-    pub fn lookup(&self, repo: &Repository, id: &ChunkId) -> Option<(PackId, u64, u32)> {
+    pub fn lookup(&self, repo: &Repo, id: &ChunkId) -> Option<(PackId, u64, u32)> {
         repo.chunk_index()
             .get(id)
             .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
@@ -629,7 +632,7 @@ pub(crate) fn resolve_from_index(
 /// Holds its own storage and crypto handles so the caller can keep using the
 /// repository mutably while the stream is being consumed. Every chunk is
 /// authenticated (AEAD) or, for unencrypted repositories, checked against its
-/// chunk ID, exactly like [`Repository::read_chunks_coalesced_into`].
+/// chunk ID, exactly like [`Repo::read_chunks_coalesced_into`].
 ///
 /// A pack that answers 404 (a concurrent compact repacked or removed it
 /// after the index was loaded) is re-resolved against the latest head
@@ -682,7 +685,7 @@ impl<'a> LazyItemStream<'a> {
     /// opened with `OpenOptions::with_index`). Resolves every pointer, then
     /// performs the first read, as [`ItemStreamReader::open_lazy_ptrs`].
     pub(crate) fn open(
-        repo: &Repository,
+        repo: &Repo,
         item_ptrs: &[ChunkId],
         shutdown: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
@@ -690,8 +693,8 @@ impl<'a> LazyItemStream<'a> {
         let chunks = resolve_from_index(repo.chunk_index(), item_ptrs)?;
 
         let mut stream = LazyItemStream {
-            storage: Arc::clone(&repo.storage),
-            crypto: Arc::clone(&repo.crypto),
+            storage: Arc::clone(repo.storage()),
+            crypto: Arc::clone(repo.crypto()),
             shutdown,
             chunks,
             relocation: repo.relocation_source(),
@@ -721,15 +724,15 @@ impl<'a> LazyItemStream<'a> {
     #[cfg(test)]
     /// `retry: false` disables the re-resolve on a failed read.
     pub(crate) fn for_test(
-        repo: &Repository,
+        repo: &Repo,
         chunks: Vec<ChunkLoc>,
         retry: bool,
         window_max: u64,
         shutdown: &'a CancelToken,
     ) -> Self {
         Self {
-            storage: Arc::clone(&repo.storage),
-            crypto: Arc::clone(&repo.crypto),
+            storage: Arc::clone(repo.storage()),
+            crypto: Arc::clone(repo.crypto()),
             shutdown,
             chunks,
             relocation: repo.relocation_source(),
@@ -753,7 +756,7 @@ impl<'a> LazyItemStream<'a> {
     /// [`Self::for_test`] reading through the repository's tree-chunk cache.
     #[cfg(test)]
     pub(crate) fn for_test_with_cache(
-        repo: &Repository,
+        repo: &Repo,
         chunks: Vec<ChunkLoc>,
         retry: bool,
         window_max: u64,
@@ -979,9 +982,8 @@ impl<'a> LazyItemStream<'a> {
                 // to report, not the retry's.
                 let rest = self.chunks.get(self.next..).unwrap_or_default();
                 let ids: Vec<ChunkId> = rest.iter().map(|c| c.0).collect();
-                let resolved =
-                    Repository::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())
-                        .and_then(|index| resolve_from_index(&index, &ids));
+                let resolved = Repo::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())
+                    .and_then(|index| resolve_from_index(&index, &ids));
                 let resolved = match resolved {
                     Ok(resolved) => resolved,
                     Err(retry @ VykarError::Interrupted) => return Err(retry),
@@ -1082,7 +1084,7 @@ impl ItemSource for &mut LazyItemStream<'_> {
 /// Load item stream using a lookup closure instead of the chunk index.
 /// Returns ChunkNotInIndex if any tree-pack chunk is missing from the lookup.
 pub fn load_snapshot_item_stream_via_lookup<L>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     lookup: L,
     shutdown: &CancelToken,
@@ -1104,7 +1106,7 @@ where
 /// reading tree chunks from the local tree-chunk cache first.
 /// Returns ChunkNotInIndex if a chunk is missing from the chunk index, cached or not.
 pub fn load_item_stream_from_ptrs(
-    repo: &mut Repository,
+    repo: &mut Repo,
     item_ptrs: &[ChunkId],
     shutdown: &CancelToken,
 ) -> Result<Vec<u8>> {
@@ -1118,7 +1120,7 @@ pub fn load_item_stream_from_ptrs(
 }
 
 /// The location of `chunk_id` in the repository's chunk index.
-fn resolve_through_index(chunk_id: &ChunkId, repo: &Repository) -> Result<(PackId, u64, u32)> {
+fn resolve_through_index(chunk_id: &ChunkId, repo: &Repo) -> Result<(PackId, u64, u32)> {
     let entry = repo
         .chunk_index()
         .get(chunk_id)
@@ -1130,14 +1132,14 @@ fn resolve_through_index(chunk_id: &ChunkId, repo: &Repository) -> Result<(PackI
 /// reads from `source`. Resolution comes before any read, so a pointer the
 /// index lacks fails even when its chunk is cached.
 fn resolve_and_read<R>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     item_ptrs: &[ChunkId],
     resolve: R,
     shutdown: &CancelToken,
     source: TreeChunkSource,
 ) -> Result<Vec<u8>>
 where
-    R: Fn(&ChunkId, &Repository) -> Result<(PackId, u64, u32)>,
+    R: Fn(&ChunkId, &Repo) -> Result<(PackId, u64, u32)>,
 {
     shutdown.check()?;
     let chunks: Vec<(ChunkId, PackId, u64, u32)> = item_ptrs
@@ -1155,7 +1157,7 @@ where
 
 /// Load and deserialize all items using a lookup closure.
 pub fn load_snapshot_items_via_lookup<L>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     lookup: L,
     shutdown: &CancelToken,
@@ -1190,7 +1192,7 @@ pub fn for_each_decoded_item(
 
 /// Stream items from a snapshot without materializing `Vec<Item>`.
 pub fn for_each_snapshot_item(
-    repo: &mut Repository,
+    repo: &mut Repo,
     snapshot_name: &str,
     shutdown: &CancelToken,
     visit: impl FnMut(Item) -> Result<()>,

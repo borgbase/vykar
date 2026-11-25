@@ -21,7 +21,7 @@ use crate::repo::pack::read_blob_from_pack;
 use crate::repo::pack_trailer::{
     PackTrailer, TrailerRead, read_pack_trailer, read_trailer_from_pack_bytes,
 };
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::item::ItemType;
 use crate::snapshot::listing::{ChunkPaths, ExtCheck, check_ext};
 use vykar_crypto::CryptoEngine;
@@ -149,7 +149,7 @@ enum KeyCopyFinding {
 /// `check`, and would need the passphrase threaded all the way into the scan.
 /// The blob already unwrapped at open, so comparing bytes proves the stored
 /// objects are still intact at neither cost.
-fn scan_key_copies(repo: &Repository) -> KeyScan {
+fn scan_key_copies(repo: &Repo) -> KeyScan {
     // Unencrypted repositories have no key file at all.
     let Some(winner) = repo.key_blob() else {
         return KeyScan::default();
@@ -159,7 +159,7 @@ fn scan_key_copies(repo: &Repository) -> KeyScan {
     let mut findings: Vec<(String, KeyCopyFinding)> = Vec::new();
 
     for storage_key in [crate::repo::KEY_PRIMARY, crate::repo::KEY_SECONDARY] {
-        let finding = match repo.storage.get(storage_key) {
+        let finding = match repo.storage().get(storage_key) {
             Ok(None) => KeyCopyFinding::Absent,
             Err(e) => KeyCopyFinding::Unreadable(e.to_string()),
             Ok(Some(bytes)) => {
@@ -422,7 +422,7 @@ pub(crate) struct ScanForTest {
 /// Run [`integrity_scan`] without orphan detection or data verification.
 #[cfg(test)]
 pub(crate) fn scan_for_test(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     collect_chunk_refs: bool,
 ) -> Result<ScanForTest> {
@@ -451,7 +451,7 @@ pub(crate) fn scan_for_test(
 /// The caller is responsible for calling `repo.refresh_snapshot_list()` before
 /// this function when repair-level freshness is needed.
 pub(super) fn integrity_scan(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     opts: &ScanOptions,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
@@ -465,7 +465,7 @@ pub(super) fn integrity_scan(
     let mut snapshot_item_counts: HashMap<SnapshotId, usize> = HashMap::new();
     let mut listing_index_warnings: Vec<(String, String)> = Vec::new();
 
-    let concurrency = repo.storage.profile().request_width;
+    let concurrency = repo.storage().profile().request_width;
 
     // Phase K: repository key copies. Runs before the snapshot passes so a
     // damaged key file is the first thing reported, and so a healthy run says
@@ -482,7 +482,7 @@ pub(super) fn integrity_scan(
             .iter()
             .map(|e| e.id.to_hex())
             .collect();
-        let remote_keys = repo.storage.list("snapshots/")?;
+        let remote_keys = repo.storage().list("snapshots/")?;
         for key in &remote_keys {
             shutdown.check()?;
             let Some(id_hex) = key.strip_prefix("snapshots/") else {
@@ -497,7 +497,7 @@ pub(super) fn integrity_scan(
                         storage_key: key.clone(),
                     });
                 }
-                Ok(snapshot_id) => match repo.storage.get(key) {
+                Ok(snapshot_id) => match repo.storage().get(key) {
                     Ok(Some(blob)) => {
                         // Keep decrypt and decode failures separate: a decode
                         // failure *after* a successful decrypt is a version
@@ -506,7 +506,7 @@ pub(super) fn integrity_scan(
                             &blob,
                             ObjectType::SnapshotMeta,
                             snapshot_id.as_bytes(),
-                            repo.crypto.as_ref(),
+                            repo.crypto().as_ref(),
                         ) {
                             Err(_) => {
                                 issues.push(IntegrityIssue::CorruptSnapshot {
@@ -685,7 +685,7 @@ pub(super) fn integrity_scan(
     let mut outcomes: Vec<Option<ChunkOutcome<CheckedChunk>>> =
         std::iter::repeat_with(|| None).take(set.len()).collect();
     {
-        let repo: &Repository = repo;
+        let repo: &Repo = repo;
         let index = repo.chunk_index();
         walk_tree_chunks(
             repo,
@@ -925,7 +925,7 @@ pub(super) fn integrity_scan(
         );
 
         let (existence_checked, missing_count, pack_issues) =
-            parallel_pack_existence(&repo.storage, &packs_for_existence, concurrency, shutdown);
+            parallel_pack_existence(repo.storage(), &packs_for_existence, concurrency, shutdown);
         // Workers `break` out of the work queue on cancellation, so a short
         // count must never be folded into the result as coverage.
         shutdown.check()?;
@@ -983,8 +983,8 @@ pub(super) fn integrity_scan(
             pack_chunks.into_iter().collect();
 
         let (data_count, data_issues) = parallel_verify_data(
-            &repo.storage,
-            &repo.crypto,
+            repo.storage(),
+            repo.crypto(),
             &packs_vec,
             config.limits.verify_data_concurrency(),
             BATCH_THRESHOLD,
@@ -1038,7 +1038,7 @@ pub(super) fn integrity_scan(
 /// one failure that is *not* skipped: it is re-raised, so a truncated impact
 /// list can never be mistaken for a complete one.
 fn locate_items_in_missing_packs(
-    repo: &mut Repository,
+    repo: &mut Repo,
     missing_packs: &HashSet<PackId>,
     shutdown: &CancelToken,
 ) -> Result<Vec<ItemImpact>> {
@@ -1463,7 +1463,7 @@ fn trailer_mismatch(
 /// depend on its trailer any more. Maps are read only when there is such an
 /// issue; a failure to read them keeps every issue.
 fn drop_trailer_issues_covered_by_maps(
-    repo: &Repository,
+    repo: &Repo,
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     issues: Vec<IntegrityIssue>,
     width: usize,
@@ -1476,8 +1476,8 @@ fn drop_trailer_issues_covered_by_maps(
         return Ok(issues);
     }
     let maps = match crate::repo::pack_map::read_pack_maps(
-        repo.storage.as_ref(),
-        repo.crypto.as_ref(),
+        repo.storage().as_ref(),
+        repo.crypto().as_ref(),
         width,
         true,
         shutdown,

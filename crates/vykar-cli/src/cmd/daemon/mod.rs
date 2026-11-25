@@ -347,7 +347,7 @@ struct CycleReport {
 /// Run a backup cycle for the `due` repositories.
 ///
 /// `all` is the full configured set: it decides whether the
-/// `=== Repository ===` headers print, which must not switch off just because
+/// `=== Repo ===` headers print, which must not switch off just because
 /// a single repo came due.
 fn run_backup_cycle(
     due: &[&ResolvedRepo],

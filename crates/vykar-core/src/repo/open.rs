@@ -12,7 +12,7 @@ use super::snapshot_cache;
 use super::tree_cache::TreeChunkCache;
 use super::{
     ChunkerParams, EncryptionMode, HostEnv, InitOptions, KEY_PRIMARY, KEY_SECONDARY,
-    MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size,
+    MAX_PACK_SIZE_LIMIT, OpenOptions, Repo, RepoConfig, RepoFormat, default_max_pack_size,
     default_min_pack_size,
 };
 use crate::index::LiveIndex;
@@ -76,7 +76,7 @@ thread_local! {
     static CHEAP_KDF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run `f` with every `Repository::init` on this thread wrapping the
+/// Run `f` with every `Repo::init` on this thread wrapping the
 /// master key with Argon2id t = 1, m = 8 KiB, p = 1 (the simulator's
 /// encrypted template; tests). Opens derive with the parameters the blob
 /// stores, so later opens of such a repository are cheap without it.
@@ -106,7 +106,7 @@ fn wrap_master_key(master_key: &MasterKey, pass: &str) -> Result<EncryptedKey> {
 type FileCacheLoad =
     std::thread::JoinHandle<(FileCache, Option<super::file_cache::FileCacheStamp>)>;
 
-impl Repository {
+impl Repo {
     /// Initialize a new repository.
     pub fn init(
         storage: Box<dyn StorageBackend>,
@@ -310,7 +310,7 @@ impl Repository {
         }
 
         let tree_cache = TreeChunkCache::for_repo(&repo_config.id, cache_dir.as_deref());
-        Ok(Repository {
+        Ok(Repo {
             storage,
             crypto,
             manifest,
@@ -329,8 +329,6 @@ impl Repository {
             cache_dir_override: cache_dir,
             tree_cache,
             host_env: HostEnv::system(),
-            write_session: None,
-            lock_fence: None,
             key_blob,
             index_head,
             fold_policy: Default::default(),
@@ -544,7 +542,7 @@ impl Repository {
         };
 
         let tree_cache = TreeChunkCache::for_repo(&repo_config.id, cache_dir.as_deref());
-        let repo = Repository {
+        let repo = Repo {
             storage,
             crypto,
             manifest,
@@ -563,8 +561,6 @@ impl Repository {
             cache_dir_override: cache_dir,
             tree_cache,
             host_env: opts.host_env.for_new_run(),
-            write_session: None,
-            lock_fence: None,
             key_blob,
             index_head,
             fold_policy: Default::default(),
@@ -594,10 +590,10 @@ mod tests {
 
     /// A plaintext repository whose index was persisted as a base, with its
     /// table file in `cache`.
-    fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
+    fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repo) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(Arc::clone(&inner)),
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -607,7 +603,8 @@ mod tests {
         )
         .unwrap();
         let pack = PackId::from_bytes([0xAA; 32]);
-        let index = repo.chunk_index_mut();
+        let mut writer = repo.unchecked_writer();
+        let index = writer.chunk_index_mut();
         for i in 0..3u8 {
             index.add(
                 ChunkId::from_bytes([i; 32]),
@@ -619,7 +616,7 @@ mod tests {
         index.set_pack_trailer(pack, 0);
         // A fold, so that the base's table file is in the cache dir.
         repo.request_index_fold();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         (inner, repo)
     }
 
@@ -654,7 +651,7 @@ mod tests {
         drop(repo);
 
         let open = || {
-            Repository::open(
+            Repo::open(
                 Box::new(Arc::clone(&inner)),
                 None,
                 Some(cache.path().to_path_buf()),

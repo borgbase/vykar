@@ -7,7 +7,7 @@
 //! The index path starts at the grid chunk of the last key below the
 //! queried range; for a directory's children and descendants the search
 //! takes the last key not greater than `dir/`. It reads tree chunks through
-//! `Repository::read_tree_chunks_split`, the local tree-chunk cache first,
+//! `Repo::read_tree_chunks_split`, the local tree-chunk cache first,
 //! and verifies every chunk it decodes: each entry is clean, inside its
 //! segment root and not before the previous one; the first chunk it starts
 //! at is not before its key; the chunk before that ends before the queried
@@ -30,7 +30,7 @@ use tracing::debug;
 
 use crate::commands::list::{LazyItemStream, resolve_from_index};
 use crate::repo::control::CancelToken;
-use crate::repo::{Repository, TreeChunkSource};
+use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
 use crate::snapshot::listing::{
@@ -123,7 +123,7 @@ impl<'m> ListingView<'m> {
     /// fails the read, as every listing reader does.
     pub fn dir_entries(
         &self,
-        repo: &Repository,
+        repo: &Repo,
         dir: &[u8],
         shutdown: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
@@ -139,7 +139,7 @@ impl<'m> ListingView<'m> {
     /// fails the read, as every listing reader does.
     pub fn subtree(
         &self,
-        repo: &Repository,
+        repo: &Repo,
         dir: &[u8],
         shutdown: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
@@ -149,7 +149,7 @@ impl<'m> ListingView<'m> {
 
     fn read(
         &self,
-        repo: &Repository,
+        repo: &Repo,
         q: Query<'_>,
         shutdown: &CancelToken,
         visit: &mut dyn FnMut(Item) -> Result<()>,
@@ -245,7 +245,7 @@ pub(crate) trait SpanReader {
 /// Production reader: resolved through the chunk index, read through the
 /// tree-chunk cache first.
 struct RepoSpans<'a> {
-    repo: &'a Repository,
+    repo: &'a Repo,
     ptrs: &'a [ChunkId],
     shutdown: &'a CancelToken,
 }

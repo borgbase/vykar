@@ -22,7 +22,7 @@ use vykar_core::commands;
 use vykar_core::index::ChunkIndex;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::file_cache::FileCache;
-use vykar_core::repo::{OpenOptions, Repository, identity};
+use vykar_core::repo::{OpenOptions, Repo, identity};
 use vykar_storage::local_backend::LocalBackend;
 
 use crate::common::fixtures::{self, Fixture, read_tree};
@@ -70,7 +70,7 @@ fn v2_fixtures_open_only_for_upgrade() {
         let tree = read_tree(&fx.repo_dir());
         for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
             let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
-            let err = Repository::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
+            let err = Repo::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
                 .err()
                 .unwrap()
                 .to_string();
@@ -84,10 +84,11 @@ fn v2_fixtures_open_only_for_upgrade() {
 
         let repo = fx.open_legacy();
         assert_eq!(
-            repo.config.version, 2,
+            repo.config().version,
+            2,
             "{mode}: fixture must stay at format v2"
         );
-        assert_eq!(repo.config.encryption, fx.expected_encryption(), "{mode}");
+        assert_eq!(repo.config().encryption, fx.expected_encryption(), "{mode}");
         assert_eq!(
             repo.manifest().snapshots.len(),
             fx.snapshots.len(),
@@ -179,8 +180,8 @@ fn v2_fixtures_upgrade_to_v6_with_blake2b() {
         assert!(fx.repo_dir().join("index.h/1").is_file(), "{mode}");
 
         let repo = fx.open();
-        assert_eq!(repo.config.version, 6, "{mode}");
-        assert_eq!(repo.config.chunk_hash, "blake2b", "{mode}");
+        assert_eq!(repo.config().version, 6, "{mode}");
+        assert_eq!(repo.config().chunk_hash, "blake2b", "{mode}");
         let head = repo.index_head().unwrap();
         assert_eq!(head.layout, 3, "{mode}");
         assert!(head.base.is_some() && head.segments.is_empty(), "{mode}");
@@ -367,7 +368,7 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
         // copy: the diagnosis says so rather than claiming corroboration.
         let open = |opts| {
             let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
-            Repository::open(storage, wrong, None, opts)
+            Repo::open(storage, wrong, None, opts)
                 .err()
                 .unwrap_or_else(|| panic!("{mode}: opening with a wrong passphrase must fail"))
                 .to_string()
@@ -441,8 +442,8 @@ fn v2_fixture_pin_files_are_superseded() {
         let fx = extract(mode);
         let repo = fx.open_legacy();
         let url = fx.repo_dir().to_string_lossy().into_owned();
-        let repo_id = &repo.config.id;
-        let key = repo.crypto.chunk_hasher().key();
+        let repo_id = &repo.config().id;
+        let key = repo.crypto().chunk_hasher().key();
 
         // Guards the fixture reading: the pin really is the old derivation.
         assert_eq!(
@@ -504,13 +505,13 @@ fn v2_fixture_file_caches_are_dropped() {
         // The file cache is keyed by repo_id, so its path is portable as-is.
         assert!(
             cache
-                .join(hex::encode(&repo.config.id))
+                .join(hex::encode(&repo.config().id))
                 .join("filecache")
                 .exists(),
             "{mode}: fixture is missing the pre-change file cache"
         );
 
-        let loaded = FileCache::load(&repo.config.id, repo.crypto.as_ref(), Some(&cache));
+        let loaded = FileCache::load(&repo.config().id, repo.crypto().as_ref(), Some(&cache));
         assert!(
             loaded.is_empty(),
             "{mode}: BLAKE2b-keyed file cache was loaded"

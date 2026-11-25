@@ -7,7 +7,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
 use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_exclusion};
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::{OpenOptions, Repo};
 
 /// Aggregate result of a prune operation.
 ///
@@ -55,7 +55,7 @@ pub fn run(
 /// [`run`] on an already opened repository, under the maintenance lock or,
 /// lock-free, a registered session (`with_snapshot_removal_exclusion`).
 pub(crate) fn run_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     dry_run: bool,
     list: bool,
@@ -144,7 +144,7 @@ pub(crate) fn run_on_repo(
         }
 
         if !to_prune.is_empty() {
-            refuse_on_append_only_server(repo.storage.as_ref(), "vykar prune")?;
+            refuse_on_append_only_server(repo.storage().as_ref(), "vykar prune")?;
         }
 
         // Process oldest first

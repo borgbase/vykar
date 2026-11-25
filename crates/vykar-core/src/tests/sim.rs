@@ -2026,7 +2026,7 @@ fn a_pack_the_sweep_empties_is_kept_while_young() {
     sim.custom(
         c,
         "compact without segment grace",
-        |repo: &mut crate::repo::Repository| {
+        |repo: &mut crate::repo::RepoWriter<'_>| {
             repo.load_chunk_index_under_lock()?;
             repo.set_segment_grace(Duration::ZERO);
             stats = Some(crate::commands::compact::compact_repo(
@@ -2083,7 +2083,7 @@ fn compact_dry_run_counts_young_entries() {
     sim.custom(
         c,
         "compact --dry-run",
-        |repo: &mut crate::repo::Repository| {
+        |repo: &mut crate::repo::RepoWriter<'_>| {
             repo.load_chunk_index_under_lock()?;
             dry = Some(crate::commands::compact::compact_repo(
                 repo,

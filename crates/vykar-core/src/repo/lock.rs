@@ -2253,7 +2253,7 @@ impl LiveSession {
 /// (malformed JSON) are passed through as `ActiveSessionInfo { details: None }`
 /// so `ActiveSessionList`'s `Display` surfaces them to the operator instead
 /// of silently dropping them — the fail-closed policy of
-/// `Repository::refuse_live_sessions`.
+/// `Repo::refuse_live_sessions`.
 pub(crate) fn build_active_session_list(
     entries: Vec<(String, Option<SessionEntry>)>,
     now: &chrono::DateTime<chrono::Utc>,

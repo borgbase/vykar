@@ -16,7 +16,7 @@ use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::identity::{self, KeyProof};
 use vykar_core::repo::{
-    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, OpenOptions, RepoConfig, RepoFormat, Repository,
+    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, OpenOptions, Repo, RepoConfig, RepoFormat,
 };
 use vykar_crypto::key::MasterKey;
 use vykar_storage::local_backend::LocalBackend;
@@ -85,9 +85,9 @@ impl Fixture {
         std::fs::read(self.primary()).unwrap()
     }
 
-    fn open(&self) -> vykar_types::error::Result<Repository> {
+    fn open(&self) -> vykar_types::error::Result<Repo> {
         let storage = Box::new(LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap());
-        Repository::open(
+        Repo::open(
             storage,
             Some(PASS),
             Some(self.cache_dir.clone()),
@@ -98,8 +98,8 @@ impl Fixture {
     /// Open through an arbitrary backend — used to inject storage failures
     /// deterministically, without depending on permission bits (which root
     /// bypasses).
-    fn open_on(&self, storage: Box<dyn StorageBackend>) -> vykar_types::error::Result<Repository> {
-        Repository::open(
+    fn open_on(&self, storage: Box<dyn StorageBackend>) -> vykar_types::error::Result<Repo> {
+        Repo::open(
             storage,
             Some(PASS),
             Some(self.cache_dir.clone()),
@@ -119,9 +119,9 @@ impl Fixture {
 
     /// Open the way the CLI does: with the URL, so the identity pin is
     /// consulted during key selection.
-    fn open_pinned(&self) -> vykar_types::error::Result<Repository> {
+    fn open_pinned(&self) -> vykar_types::error::Result<Repo> {
         let storage = Box::new(LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap());
-        Repository::open(
+        Repo::open(
             storage,
             Some(PASS),
             Some(self.cache_dir.clone()),
@@ -139,9 +139,9 @@ impl Fixture {
         std::fs::write(&pins[0], serde_json::to_string_pretty(&pin).unwrap()).unwrap();
     }
 
-    fn open_with(&self, passphrase: &str) -> vykar_types::error::Result<Repository> {
+    fn open_with(&self, passphrase: &str) -> vykar_types::error::Result<Repo> {
         let storage = Box::new(LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap());
-        Repository::open(
+        Repo::open(
             storage,
             Some(passphrase),
             Some(self.cache_dir.clone()),
@@ -631,7 +631,7 @@ fn same_key_wrapped_twice_needs_no_proof() {
     // Without `index` the head read fails after key selection; tolerate it,
     // so the open shows that key selection succeeded.
     let storage = Box::new(fx.storage());
-    Repository::open(
+    Repo::open(
         storage,
         Some(PASS),
         Some(fx.cache_dir.clone()),
@@ -790,7 +790,7 @@ fn a_contradicting_pin_beats_self_consistent_repository_data() {
     fresh_config.trust_repo = false;
     // `init` re-pins unconditionally, so build the replacement without it.
     let storage = Box::new(LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap());
-    Repository::init(
+    Repo::init(
         storage,
         EncryptionMode::Aes256Gcm,
         fresh_config.chunker.params(),
@@ -980,7 +980,7 @@ fn import_rejects_a_malformed_blob_before_touching_storage() {
     assert_eq!(key_dir_snapshot(&fx.repo_dir), before);
 }
 
-/// `export` must not go through `Repository::open`: a recovery tool for the
+/// `export` must not go through `Repo::open`: a recovery tool for the
 /// key cannot fail on an unreadable index head, and must write nothing.
 ///
 /// The head is made unreadable by replacing it with a directory, which

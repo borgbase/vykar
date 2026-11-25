@@ -59,7 +59,7 @@ fn flip_byte_in_chunk(repo_dir: &Path, id: &ChunkId) {
 /// Delete the local tree-chunk cache (`$XDG_CACHE_HOME/vykar/<repo id>/tree_chunks`)
 /// so the next listing read goes to storage.
 fn remove_tree_cache(repo_dir: &Path) {
-    let repo_id = open_local_repo(repo_dir, None).config.id.clone();
+    let repo_id = open_local_repo(repo_dir, None).config().id.clone();
     let root = std::path::PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap())
         .join("vykar")
         .join(hex::encode(repo_id))

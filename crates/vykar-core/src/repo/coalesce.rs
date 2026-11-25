@@ -1,5 +1,5 @@
 //! Grouping of blobs in one pack into range reads. Used through
-//! `blob_read::coalesce_groups` by `Repository::read_chunks_coalesced_into`
+//! `blob_read::coalesce_groups` by `Repo::read_chunks_coalesced_into`
 //! and restore's read planner.
 
 use vykar_types::error::{Result, VykarError};

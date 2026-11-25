@@ -20,7 +20,7 @@ mod common;
 use vykar_core::commands;
 use vykar_core::index::ChunkIndex;
 use vykar_core::repo::control::CancelToken;
-use vykar_core::repo::{OpenOptions, Repository, UpgradeOutcome};
+use vykar_core::repo::{OpenOptions, Repo, UpgradeOutcome};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
@@ -135,7 +135,7 @@ fn v3_fixtures_open_only_for_upgrade() {
         let tree = read_tree(&fx.repo_dir());
         for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
             let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
-            let err = Repository::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
+            let err = Repo::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
                 .err()
                 .unwrap()
                 .to_string();
@@ -149,11 +149,12 @@ fn v3_fixtures_open_only_for_upgrade() {
 
         let repo = fx.open_legacy();
         assert_eq!(
-            repo.config.version, 3,
+            repo.config().version,
+            3,
             "{mode}: fixture must stay at format v3"
         );
         assert!(repo.index_head().is_none(), "{mode}");
-        assert_eq!(repo.config.encryption, fx.expected_encryption(), "{mode}");
+        assert_eq!(repo.config().encryption, fx.expected_encryption(), "{mode}");
 
         let mut listed: Vec<String> = repo
             .manifest()
@@ -254,8 +255,8 @@ fn v3_fixtures_upgrade_to_v6() {
         assert!(fx.repo_dir().join("index.h/1").is_file(), "{mode}");
 
         let repo = fx.open();
-        assert_eq!(repo.config.version, 6, "{mode}");
-        assert_eq!(repo.config.chunk_hash, "blake3", "{mode}");
+        assert_eq!(repo.config().version, 6, "{mode}");
+        assert_eq!(repo.config().chunk_hash, "blake3", "{mode}");
         let head = repo.index_head().unwrap();
         assert_eq!(head.layout, 3, "{mode}");
         assert!(head.base.is_some() && head.segments.is_empty(), "{mode}");

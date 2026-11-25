@@ -26,7 +26,7 @@ use crate::config::{EncryptionModeConfig, RetentionConfig, VykarConfig};
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::pack::PackType;
-use crate::repo::{OpenOptions, Repository, TreeChunkSource, WriteSessionOptions};
+use crate::repo::{OpenOptions, Repo, TreeChunkSource, WriteSessionOptions};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{Item, ItemType};
 
@@ -154,7 +154,7 @@ impl Fx {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    pub(super) fn open_probe(&self, fail: Option<(String, usize)>) -> (Repository, Reads) {
+    pub(super) fn open_probe(&self, fail: Option<(String, usize)>) -> (Repo, Reads) {
         self.open_probe_with(fail.map(|(key, times)| Fail {
             key,
             at: None,
@@ -162,14 +162,14 @@ impl Fx {
         }))
     }
 
-    fn open_probe_with(&self, fail: Option<Fail>) -> (Repository, Reads) {
+    fn open_probe_with(&self, fail: Option<Fail>) -> (Repo, Reads) {
         let reads = Reads::default();
         let backend = Probe {
             inner: LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap(),
             reads: Arc::clone(&reads),
             fail,
         };
-        let repo = Repository::open(
+        let repo = Repo::open(
             Box::new(backend),
             self.pass,
             None,
@@ -179,7 +179,7 @@ impl Fx {
         (repo, reads)
     }
 
-    pub(super) fn open(&self) -> Repository {
+    pub(super) fn open(&self) -> Repo {
         self.open_probe(None).0
     }
 
@@ -195,7 +195,7 @@ impl Fx {
     fn leak_snapshot(&self, name: &str) {
         let repo = self.open();
         let id = repo.manifest().find_snapshot(name).unwrap().id;
-        repo.storage.delete(&id.storage_key()).unwrap();
+        repo.storage().delete(&id.storage_key()).unwrap();
     }
 
     fn cache_root(&self) -> PathBuf {
@@ -238,7 +238,7 @@ impl Fx {
     }
 
     /// Edit the index under the maintenance lock and persist it.
-    pub(super) fn edit_index(&self, f: impl FnOnce(&mut Repository)) {
+    pub(super) fn edit_index(&self, f: impl FnOnce(&mut Repo)) {
         let mut repo = self.open();
         commands::util::with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
@@ -314,7 +314,7 @@ pub(super) fn with_four_tree_chunks(encrypted: bool, name: &str, build: impl Fn(
 /// The independent oracle: a sequential count of references with snapshot
 /// multiplicity (the mark's counting rule), per snapshot of the manifest,
 /// over the snapshot's whole item stream.
-fn sequential_counts(repo: &mut Repository) -> HashMap<ChunkId, u32> {
+fn sequential_counts(repo: &mut Repo) -> HashMap<ChunkId, u32> {
     let mut counts: HashMap<ChunkId, u32> = HashMap::new();
     let names: Vec<String> = repo
         .manifest()
@@ -349,7 +349,7 @@ fn sequential_counts(repo: &mut Repository) -> HashMap<ChunkId, u32> {
 /// Per index entry: (marked, counted references), by `mark_live` over the
 /// strict listing.
 fn mark_counts(
-    repo: &Repository,
+    repo: &Repo,
     source: TreeChunkSource,
     decode_threads: usize,
 ) -> HashMap<ChunkId, (bool, u32)> {
@@ -584,7 +584,7 @@ fn references_of_non_regular_items_are_marked_not_counted() {
 // ---------------------------------------------------------------------------
 
 /// Bytes read from the packs that hold `ids`.
-fn bytes_read_from(reads: &Reads, repo: &Repository, ids: &[ChunkId]) -> (usize, u64) {
+fn bytes_read_from(reads: &Reads, repo: &Repo, ids: &[ChunkId]) -> (usize, u64) {
     let keys: HashSet<String> = ids
         .iter()
         .map(|id| repo.chunk_index().get(id).unwrap().pack_id.storage_key())
@@ -760,10 +760,12 @@ fn report_refuses_a_newer_snapshot_format() {
             ObjectType::SnapshotMeta,
             entry.id.as_bytes(),
             &rmp_serde::to_vec(&meta).unwrap(),
-            repo.crypto.as_ref(),
+            repo.crypto().as_ref(),
         )
         .unwrap();
-        repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+        repo.storage()
+            .put(&entry.id.storage_key(), &packed)
+            .unwrap();
     });
     assert!(
         matches!(err, VykarError::UnsupportedSnapshotVersion { .. }),
@@ -818,8 +820,8 @@ delegate_storage_backend! {
 }
 
 impl Ghost {
-    fn open(fx: &Fx, hidden: &str) -> Repository {
-        Repository::open(
+    fn open(fx: &Fx, hidden: &str) -> Repo {
+        Repo::open(
             Box::new(Ghost {
                 inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
                 hidden: hidden.to_string(),
@@ -885,7 +887,10 @@ fn report_refuses_a_data_reference_missing_from_the_index() {
         let id = a_file_chunk(&fx, "s2");
         let err = refused(&fx, |fx| {
             fx.edit_index(|repo| {
-                repo.chunk_index_mut().remove(&id).unwrap();
+                repo.unchecked_writer()
+                    .chunk_index_mut()
+                    .remove(&id)
+                    .unwrap();
             });
         });
         assert_framed(
@@ -901,7 +906,10 @@ fn report_refuses_a_tree_chunk_missing_from_the_index() {
     let id = fx.item_ptrs("s2")[0];
     let err = refused(&fx, |fx| {
         fx.edit_index(|repo| {
-            repo.chunk_index_mut().remove(&id).unwrap();
+            repo.unchecked_writer()
+                .chunk_index_mut()
+                .remove(&id)
+                .unwrap();
         });
         assert!(fx.cached().contains(&id), "the chunk stays cached");
     });
@@ -959,12 +967,12 @@ fn report_runs_beside_a_live_session() {
 // ---------------------------------------------------------------------------
 
 /// Re-seal snapshot `name`'s object with its `item_ptrs` edited by `f`.
-pub(super) fn edit_item_ptrs(repo: &Repository, name: &str, f: impl FnOnce(&mut Vec<ChunkId>)) {
+pub(super) fn edit_item_ptrs(repo: &Repo, name: &str, f: impl FnOnce(&mut Vec<ChunkId>)) {
     edit_meta(repo, name, |meta| f(&mut meta.item_ptrs));
 }
 
 /// Snapshot `name`'s object re-sealed after `f` edited its metadata.
-pub(super) fn edit_meta(repo: &Repository, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
+pub(super) fn edit_meta(repo: &Repo, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
     let entry = repo.manifest().find_snapshot(name).unwrap().clone();
     let mut meta = load_snapshot_meta(repo, name).unwrap();
     f(&mut meta);
@@ -972,10 +980,12 @@ pub(super) fn edit_meta(repo: &Repository, name: &str, f: impl FnOnce(&mut Snaps
         ObjectType::SnapshotMeta,
         entry.id.as_bytes(),
         &rmp_serde::to_vec(&meta).unwrap(),
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )
     .unwrap();
-    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+    repo.storage()
+        .put(&entry.id.storage_key(), &packed)
+        .unwrap();
 }
 
 /// Snapshot `name` with its tree chunk `k` replaced by `edit` of its
@@ -990,12 +1000,11 @@ pub(super) fn replace_tree_chunk(
     let mut repo = fx.open();
     let old = load_snapshot_meta(&repo, name).unwrap().item_ptrs[k];
     let chunk = edit(repo.read_chunk(&old).unwrap());
-    repo.begin_write_session(&WriteSessionOptions::default())
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let (id, _, _) = ws
+        .store_chunk(&repo, &chunk, Compression::None, PackType::Tree)
         .unwrap();
-    let (id, _, _) = repo
-        .store_chunk(&chunk, Compression::None, PackType::Tree)
-        .unwrap();
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_session(ws).unwrap();
     edit_item_ptrs(&repo, name, |ptrs| ptrs[k] = id);
     id
 }
@@ -1035,7 +1044,7 @@ fn invalidate_item(fx: &Fx, name: &str, k: usize) -> String {
     path
 }
 
-fn sequential_check(repo: &mut Repository) -> (Vec<String>, usize, Vec<Vec<HashSet<ChunkId>>>) {
+fn sequential_check(repo: &mut Repo) -> (Vec<String>, usize, Vec<Vec<HashSet<ChunkId>>>) {
     let mut issues = Vec::new();
     let mut items_total = 0;
     let mut per_item_all = Vec::new();
@@ -1124,7 +1133,10 @@ fn check_reports_unchanged_issues() {
             .id;
         drop(repo);
         fx.edit_index(|repo| {
-            repo.chunk_index_mut().remove(&shared).unwrap();
+            repo.unchecked_writer()
+                .chunk_index_mut()
+                .remove(&shared)
+                .unwrap();
         });
 
         let mut repo = fx.open();
@@ -1568,8 +1580,8 @@ fn head(fx: &Fx) -> crate::index::head::IndexHead {
 fn last_record(fx: &Fx) -> crate::index::sweep_record::SweepRecord {
     let repo = fx.open();
     crate::repo::index_store::fetch_sweep_record(
-        repo.storage.as_ref(),
-        repo.crypto.as_ref(),
+        repo.storage().as_ref(),
+        repo.crypto().as_ref(),
         repo.index_head().unwrap(),
     )
     .unwrap()
@@ -1723,7 +1735,10 @@ fn compact_refuses_an_index_missing_live_entries() {
     let id = fx.item_ptrs("s2")[0];
     let err = compact_refused(&fx, |fx| {
         fx.edit_index(|repo| {
-            repo.chunk_index_mut().remove(&id).unwrap();
+            repo.unchecked_writer()
+                .chunk_index_mut()
+                .remove(&id)
+                .unwrap();
         });
     });
     assert_mark_refused(
@@ -1736,7 +1751,10 @@ fn compact_refuses_an_index_missing_live_entries() {
         let id = a_file_chunk(&fx, "s2");
         let err = compact_refused(&fx, |fx| {
             fx.edit_index(|repo| {
-                repo.chunk_index_mut().remove(&id).unwrap();
+                repo.unchecked_writer()
+                    .chunk_index_mut()
+                    .remove(&id)
+                    .unwrap();
             });
         });
         assert_mark_refused(
@@ -1852,7 +1870,7 @@ fn compact_refuses_a_listing_that_hides_a_marked_snapshot() {
         inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
         hidden: hidden.clone(),
     };
-    let mut repo = Repository::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
+    let mut repo = Repo::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
     let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
         .unwrap_err();
     drop(repo);
@@ -1964,7 +1982,7 @@ fn compact_refuses_when_the_sweep_record_cannot_be_fetched() {
         inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
         key: key.clone(),
     };
-    let mut repo = Repository::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
+    let mut repo = Repo::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
     let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
         .unwrap_err();
     drop(repo);
@@ -1982,7 +2000,7 @@ fn compact_refuses_a_newer_sweep_record() {
     record.version = crate::index::sweep_record::SWEEP_RECORD_VERSION + 1;
     fx.edit_index(|repo| {
         repo.set_pending_sweep(crate::repo::index_write::PendingSweep::Swept(record));
-        repo.mark_index_dirty();
+        repo.unchecked_writer().mark_index_dirty();
     });
     let err = compact_refused(&fx, |_| {});
     assert_mark_refused(
@@ -2050,8 +2068,8 @@ fn compact_deletes_the_maps_of_deleted_packs() {
     assert!(left.len() < all.len() + 1, "{left:?} vs {all:?}");
     // Every pack a remaining (readable) map names still exists.
     let scan = crate::repo::pack_map::read_pack_maps(
-        fx.open().storage.as_ref(),
-        fx.open().crypto.as_ref(),
+        fx.open().storage().as_ref(),
+        fx.open().crypto().as_ref(),
         2,
         false,
         &CancelToken::new(),
@@ -2105,7 +2123,7 @@ fn compact_collects_old_heads_and_unnamed_objects() {
     }
     drop(repo);
     let heads = |fx: &Fx| {
-        crate::repo::index_store::list_head_generations(fx.open().storage.as_ref()).unwrap()
+        crate::repo::index_store::list_head_generations(fx.open().storage().as_ref()).unwrap()
     };
     let objects = |fx: &Fx| {
         let mut v = Vec::new();
@@ -2142,11 +2160,11 @@ fn compact_collects_old_heads_and_unnamed_objects() {
     let mut named = HashSet::new();
     for g in &kept {
         let bytes = repo
-            .storage
+            .storage()
             .get(&crate::repo::index_store::head_key(*g))
             .unwrap()
             .unwrap();
-        let h = crate::repo::index_store::classify_head(*g, &bytes, repo.crypto.as_ref())
+        let h = crate::repo::index_store::classify_head(*g, &bytes, repo.crypto().as_ref())
             .into_head()
             .unwrap();
         named.extend(h.named_objects().map(|n| n.to_hex()));

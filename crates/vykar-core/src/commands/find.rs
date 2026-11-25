@@ -6,7 +6,7 @@ use globset::GlobMatcher;
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{OpenOptions, Repository, TreeChunkSource};
+use crate::repo::{OpenOptions, Repo, TreeChunkSource};
 use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -190,7 +190,7 @@ struct SlotHit {
 /// their tree chunk. Holds the pointer lists of every selected snapshot for
 /// the run (32 bytes per pointer).
 pub(crate) fn find_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     entries: &[SnapshotEntry],
     filter: &FindFilter,
     shutdown: &CancelToken,

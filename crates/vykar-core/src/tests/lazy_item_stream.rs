@@ -11,16 +11,16 @@ use crate::commands::list::{LazyItemStream, for_each_decoded_item};
 use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
-use crate::repo::{Repository, WriteSessionOptions};
+use crate::repo::{Repo, WriteSessionOptions};
 use crate::snapshot::item::{Item, ItemType};
 use crate::testutil::{PutLog, RecordingBackend, init_test_environment};
 
 type Loc = (ChunkId, PackId, u64, u32);
 
-fn repo_on_counting_backend() -> (Repository, PutLog) {
+fn repo_on_counting_backend() -> (Repo, crate::repo::WriteSession, PutLog) {
     init_test_environment();
     let (backend, log) = RecordingBackend::new();
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -29,15 +29,14 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    (repo, log)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
-fn aes_repo_on_counting_backend() -> (Repository, PutLog) {
+fn aes_repo_on_counting_backend() -> (Repo, crate::repo::WriteSession, PutLog) {
     init_test_environment();
     let (backend, log) = RecordingBackend::new();
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         Box::new(backend),
         crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
@@ -46,9 +45,8 @@ fn aes_repo_on_counting_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .expect("begin write session");
-    (repo, log)
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws, log)
 }
 
 fn item(i: usize) -> Item {
@@ -75,7 +73,12 @@ fn item(i: usize) -> Item {
 /// Encode `n` items, cut the stream every `cut` bytes (so items straddle the
 /// cuts), store each piece as a tree chunk and return the stream plus the
 /// chunk locations in stream order.
-fn stored_stream(repo: &mut Repository, n: usize, cut: usize) -> (Vec<u8>, Vec<Loc>) {
+fn stored_stream(
+    repo: &mut Repo,
+    ws: &mut crate::repo::WriteSession,
+    n: usize,
+    cut: usize,
+) -> (Vec<u8>, Vec<Loc>) {
     let mut stream = Vec::new();
     for i in 0..n {
         stream.extend_from_slice(&rmp_serde::to_vec(&item(i)).unwrap());
@@ -83,15 +86,13 @@ fn stored_stream(repo: &mut Repository, n: usize, cut: usize) -> (Vec<u8>, Vec<L
     let ids: Vec<ChunkId> = stream
         .chunks(cut)
         .map(|piece| {
-            repo.store_chunk(piece, Compression::None, PackType::Tree)
+            ws.store_chunk(repo, piece, Compression::None, PackType::Tree)
                 .unwrap()
                 .0
         })
         .collect();
     // Chunks stored in a session are in the index once it is saved.
-    repo.save_state().unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    crate::testutil::save_and_resume(repo, ws);
     let locs = ids
         .iter()
         .map(|id| {
@@ -123,9 +124,9 @@ fn eager_paths(stream: &[u8]) -> Vec<String> {
 
 #[test]
 fn lazy_stream_matches_eager_decode_across_windows() {
-    let (mut repo, log) = repo_on_counting_backend();
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
     // 33-byte cuts: almost every item straddles a chunk boundary.
-    let (stream, locs) = stored_stream(&mut repo, 500, 33);
+    let (stream, locs) = stored_stream(&mut repo, &mut ws, 500, 33);
     assert!(locs.len() > 100);
     let expected = eager_paths(&stream);
     assert_eq!(expected.len(), 500);
@@ -157,7 +158,7 @@ fn lazy_stream_matches_eager_decode_across_windows() {
 
 #[test]
 fn lazy_stream_empty_is_empty() {
-    let (repo, log) = repo_on_counting_backend();
+    let (repo, _ws, log) = repo_on_counting_backend();
     let never = CancelToken::new();
     let mut lazy = LazyItemStream::for_test(&repo, Vec::new(), false, u64::MAX, &never);
     assert!(paths_of(&mut lazy).unwrap().is_empty());
@@ -166,8 +167,8 @@ fn lazy_stream_empty_is_empty() {
 
 #[test]
 fn lazy_stream_surfaces_chunk_id_mismatch_not_a_decode_error() {
-    let (mut repo, _log) = repo_on_counting_backend();
-    let (_stream, mut locs) = stored_stream(&mut repo, 200, 64);
+    let (mut repo, mut ws, _log) = repo_on_counting_backend();
+    let (_stream, mut locs) = stored_stream(&mut repo, &mut ws, 200, 64);
     // Point chunk 3's location at chunk 4's bytes: on a plaintext repo only
     // the chunk-ID check can notice.
     let (_, p, o, s) = locs[4];
@@ -183,8 +184,8 @@ fn lazy_stream_surfaces_chunk_id_mismatch_not_a_decode_error() {
 
 #[test]
 fn lazy_stream_polls_shutdown_between_range_reads() {
-    let (mut repo, log) = repo_on_counting_backend();
-    let (_stream, locs) = stored_stream(&mut repo, 300, 64);
+    let (mut repo, mut ws, log) = repo_on_counting_backend();
+    let (_stream, locs) = stored_stream(&mut repo, &mut ws, 300, 64);
     let cap = u64::from(locs[0].3) * 2;
     let shutdown = CancelToken::new();
     let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, &shutdown);
@@ -211,8 +212,8 @@ fn lazy_stream_polls_shutdown_between_range_reads() {
 /// head, and the read goes on.
 #[test]
 fn lazy_stream_retries_a_bad_location_against_a_fresh_index() {
-    let (mut repo, _log) = repo_on_counting_backend();
-    let (stream, mut locs) = stored_stream(&mut repo, 200, 64);
+    let (mut repo, mut ws, _log) = repo_on_counting_backend();
+    let (stream, mut locs) = stored_stream(&mut repo, &mut ws, 200, 64);
     // A location that decodes to the wrong chunk.
     let (_, p, o, s) = locs[2];
     locs[5] = (locs[5].0, p, o, s);
@@ -230,9 +231,9 @@ fn lazy_stream_retries_a_bad_location_against_a_fresh_index() {
 
 #[test]
 fn lazy_stream_reads_an_aead_repo() {
-    let (mut repo, _log) = aes_repo_on_counting_backend();
+    let (mut repo, mut ws, _log) = aes_repo_on_counting_backend();
     let cut = 64;
-    let (stream, mut locs) = stored_stream(&mut repo, 200, cut);
+    let (stream, mut locs) = stored_stream(&mut repo, &mut ws, 200, cut);
     let mut pieces: Vec<&[u8]> = stream.chunks(cut).collect();
     locs.insert(4, locs[3]);
     pieces.insert(4, pieces[3]);
@@ -248,7 +249,7 @@ fn lazy_stream_reads_an_aead_repo() {
 /// Move every index entry of `from` to a copy of the pack at `to` (same
 /// offsets), publish that as a new head and delete `from`: what a compact
 /// that repacks one pack looks like to a reader.
-fn move_pack(w: &mut Repository, dir: &std::path::Path, from: PackId, to: PackId) {
+fn move_pack(w: &mut Repo, dir: &std::path::Path, from: PackId, to: PackId) {
     std::fs::copy(dir.join(from.storage_key()), dir.join(to.storage_key())).unwrap();
     let moved: Vec<(ChunkId, crate::index::ChunkIndexEntry)> = w
         .chunk_index()
@@ -257,15 +258,16 @@ fn move_pack(w: &mut Repository, dir: &std::path::Path, from: PackId, to: PackId
         .collect();
     assert!(!moved.is_empty());
     let trailer = w.chunk_index().pack_trailer_len(&from).unwrap_or(0);
-    w.chunk_index_mut().set_pack_trailer(to, trailer);
+    w.unchecked_writer()
+        .chunk_index_mut()
+        .set_pack_trailer(to, trailer);
     for (id, e) in moved {
-        let index = w.chunk_index_mut();
+        let mut writer = w.unchecked_writer();
+        let index = writer.chunk_index_mut();
         index.remove(&id);
         index.add(id, e.stored_size, to, e.pack_offset);
     }
-    w.save_state().unwrap();
-    w.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
+    w.unchecked_writer().save_state().unwrap();
     std::fs::remove_file(dir.join(from.storage_key())).unwrap();
 }
 
@@ -282,7 +284,7 @@ fn lazy_stream_follows_two_packs_moved_at_two_heads() {
     let local = || {
         Box::new(vykar_storage::local_backend::LocalBackend::new(dir.to_str().unwrap()).unwrap())
     };
-    let mut w = Repository::init(
+    let mut w = Repo::init(
         local(),
         crate::repo::EncryptionMode::None,
         crate::repo::ChunkerParams::default(),
@@ -291,17 +293,16 @@ fn lazy_stream_follows_two_packs_moved_at_two_heads() {
         None,
     )
     .unwrap();
-    w.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    let (first, mut locs) = stored_stream(&mut w, 200, 33);
-    let (second, more) = stored_stream(&mut w, 300, 64);
+    let mut ws = w.begin_write_session(&WriteSessionOptions::default());
+    let (first, mut locs) = stored_stream(&mut w, &mut ws, 200, 33);
+    let (second, more) = stored_stream(&mut w, &mut ws, 300, 64);
     let (p1, p2) = (locs[0].1, more[0].1);
     assert_ne!(p1, p2, "two saves, two packs");
     locs.extend(more);
     let mut expected = eager_paths(&first);
     expected.extend(eager_paths(&second));
 
-    let h = Repository::open(
+    let h = Repo::open(
         local(),
         None,
         None,

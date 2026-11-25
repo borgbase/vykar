@@ -11,8 +11,8 @@ use crate::chunker;
 use crate::compress::Compression;
 use crate::config::CommandDump;
 use crate::platform::shell;
-use crate::repo::Repository;
 use crate::repo::pack::PackType;
+use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
@@ -94,14 +94,15 @@ impl Drop for DumpProcessGuard {
 
 /// Stream a single command dump through the chunker with checkpoint/rollback.
 fn stream_dump_command(
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     dump: &CommandDump,
     compression: Compression,
     stats: &mut SnapshotStats,
     timeout: Duration,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
 ) -> Result<(Vec<ChunkRef>, u64)> {
-    with_rollback_checkpoint(repo, stats, |repo, stats| {
+    with_rollback_checkpoint(repo, ws, stats, |repo, ws, stats| {
         // Spawn child with piped stdout and stderr.
         let mut cmd = shell::command_for_script(&dump.command);
         let mut child = cmd
@@ -149,11 +150,11 @@ fn stream_dump_command(
         };
 
         // Stream stdout through chunker.
-        let chunk_hasher = repo.crypto.chunk_hasher().clone();
+        let chunk_hasher = repo.crypto().chunk_hasher().clone();
         let stdout = stdout.ok_or_else(|| {
             VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
         })?;
-        let chunk_stream = chunker::chunk_stream(stdout, &repo.config.chunker_params);
+        let chunk_stream = chunker::chunk_stream(stdout, &repo.config().chunker_params);
 
         let mut chunk_refs = Vec::new();
         let mut total_size: u64 = 0;
@@ -176,7 +177,7 @@ fn stream_dump_command(
             total_size += size as u64;
             let chunk_id = ChunkId::compute(&chunk_hasher, &chunk.data);
 
-            if let Some(csize) = repo.bump_ref_if_exists(&chunk_id) {
+            if let Some(csize) = ws.bump_ref_if_exists(repo, &chunk_id) {
                 stats.original_size += size as u64;
                 stats.compressed_size += csize as u64;
                 chunk_refs.push(ChunkRef {
@@ -185,8 +186,13 @@ fn stream_dump_command(
                     csize,
                 });
             } else {
-                let csize =
-                    repo.commit_chunk_inline(chunk_id, &chunk.data, compression, PackType::Data)?;
+                let csize = ws.commit_chunk_inline(
+                    repo,
+                    chunk_id,
+                    &chunk.data,
+                    compression,
+                    PackType::Data,
+                )?;
                 stats.original_size += size as u64;
                 stats.compressed_size += csize as u64;
                 stats.deduplicated_size += csize as u64;
@@ -238,8 +244,10 @@ fn stream_dump_command(
 /// `vykar-dumps` directory item.
 pub(crate) const DUMPS_ROOT: &[u8] = b"vykar-dumps";
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn process_command_dumps(
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     command_dumps: &[CommandDump],
     compression: Compression,
     listing: &mut ListingWriter,
@@ -270,8 +278,8 @@ pub(super) fn process_command_dumps(
         hardlink: None,
     };
     debug_assert_eq!(dumps_dir_item.path.as_bytes(), DUMPS_ROOT);
-    listing.begin_segment(repo, DUMPS_ROOT.to_vec())?;
-    listing.push(repo, &dumps_dir_item)?;
+    listing.begin_segment(repo, ws, DUMPS_ROOT.to_vec())?;
+    listing.push(repo, ws, &dumps_dir_item)?;
 
     let mut dump_items: Vec<Item> = Vec::with_capacity(command_dumps.len());
     for dump in command_dumps {
@@ -290,6 +298,7 @@ pub(super) fn process_command_dumps(
 
         let (chunk_refs, total_size) = stream_dump_command(
             repo,
+            ws,
             dump,
             compression,
             stats,
@@ -326,7 +335,7 @@ pub(super) fn process_command_dumps(
     // order, since a later dump may depend on an earlier one.
     dump_items.sort_unstable_by(|a, b| a.path_bytes().cmp(b.path_bytes()));
     for item in &dump_items {
-        listing.push(repo, item)?;
+        listing.push(repo, ws, item)?;
     }
 
     Ok(())
@@ -367,22 +376,22 @@ mod tests {
         "true"
     }
 
-    /// Helper: set up a repo with an active write session for streaming
-    /// dump tests.
-    fn setup_test_repo() -> Repository {
-        crate::testutil::test_repo_plaintext()
+    /// Helper: set up a repo with a write session for streaming dump tests.
+    fn setup_test_repo() -> (Repo, WriteSession) {
+        crate::testutil::test_repo_plaintext_with_session()
     }
 
     #[test]
     fn streaming_dump_captures_stdout() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         let dump = CommandDump {
             name: "test.txt".to_string(),
             command: shell_echo_hello().to_string(),
         };
         let mut stats = SnapshotStats::default();
         let (refs, total_size) = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,
@@ -396,14 +405,15 @@ mod tests {
 
     #[test]
     fn streaming_dump_fails_on_nonzero_exit() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         let dump = CommandDump {
             name: "fail.txt".to_string(),
             command: shell_fail().to_string(),
         };
         let mut stats = SnapshotStats::default();
         let result = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,
@@ -420,14 +430,15 @@ mod tests {
 
     #[test]
     fn streaming_dump_empty_stdout_succeeds() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         let dump = CommandDump {
             name: "empty.txt".to_string(),
             command: shell_success_no_output().to_string(),
         };
         let mut stats = SnapshotStats::default();
         let (refs, total_size) = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,
@@ -442,14 +453,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn streaming_dump_timeout_kills_child() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         let dump = CommandDump {
             name: "hang.txt".to_string(),
             command: "sleep 60".to_string(),
         };
         let mut stats = SnapshotStats::default();
         let result = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,
@@ -467,14 +479,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn streaming_dump_fail_after_large_output() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         let dump = CommandDump {
             name: "big_fail.txt".to_string(),
             command: "head -c 1000000 /dev/urandom; exit 1".to_string(),
         };
         let mut stats = SnapshotStats::default();
         let result = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,
@@ -492,7 +505,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn streaming_dump_stderr_capped() {
-        let mut repo = setup_test_repo();
+        let (repo, mut ws) = setup_test_repo();
         // Write 2 MiB to stderr, nothing to stdout
         let dump = CommandDump {
             name: "stderr_test.txt".to_string(),
@@ -500,7 +513,8 @@ mod tests {
         };
         let mut stats = SnapshotStats::default();
         let result = stream_dump_command(
-            &mut repo,
+            &repo,
+            &mut ws,
             &dump,
             Compression::None,
             &mut stats,

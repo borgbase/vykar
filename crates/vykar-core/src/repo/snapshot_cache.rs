@@ -145,7 +145,7 @@ pub fn classify_decode_error(err: &rmp_serde::decode::Error, meta_bytes: &[u8]) 
 
 /// Warn once per process per snapshot ID.
 ///
-/// `refresh_snapshot_cache` runs on every `Repository::open()` and a skipped
+/// `refresh_snapshot_cache` runs on every `Repo::open()` and a skipped
 /// snapshot is never cached, so without this a single `vykar` run repeats the
 /// same warning for each phase it runs (backup, prune, compact, check).
 fn warn_skip_once(id_hex: &str, reason: &SkipReason) {

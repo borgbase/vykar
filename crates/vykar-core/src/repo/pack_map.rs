@@ -27,7 +27,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-use super::Repository;
+use super::Repo;
 use super::bounded::try_for_each_bounded;
 use super::control::CancelToken;
 use super::format::{
@@ -430,7 +430,7 @@ pub(crate) fn delete_dead_pack_maps(
     Ok(deleted)
 }
 
-/// What `Repository::write_pack_maps` did.
+/// What `Repo::write_pack_maps` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackMapStats {
     pub maps_written: usize,
@@ -497,7 +497,7 @@ fn group_into_maps(packs: Vec<(PackId, Vec<PackMapEntry>)>, target: usize) -> Ve
     maps
 }
 
-impl Repository {
+impl Repo {
     /// Write pack maps for the packs the loaded index names (all of them, or
     /// only those in `only`), skipping packs a readable map covers: for all
     /// packs, a pack any map names; for `only` (repair), a pack whose index
@@ -815,11 +815,11 @@ mod tests {
 
     /// A plaintext repository whose index holds `packs` packs of `per_pack`
     /// entries each.
-    fn repo_with_packs(packs: u8, per_pack: usize) -> Repository {
+    fn repo_with_packs(packs: u8, per_pack: usize) -> Repo {
         let mut repo = test_repo_plaintext();
         for p in 0..packs {
             for e in entries(per_pack, usize::from(p) * per_pack, 100) {
-                repo.chunk_index_mut().add(
+                repo.unchecked_writer().chunk_index_mut().add(
                     e.chunk_id,
                     e.stored_size,
                     pack(p + 1),
@@ -830,7 +830,7 @@ mod tests {
         repo
     }
 
-    fn index_by_pack(repo: &Repository) -> HashMap<PackId, Vec<PackMapEntry>> {
+    fn index_by_pack(repo: &Repo) -> HashMap<PackId, Vec<PackMapEntry>> {
         let mut out: HashMap<PackId, Vec<PackMapEntry>> = HashMap::new();
         for (chunk_id, e) in repo.chunk_index().iter() {
             out.entry(e.pack_id).or_default().push(PackMapEntry {
@@ -875,10 +875,18 @@ mod tests {
     fn write_pack_maps_skips_packs_a_map_cannot_hold() {
         let mut repo = repo_with_packs(1, 2);
         // Pack 7: an offset past u32. Pack 8: two overlapping blobs.
-        repo.chunk_index_mut()
-            .add(chunk(100), 10, pack(7), u64::from(u32::MAX) + 1);
-        repo.chunk_index_mut().add(chunk(101), 10, pack(8), 13);
-        repo.chunk_index_mut().add(chunk(102), 10, pack(8), 20);
+        repo.unchecked_writer().chunk_index_mut().add(
+            chunk(100),
+            10,
+            pack(7),
+            u64::from(u32::MAX) + 1,
+        );
+        repo.unchecked_writer()
+            .chunk_index_mut()
+            .add(chunk(101), 10, pack(8), 13);
+        repo.unchecked_writer()
+            .chunk_index_mut()
+            .add(chunk(102), 10, pack(8), 20);
         let only: HashSet<PackId> = [pack(1), pack(7), pack(8)].into_iter().collect();
         let stats = repo
             .write_pack_maps(Some(&only), &CancelToken::new())

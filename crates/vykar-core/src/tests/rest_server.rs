@@ -15,7 +15,7 @@ use crate::index::head::IndexHead;
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::index_write::FoldPolicy;
-use crate::repo::{OpenOptions, RepoFormat, Repository};
+use crate::repo::{OpenOptions, Repo, RepoFormat};
 use vykar_server::config::ServerSection;
 
 const TOKEN: &str = "rest-server-test";
@@ -105,7 +105,7 @@ fn client(server: &Server, tmp: &Path, cache: &str) -> VykarConfig {
     config
 }
 
-fn open(config: &VykarConfig) -> Repository {
+fn open(config: &VykarConfig) -> Repo {
     commands::util::open_repo(config, None, OpenOptions::new(), &CancelToken::new()).unwrap()
 }
 
@@ -286,7 +286,7 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
         repo.load_chunk_index_under_lock().unwrap();
         crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_state().unwrap();
         let head = repo.index_head().unwrap().clone();
         assert_eq!(head, self::head(&c.config));
         if head.segments.is_empty() {
@@ -315,7 +315,7 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     // Put the removed entry back before the check.
     repo.load_chunk_index_under_lock().unwrap();
     crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
-    repo.save_state().unwrap();
+    repo.unchecked_writer().save_state().unwrap();
     drop(repo);
     check_clean(&c.config);
 }
@@ -890,17 +890,13 @@ fn assert_trailers_match_index(
     .unwrap();
     let mut types = std::collections::HashMap::new();
     for (key, len) in server_packs(server) {
-        let trailer = match read_pack_trailer(
-            repo.storage.as_ref(),
-            &key,
-            len,
-            repo.crypto.as_ref(),
-        )
-        .unwrap()
-        {
-            TrailerRead::Found(t) => t,
-            other => panic!("{key}: {other:?}"),
-        };
+        let trailer =
+            match read_pack_trailer(repo.storage().as_ref(), &key, len, repo.crypto().as_ref())
+                .unwrap()
+            {
+                TrailerRead::Found(t) => t,
+                other => panic!("{key}: {other:?}"),
+            };
         let mut indexed: Vec<(String, u32, u64)> = repo
             .chunk_index()
             .iter()

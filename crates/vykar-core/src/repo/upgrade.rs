@@ -39,7 +39,7 @@ use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::index_store;
 use super::index_write::PendingSweep;
-use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat, Repository};
+use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat};
 use crate::compress;
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ use crate::index::{IndexBlob, LegacyChunkIndex, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
-/// What [`Repository::upgrade_index_layout`] did.
+/// What [`super::RepoWriter::upgrade_index_layout`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeOutcome {
     /// The repository already uses the current format.
@@ -111,11 +111,15 @@ pub(crate) fn is_index_head(data: &[u8]) -> bool {
     data.first() == Some(&(ObjectType::IndexHead as u8))
 }
 
-impl Repository {
+impl Repo {
     /// Upgrade a v2/v3 repository to v6 in place; see the module docs.
-    /// The caller holds the maintenance lock. One-way: older binaries cannot
+    /// The caller holds the maintenance lock, whose fence is `fence`
+    /// (`RepoWriter::upgrade_index_layout`). One-way: older binaries cannot
     /// read the repository afterwards.
-    pub fn upgrade_index_layout(&mut self) -> Result<UpgradeOutcome> {
+    pub(super) fn upgrade_index_layout_under(
+        &mut self,
+        fence: &super::Fence,
+    ) -> Result<UpgradeOutcome> {
         let from = self.format;
         let Some(target) = from.upgrade_target() else {
             // An upgrade interrupted after its switch left these behind.
@@ -221,10 +225,16 @@ impl Repository {
         self.storage.create_dir(index_store::HEAD_PREFIX)?;
         self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         self.set_pending_sweep(PendingSweep::Initial);
-        let head = self.put_base(None, false, super::index_write::FoldRequest::Full, None)?;
+        let head = self.put_base(
+            None,
+            false,
+            super::index_write::FoldRequest::Full,
+            None,
+            fence,
+        )?;
 
         // 6. The version switch.
-        self.switch_version(target)?;
+        self.switch_version(target, fence)?;
         // 7. Leftovers.
         self.remove_legacy_index();
 
@@ -268,13 +278,13 @@ impl Repository {
 
     /// Step 6: the version switch. Fence check, then the `config` PUT of
     /// the handle's config as the v6 map (its hash is already the target's).
-    fn switch_version(&mut self, target: RepoFormat) -> Result<()> {
+    fn switch_version(&mut self, target: RepoFormat, fence: &super::Fence) -> Result<()> {
         let mut config = self.config.clone();
         config.version = target.version();
         config.chunk_hash = target.chunk_hash().as_str().to_string();
         config.features = Vec::new();
         let bytes = config.encode()?;
-        self.check_lock_fence()?;
+        fence.check()?;
         self.storage.put("config", &bytes)?;
         self.config = config;
         self.format = target;

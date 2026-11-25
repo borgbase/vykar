@@ -256,7 +256,7 @@ pub fn decode_pending_journal(bytes: &[u8]) -> Result<DecodedJournal, rmp_serde:
 }
 
 /// Lightweight entry for recovered chunks (from a previous interrupted session).
-/// Lives in `Repository::recovered_chunks` until promoted into the session on
+/// Lives in `Repo::recovered_chunks` until promoted into the session on
 /// a dedup hit.
 #[derive(Debug, Clone)]
 pub struct RecoveredChunkEntry {

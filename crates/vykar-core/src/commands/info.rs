@@ -73,8 +73,8 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
     }
     let record = match repo.index_head() {
         Some(head) => crate::repo::index_store::fetch_sweep_record(
-            repo.storage.as_ref(),
-            repo.crypto.as_ref(),
+            repo.storage().as_ref(),
+            repo.crypto().as_ref(),
             head,
         )
         .unwrap_or_else(|e| {
@@ -94,8 +94,8 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         referenced_stored_size: record.as_ref().map(|r| r.referenced_bytes),
         last_sweep_time: record.as_ref().map(|r| r.time),
         unique_chunks: repo.chunk_index().len(),
-        repo_created: repo.config.created,
-        encryption: repo.config.encryption.clone(),
+        repo_created: repo.config().created,
+        encryption: repo.config().encryption.clone(),
         format: repo.format(),
         index: repo.index_head().map(|head| IndexLayoutStats {
             base_bytes: head.base.as_ref().map_or(0, |b| b.size),

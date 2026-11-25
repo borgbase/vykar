@@ -1,6 +1,6 @@
 //! `vykar key export` and `vykar key import`.
 //!
-//! Both work on **raw storage**, without `Repository::open`. `import` has to:
+//! Both work on **raw storage**, without `Repo::open`. `import` has to:
 //! it runs on a repository that can no longer be opened, which is exactly when
 //! a key needs restoring. `export` must too: a recovery tool for the key cannot
 //! be allowed to fail on an unreadable index head, scale with the
@@ -125,7 +125,7 @@ fn require_passphrase<'a>(passphrase: Option<&'a str>, what: &str) -> Result<&'a
 
 /// Read, verify and hand back the repository key for safekeeping.
 ///
-/// Uses the same copy selection as `Repository::open`, so a planted copy can
+/// Uses the same copy selection as `Repo::open`, so a planted copy can
 /// never be exported while the genuine key sits in the other one. Unwrapping
 /// the key means `key export` doubles as a check that the passphrase and key
 /// file still work together. Runs the same identity check every ordinary
@@ -136,7 +136,7 @@ fn require_passphrase<'a>(passphrase: Option<&'a str>, what: &str) -> Result<&'a
 ///
 /// # Errors
 ///
-/// Anything `Repository::open` would refuse the key for, plus a missing
+/// Anything `Repo::open` would refuse the key for, plus a missing
 /// passphrase, an unencrypted repository, or an identity mismatch.
 pub fn export(config: &VykarConfig, passphrase: Option<&str>) -> Result<ExportedKey> {
     let (backend, repo_config, format) = open_raw(config)?;

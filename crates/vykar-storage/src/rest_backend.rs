@@ -78,7 +78,7 @@ pub struct RestBackend {
     cancel: CancelToken,
     timeouts: HttpTimeouts,
     /// The repository's content-digest algorithm, bound once by
-    /// `Repository::init`/`open` after the format is resolved.
+    /// `Repo::init`/`open` after the format is resolved.
     ///
     /// A `OnceLock` rather than a setter over a `Mutex`/atomic: backends are
     /// held as `Arc<dyn StorageBackend>`, and bind-once needs to be the

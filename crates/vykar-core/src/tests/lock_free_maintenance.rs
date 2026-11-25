@@ -1198,7 +1198,7 @@ fn a_lock_free_delete_of_a_named_pack_is_flagged() {
         .expect("a1 uploaded a pack")
         .key;
     let run = sim.custom_lock_free(c, "delete a named pack", MarkerFlags::default(), |repo| {
-        repo.storage.delete(&pack)
+        repo.storage().delete(&pack)
     });
     run.expect_ok();
     assert!(run.lock_free);
@@ -1245,7 +1245,7 @@ fn a_lock_free_delete_of_a_young_orphan_is_flagged() {
         .expect("b uploaded a pack")
         .key;
     let run = sim.custom_lock_free(c, "delete a young orphan", MarkerFlags::default(), |repo| {
-        repo.storage.delete(&pack)
+        repo.storage().delete(&pack)
     });
     run.expect_ok();
     sim.resume(b_snap);
@@ -1269,7 +1269,7 @@ fn a_lock_free_silent_snapshot_delete_is_flagged() {
     sim.backup(a, "a1", &tree("a1")).expect_ok();
     let key = sim.store().keys("snapshots/").pop().expect("a1's snapshot");
     sim.custom_lock_free(c, "delete a snapshot", MarkerFlags::default(), |repo| {
-        repo.storage.delete(&key)
+        repo.storage().delete(&key)
     })
     .expect_ok();
     let report = sim.check_invariants(Invariant::STEP8);
@@ -1298,7 +1298,7 @@ fn a_lock_free_delete_of_a_named_index_object_is_flagged() {
         c,
         "delete a named index object",
         MarkerFlags::default(),
-        |repo| repo.storage.delete(&object),
+        |repo| repo.storage().delete(&object),
     )
     .expect_ok();
     let report = sim.check_invariants(Invariant::STEP8);
@@ -1325,8 +1325,8 @@ fn a_lock_free_head_overwrite_is_flagged() {
         heads[heads.len() - 1].clone(),
     );
     sim.custom_lock_free(c, "overwrite a head", MarkerFlags::default(), |repo| {
-        let bytes = repo.storage.get(&older)?.expect("the older head");
-        repo.storage.put(&latest, &bytes)
+        let bytes = repo.storage().get(&older)?.expect("the older head");
+        repo.storage().put(&latest, &bytes)
     })
     .expect_ok();
     let report = sim.check_invariants(Invariant::STEP8);

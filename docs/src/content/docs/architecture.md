@@ -66,7 +66,7 @@ Every degraded state — a missing copy, a copy that disagrees, a backfill that 
 
 An **unreadable** copy is distinguished from a missing one. An I/O or permission failure on one object must not defeat the redundancy the other exists to provide, so the open proceeds off the survivor — and the unreadable object is left strictly alone, never backfilled over, since it may well be intact.
 
-Redundancy inside the repository covers bit rot, not loss of the storage. `vykar key export` and `vykar key import` (see [Commands](/commands)) move the passphrase-protected blob in and out of a password manager. Both work on raw storage rather than through `Repository::open`: `import` because it runs on a repository that can no longer be opened, `export` because a recovery tool for the key must not fail on an unreadable index head, scale with the snapshot count, or write anything. Export uses the same copy selection as `open`, so it can never hand out a copy `open` would have rejected. A key belongs to exactly one repository, so both commands require `-R` when several are configured.
+Redundancy inside the repository covers bit rot, not loss of the storage. `vykar key export` and `vykar key import` (see [Commands](/commands)) move the passphrase-protected blob in and out of a password manager. Both work on raw storage rather than through `Repo::open`: `import` because it runs on a repository that can no longer be opened, `export` because a recovery tool for the key must not fail on an unreadable index head, scale with the snapshot count, or write anything. Export uses the same copy selection as `open`, so it can never hand out a copy `open` would have rejected. A key belongs to exactly one repository, so both commands require `-R` when several are configured.
 
 ### Hashing / Chunk IDs
 
@@ -128,7 +128,7 @@ Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 i
 
 The repository's chunk index is one memory-mapped **chunk table** per base, the head's segments applied over it in memory, and this process's edits (`LiveIndex`, see [Local Optimization Caches](#local-optimization-caches-client-machine)). There is one lookup path for backup, restore, compact and check; no dedup mode is chosen.
 
-**Dedup check during a write session** (`Repository::bump_ref_if_exists` and the backup consumer):
+**Dedup check during a write session** (`WriteSession::bump_ref_if_exists` and the backup consumer):
 1. **Chunks stored earlier in this session** — a small `session_new` map
 2. **The session's view of the index** — first the additions of the head's segments applied over the table (found by key, and recorded as reused by key), then an xor filter (`xorf::Xor8`, built once per table) as probabilistic negative check and a binary search of the mapped table. A table hit is recorded as reused by *table position* (`ReusedChunks`: one bit per table entry, and a key set for everything outside the table); no count is kept. The commit checks the reused chunks again only when the head changed in a way that can have removed entries (see [Commit Check](#commit-check)). Backup workers run this check themselves (`DedupPrefilter`) and send a confirmed hit without its data. Over an index with unsaved edits (repair) the lookup goes through the live index by key instead, with no prefilter.
 3. **Chunks recovered** from an interrupted session's journal
@@ -574,7 +574,7 @@ flowchart LR
 generate session_id (128-bit random hex)
 register_session() → write sessions/<session_id>.json, probe for active lock
 open repo (full index loaded once)
-begin_write_session(session_id) → journal key = sessions/<session_id>.index
+begin_write_session(session_id) → a WriteSession; journal key = sessions/<session_id>.index
   → prune stale local file-cache entries
   → recover own sessions/<session_id>.index if present (batch-verify packs, promote into dedup structures)
   → dedup against the session's view of the index: the head's applied additions (reuse recorded by key), then the table (xor filter + mmap, reuse recorded by table position)
@@ -608,7 +608,7 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
 
 #### Phase 2: Commit (lock-free, or under the exclusive lock)
 
-Each client decides its commit mode once per run, after the upload and before any commit write (`Repository::commit_mode`): **lock-free** on an encrypted repository whose storage passed the put-if-absent check (the one index heads are created with, see [Locking](#locking)), **lock mode** otherwise: a plaintext repository (its index objects are named by their contents, so it never commits lock-free), a backend that offers no put-if-absent, or one whose check concluded "unsupported". An undecided check (no write permission, a transport failure) fails the backup. A lock-free client never falls back to a plain head PUT later: a create the storage refuses after the check passed fails the commit. A backup that would commit lock-free but whose session marker record is already not continuous at that point (a machine suspended for over 30 minutes, marker writes failing that long, a slow marker write, a marker found missing) commits in lock mode instead, and logs why at info: a lock holder may have taken its session for ended, and the record never becomes continuous again, so lock-free it could only refuse its snapshot. In lock mode it lists `sessions/` after its lock as every lock holder does (and yields to committing lock-free backups), and the commit rule judges its record with the pack-age term, as for any lock-mode backup.
+Each client decides its commit mode once per run, after the upload and before any commit write (`Repo::commit_mode`): **lock-free** on an encrypted repository whose storage passed the put-if-absent check (the one index heads are created with, see [Locking](#locking)), **lock mode** otherwise: a plaintext repository (its index objects are named by their contents, so it never commits lock-free), a backend that offers no put-if-absent, or one whose check concluded "unsupported". An undecided check (no write permission, a transport failure) fails the backup. A lock-free client never falls back to a plain head PUT later: a create the storage refuses after the check passed fails the commit. A backup that would commit lock-free but whose session marker record is already not continuous at that point (a machine suspended for over 30 minutes, marker writes failing that long, a slow marker write, a marker found missing) commits in lock mode instead, and logs why at info: a lock holder may have taken its session for ended, and the record never becomes continuous again, so lock-free it could only refuse its snapshot. In lock mode it lists `sessions/` after its lock as every lock holder does (and yields to committing lock-free backups), and the commit rule judges its record with the pack-age term, as for any lock-mode backup.
 
 Lock-free:
 
@@ -628,7 +628,7 @@ mark: write the next marker key with "committing": true (every later key of the 
 probe: LIST sessions/ ("now" = the mtime of that key), reap stale locks, a live lock → wait and probe
        again (COMMIT_LOCK_MAX_WAIT = 2 h, 500 ms base, exponential backoff + jitter, interruptible),
        the flag kept while waiting
-the commit machine, as below, without a lock fence; its head create is put-if-absent and its
+the commit machine, as below, under a fence that passes (no lock fence); its head create is put-if-absent and its
   retry after a taken generation is the same; before the snapshot PUT, EXISTS of the marker's
   current key: gone, a refresh found it reaped, or the record not continuous (unrefreshed for
   over 30 min, a slow marker write) → Err(MarkerLostDuringCommit)
@@ -697,7 +697,7 @@ The commit and the index write it ends with (`repo::publish_machine::PublishMach
 
 ```text
   → on VykarError::Interrupted (Ctrl-C):
-    → flush_on_abort(): seal partial packs, join upload threads, write final sessions/<id>.index
+    → WriteSession::flush_on_abort(): seal partial packs, join upload threads, write final sessions/<id>.index
     → deregister_session(), release advisory lock, exit code 130
   → on soft file error (PermissionDenied / NotFound before commit):
     → skip file, increment snapshot.stats.errors, continue
@@ -897,7 +897,7 @@ Two-stage signal handling applies to all commands:
 2. Second signal restores the default handler (immediate kill)
 3. SIGHUP (daemon only): sets a reload flag; the daemon re-reads the config file between backup cycles. Invalid config is logged and ignored — the daemon continues with the previous config.
 4. SIGUSR1 (daemon only): sets a trigger flag; the daemon runs an immediate backup cycle between scheduled runs. The existing schedule is preserved unless the ad-hoc cycle overruns the scheduled slot.
-5. On backup abort: `flush_on_abort()` seals partial packs, joins upload threads, writes final `sessions/<id>.index` journal for recovery
+5. On backup abort: `WriteSession::flush_on_abort()` seals partial packs, joins upload threads, writes final `sessions/<id>.index` journal for recovery
 6. Advisory lock is released before exit; CLI exits with code 130
 
 ### Liveness
@@ -927,7 +927,7 @@ If a backup is interrupted after packs have been flushed but before commit, thos
 2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its session has no `.json` marker (orphaned) or only stale ones; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends). A pack is adopted when its length is exactly the end of its last journaled chunk (a pack without a trailer) or that plus exactly the trailer frame for its chunk count; no pack content is read. A pack older than `T_pack/2` (6 h) on the storage's clock (its mtime in a listing of its shard against the mtime of the backup's own marker), or of unknown age, is not adopted: its chunks are uploaded again and it stays an orphan, which compact deletes once `T_pack` old. The age of the oldest adopted pack pulls the session's start back, so the next marker refresh writes an `elapsed_secs` that covers it (until then, at most 15 minutes, the recovered packs are protected by age). On a backend that reports no modification times every journal pack is of unknown age, so an interrupted backup's journal is never adopted there: its chunks are always uploaded again. A re-uploaded pack gets a new mtime on vykar-server (pack keys are written with a plain put; only `index.d/` keeps the mtime of an identical re-PUT). In a plaintext repository the re-upload seals the same bytes under the same key (a pack's key is the hash of its bytes, in every mode), and an append-only server refuses that overwrite with `403` (compact does not run there, so the key would stay taken). The backup then reads the key's size and mtime from a listing of its shard: when the server advertises `append_only`, the error reads as a write refusal, the key's class forbids an overwrite and the stored object has the sealed pack's size, the stored copy counts as uploaded. It is an old object the session now depends on, so like an adopted journal pack its age on the storage's clock (its mtime against a clock probe in `locks/`) pulls the session's start back; one of unknown age counts as the oldest possible: the session's marker then gives compact no horizon, and the commit refuses if its marker record is not sound (I8). A stored object of another size leaves the refusal as the backup's error.
 3. Verified chunks are promoted into the dedup structures so subsequent dedup checks find them
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
-5. `flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
+5. `WriteSession::flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
 
 If a backup process crashes or is killed without clean shutdown, its session markers (`sessions/<id>[.<n>].json`) remain on storage. They no longer block maintenance: compact keeps the crashed backup's uploads while the marker is live (inside its horizon) and after it is reaped until they are `T_pack` old. `cleanup_stale_sessions()` removes every marker key of a session whose newest key was last written strictly more than 45 minutes ago on the storage's clock (three missed 15-minute heartbeats), and at once a marker that [same-host reaping](#same-host-reaping) proves was left on this machine by a dead process or an earlier boot. Companion `.index` journals are **preserved** across this cleanup so the next backup can recover any uploaded-but-uncommitted chunks; only `.index` files whose `.json` marker was already absent (orphaned from a prior run) are deleted. Malformed `.json` markers (unparseable JSON or bad timestamps) are judged by their mtime: while younger than 45 minutes they are left in place and give compact no horizon, after that they are reaped like any stale marker (`break-lock --sessions` clears them at once).
 
@@ -1023,7 +1023,7 @@ For each candidate pack (most wasteful first, respecting `--max-repack-size` cap
    - If all blobs are dead → delete the pack file directly
    - Else validate pack header (magic + version) via `get_range(0..9)` and cross-check each on-disk blob length prefix against the index's `stored_size`
    - Read live blobs as encrypted passthrough (no decrypt/re-encrypt cycle), write a new pack, update index mappings
-3. Persist index updates before old pack deletion (`save_state()`); client-side repack saves once per batch of 64 source packs or 4 GiB
+3. Persist index updates before old pack deletion (`RepoWriter::save_state()`, lock-free `persist_maintenance()`); client-side repack saves once per batch of 64 source packs or 4 GiB
 4. Delete old pack(s)
 5. Fold the index at the soft limit, then collect old heads and unreferenced `index.d/` objects by age — also when nothing was repacked
 6. Delete the pack maps whose packs are all gone

@@ -12,7 +12,7 @@ use crate::commands::list::{
 use crate::commands::listing::{ListingRead, ListingView, Query, matches};
 use crate::compress::Compression;
 use crate::config::{CommandDump, VykarConfig};
-use crate::repo::Repository;
+use crate::repo::Repo;
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::snapshot::SnapshotMeta;
@@ -109,7 +109,7 @@ pub(crate) fn make_big(root: &Path) {
 }
 
 /// Every entry of the snapshot, by a scan: (path, is a directory).
-fn scan_all(repo: &mut Repository, meta: &SnapshotMeta) -> Vec<(Vec<u8>, bool)> {
+fn scan_all(repo: &mut Repo, meta: &SnapshotMeta) -> Vec<(Vec<u8>, bool)> {
     ItemStreamReader::new(repo).ensure_index(repo).unwrap();
     let mut all = Vec::new();
     let stats = ListingView::ignore_index(meta)
@@ -123,7 +123,7 @@ fn scan_all(repo: &mut Repository, meta: &SnapshotMeta) -> Vec<(Vec<u8>, bool)> 
 }
 
 fn read(
-    repo: &mut Repository,
+    repo: &mut Repo,
     view: &ListingView<'_>,
     dir: &[u8],
     subtree: bool,
@@ -238,10 +238,12 @@ pub(crate) fn reseal(repo_dir: &Path, name: &str, f: impl FnOnce(&mut SnapshotMe
         ObjectType::SnapshotMeta,
         entry.id.as_bytes(),
         &rmp_serde::to_vec(&meta).unwrap(),
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )
     .unwrap();
-    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+    repo.storage()
+        .put(&entry.id.storage_key(), &packed)
+        .unwrap();
 }
 
 pub(crate) fn index_of(repo_dir: &Path, snap: &str) -> (SnapshotMeta, ListingIndex) {
@@ -329,7 +331,7 @@ fn a_wrong_index_falls_back_and_check_warns() {
     let mut repo = open_local_repo(&repo_dir);
     let all = scan_all(&mut repo, &meta);
 
-    let run = |repo: &mut Repository, ext: Option<Vec<u8>>, dir: &[u8]| {
+    let run = |repo: &mut Repo, ext: Option<Vec<u8>>, dir: &[u8]| {
         let mut m = meta.clone();
         m.ext = ext;
         let (got, stats) = read(repo, &ListingView::new(&m), dir, true);
@@ -409,7 +411,7 @@ fn a_wrong_index_falls_back_and_check_warns() {
 }
 
 /// `list_under_on_repo` of `dir`: the display paths, in order, and how it read.
-fn list_under(repo: &Repository, meta: &SnapshotMeta, dir: &str) -> (Vec<String>, ListUnderRead) {
+fn list_under(repo: &Repo, meta: &SnapshotMeta, dir: &str) -> (Vec<String>, ListUnderRead) {
     let mut got = Vec::new();
     let read = list_under_on_repo(repo, meta, dir, &CancelToken::new(), |i| {
         got.push(i.path);
@@ -502,7 +504,10 @@ fn list_under_refuses_a_dangling_pointer_outside_the_subtree() {
     let mut repo = open_local_repo(&repo_dir);
     let meta = load_snapshot_meta(&repo, "snap").unwrap();
     let id = *meta.item_ptrs.last().unwrap();
-    repo.chunk_index_mut().remove(&id).unwrap();
+    repo.unchecked_writer()
+        .chunk_index_mut()
+        .remove(&id)
+        .unwrap();
     let err = list_under_on_repo(&repo, &meta, "0", &CancelToken::new(), |_| Ok(())).unwrap_err();
     assert!(
         matches!(err, VykarError::ChunkNotInIndex(missing) if missing == id),

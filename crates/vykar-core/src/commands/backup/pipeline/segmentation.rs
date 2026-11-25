@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::platform::fs;
-use crate::repo::Repository;
+use crate::repo::{Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use vykar_types::error::{Result, VykarError};
@@ -46,7 +46,7 @@ pub(super) struct LargeFileAccum {
 /// The rollback checkpoint is armed for the entire lifetime of the
 /// accumulator, so aborting it here is unconditional.
 pub(super) fn rollback_and_skip_large_file(
-    repo: &mut Repository,
+    ws: &mut WriteSession,
     stats: &mut SnapshotStats,
     large_file_accum: &mut Option<LargeFileAccum>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
@@ -56,7 +56,7 @@ pub(super) fn rollback_and_skip_large_file(
     let Some(accum) = large_file_accum.take() else {
         return 0;
     };
-    repo.abort_rollback_checkpoint();
+    ws.abort_rollback_checkpoint();
     stats.restore_byte_counters(accum.stats_snap);
     stats.errors += 1;
     super::super::emit_post_commit_warning(
@@ -88,7 +88,8 @@ pub(super) fn validate_segment_accum(
     segment_index: usize,
     num_segments: usize,
     dedup_baseline: u64,
-    repo: &mut Repository,
+    repo: &Repo,
+    ws: &mut WriteSession,
     stats: &SnapshotStats,
 ) -> Result<()> {
     if segment_index == 0 {
@@ -102,7 +103,7 @@ pub(super) fn validate_segment_accum(
         // Arm the rollback checkpoint BEFORE installing the accumulator so
         // the invariant `accum.is_some() ⇒ checkpoint armed` holds
         // unconditionally.
-        repo.begin_rollback_checkpoint()?;
+        ws.begin_rollback_checkpoint(repo)?;
         let stats_snap = stats.snapshot_byte_counters();
         *large_file_accum = Some(LargeFileAccum {
             item,
@@ -144,7 +145,7 @@ mod tests {
 
     #[test]
     fn segment_out_of_order() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -158,7 +159,8 @@ mod tests {
             0,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -172,7 +174,8 @@ mod tests {
             2,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap_err();
@@ -180,12 +183,12 @@ mod tests {
             err.to_string().contains("segment index mismatch"),
             "expected 'segment index mismatch', got: {err}"
         );
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_file_identity_mismatch() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -199,7 +202,8 @@ mod tests {
             0,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -213,7 +217,8 @@ mod tests {
             1,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap_err();
@@ -221,12 +226,12 @@ mod tests {
             err.to_string().contains("segment file identity mismatch"),
             "expected 'segment file identity mismatch', got: {err}"
         );
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_nested_start() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -240,7 +245,8 @@ mod tests {
             0,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -256,7 +262,8 @@ mod tests {
             0,
             2,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap_err();
@@ -264,12 +271,12 @@ mod tests {
             err.to_string().contains("nested large file segmentation"),
             "expected 'nested large file segmentation', got: {err}"
         );
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_without_start() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
 
@@ -282,7 +289,8 @@ mod tests {
             1,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap_err();
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn incomplete_accumulator_check() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -309,7 +317,8 @@ mod tests {
             0,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -321,7 +330,8 @@ mod tests {
             1,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -340,12 +350,12 @@ mod tests {
             err_msg.contains("incomplete segmented file"),
             "expected incomplete message, got: {err_msg}"
         );
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_count_mismatch() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -359,7 +369,8 @@ mod tests {
             0,
             3,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap();
@@ -373,7 +384,8 @@ mod tests {
             1,
             5,
             0,
-            &mut repo,
+            &repo,
+            &mut ws,
             &stats,
         )
         .unwrap_err();
@@ -381,12 +393,12 @@ mod tests {
             err.to_string().contains("segment count mismatch"),
             "expected 'segment count mismatch', got: {err}"
         );
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_happy_path() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -407,7 +419,8 @@ mod tests {
                 i,
                 3,
                 0,
-                &mut repo,
+                &repo,
+                &mut ws,
                 &stats,
             )
             .unwrap();
@@ -419,7 +432,7 @@ mod tests {
         assert_eq!(a.num_segments, 3);
         assert_eq!(a.item.path, "file_a");
         assert_eq!(&*a.abs_path, "/tmp/file_a");
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
     }
 
     /// Drives `rollback_and_skip_large_file` directly (Mechanism B): an
@@ -428,12 +441,12 @@ mod tests {
     /// segments is reported correctly.
     #[test]
     fn rollback_and_skip_large_file_drains_and_restores_stats() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
 
         // Arm the checkpoint just like validate_segment_accum would for
         // segment 0.
-        repo.begin_rollback_checkpoint().unwrap();
-        assert!(repo.rollback_tracker_armed());
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        assert!(ws.rollback_tracker_armed());
 
         // Snapshot initial byte counters (all zeros), then dirty them so
         // we can verify they get restored.
@@ -459,7 +472,7 @@ mod tests {
         let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
 
         let drain = rollback_and_skip_large_file(
-            &mut repo,
+            &mut ws,
             &mut stats,
             &mut accum,
             &mut progress,
@@ -470,7 +483,7 @@ mod tests {
         // 4 segments, skipped at index 2 → segments 3 remain to drain.
         assert_eq!(drain, 1, "4 segs, skipped at idx 2 → 1 remaining");
         assert!(accum.is_none(), "accumulator cleared");
-        assert!(!repo.rollback_tracker_armed(), "checkpoint must be aborted");
+        assert!(!ws.rollback_tracker_armed(), "checkpoint must be aborted");
         assert_eq!(stats.errors, 1);
         assert_eq!(
             stats.deduplicated_size, 0,
@@ -490,7 +503,7 @@ mod tests {
     /// accumulator is a no-op — drain count of zero, stats untouched.
     #[test]
     fn rollback_and_skip_large_file_no_accum_is_noop() {
-        let mut repo = crate::testutil::test_repo_plaintext();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let mut stats = SnapshotStats {
             deduplicated_size: 7,
             ..Default::default()
@@ -499,7 +512,7 @@ mod tests {
         let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
 
         let drain = rollback_and_skip_large_file(
-            &mut repo,
+            &mut ws,
             &mut stats,
             &mut accum,
             &mut progress,

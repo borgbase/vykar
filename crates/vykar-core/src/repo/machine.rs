@@ -6,7 +6,7 @@
 //! simulator's driver (`sim::driver`) runs one step at a time, between
 //! steps of other clients.
 
-use super::Repository;
+use super::Repo;
 use super::control::{CommitEvent, EventSink};
 use vykar_types::error::{Result, VykarError};
 
@@ -199,7 +199,9 @@ const ALL: &[StepKind] = &[
 
 /// What a step runs with.
 pub(crate) struct StepCx<'a> {
-    pub(crate) repo: &'a mut Repository,
+    pub(crate) repo: &'a mut Repo,
+    /// The exclusion the steps' writes run under.
+    pub(crate) fence: &'a super::writer::Fence,
     pub(crate) events: &'a dyn EventSink<CommitEvent>,
 }
 

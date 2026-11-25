@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::shape::{DirShape, EntryKind, Percentiles, ShapeReport, percentiles};
 use crate::commands::list::load_snapshot_meta;
-use crate::repo::Repository;
+use crate::repo::Repo;
 use crate::repo::manifest::SnapshotEntry;
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{Item, ItemType};
@@ -274,15 +274,11 @@ fn select(entries: &[SnapshotEntry], opts: &ListingOptions) -> Vec<SnapshotEntry
 }
 
 /// Selected snapshots in time order, as `--list` shows them.
-pub fn select_snapshots(repo: &Repository, opts: &ListingOptions) -> Vec<SnapshotEntry> {
+pub fn select_snapshots(repo: &Repo, opts: &ListingOptions) -> Vec<SnapshotEntry> {
     select(&repo.manifest().snapshots, opts)
 }
 
-fn decode_chunk(
-    repo: &mut Repository,
-    id: &ChunkId,
-    shape: Option<&mut DirShape>,
-) -> Result<ChunkKeys> {
+fn decode_chunk(repo: &mut Repo, id: &ChunkId, shape: Option<&mut DirShape>) -> Result<ChunkKeys> {
     let entry = repo
         .chunk_index()
         .get(id)
@@ -367,7 +363,7 @@ fn summarize(entry: &SnapshotEntry, meta: &SnapshotMeta) -> Result<SnapshotSumma
 /// Analyze the selected snapshots: shape of the latest listing, positions of
 /// new tree chunks between consecutive snapshots of the same source, and a
 /// simulated pointer-leaf cut per target.
-pub fn analyze(repo: &mut Repository, opts: &ListingOptions) -> Result<ListingReport> {
+pub fn analyze(repo: &mut Repo, opts: &ListingOptions) -> Result<ListingReport> {
     let start = Instant::now();
     let selected = select_snapshots(repo, opts);
     let mut metas = Vec::with_capacity(selected.len());

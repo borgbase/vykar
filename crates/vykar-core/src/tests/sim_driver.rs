@@ -745,7 +745,7 @@ fn the_encrypted_template_is_encrypted_with_a_cheap_key() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = crate::sim::checker::open_observer(sim.store(), tmp.path()).unwrap();
     assert_eq!(
-        repo.config.encryption,
+        repo.config().encryption,
         crate::repo::EncryptionMode::Aes256Gcm
     );
     let blob = sim

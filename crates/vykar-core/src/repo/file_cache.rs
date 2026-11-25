@@ -510,7 +510,7 @@ pub struct FileCache {
 /// Deserializes a [`FileCache`] like its derived `Deserialize`, but consumes
 /// the value of every section whose key is in `skip` as
 /// [`serde::de::IgnoredAny`], so those sections are never built (the merged
-/// save of `Repository::save_file_cache_if_dirty`).
+/// save of `Repo::save_file_cache_if_dirty`).
 struct CacheExcept<'a> {
     skip: &'a BTreeSet<String>,
 }
@@ -968,7 +968,7 @@ impl FileCache {
 
     /// [`Self::invalidate_missing_snapshots`], returning the anchors of the
     /// removed sections (what a merged save must not take back from another
-    /// process's copy, see `Repository::save_file_cache_if_dirty`).
+    /// process's copy, see `Repo::save_file_cache_if_dirty`).
     pub(crate) fn invalidate_missing_snapshots_collect(
         &mut self,
         exists: &dyn Fn(&SnapshotId) -> bool,

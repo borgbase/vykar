@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use super::Repository;
+use super::Repo;
 use super::blob_read::{
     BlobReader, GroupEnd, PlannedRead, RawSink, ReadBuffers, ReadGroup, coalesce_groups,
     fetch_groups_bounded,
@@ -30,7 +30,7 @@ pub(crate) enum TreeChunkSource {
 }
 
 /// Chunks per unit of work of the cache pass of
-/// [`Repository::read_tree_chunks_into`].
+/// [`Repo::read_tree_chunks_into`].
 const CACHE_BATCH: usize = 256;
 
 /// Thread cap of that cache pass: it is local reads and decode, CPU work,
@@ -276,7 +276,7 @@ impl<'a> Assembler<'a> {
     }
 }
 
-impl Repository {
+impl Repo {
     /// Read and decrypt a chunk located through the in-memory chunk index.
     /// A pack that answers 404 is re-resolved against the latest head
     /// (`repo::relocate`).

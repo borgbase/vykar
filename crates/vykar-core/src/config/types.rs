@@ -283,7 +283,7 @@ impl RepositoryConfig {
         }
     }
 
-    /// The pack sizing and URL that `Repository::init` takes.
+    /// The pack sizing and URL that `Repo::init` takes.
     ///
     /// `url` is `Some` even when it is empty, so the capability-probe error
     /// names exactly what was configured.

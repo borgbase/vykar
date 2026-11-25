@@ -453,7 +453,7 @@ mod tests {
 
     /// Regression guard for the retry loop's coupling to the error *type*.
     ///
-    /// Driven by a real `Repository::open` against a real encrypted
+    /// Driven by a real `Repo::open` against a real encrypted
     /// repository, because the failure this must catch was introduced by
     /// changing which variant that open returns — a hand-written
     /// `Err(DecryptionFailed)` stub would have kept passing throughout.
@@ -469,13 +469,8 @@ mod tests {
                 )
                 .map_err(|e| VykarError::Other(e.to_string()))?,
             );
-            vykar_core::repo::Repository::open(
-                storage,
-                pass,
-                None,
-                vykar_core::repo::OpenOptions::new(),
-            )
-            .map(|_| ())
+            vykar_core::repo::Repo::open(storage, pass, None, vykar_core::repo::OpenOptions::new())
+                .map(|_| ())
         }
     }
 
@@ -490,7 +485,7 @@ mod tests {
             )
             .expect("local backend"),
         );
-        vykar_core::repo::Repository::init(
+        vykar_core::repo::Repo::init(
             storage,
             vykar_core::repo::EncryptionMode::Aes256Gcm,
             vykar_core::repo::ChunkerParams::default(),

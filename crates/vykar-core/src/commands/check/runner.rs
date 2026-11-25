@@ -13,7 +13,7 @@ use crate::index::table::IndexState;
 use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::control::CancelToken;
 use crate::repo::index_store;
-use crate::repo::{OpenOptions, Repository, needs_recheck};
+use crate::repo::{OpenOptions, Repo, needs_recheck};
 use tracing::info;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -43,7 +43,7 @@ fn group_by_pack(index: &LiveIndex) -> PackChunks {
 /// with a warning, when the storage cannot hold them (an older server); when
 /// asking the server fails, the error is returned (nothing has changed yet).
 fn plan_repair(
-    repo: &Repository,
+    repo: &Repo,
     scan: &ScanResult,
     pack_chunks: &PackChunks,
     load: &RepairIndexLoad,
@@ -62,7 +62,7 @@ fn plan_repair(
         .actions
         .iter()
         .any(|a| matches!(a, RepairAction::WritePackMaps { .. }))
-        && !crate::repo::pack_map::pack_maps_supported(repo.storage.as_ref())?
+        && !crate::repo::pack_map::pack_maps_supported(repo.storage().as_ref())?
     {
         tracing::warn!(
             "the server does not accept pack maps (packmaps/); upgrade vykar-server. The repair \
@@ -189,7 +189,7 @@ pub fn run_with_progress(
 /// `OpenOptions::new()`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     verify_data: bool,
     distrust_server: bool,
@@ -245,7 +245,7 @@ pub(crate) fn run_on_repo(
         shutdown,
     )?;
     while !result.errors.is_empty() {
-        let latest = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())?;
+        let latest = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())?;
         let Some(head) = repo.index_head() else {
             break;
         };
@@ -319,7 +319,7 @@ struct CheckSample {
 impl CheckSample {
     /// Draw `percent` of the packs of `pack_chunks` and of the snapshots
     /// `repo` lists (at least one of each when there are any).
-    fn draw(repo: &Repository, pack_chunks: &PackChunks, percent: u8) -> Self {
+    fn draw(repo: &Repo, pack_chunks: &PackChunks, percent: u8) -> Self {
         let mut pack_ids: Vec<PackId> = pack_chunks.keys().copied().collect();
         // Sorted, so that a pinned draw (tests) names the same packs.
         pack_ids.sort_by_cached_key(PackId::storage_key);
@@ -386,7 +386,7 @@ fn sample_indices(of: SampleOf, total: usize, percent: u8) -> HashSet<usize> {
 /// `sample` when it is `None`, and checks what it names otherwise.
 #[allow(clippy::too_many_arguments)]
 fn check_pass(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     verify_data: bool,
     distrust_server: bool,
@@ -425,7 +425,7 @@ fn check_pass(
     // Try server-side verify for both existence and data checks.
     let server_outcome = if !distrust_server {
         try_server_verify(
-            &repo.storage,
+            repo.storage(),
             &pack_chunks,
             verify_data,
             repo.content_hash(),
@@ -511,10 +511,10 @@ fn skipped_result() -> CheckResult {
 }
 
 /// Compute a hex fingerprint from the repo's identity material.
-fn compute_repo_fingerprint(repo: &crate::repo::Repository) -> String {
+fn compute_repo_fingerprint(repo: &crate::repo::Repo) -> String {
     let fp = crate::repo::identity::compute_fingerprint(
-        &repo.config.id,
-        repo.crypto.chunk_hasher().key(),
+        &repo.config().id,
+        repo.crypto().chunk_hasher().key(),
     );
     hex::encode(fp)
 }
@@ -599,7 +599,7 @@ pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
 /// [`repair_open_options`]`(mode)`. PlanOnly takes no lock and registers no
 /// marker; Apply/ApplyShown take the maintenance lock here.
 pub(crate) fn run_with_repair_on_repo(
-    repo: &mut Repository,
+    repo: &mut Repo,
     config: &VykarConfig,
     verify_data: bool,
     mode: RepairMode,
@@ -664,10 +664,10 @@ pub(crate) fn run_with_repair_on_repo(
             // mode (no probe is sent), else by the delete probe.
             if plan.has_data_loss {
                 crate::commands::util::refuse_on_append_only_server(
-                    repo.storage.as_ref(),
+                    repo.storage().as_ref(),
                     "vykar check --repair",
                 )?;
-                if !probe_deletes_allowed(repo.storage.as_ref()) {
+                if !probe_deletes_allowed(repo.storage().as_ref()) {
                     return Err(VykarError::Other(
                         "repair requires deleting immutable snapshot objects; \
                      not supported on append-only backends"
@@ -746,7 +746,7 @@ mod tests {
     /// The repair plan of a healthy repository whose rebuilt index took a
     /// pack from a local table, against a server answering `caps`.
     fn plan_against(caps: Option<ServerCapabilities>) -> Result<RepairPlan> {
-        let mut repo = Repository::init(
+        let mut repo = Repo::init(
             Box::new(MemoryBackend::new()),
             EncryptionMode::None,
             ChunkerParams::default(),
@@ -765,10 +765,10 @@ mod tests {
         };
         let scan =
             integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
-        repo.storage = Arc::new(Server {
+        repo.set_storage_for_test(Arc::new(Server {
             inner: MemoryBackend::new(),
             caps,
-        });
+        }));
         let load = RepairIndexLoad {
             recovery: IndexRecovery::Complete,
             uncovered_packs: Vec::new(),

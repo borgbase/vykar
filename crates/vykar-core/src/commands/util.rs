@@ -8,7 +8,7 @@ use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
 use crate::repo::control::CancelToken;
 use crate::repo::lock;
-use crate::repo::{OpenOptions, OpenRequest, Repository, identity};
+use crate::repo::{Fence, OpenOptions, OpenRequest, Repo, RepoWriter, identity};
 use crate::storage;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
@@ -37,17 +37,17 @@ pub fn open_request(config: &VykarConfig) -> OpenRequest {
 }
 
 /// Verify the repository identity against the locally pinned fingerprint.
-pub(crate) fn verify_repo_identity(req: &OpenRequest, repo: &Repository) -> Result<()> {
+pub(crate) fn verify_repo_identity(req: &OpenRequest, repo: &Repo) -> Result<()> {
     identity::verify_or_pin(
         &req.url,
-        &repo.config.id,
-        repo.crypto.chunk_hasher().key(),
+        &repo.config().id,
+        repo.crypto().chunk_hasher().key(),
         req.cache_dir.as_deref(),
         req.trust_repo,
     )
 }
 
-/// Attach the identity context `Repository::open` cannot derive on its own.
+/// Attach the identity context `Repo::open` cannot derive on its own.
 ///
 /// The URL is what lets the key loader consult the local identity pin, and
 /// `trust_repo` is the deliberate waiver of it. The configured encryption mode
@@ -69,7 +69,7 @@ pub fn open_repo(
     passphrase: Option<&str>,
     opts: OpenOptions,
     cancel: &CancelToken,
-) -> Result<Repository> {
+) -> Result<Repo> {
     let backend = storage::backend_from_config(
         &config
             .repository
@@ -87,9 +87,9 @@ pub(crate) fn open_repo_on(
     req: &OpenRequest,
     passphrase: Option<&str>,
     opts: OpenOptions,
-) -> Result<Repository> {
+) -> Result<Repo> {
     let opts = with_identity_context(opts, req);
-    let repo = Repository::open(backend, passphrase, req.cache_dir.clone(), opts)
+    let repo = Repo::open(backend, passphrase, req.cache_dir.clone(), opts)
         .map_err(|e| enrich_repo_not_found(e, &req.url))?;
     verify_repo_identity(req, &repo)?;
     Ok(repo)
@@ -97,19 +97,19 @@ pub(crate) fn open_repo_on(
 
 /// Execute a repository mutation while holding an advisory lock.
 /// Ensures the lock release is always attempted even when the action fails.
-/// On error, performs best-effort cleanup (seals partial packs, waits for
-/// in-flight uploads, writes pending_index) before releasing the lock.
+/// A write session the action begins is the action's to save or flush
+/// (`WriteSession::flush_on_abort`) before it returns.
 pub fn with_repo_lock<T>(
-    repo: &mut Repository,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    repo: &mut Repo,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
     let env = repo.host_env().clone();
-    let guard = lock::acquire_lock(repo.storage.as_ref(), &env)?;
+    let guard = lock::acquire_lock(repo.storage().as_ref(), &env)?;
     run_under_fence(repo, guard, action)
 }
 
-/// Clear the lock fence and release the advisory lock, reporting a failed
-/// release without changing the operation's outcome.
+/// Clear the lock-hold state and release the advisory lock, reporting a
+/// failed release without changing the operation's outcome.
 ///
 /// # Failure policy
 ///
@@ -126,14 +126,14 @@ pub fn with_repo_lock<T>(
 /// too. Leaked advisory locks self-heal after 6 hours, and `vykar break-lock`
 /// clears them immediately.
 pub(crate) fn clear_fence_and_release(
-    repo: &mut Repository,
+    repo: &mut Repo,
     guard: lock::LockGuard,
     action_succeeded: bool,
     on_warning: &mut dyn FnMut(String),
 ) {
-    repo.clear_lock_fence();
+    repo.clear_lock_state();
     let lock_key = guard.key().to_string();
-    let Err(release_err) = lock::release_lock(repo.storage.as_ref(), guard) else {
+    let Err(release_err) = lock::release_lock(repo.storage().as_ref(), guard) else {
         return;
     };
     if !action_succeeded {
@@ -149,23 +149,22 @@ pub(crate) fn clear_fence_and_release(
     ));
 }
 
-/// Shared epilogue for lock-guarded operations: installs a lock fence, runs
-/// the action, performs best-effort cleanup on error, then releases the lock
-/// via [`clear_fence_and_release`]. Action errors are propagated as-is.
+/// Shared epilogue for lock-guarded operations: runs the action on a
+/// writer under the lock's fence, then releases the lock via
+/// [`clear_fence_and_release`]. Action errors are propagated as-is.
 fn run_under_fence<T>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     guard: lock::LockGuard,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
-    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
-    repo.set_lock_fence(fence);
+    let fence = Fence::lock(lock::build_lock_fence(
+        &guard,
+        Arc::clone(repo.storage()),
+        repo.host_env().clone(),
+    ));
     repo.set_lock_store_time(guard.store_time());
 
-    let result = action(repo);
-
-    if result.is_err() {
-        repo.flush_on_abort();
-    }
+    let result = action(&mut repo.writer(fence));
 
     clear_fence_and_release(repo, guard, result.is_ok(), &mut |msg| {
         tracing::warn!("{msg}");
@@ -183,7 +182,7 @@ pub fn with_open_repo_maintenance_lock<T>(
     config: &VykarConfig,
     passphrase: Option<&str>,
     opts: OpenOptions,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
     // Upgrade, the only caller, has no token.
     let mut repo = open_repo(config, passphrase, opts, &CancelToken::new())?;
@@ -212,12 +211,12 @@ pub(crate) fn refuse_on_append_only_server(
 ///
 /// Acquires the lock, cleans up stale sessions (no marker written for 45 min
 /// by the store's clock), lists the sessions that remain live (for compact's
-/// horizon, `Repository::live_sessions`), installs the lock fence, runs the
-/// action and releases the lock. It does not refuse on live sessions:
+/// horizon, `Repo::live_sessions`), runs the action on a writer under
+/// the lock's fence and releases the lock. It does not refuse on live sessions:
 /// compact, prune and delete run beside backups (04 step 7), compact keeping
 /// their uploads by age and inside their markers' horizons. Actions that
 /// must not run beside a backup refuse themselves with
-/// `Repository::refuse_live_sessions` (`check --repair`, upgrade).
+/// `Repo::refuse_live_sessions` (`check --repair`, upgrade).
 /// Malformed markers (unparseable JSON or bad timestamps) are judged by
 /// their mtime: while younger than 45 minutes they are preserved and give
 /// compact no horizon (no orphan pack is deleted), after that they are
@@ -228,8 +227,8 @@ pub(crate) fn refuse_on_append_only_server(
 /// `list_live_sessions_under_lock` called first in the action): a failed
 /// listing returns through the fence's epilogue, which releases the lock.
 pub fn with_maintenance_lock<T>(
-    repo: &mut Repository,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    repo: &mut Repo,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
     with_maintenance_lock_unlisted(repo, |repo| {
         list_live_sessions_under_lock(repo)?;
@@ -242,23 +241,23 @@ pub fn with_maintenance_lock<T>(
 /// sessions itself ([`list_live_sessions_under_lock`]) where the order
 /// matters: compact, after its pack listing (04 "Compact" 1).
 pub(crate) fn with_maintenance_lock_unlisted<T>(
-    repo: &mut Repository,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    repo: &mut Repo,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
     let env = repo.host_env().clone();
-    let guard = lock::acquire_lock(repo.storage.as_ref(), &env)?;
+    let guard = lock::acquire_lock(repo.storage().as_ref(), &env)?;
     // An uncontended acquirer never probes the store's clock, so it removes
     // the old probes its acquisition listed (best effort).
-    guard.remove_probe_debris(repo.storage.as_ref());
+    guard.remove_probe_debris(repo.storage().as_ref());
     run_under_fence(repo, guard, action)
 }
 
 /// The stale-session reap and the live listing of [`with_maintenance_lock`],
 /// for an action already under the maintenance lock; sets
-/// `Repository::live_sessions`. "Now" is `Repository::lock_store_time`.
+/// `Repo::live_sessions`. "Now" is `Repo::lock_store_time`.
 /// Fails closed: without the listing compact would not know whose uploads
 /// to keep, so a failed listing refuses the maintenance.
-pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()> {
+pub(crate) fn list_live_sessions_under_lock(repo: &mut Repo) -> Result<()> {
     // Clean up stale sessions; the ones kept are live. Backups may run
     // beside maintenance (04 step 7): compact keeps their uploads by age and
     // by their marker's horizon.
@@ -270,16 +269,16 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repository) -> Result<()>
     // this holder yield with `Locked` naming it, before any write; the user
     // retries. A plaintext repository has no lock-free writers.
     let stale_threshold = lock::default_stale_session_duration();
-    let listed = if repo.config.encryption == crate::repo::EncryptionMode::None {
+    let listed = if repo.config().encryption == crate::repo::EncryptionMode::None {
         lock::cleanup_stale_sessions_keeping(
-            repo.storage.as_ref(),
+            repo.storage().as_ref(),
             stale_threshold,
             repo.host_env(),
             repo.lock_store_time(),
         )
     } else {
         lock::yield_to_lock_free_writers(
-            repo.storage.as_ref(),
+            repo.storage().as_ref(),
             repo.host_env(),
             repo.lock_store_time(),
             None,
@@ -381,7 +380,7 @@ fn maintenance_marker_fence(
 
 /// Lock-free maintenance (04 step 9): register a session marker carrying
 /// `flags`, adopt it with a heartbeat, run `action`, deregister. No lock is
-/// taken; the handle's lock fence is the marker check
+/// taken; the action's writer is fenced by the marker check
 /// ([`maintenance_marker_fence`]) for the whole run.
 ///
 /// The registration probe keeps the lock holders out: the marker is written
@@ -390,37 +389,33 @@ fn maintenance_marker_fence(
 /// lists `sessions/` after its lock is confirmed, so `check --repair` and
 /// `upgrade` refuse beside this session (`refuse_live_sessions`) and a
 /// lock-mode writer yields to a marker that may write heads
-/// (`writes_heads`: a compact). On error `flush_on_abort` runs, as under
-/// the lock. Clears the store time, live sessions and segment ages at the
-/// end (`Repository::clear_lock_fence`).
+/// (`writes_heads`: a compact). Clears the store time, live sessions and
+/// segment ages at the end (`Repo::clear_lock_state`).
 pub(crate) fn with_maintenance_session<T>(
-    repo: &mut Repository,
+    repo: &mut Repo,
     flags: lock::MarkerFlags,
-    action: impl FnOnce(&mut Repository, &MaintenanceSession) -> Result<T>,
+    action: impl FnOnce(&mut RepoWriter<'_>, &MaintenanceSession) -> Result<T>,
 ) -> Result<T> {
     let env = repo.host_env().clone();
     let id = format!("{:032x}", rand::random::<u128>());
-    let registration = lock::register_session_with(repo.storage.as_ref(), &id, &env, flags)?;
+    let registration = lock::register_session_with(repo.storage().as_ref(), &id, &env, flags)?;
     let guard =
-        match lock::SessionGuard::adopt(Arc::clone(&repo.storage), registration, env.clone()) {
+        match lock::SessionGuard::adopt(Arc::clone(repo.storage()), registration, env.clone()) {
             Ok(g) => g,
             Err(e) => {
-                lock::deregister_session(repo.storage.as_ref(), &id, &env);
+                lock::deregister_session(repo.storage().as_ref(), &id, &env);
                 return Err(e);
             }
         };
     tracing::debug!(session_id = id, ?flags, "maintenance session registered");
     let session = MaintenanceSession { guard };
-    repo.set_lock_fence(maintenance_marker_fence(
+    let fence = Fence::marker(maintenance_marker_fence(
         session.marker(),
-        Arc::clone(&repo.storage),
+        Arc::clone(repo.storage()),
         Arc::clone(&repo.host_env().clock),
     ));
-    let result = action(repo, &session);
-    if result.is_err() {
-        repo.flush_on_abort();
-    }
-    repo.clear_lock_fence();
+    let result = action(&mut repo.writer(fence), &session);
+    repo.clear_lock_state();
     drop(session);
     result
 }
@@ -437,8 +432,8 @@ pub(crate) fn with_maintenance_session<T>(
 /// compact's handling of committing sessions) or fails
 /// `StaleChunksDuringCommit`.
 pub(crate) fn with_snapshot_removal_exclusion<T>(
-    repo: &mut Repository,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
+    repo: &mut Repo,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
     match repo.commit_mode()? {
         crate::repo::CommitMode::Lock => with_maintenance_lock(repo, action),
@@ -452,15 +447,15 @@ pub(crate) fn with_snapshot_removal_exclusion<T>(
 /// `sessions/`; "now" on the store's clock is the mtime of `own`'s newest
 /// key in it (written after registration and before this listing, so it
 /// precedes compact's head read, as 8b's I8 argument needs); stale sessions
-/// are reaped with that "now"; `Repository::live_sessions` are the others
-/// and `Repository::lock_store_time` is that "now". Fails closed as
+/// are reaped with that "now"; `Repo::live_sessions` are the others
+/// and `Repo::lock_store_time` is that "now". Fails closed as
 /// [`list_live_sessions_under_lock`].
 pub(crate) fn list_live_sessions_registered(
-    repo: &mut Repository,
+    repo: &mut Repo,
     own: &MaintenanceSession,
 ) -> Result<()> {
     let (cleaned, live, now) =
-        match lock::reap_sessions_registered(repo.storage.as_ref(), repo.host_env(), own.id()) {
+        match lock::reap_sessions_registered(repo.storage().as_ref(), repo.host_env(), own.id()) {
             Ok(listed) => listed,
             Err(e) => {
                 return Err(VykarError::Other(format!(

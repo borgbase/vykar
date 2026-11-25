@@ -19,7 +19,7 @@ use vykar_core::config::{
     VykarConfig,
 };
 use vykar_core::repo::control::CancelToken;
-use vykar_core::repo::{OpenOptions, Repository};
+use vykar_core::repo::{OpenOptions, Repo};
 use vykar_core::snapshot::SnapshotStats;
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::hash::HashAlgorithm;
@@ -80,18 +80,18 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
 }
 
 /// Open the repository at `repo_dir` with the chunk index loaded.
-pub fn open_local_repo(repo_dir: &Path, passphrase: Option<&str>) -> Repository {
+pub fn open_local_repo(repo_dir: &Path, passphrase: Option<&str>) -> Repo {
     init_test_environment();
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repository::open(storage, passphrase, None, OpenOptions::new().with_index()).unwrap()
+    Repo::open(storage, passphrase, None, OpenOptions::new().with_index()).unwrap()
 }
 
 /// Like [`open_local_repo`], but also enables the local file cache. Tests that
 /// exercise snapshot-cache behaviour must use the uncached variant.
-pub fn open_local_repo_cached(repo_dir: &Path, passphrase: Option<&str>) -> Repository {
+pub fn open_local_repo_cached(repo_dir: &Path, passphrase: Option<&str>) -> Repo {
     init_test_environment();
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repository::open(
+    Repo::open(
         storage,
         passphrase,
         None,

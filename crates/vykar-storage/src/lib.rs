@@ -388,7 +388,7 @@ pub trait StorageBackend: Send + Sync {
 /// [`StorageBackend::remove_stale_temp_files`] sweeps.
 ///
 /// `Sync` so a repository holding an open staged pack can be shared
-/// (`Arc<Repository>`); the methods take `&mut self` or `self`, so
+/// (`Arc<Repo>`); the methods take `&mut self` or `self`, so
 /// implementors need no locking.
 pub trait StagedPut: Send + Sync {
     /// Append `data` to the object.

@@ -12,7 +12,7 @@ use crate::index::ChunkIndexEntry;
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{Repository, TreeChunkSource, WriteSessionOptions};
+use crate::repo::{Repo, RepoWriter, TreeChunkSource, WriteSession, WriteSessionOptions};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::ItemType;
 use vykar_storage::StorageBackend;
@@ -52,7 +52,7 @@ struct PreparedRewrite {
 /// rollback DELETE also failed" — that returns the typed duplicate-blobs
 /// error so the operator can manually intervene.
 fn apply_item_level_rewrites(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     plan: &RepairPlan,
     applied: &mut Vec<RepairAction>,
     repair_errors: &mut Vec<String>,
@@ -67,7 +67,8 @@ fn apply_item_level_rewrites(
     }
 
     // 1. Begin a write session so store_chunk can pack new tree chunks.
-    repo.begin_write_session(&WriteSessionOptions::default())?;
+    //    Every return below consumes it: saved, or flushed on error.
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
 
     // 2. Prepare each rewrite (defer all PUT/DELETE until after Step 4 of
     //    this routine, mirroring the backup commit's index write → snapshot
@@ -83,7 +84,14 @@ fn apply_item_level_rewrites(
         else {
             continue;
         };
-        match prepare_rewrite(repo, *snapshot_id, snapshot_name, item_indices, action_idx) {
+        match prepare_rewrite(
+            repo,
+            &mut ws,
+            *snapshot_id,
+            snapshot_name,
+            item_indices,
+            action_idx,
+        ) {
             Ok(rw) => prepared.push(rw),
             Err(e) => {
                 repair_errors.push(format!(
@@ -94,25 +102,31 @@ fn apply_item_level_rewrites(
     }
 
     if prepared.is_empty() {
-        // No work survived preparation — close the session via save_state so
-        // any pending state is consistent. The trailing sweep removes any
+        // No work survived preparation — close the session via save_session
+        // so any pending state is consistent. The trailing sweep removes any
         // orphan chunks store_chunk may have produced.
-        repo.flush_packs()?;
-        repo.save_state()?;
+        if let Err(e) = ws.flush_packs(repo) {
+            ws.flush_on_abort(repo);
+            return Err(e);
+        }
+        repo.save_session(ws)?;
         return Ok(());
     }
 
     // 3. Flush new data/tree packs to storage.
-    repo.flush_packs()?;
+    if let Err(e) = ws.flush_packs(repo) {
+        ws.flush_on_abort(repo);
+        return Err(e);
+    }
 
     // 4. Persist the chunk index so newly-stored chunks are durable BEFORE
     //    any snapshot blob references them.
-    repo.save_state()?;
+    repo.save_session(ws)?;
 
     // 5. Publish each rewrite: PUT new blob, swap manifest, DELETE old.
     for rw in &prepared {
         // 5a. PUT new snapshot blob (the new commit point).
-        if let Err(e) = repo.storage.put(&rw.new_id.storage_key(), &rw.new_packed) {
+        if let Err(e) = repo.storage().put(&rw.new_id.storage_key(), &rw.new_packed) {
             repair_errors.push(format!(
                 "failed to publish rewritten snapshot '{}': {e}",
                 rw.new_entry.name
@@ -125,7 +139,7 @@ fn apply_item_level_rewrites(
         repo.manifest_mut().snapshots.push(rw.new_entry.clone());
 
         // 5c. DELETE old blob; on failure, attempt rollback.
-        match repo.storage.delete(&rw.old_id.storage_key()) {
+        match repo.storage().delete(&rw.old_id.storage_key()) {
             Ok(()) => {
                 applied.push(
                     plan.actions
@@ -135,7 +149,7 @@ fn apply_item_level_rewrites(
                 );
             }
             Err(e) => {
-                let new_delete = repo.storage.delete(&rw.new_id.storage_key());
+                let new_delete = repo.storage().delete(&rw.new_id.storage_key());
                 repo.manifest_mut().remove_snapshot(&rw.new_entry.name);
                 if let Some(prev) = removed {
                     repo.manifest_mut().snapshots.push(prev);
@@ -164,10 +178,11 @@ fn apply_item_level_rewrites(
 }
 
 /// Re-encode an items_stream with the listed `item_indices` dropped, store
-/// the resulting tree chunks (via the active write session), and pack a
+/// the resulting tree chunks (via the write session `ws`), and pack a
 /// fresh `SnapshotMeta` blob for publication. Does not write the blob.
 fn prepare_rewrite(
-    repo: &mut Repository,
+    repo: &mut Repo,
+    ws: &mut WriteSession,
     snapshot_id: SnapshotId,
     snapshot_name: &str,
     item_indices: &[usize],
@@ -181,7 +196,7 @@ fn prepare_rewrite(
     let old_stream =
         load_snapshot_item_stream_from_storage(repo, snapshot_name, &CancelToken::new())?;
 
-    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::default());
+    let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::default());
     let mut nfiles: u64 = 0;
     let mut original_size: u64 = 0;
     let mut idx: usize = 0;
@@ -198,7 +213,7 @@ fn prepare_rewrite(
             nfiles += 1;
             original_size += item.size;
         }
-        listing.push(repo, &item)
+        listing.push(repo, ws, &item)
     })?;
 
     if kept == 0 {
@@ -207,7 +222,7 @@ fn prepare_rewrite(
         )));
     }
 
-    let listing = listing.finish(repo)?;
+    let listing = listing.finish(repo, ws)?;
 
     // Build new SnapshotMeta. Time fields and source labels mirror the
     // original so users still see when the data was captured.
@@ -232,7 +247,7 @@ fn prepare_rewrite(
         ObjectType::SnapshotMeta,
         new_id.as_bytes(),
         &meta_bytes,
-        repo.crypto.as_ref(),
+        repo.crypto().as_ref(),
     )?;
 
     let new_entry = SnapshotEntry {
@@ -257,7 +272,7 @@ fn prepare_rewrite(
 /// Rewrite each key copy named by a [`RepairAction::RestoreKeyCopy`] from the
 /// key this repository opened with.
 ///
-/// The bytes written are [`Repository::key_blob`], not a fresh read of the
+/// The bytes written are [`Repo::key_blob`], not a fresh read of the
 /// source copy: the scan established `from` as byte-identical to it, but
 /// nothing holds that between scan and write, and the verified bytes are
 /// already in hand. `from` is kept on the action for the plan printout.
@@ -266,7 +281,7 @@ fn prepare_rewrite(
 /// blocks overwrites but not creations. *Replacing* a divergent copy is an
 /// overwrite and will be refused there.
 fn restore_key_copies(
-    repo: &mut Repository,
+    repo: &mut Repo,
     plan: &RepairPlan,
     applied: &mut Vec<RepairAction>,
     repair_errors: &mut Vec<String>,
@@ -281,7 +296,7 @@ fn restore_key_copies(
             ));
             continue;
         };
-        match repo.storage.put(to, bytes) {
+        match repo.storage().put(to, bytes) {
             Ok(()) => {
                 tracing::info!("restored repository key copy {to}");
                 applied.push(action.clone());
@@ -298,7 +313,7 @@ fn restore_key_copies(
 
 /// Execute repair actions in the correct order.
 pub(super) fn execute_repair(
-    repo: &mut Repository,
+    repo: &mut RepoWriter<'_>,
     plan: &RepairPlan,
     issues: &[IntegrityIssue],
     _pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
@@ -334,7 +349,7 @@ pub(super) fn execute_repair(
     for action in &plan.actions {
         if let RepairAction::RemoveCorruptSnapshot { snapshot_id, name } = action {
             let key = snapshot_id.storage_key();
-            match repo.storage.delete(&key) {
+            match repo.storage().delete(&key) {
                 Ok(()) => {
                     // Remove from manifest if present
                     if let Some(name) = name {
@@ -355,7 +370,7 @@ pub(super) fn execute_repair(
     // Step 2: Remove invalid snapshot keys from storage.
     for action in &plan.actions {
         if let RepairAction::RemoveInvalidSnapshotKey { storage_key } = action {
-            match repo.storage.delete(storage_key) {
+            match repo.storage().delete(storage_key) {
                 Ok(()) => {
                     applied.push(action.clone());
                 }
@@ -415,7 +430,7 @@ pub(super) fn execute_repair(
             && let Some(entry) = repo.manifest().find_snapshot(snapshot_name)
         {
             let key = entry.id.storage_key();
-            match repo.storage.delete(&key) {
+            match repo.storage().delete(&key) {
                 Ok(()) => {
                     repo.manifest_mut().remove_snapshot(snapshot_name);
                     applied.push(action.clone());
@@ -560,7 +575,7 @@ mod tests {
     /// must be left alone, because nothing has established what it now holds.
     #[test]
     fn restore_key_copy_writes_the_opened_key_even_if_the_source_changed() {
-        let mut repo = crate::repo::Repository::init(
+        let mut repo = crate::repo::Repo::init(
             Box::new(MemoryBackend::new()),
             EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
@@ -570,7 +585,7 @@ mod tests {
         )
         .unwrap();
         let opened_with = repo.key_blob().unwrap().to_vec();
-        repo.storage.put(KEY_SECONDARY, b"garbage").unwrap();
+        repo.storage().put(KEY_SECONDARY, b"garbage").unwrap();
 
         let config = crate::tests::helpers::make_test_config(std::path::Path::new("/mem"));
         let opts = ScanOptions {
@@ -602,10 +617,15 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        repo.storage.put(KEY_PRIMARY, &swapped).unwrap();
+        repo.storage().put(KEY_PRIMARY, &swapped).unwrap();
 
-        let (applied, errors) =
-            execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new()).unwrap();
+        let (applied, errors) = execute_repair(
+            &mut repo.unchecked_writer(),
+            &plan,
+            &scan.issues,
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
             applied
@@ -614,12 +634,12 @@ mod tests {
         );
 
         assert_eq!(
-            repo.storage.get(KEY_SECONDARY).unwrap().unwrap(),
+            repo.storage().get(KEY_SECONDARY).unwrap().unwrap(),
             opened_with,
             "the restored copy must hold the key this repository opened with"
         );
         assert_eq!(
-            repo.storage.get(KEY_PRIMARY).unwrap().unwrap(),
+            repo.storage().get(KEY_PRIMARY).unwrap().unwrap(),
             swapped,
             "the changed source must not be touched"
         );
@@ -658,21 +678,27 @@ mod tests {
             "{:?}",
             plan.actions
         );
-        let heads = crate::repo::index_store::list_head_generations(repo.storage.as_ref()).unwrap();
+        let heads =
+            crate::repo::index_store::list_head_generations(repo.storage().as_ref()).unwrap();
 
         // Between scan and apply, the snapshot object goes away.
         let id = repo.manifest().find_snapshot("s1").unwrap().id;
-        repo.storage.delete(&id.storage_key()).unwrap();
+        repo.storage().delete(&id.storage_key()).unwrap();
 
-        let err = execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new())
-            .expect_err("the repair aborts");
+        let err = execute_repair(
+            &mut repo.unchecked_writer(),
+            &plan,
+            &scan.issues,
+            &HashMap::new(),
+        )
+        .expect_err("the repair aborts");
         let msg = err.to_string();
         assert!(
             msg.contains("cannot load snapshot 's1' while sweeping the index"),
             "{msg}"
         );
         assert_eq!(
-            crate::repo::index_store::list_head_generations(repo.storage.as_ref()).unwrap(),
+            crate::repo::index_store::list_head_generations(repo.storage().as_ref()).unwrap(),
             heads,
             "no head written"
         );
@@ -771,16 +797,15 @@ mod tests {
         })
         .unwrap();
 
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
         let id = repo.manifest().find_snapshot("snap1").unwrap().id;
         let mut rewrite = |drop: &[usize]| -> SnapshotMeta {
-            let rw = prepare_rewrite(&mut repo, id, "snap1", drop, 0).unwrap();
+            let rw = prepare_rewrite(&mut repo, &mut ws, id, "snap1", drop, 0).unwrap();
             let bytes = unpack_object_expect_with_context(
                 &rw.new_packed,
                 ObjectType::SnapshotMeta,
                 rw.new_id.as_bytes(),
-                repo.crypto.as_ref(),
+                repo.crypto().as_ref(),
             )
             .unwrap();
             rmp_serde::from_slice(&bytes).unwrap()
@@ -863,15 +888,14 @@ mod tests {
         let old_index = decode_ext(old_meta.ext.as_deref(), old_meta.item_ptrs.len()).unwrap();
         assert_eq!(old_index.segments.len(), 3);
 
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
         let id = repo.manifest().find_snapshot("snap1").unwrap().id;
-        let rw = prepare_rewrite(&mut repo, id, "snap1", &[5], 0).unwrap();
+        let rw = prepare_rewrite(&mut repo, &mut ws, id, "snap1", &[5], 0).unwrap();
         let bytes = unpack_object_expect_with_context(
             &rw.new_packed,
             ObjectType::SnapshotMeta,
             rw.new_id.as_bytes(),
-            repo.crypto.as_ref(),
+            repo.crypto().as_ref(),
         )
         .unwrap();
         let new_meta: SnapshotMeta = rmp_serde::from_slice(&bytes).unwrap();

@@ -12,7 +12,9 @@ use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::ChunkerParams;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::pack::PackType;
-use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repository, WriteSessionOptions};
+use vykar_core::repo::{
+    EncryptionMode, HostEnv, OpenOptions, Repo, WriteSession, WriteSessionOptions,
+};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
@@ -20,10 +22,10 @@ use crate::common::{
     backup_source, init_test_environment, make_test_config, open_local_repo_cached,
 };
 
-fn init_local_repo(dir: &std::path::Path) -> Repository {
+fn init_local_repo(dir: &std::path::Path) -> (Repo, WriteSession) {
     init_test_environment();
     let storage = Box::new(LocalBackend::new(dir.to_str().unwrap()).unwrap());
-    let mut repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -32,9 +34,8 @@ fn init_local_repo(dir: &std::path::Path) -> Repository {
         None,
     )
     .unwrap();
-    repo.begin_write_session(&WriteSessionOptions::default())
-        .unwrap();
-    repo
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws)
 }
 
 #[cfg(unix)]
@@ -114,14 +115,15 @@ fn init_store_reopen_read() {
     let data1 = b"chunk one data for integration test";
     let data2 = b"chunk two data for integration test";
     let (id1, id2) = {
-        let mut repo = init_local_repo(dir);
-        let (id1, _, _) = repo
-            .store_chunk(data1, Compression::Lz4, PackType::Data)
+        let (mut repo, mut ws) = init_local_repo(dir);
+        let (id1, _, _) = ws
+            .store_chunk(&repo, data1, Compression::Lz4, PackType::Data)
             .unwrap();
-        let (id2, _, _) = repo
-            .store_chunk(data2, Compression::Lz4, PackType::Data)
+        let (id2, _, _) = ws
+            .store_chunk(&repo, data2, Compression::Lz4, PackType::Data)
             .unwrap();
-        repo.save_state().unwrap();
+        // No cfg(test) writer outside the crate: save under the lock.
+        commands::util::with_maintenance_lock(&mut repo, |w| w.save_session(ws)).unwrap();
         (id1, id2)
     };
 
@@ -338,7 +340,7 @@ fn init_auto_mode_persists_concrete_encryption_mode() {
     config.encryption.mode = EncryptionModeConfig::Auto;
 
     let repo = commands::init::run(&config, Some("test-passphrase")).unwrap();
-    let selected = repo.config.encryption.clone();
+    let selected = repo.config().encryption.clone();
     assert!(matches!(
         selected,
         EncryptionMode::Aes256Gcm | EncryptionMode::Chacha20Poly1305
@@ -346,14 +348,14 @@ fn init_auto_mode_persists_concrete_encryption_mode() {
     drop(repo);
 
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let reopened = Repository::open(
+    let reopened = Repo::open(
         storage,
         Some("test-passphrase"),
         None,
         OpenOptions::new().with_index(),
     )
     .unwrap();
-    assert_eq!(reopened.config.encryption, selected);
+    assert_eq!(reopened.config().encryption, selected);
 }
 
 #[test]
@@ -2983,7 +2985,7 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
 
     // Init a plaintext repo and compute a ChunkId
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -2992,14 +2994,14 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
         None,
     )
     .unwrap();
-    let hasher_init = repo.crypto.chunk_hasher().clone();
+    let hasher_init = repo.crypto().chunk_hasher().clone();
     let id_init = vykar_types::chunk_id::ChunkId::compute(&hasher_init, data);
     drop(repo);
 
     // Re-open the same repo and compute the ChunkId for the same data
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
-    let hasher_open = repo.crypto.chunk_hasher().clone();
+    let repo = Repo::open(storage, None, None, OpenOptions::new()).unwrap();
+    let hasher_open = repo.crypto().chunk_hasher().clone();
     let id_open = vykar_types::chunk_id::ChunkId::compute(&hasher_open, data);
 
     assert_eq!(
@@ -3034,7 +3036,7 @@ fn maintenance_runs_beside_a_live_session_guard() {
 
     // Init a repo so with_maintenance_lock can open it
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -3091,7 +3093,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
 
     // Init a repo.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),
@@ -3147,7 +3149,7 @@ fn maintenance_runs_beside_a_malformed_session_marker() {
 
     // Init a repo.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::init(
+    let repo = Repo::init(
         storage,
         EncryptionMode::None,
         ChunkerParams::default(),

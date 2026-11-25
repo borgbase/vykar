@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::info;
 
-use super::Repository;
+use super::Repo;
 use super::index_store::{self, CacheLocation};
 use crate::index::LiveIndex;
 use vykar_crypto::CryptoEngine;
@@ -177,7 +177,7 @@ impl RelocationSource {
     }
 }
 
-impl Repository {
+impl Repo {
     /// The generation a reader of this handle planned from: that of the
     /// loaded head, `None` when there is none.
     fn planned_generation(&self) -> Option<u64> {

@@ -1,17 +1,17 @@
 use tracing::warn;
 
-use super::Repository;
+use super::Repo;
 use super::journal_recovery::PendingIndexRecovery;
 use super::pack::{PackType, PackWriter, compute_data_pack_target, compute_tree_pack_target};
 use super::write_session::{
-    DEFAULT_SESSION_ID, RollbackTracker, SessionView, WriteMetricsSnapshot, WriteSessionState,
-    active, active_mut,
+    DEFAULT_SESSION_ID, RollbackTracker, SessionView, WriteMetricsSnapshot, WriteSession,
 };
 use crate::index::IndexDelta;
 use crate::index::table::DedupPrefilter;
 use vykar_storage::BackendProfile;
+#[cfg(test)]
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
 /// `max_in_flight_uploads` of `WriteSessionOptions::default()`.
 const DEFAULT_MAX_IN_FLIGHT_UPLOADS: usize = 2;
@@ -31,7 +31,7 @@ pub struct WriteSessionOptions {
     /// (see `UploadQueue::cap_pending_upload_bytes`).
     pub cap_upload_bytes: bool,
     /// Stream data packs to the backend while they fill
-    /// (see `WriteSessionState::stream_data_packs`).
+    /// (see `WriteSession::stream_data_packs`).
     pub stream_data_packs: bool,
 }
 
@@ -61,24 +61,14 @@ impl WriteSessionOptions {
     }
 }
 
-impl Repository {
-    /// The active write session. Panics when none is active.
-    #[track_caller]
-    pub(super) fn ws(&self) -> &WriteSessionState {
-        active(&self.write_session)
-    }
-
-    /// The active write session, mutably. Panics when none is active.
-    #[track_caller]
-    pub(super) fn ws_mut(&mut self) -> &mut WriteSessionState {
-        active_mut(&mut self.write_session)
-    }
-
-    /// Activate a write session.
+impl Repo {
+    /// Begin a write session over this repository's index as it is now.
     ///
-    /// Creates a fresh `WriteSessionState` with pack targets computed from the
-    /// current chunk index and repo config. Must be called before any write-path
-    /// methods (`store_chunk`, `flush_packs`, etc.).
+    /// Creates a fresh [`WriteSession`] with pack targets computed from the
+    /// current chunk index and repo config. The chunk-store, flush and
+    /// rollback methods are on the session; a save
+    /// (`RepoWriter::save_session`) or a backup commit consumes it, and
+    /// [`WriteSession::flush_on_abort`] ends it on failure.
     ///
     /// Over an unedited index the session resolves existing chunks against
     /// the repository's index view as it is now (the table and the head's
@@ -88,14 +78,8 @@ impl Repository {
     /// edits (repair) every lookup and every reuse goes through the live index
     /// by key, and there is no prefilter.
     ///
-    /// Applies every field of `opts`.
-    ///
-    /// Returns an error if a session is already active (caller must `save_state()`
-    /// or `flush_on_abort()` first).
-    pub fn begin_write_session(&mut self, opts: &WriteSessionOptions) -> Result<()> {
-        if self.write_session.is_some() {
-            return Err(VykarError::Other("write session already active".into()));
-        }
+    /// Applies every field of `opts`. No I/O.
+    pub fn begin_write_session(&self, opts: &WriteSessionOptions) -> WriteSession {
         let num_packs = self.chunk_index.count_distinct_packs();
         let data_target = compute_data_pack_target(
             num_packs,
@@ -103,7 +87,7 @@ impl Repository {
             self.config.max_pack_size,
         );
         let tree_target = compute_tree_pack_target(self.config.min_pack_size);
-        let mut ws = WriteSessionState::new(
+        let mut ws = WriteSession::new(
             data_target,
             tree_target,
             opts.max_in_flight_uploads.max(1),
@@ -130,24 +114,7 @@ impl Repository {
             Some(v) => IndexDelta::with_table(std::sync::Arc::clone(v.view.table())),
             None => IndexDelta::new(),
         });
-        self.write_session = Some(ws);
-        Ok(())
-    }
-
-    /// The backup's session marker, pulled back by the age of every pack
-    /// upload an append-only server refuses because the pack is stored
-    /// already (`existing_pack`). No-op without an active write session.
-    pub(crate) fn attach_session_marker(
-        &mut self,
-        marker: std::sync::Arc<super::lock::SessionMarker>,
-    ) {
-        if let Some(existing) = self
-            .write_session
-            .as_ref()
-            .and_then(|ws| ws.existing_packs.as_ref())
-        {
-            existing.attach_marker(marker);
-        }
+        ws
     }
 
     /// Independent read-only requests worth issuing at once against this
@@ -157,97 +124,73 @@ impl Repository {
         self.storage.profile().request_width.max(1)
     }
 
-    /// Recompute pack-target state from `self.chunk_index`.
-    ///
-    /// Sets `persisted_pack_count` from the index, resets `session_packs_flushed`,
-    /// and updates the data pack writer's target size. Called after any operation
-    /// that brings `chunk_index` in sync with persisted storage (load or save).
-    /// No-op when no write session is active.
-    pub(super) fn rebase_pack_target_from_index(&mut self) {
-        let Some(ws) = self.write_session.as_mut() else {
-            return;
+    /// Best-effort delete of the `pending_index` file from storage.
+    /// Called from the backup command after the commit succeeds.
+    pub fn clear_pending_index(&self, session_id: &str) {
+        super::session_journal::clear_pending_index(&*self.storage, session_id);
+    }
+
+    /// Make `index` the repository's table and restart `ws`'s lookups and
+    /// delta over it, as if the session had begun with it loaded (for
+    /// testing).
+    #[cfg(test)]
+    pub(crate) fn set_session_table_for_test(
+        &mut self,
+        ws: &mut WriteSession,
+        index: &crate::index::ChunkIndex,
+    ) {
+        use std::sync::Arc;
+        let table = crate::testutil::base_table_of(index);
+        self.chunk_index = crate::index::LiveIndex::from_table(Arc::clone(&table));
+        let view = SessionView {
+            view: self
+                .chunk_index
+                .view()
+                .expect("an unedited index has a view"),
+            state: self.chunk_index.state().clone(),
+            sweep_gen: self.index_head.as_ref().map_or(0, |h| h.sweep.generation),
         };
-        // NOTE: count_distinct_packs() includes tree packs, which slightly
-        // inflates the data pack target. Tree packs are a small fraction of
-        // total packs (~1-2 per backup) so the effect is negligible (~2% via
-        // sqrt scaling). A proper fix would require persisting pack type
-        // metadata in the index or manifest.
-        let num_packs = self.chunk_index.count_distinct_packs();
-        ws.persisted_pack_count = num_packs;
-        ws.session_packs_flushed = 0;
-        let data_target = compute_data_pack_target(
-            num_packs,
-            self.config.min_pack_size,
-            self.config.max_pack_size,
-        );
-        ws.data_pack_writer.set_target_size(data_target);
+        ws.index_delta = Some(IndexDelta::with_table(Arc::clone(&table)));
+        ws.view = Some(view);
+    }
+}
+
+impl WriteSession {
+    /// The backup's session marker, pulled back by the age of every pack
+    /// upload an append-only server refuses because the pack is stored
+    /// already (`existing_pack`).
+    pub(crate) fn attach_session_marker(&self, marker: std::sync::Arc<super::lock::SessionMarker>) {
+        if let Some(existing) = self.existing_packs.as_ref() {
+            existing.attach_marker(marker);
+        }
     }
 
-    /// Apply backpressure to keep the number of in-flight uploads bounded.
-    pub(super) fn cap_pending_uploads(&mut self, incoming: usize) -> Result<()> {
-        active_mut(&mut self.write_session).cap_pending_uploads(
-            &self.storage,
-            &self.crypto,
-            incoming,
-        )
-    }
-
-    /// Pipeline budget to lend to the upload queue (see
-    /// `WriteSessionState::upload_slack_bytes`); 0 without a write session.
-    pub(crate) fn upload_slack_bytes(&self) -> usize {
-        self.write_session
-            .as_ref()
-            .map_or(0, |ws| ws.upload_slack_bytes())
-    }
-
-    /// Snapshot of the active write session's diagnostic counters; `None` without one.
-    pub(crate) fn write_metrics(&self) -> Option<WriteMetricsSnapshot> {
-        self.write_session.as_ref().map(|ws| ws.metrics.snapshot())
+    /// Snapshot of the session's diagnostic counters.
+    pub(crate) fn write_metrics(&self) -> WriteMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// The worker-side prefilter over the session's view: `None` without a
-    /// write session or a view (an edited or unloaded index).
+    /// view (an edited or unloaded index).
     pub(crate) fn dedup_prefilter(&self) -> Option<DedupPrefilter> {
-        let ws = self.write_session.as_ref()?;
-        ws.view
+        self.view
             .as_ref()
             .map(|v| DedupPrefilter::new(v.view.clone()))
     }
 
-    /// Check if a chunk exists: stored earlier in the active session, or in
-    /// the index.
-    pub fn chunk_exists(&self, id: &ChunkId) -> bool {
-        if let Some(ref ws) = self.write_session
-            && ws.session_new.contains_key(id)
-        {
-            return true;
-        }
-        self.chunk_index.contains(id)
-    }
-
-    /// Wait for the session's background journal write, if any (the
-    /// simulator's driver, after Phase 1). No-op without a write session.
-    #[cfg(any(test, feature = "sim"))]
-    pub(crate) fn join_journal_write(&mut self) {
-        if let Some(ws) = self.write_session.as_mut() {
-            ws.join_journal_write();
-        }
-    }
-
-    /// Best-effort cleanup after a failed backup or other operation.
+    /// Best-effort cleanup after a failed backup or other operation; ends
+    /// the session.
     ///
     /// Seals any partial pack writers, waits for in-flight uploads to land,
     /// and writes the final `pending_index` journal so a subsequent run can
     /// recover. All errors are logged but never propagated.
     ///
-    /// No-ops when no write session is active or there is nothing to clean up.
-    pub fn flush_on_abort(&mut self) {
-        let Some(ws) = self.write_session.as_ref() else {
-            return;
-        };
+    /// Returns at once when there is nothing to clean up.
+    pub fn flush_on_abort(mut self, repo: &Repo) {
+        self.finished = true;
         let has_partial_packs =
-            ws.data_pack_writer.has_pending() || ws.tree_pack_writer.has_pending();
-        if ws.uploads.is_empty() && ws.journal.entries.is_empty() && !has_partial_packs {
+            self.data_pack_writer.has_pending() || self.tree_pack_writer.has_pending();
+        if self.uploads.is_empty() && self.journal.entries.is_empty() && !has_partial_packs {
             return;
         }
 
@@ -256,32 +199,26 @@ impl Repository {
         // Seal and flush any partial data/tree pack writers.
         // Sample both has_pending() flags before flushing either writer:
         // the data and tree pack writers are independent, so flushing one
-        // can't change the other's pending state. This avoids reborrowing
-        // `self.write_session` between the two if-checks.
-        let flush_data = ws.data_pack_writer.has_pending();
-        let flush_tree = ws.tree_pack_writer.has_pending();
+        // can't change the other's pending state.
+        let flush_data = self.data_pack_writer.has_pending();
+        let flush_tree = self.tree_pack_writer.has_pending();
 
-        if flush_data && let Err(e) = self.flush_writer_async(PackType::Data) {
+        if flush_data && let Err(e) = self.flush_writer_async(repo, PackType::Data) {
             warn!("flush_on_abort: failed to seal data pack: {e}");
         }
-        if flush_tree && let Err(e) = self.flush_writer_async(PackType::Tree) {
+        if flush_tree && let Err(e) = self.flush_writer_async(repo, PackType::Tree) {
             warn!("flush_on_abort: failed to seal tree pack: {e}");
         }
 
         // Join all in-flight upload threads so packs land on storage.
-        let ws = self.ws_mut();
-        for upload in ws.uploads.take_all() {
-            if let Err(e) = ws.finish_upload(upload) {
+        for upload in self.uploads.take_all() {
+            if let Err(e) = self.finish_upload(upload) {
                 warn!("flush_on_abort: upload thread failed: {e}");
             }
         }
 
         // Write final pending_index so next run can recover.
-        active_mut(&mut self.write_session)
-            .write_pending_index_best_effort(&*self.storage, &*self.crypto);
-
-        // Clear the session so Drop doesn't fire the debug_assert.
-        self.write_session = None;
+        self.write_pending_index_best_effort(&*repo.storage, &*repo.crypto);
     }
 
     /// Recover chunk→pack mappings from a previous interrupted session's
@@ -292,23 +229,17 @@ impl Repository {
     /// (`BackendProfile::request_width`) and stop when `cancel` fires.
     pub fn recover_pending_index(
         &mut self,
+        repo: &Repo,
         cancel: &super::control::CancelToken,
     ) -> Result<PendingIndexRecovery> {
-        let width = self.request_width();
-        active_mut(&mut self.write_session).recover_pending_index(
-            &*self.storage,
-            &*self.crypto,
-            &self.chunk_index,
-            width,
-            self.host_env.clock.as_ref(),
+        self.recover_pending_index_from(
+            &*repo.storage,
+            &*repo.crypto,
+            &repo.chunk_index,
+            repo.request_width(),
+            repo.host_env.clock.as_ref(),
             cancel,
         )
-    }
-
-    /// Best-effort delete of the `pending_index` file from storage.
-    /// Called from the backup command after `save_state()` succeeds.
-    pub fn clear_pending_index(&self, session_id: &str) {
-        super::session_journal::clear_pending_index(&*self.storage, session_id);
     }
 
     // --- Rollback checkpoint API ---
@@ -326,30 +257,25 @@ impl Repository {
         clippy::panic_in_result_fn,
         reason = "asserts encode programmer invariants on internal state"
     )]
-    pub(crate) fn begin_rollback_checkpoint(&mut self) -> Result<()> {
-        {
-            let ws = self.ws();
-            assert!(
-                ws.rollback_tracker.is_none(),
-                "begin_rollback_checkpoint called while another checkpoint is armed"
-            );
-        }
+    pub(crate) fn begin_rollback_checkpoint(&mut self, repo: &Repo) -> Result<()> {
+        assert!(
+            self.rollback_tracker.is_none(),
+            "begin_rollback_checkpoint called while another checkpoint is armed"
+        );
 
         // Force-flush the data pack writer to isolate the scope's data.
-        let has_pending = self.ws().data_pack_writer.has_pending();
-        if has_pending {
-            self.flush_writer_async(PackType::Data)?;
-            self.ws_mut().metrics.counters.forced_data_seals += 1;
+        if self.data_pack_writer.has_pending() {
+            self.flush_writer_async(repo, PackType::Data)?;
+            self.metrics.counters.forced_data_seals += 1;
         }
 
-        let ws = self.ws_mut();
-        let delta_checkpoint = ws
+        let delta_checkpoint = self
             .index_delta
             .as_mut()
             .expect("an active session has an index delta")
             .checkpoint();
-        let data_pack_target_size = ws.data_pack_writer.target_size();
-        ws.rollback_tracker = Some(RollbackTracker {
+        let data_pack_target_size = self.data_pack_writer.target_size();
+        self.rollback_tracker = Some(RollbackTracker {
             delta_checkpoint,
             dedup_inserts: Vec::new(),
             promoted_recovered: Vec::new(),
@@ -361,15 +287,13 @@ impl Repository {
 
     /// Commit a rollback checkpoint: discard the tracker (scope succeeded).
     pub(crate) fn commit_rollback_checkpoint(&mut self) {
-        if let Some(ws) = self.write_session.as_mut() {
-            // Only discard the delta's undo log when a tracker was actually
-            // armed (mirrors `begin_rollback_checkpoint`); leave the no-tracker
-            // case untouched.
-            if ws.rollback_tracker.take().is_some()
-                && let Some(ref mut delta) = ws.index_delta
-            {
-                delta.discard_checkpoint();
-            }
+        // Only discard the delta's undo log when a tracker was actually
+        // armed (mirrors `begin_rollback_checkpoint`); leave the no-tracker
+        // case untouched.
+        if self.rollback_tracker.take().is_some()
+            && let Some(ref mut delta) = self.index_delta
+        {
+            delta.discard_checkpoint();
         }
     }
 
@@ -377,102 +301,71 @@ impl Repository {
     /// occurred since `begin_rollback_checkpoint()`. Packs already uploaded
     /// to storage become orphans cleaned by compact.
     pub(crate) fn abort_rollback_checkpoint(&mut self) {
-        let ws = self.ws_mut();
-        let Some(tracker) = ws.rollback_tracker.take() else {
+        let Some(tracker) = self.rollback_tracker.take() else {
             return;
         };
 
         // 1. Rollback IndexDelta (always Some when a checkpoint was armed).
-        if let Some(ref mut delta) = ws.index_delta {
+        if let Some(ref mut delta) = self.index_delta {
             delta.rollback(tracker.delta_checkpoint);
         }
 
         // 2. Forget the chunks the scope stored or promoted.
         for chunk_id in &tracker.dedup_inserts {
-            ws.session_new.remove(chunk_id);
+            self.session_new.remove(chunk_id);
         }
 
         // 3. Re-insert promoted recovered chunks.
         for (chunk_id, entry) in tracker.promoted_recovered {
-            ws.recovered_chunks.insert(chunk_id, entry);
+            self.recovered_chunks.insert(chunk_id, entry);
         }
 
         // 4. Remove tracked packs from the pending journal, and keep uploads
         // still in flight from journaling them when they complete.
         for pack_id in &tracker.journal_pack_ids {
-            ws.journal.entries.remove_pack(pack_id);
+            self.journal.entries.remove_pack(pack_id);
         }
-        ws.uploads.exclude_from_journal(&tracker.journal_pack_ids);
+        self.uploads.exclude_from_journal(&tracker.journal_pack_ids);
 
         // 5. Reset data pack writer (discards any partial pack buffer).
         // Carry the algorithm over from the writer being replaced rather than
         // re-deriving it — a reset must not be able to change a pack's name.
-        let hash_algo = ws.data_pack_writer.hash_algorithm();
-        ws.data_pack_writer =
+        let hash_algo = self.data_pack_writer.hash_algorithm();
+        self.data_pack_writer =
             PackWriter::new(PackType::Data, tracker.data_pack_target_size, hash_algo);
-    }
-
-    /// Promote a recovered chunk into the session and its index delta.
-    /// Returns the stored size if the chunk was in `recovered_chunks`, None otherwise.
-    pub(super) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        active_mut(&mut self.write_session).promote_recovered_chunk(chunk_id)
     }
 }
 
 #[cfg(test)]
-impl Repository {
+impl WriteSession {
     /// Current data pack target size in bytes (for testing).
     pub(crate) fn data_pack_target(&self) -> usize {
-        self.ws().data_pack_writer.target_size()
+        self.data_pack_writer.target_size()
     }
 
-    /// Make `index` the repository's table and restart the active session's
-    /// lookups and delta over it, as if the session had begun with it
-    /// loaded (for testing).
-    pub(crate) fn set_session_table_for_test(&mut self, index: &crate::index::ChunkIndex) {
-        use std::sync::Arc;
-        let table = crate::testutil::base_table_of(index);
-        self.chunk_index = crate::index::LiveIndex::from_table(Arc::clone(&table));
-        let view = SessionView {
-            view: self
-                .chunk_index
-                .view()
-                .expect("an unedited index has a view"),
-            state: self.chunk_index.state().clone(),
-            sweep_gen: self.index_head.as_ref().map_or(0, |h| h.sweep.generation),
-        };
-        let ws = self.ws_mut();
-        ws.index_delta = Some(IndexDelta::with_table(Arc::clone(&table)));
-        ws.view = Some(view);
-    }
-
-    /// The active session's index delta (for testing).
+    /// The session's index delta (for testing).
     pub(crate) fn write_session_delta_for_test(&self) -> &IndexDelta {
-        self.ws().index_delta.as_ref().unwrap()
+        self.index_delta.as_ref().unwrap()
     }
 
     /// Whether the session's delta records `id` as reused, by key or by
     /// table position (for testing).
     pub(crate) fn delta_reuses(&self, id: &ChunkId) -> bool {
-        self.write_session
+        self.index_delta
             .as_ref()
-            .and_then(|ws| ws.index_delta.as_ref())
             .is_some_and(|delta| delta.reused.contains(id))
     }
 
     /// True if a rollback checkpoint is currently armed (for testing).
     pub(crate) fn rollback_tracker_armed(&self) -> bool {
-        self.write_session
-            .as_ref()
-            .and_then(|ws| ws.rollback_tracker.as_ref())
-            .is_some()
+        self.rollback_tracker.is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::WriteSessionOptions;
-    use crate::testutil::test_repo_plaintext;
+    use crate::testutil::test_repo_plaintext_with_session;
     use std::sync::Arc;
     use vykar_storage::{BackendProfile, InnerBackend, StorageBackend, delegate_storage_backend};
 
@@ -510,35 +403,27 @@ mod tests {
     /// dumps already run under them.
     #[test]
     fn begin_write_session_applies_every_option() {
-        let mut repo = test_repo_plaintext();
-        repo.write_session = None;
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        drop(ws);
         let mut opts = WriteSessionOptions {
             session_id: "abc".into(),
             max_in_flight_uploads: 7,
             cap_upload_bytes: true,
             stream_data_packs: true,
         };
-        repo.begin_write_session(&opts).unwrap();
+        ws = repo.begin_write_session(&opts);
         {
-            let ws = repo.write_session.as_ref().unwrap();
             assert_eq!(ws.session_id, "abc");
             assert!(ws.stream_data_packs);
             assert_eq!(ws.uploads.max_in_flight_uploads, 7);
             assert!(ws.uploads.cap_pending_upload_bytes);
         }
 
-        repo.write_session = None;
+        drop(ws);
         opts.max_in_flight_uploads = 0;
-        repo.begin_write_session(&opts).unwrap();
-        assert_eq!(
-            repo.write_session
-                .as_ref()
-                .unwrap()
-                .uploads
-                .max_in_flight_uploads,
-            1
-        );
-        repo.write_session = None;
+        ws = repo.begin_write_session(&opts);
+        assert_eq!(ws.uploads.max_in_flight_uploads, 1);
+        drop(ws);
     }
 
     struct ZeroWidth(Arc<dyn StorageBackend>);
@@ -563,40 +448,62 @@ mod tests {
 
     #[test]
     fn request_width_follows_the_backend() {
-        let mut repo = test_repo_plaintext();
+        let (mut repo, ws) = test_repo_plaintext_with_session();
         assert_eq!(repo.request_width(), 2);
-        repo.write_session = None;
+        drop(ws);
         assert_eq!(repo.request_width(), 2);
 
         repo.storage = Arc::new(ZeroWidth(Arc::clone(&repo.storage)));
         assert_eq!(repo.request_width(), 1);
     }
 
+    /// `holds_unflushed_work` (the drop warning): not for a fresh session,
+    /// yes once a stored chunk sits in an open pack, not once `flush_packs`
+    /// has uploaded it and written the journal.
+    #[test]
+    fn holds_unflushed_work_follows_the_flush() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        assert!(!ws.holds_unflushed_work());
+        ws.store_chunk(
+            &repo,
+            b"a chunk in an open pack",
+            Compression::None,
+            PackType::Data,
+        )
+        .unwrap();
+        assert!(ws.holds_unflushed_work());
+        ws.flush_packs(&repo).unwrap();
+        assert!(!ws.holds_unflushed_work());
+    }
+
     #[test]
     fn rollback_checkpoint_armed_and_committed_round_trips() {
-        let mut repo = test_repo_plaintext();
-        assert!(!repo.rollback_tracker_armed());
-        repo.begin_rollback_checkpoint().unwrap();
-        assert!(repo.rollback_tracker_armed());
-        repo.commit_rollback_checkpoint();
-        assert!(!repo.rollback_tracker_armed());
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        assert!(!ws.rollback_tracker_armed());
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        assert!(ws.rollback_tracker_armed());
+        ws.commit_rollback_checkpoint();
+        assert!(!ws.rollback_tracker_armed());
     }
 
     #[test]
     fn rollback_checkpoint_rollback_clears_tracker() {
-        let mut repo = test_repo_plaintext();
-        repo.begin_rollback_checkpoint().unwrap();
-        repo.abort_rollback_checkpoint();
-        assert!(!repo.rollback_tracker_armed());
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        ws.abort_rollback_checkpoint();
+        assert!(!ws.rollback_tracker_armed());
     }
 
     #[test]
     #[should_panic(expected = "begin_rollback_checkpoint called while another checkpoint is armed")]
     fn cannot_begin_overlapping_rollback_checkpoint() {
-        let mut repo = test_repo_plaintext();
-        repo.begin_rollback_checkpoint().unwrap();
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        ws.begin_rollback_checkpoint(&repo).unwrap();
         // Second begin must panic via the overlap assertion.
-        let _ = repo.begin_rollback_checkpoint();
+        let _ = ws.begin_rollback_checkpoint(&repo);
     }
 
     /// A finished upload is journaled on the next stored chunk, not only when
@@ -606,22 +513,23 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
-        repo.store_chunk(b"first pack chunk", Compression::None, PackType::Data)
-            .unwrap();
-        repo.flush_writer_async(PackType::Data).unwrap();
-        let pack_id = repo.write_session.as_ref().unwrap().uploads.pending()[0].pack_id;
-        while !repo.write_session.as_ref().unwrap().uploads.pending()[0]
-            .handle
-            .is_finished()
-        {
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        ws.store_chunk(
+            &repo,
+            b"first pack chunk",
+            Compression::None,
+            PackType::Data,
+        )
+        .unwrap();
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
+        let pack_id = ws.uploads.pending()[0].pack_id;
+        while !ws.uploads.pending()[0].handle.is_finished() {
             std::thread::yield_now();
         }
 
-        repo.store_chunk(b"next chunk", Compression::None, PackType::Data)
+        ws.store_chunk(&repo, b"next chunk", Compression::None, PackType::Data)
             .unwrap();
 
-        let ws = repo.write_session.as_ref().unwrap();
         assert!(ws.uploads.is_empty());
         assert!(
             ws.journal
@@ -630,7 +538,7 @@ mod tests {
                 .iter()
                 .any(|e| e.pack_id == pack_id)
         );
-        repo.write_session = None;
+        drop(ws);
     }
 
     /// The write counters match what reached storage, and count the seal
@@ -640,18 +548,18 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
-        repo.store_chunk(b"first", Compression::None, PackType::Data)
+        let (repo, mut ws) = test_repo_plaintext_with_session();
+        ws.store_chunk(&repo, b"first", Compression::None, PackType::Data)
             .unwrap();
-        repo.begin_rollback_checkpoint().unwrap();
-        repo.commit_rollback_checkpoint();
-        repo.store_chunk(b"second", Compression::None, PackType::Data)
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        ws.commit_rollback_checkpoint();
+        ws.store_chunk(&repo, b"second", Compression::None, PackType::Data)
             .unwrap();
-        repo.store_chunk(b"tree", Compression::None, PackType::Tree)
+        ws.store_chunk(&repo, b"tree", Compression::None, PackType::Tree)
             .unwrap();
-        repo.flush_packs().unwrap();
+        ws.flush_packs(&repo).unwrap();
 
-        let m = repo.write_metrics().unwrap();
+        let m = ws.write_metrics();
         assert_eq!(m.data_packs, 2);
         assert_eq!(m.tree_packs, 1);
         assert_eq!(m.forced_data_seals, 1);
@@ -665,7 +573,7 @@ mod tests {
             .map(|key| repo.storage.get(key).unwrap().unwrap().len() as u64)
             .sum();
         assert_eq!(m.data_pack_bytes + m.tree_pack_bytes, stored);
-        repo.write_session = None;
+        drop(ws);
     }
 
     /// Files directly in `<root>/packs`, i.e. staging temp files.
@@ -689,26 +597,24 @@ mod tests {
         use vykar_types::pack_id::PackId;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut repo = test_repo_plaintext();
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
-        repo.write_session.as_mut().unwrap().stream_data_packs = true;
+        ws.stream_data_packs = true;
 
-        repo.store_chunk(b"streamed chunk", Compression::None, PackType::Data)
+        ws.store_chunk(&repo, b"streamed chunk", Compression::None, PackType::Data)
             .unwrap();
-        repo.store_chunk(b"tree chunk", Compression::None, PackType::Tree)
+        ws.store_chunk(&repo, b"tree chunk", Compression::None, PackType::Tree)
             .unwrap();
         {
-            let ws = repo.write_session.as_ref().unwrap();
             assert_eq!(ws.data_pack_writer.buffer_capacity(), 0);
             assert!(ws.tree_pack_writer.buffer_capacity() > 0);
         }
         assert_eq!(staging_files(dir.path()).len(), 1, "data pack is staged");
 
-        repo.flush_writer_async(PackType::Data).unwrap();
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
         let (pack_id, bytes) = {
-            let ws = repo.write_session.as_ref().unwrap();
             (
                 ws.uploads.pending()[0].pack_id,
                 ws.uploads.pending()[0].bytes,
@@ -716,11 +622,10 @@ mod tests {
         };
         assert_eq!(bytes, 0, "a staged pack counts no heap bytes");
 
-        repo.flush_packs().unwrap();
+        ws.flush_packs(&repo).unwrap();
         assert!(staging_files(dir.path()).is_empty());
         let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
         assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
-        let ws = repo.write_session.as_ref().unwrap();
         assert!(
             ws.journal
                 .entries
@@ -728,7 +633,7 @@ mod tests {
                 .iter()
                 .any(|e| e.pack_id == pack_id)
         );
-        repo.write_session = None;
+        drop(ws);
     }
 
     /// Stores a pack, releases its buffer, then blocks until the gate opens,
@@ -790,7 +695,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
         let (gate_tx, gate_rx) = std::sync::mpsc::channel();
         repo.storage = Arc::new(ReleaseThenBlock {
@@ -799,14 +704,14 @@ mod tests {
             gate_rx: std::sync::Mutex::new(gate_rx),
         });
 
-        repo.store_chunk(b"x", Compression::None, PackType::Data)
+        ws.store_chunk(&repo, b"x", Compression::None, PackType::Data)
             .unwrap();
-        repo.flush_writer_async(PackType::Data).unwrap();
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
         released_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         let pack_id = {
-            let upload = &repo.write_session.as_ref().unwrap().uploads.pending()[0];
+            let upload = &ws.uploads.pending()[0];
             assert!(upload.bytes > 0);
             assert!(!upload.handle.is_finished());
             assert_eq!(upload.held_bytes(), 0);
@@ -814,8 +719,7 @@ mod tests {
         };
 
         gate_tx.send(()).unwrap();
-        repo.flush_packs().unwrap();
-        let ws = repo.write_session.as_ref().unwrap();
+        ws.flush_packs(&repo).unwrap();
         assert!(
             ws.journal
                 .entries
@@ -823,7 +727,7 @@ mod tests {
                 .iter()
                 .any(|e| e.pack_id == pack_id)
         );
-        repo.write_session = None;
+        drop(ws);
     }
 
     /// Rolling back a checkpoint, or dropping the session, discards the
@@ -834,23 +738,23 @@ mod tests {
         use crate::repo::pack::PackType;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut repo = test_repo_plaintext();
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
-        repo.write_session.as_mut().unwrap().stream_data_packs = true;
+        ws.stream_data_packs = true;
 
-        repo.begin_rollback_checkpoint().unwrap();
-        repo.store_chunk(b"rolled back", Compression::None, PackType::Data)
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        ws.store_chunk(&repo, b"rolled back", Compression::None, PackType::Data)
             .unwrap();
         assert_eq!(staging_files(dir.path()).len(), 1);
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
         assert!(staging_files(dir.path()).is_empty());
 
-        repo.store_chunk(b"abandoned", Compression::None, PackType::Data)
+        ws.store_chunk(&repo, b"abandoned", Compression::None, PackType::Data)
             .unwrap();
         assert_eq!(staging_files(dir.path()).len(), 1);
-        repo.write_session = None;
+        drop(ws);
         assert!(staging_files(dir.path()).is_empty());
     }
 
@@ -861,17 +765,21 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
         let (gated, tx) =
             crate::testutil::PackUploadBackend::gated(std::sync::Arc::clone(&repo.storage));
         repo.storage = std::sync::Arc::new(gated);
 
-        repo.begin_rollback_checkpoint().unwrap();
-        repo.store_chunk(b"rolled back chunk", Compression::None, PackType::Data)
-            .unwrap();
-        repo.flush_writer_async(PackType::Data).unwrap();
+        ws.begin_rollback_checkpoint(&repo).unwrap();
+        ws.store_chunk(
+            &repo,
+            b"rolled back chunk",
+            Compression::None,
+            PackType::Data,
+        )
+        .unwrap();
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
         let pack_id = {
-            let ws = repo.write_session.as_ref().unwrap();
             assert_eq!(ws.uploads.len(), 1);
             assert!(
                 !ws.uploads.pending()[0].handle.is_finished(),
@@ -880,11 +788,10 @@ mod tests {
             ws.uploads.pending()[0].pack_id
         };
 
-        repo.abort_rollback_checkpoint();
+        ws.abort_rollback_checkpoint();
         tx.send(()).unwrap();
-        repo.flush_packs().unwrap();
+        ws.flush_packs(&repo).unwrap();
 
-        let ws = repo.write_session.as_ref().unwrap();
         assert!(ws.uploads.is_empty());
         assert!(
             ws.journal
@@ -898,7 +805,7 @@ mod tests {
             repo.storage.exists(&pack_id.storage_key()).unwrap(),
             "the upload still completes; the pack is an orphan for compact"
         );
-        repo.write_session = None;
+        drop(ws);
     }
 
     /// Over an unedited index a session finds existing chunks in the table
@@ -909,9 +816,10 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
-        let (id, size, _) = repo
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (id, size, _) = ws
             .store_chunk(
+                &repo,
                 b"stored before the session",
                 Compression::None,
                 PackType::Data,
@@ -920,36 +828,35 @@ mod tests {
         // A fold, so that the chunk is in the table rather than in an
         // applied segment.
         repo.request_index_fold();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
 
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
-        let prefilter = repo.dedup_prefilter().expect("prefilter over the table");
+        ws = repo.begin_write_session(&WriteSessionOptions::default());
+        let prefilter = ws.dedup_prefilter().expect("prefilter over the table");
         assert!(Arc::ptr_eq(
             prefilter.view().table(),
             repo.chunk_index().table().unwrap()
         ));
-        let (again, again_size, is_new) = repo
+        let (again, again_size, is_new) = ws
             .store_chunk(
+                &repo,
                 b"stored before the session",
                 Compression::None,
                 PackType::Data,
             )
             .unwrap();
         assert_eq!((again, again_size, is_new), (id, size, false));
-        assert_eq!(repo.reuse_cached_chunk_ref(&id).unwrap(), size);
+        assert_eq!(ws.reuse_cached_chunk_ref(&repo, &id).unwrap(), size);
 
-        let ws = repo.write_session.as_ref().unwrap();
         let delta = ws.index_delta.as_ref().unwrap();
         assert!(
             !delta.reused.is_keyed(&id),
             "no keyed record for a table hit"
         );
-        assert!(repo.delta_reuses(&id));
+        assert!(ws.delta_reuses(&id));
 
         // Reuse is recorded in the delta but not persisted.
         let before = repo.chunk_index().get(&id).unwrap();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
         assert_eq!(repo.chunk_index().get(&id).unwrap(), before);
     }
 
@@ -961,35 +868,33 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let mut repo = test_repo_plaintext();
-        let (kept, _, _) = repo
-            .store_chunk(b"kept chunk", Compression::None, PackType::Data)
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (kept, _, _) = ws
+            .store_chunk(&repo, b"kept chunk", Compression::None, PackType::Data)
             .unwrap();
-        let (removed, _, _) = repo
-            .store_chunk(b"removed chunk", Compression::None, PackType::Data)
+        let (removed, _, _) = ws
+            .store_chunk(&repo, b"removed chunk", Compression::None, PackType::Data)
             .unwrap();
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
 
-        assert!(repo.chunk_index_mut().remove(&removed).is_some());
-        repo.begin_write_session(&WriteSessionOptions::default())
-            .unwrap();
-        assert!(repo.dedup_prefilter().is_none());
         assert!(
-            repo.bump_ref_if_exists(&removed).is_none(),
+            repo.unchecked_writer()
+                .chunk_index_mut()
+                .remove(&removed)
+                .is_some()
+        );
+        ws = repo.begin_write_session(&WriteSessionOptions::default());
+        assert!(ws.dedup_prefilter().is_none());
+        assert!(
+            ws.bump_ref_if_exists(&repo, &removed).is_none(),
             "the removal is seen"
         );
-        assert!(repo.bump_ref_if_exists(&kept).is_some());
-        let delta = repo
-            .write_session
-            .as_ref()
-            .unwrap()
-            .index_delta
-            .as_ref()
-            .unwrap();
+        assert!(ws.bump_ref_if_exists(&repo, &kept).is_some());
+        let delta = ws.index_delta.as_ref().unwrap();
         assert!(delta.reused.is_keyed(&kept));
         assert!(delta.reused.positional().is_none());
 
-        repo.save_state().unwrap();
+        repo.unchecked_writer().save_session(ws).unwrap();
         assert!(!repo.chunk_index().contains(&removed));
         assert!(repo.chunk_index().contains(&kept));
     }

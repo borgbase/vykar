@@ -7,9 +7,7 @@ use crate::repo::format::ObjectType;
 use crate::repo::identity::{self, KeyProof};
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::index_store::tests::{Writer, entries, index_with};
-use crate::repo::{
-    EncryptionMode, OpenOptions, RepoFormat, Repository, derive_plaintext_chunk_id_key,
-};
+use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat, derive_plaintext_chunk_id_key};
 use crate::testutil::MemoryBackend;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
@@ -62,7 +60,7 @@ delegate_storage_backend! {
 struct Env {
     inner: Arc<dyn StorageBackend>,
     cache: tempfile::TempDir,
-    repo: Repository,
+    repo: Repo,
 }
 
 fn init(format: RepoFormat, encryption: EncryptionMode) -> Env {
@@ -70,7 +68,7 @@ fn init(format: RepoFormat, encryption: EncryptionMode) -> Env {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let cache = tempfile::tempdir().unwrap();
     let pass = (encryption != EncryptionMode::None).then_some("pw");
-    let repo = Repository::init_at_format(
+    let repo = Repo::init_at_format(
         Box::new(Arc::clone(&inner)),
         encryption,
         ChunkerParams::default(),
@@ -84,21 +82,20 @@ fn init(format: RepoFormat, encryption: EncryptionMode) -> Env {
 }
 
 impl Env {
-    fn open_logged(&self, opts: OpenOptions) -> (Repository, Vec<String>) {
+    fn open_logged(&self, opts: OpenOptions) -> (Repo, Vec<String>) {
         let ops = Arc::new(Mutex::new(Vec::new()));
         let storage = Box::new(OpLog {
             inner: Arc::clone(&self.inner),
             ops: Arc::clone(&ops),
         });
-        let pass = self.repo.crypto.is_encrypting().then_some("pw");
-        let repo =
-            Repository::open(storage, pass, Some(self.cache.path().to_path_buf()), opts).unwrap();
+        let pass = self.repo.crypto().is_encrypting().then_some("pw");
+        let repo = Repo::open(storage, pass, Some(self.cache.path().to_path_buf()), opts).unwrap();
         let ops = ops.lock().unwrap().clone();
         (repo, ops)
     }
 
     fn writer(&self) -> Writer {
-        Writer::new(Arc::clone(&self.inner), Arc::clone(&self.repo.crypto))
+        Writer::new(Arc::clone(&self.inner), Arc::clone(self.repo.crypto()))
     }
 }
 
@@ -163,10 +160,10 @@ fn snapshot_reader_loads_the_head_captured_at_open() {
     writer.commit(&index_with(0..30));
 
     let ops = Arc::new(Mutex::new(Vec::new()));
-    repo.storage = Arc::new(OpLog {
+    repo.set_storage_for_test(Arc::new(OpLog {
         inner: Arc::clone(&env.inner),
         ops: Arc::clone(&ops),
-    });
+    }));
     crate::commands::list::ItemStreamReader::new(&repo)
         .ensure_index(&mut repo)
         .unwrap();
@@ -196,7 +193,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         assert_eq!(entries(repo.chunk_index()), entries(&s2));
         assert_eq!(index_d_gets(&ops), 2);
         let dir =
-            crate::cache_paths::repo_cache_dir(&repo.config.id, Some(env.cache.path())).unwrap();
+            crate::cache_paths::repo_cache_dir(&repo.config().id, Some(env.cache.path())).unwrap();
         let path = crate::index::table::base_table_path(&dir, &w.head.base.as_ref().unwrap().name);
         assert!(
             path.exists(),
@@ -244,16 +241,16 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
         inner: Arc::clone(&env.inner),
         ops: Arc::clone(&ops),
     };
-    let index = Repository::fetch_full_index(&logged, env.repo.crypto.as_ref()).unwrap();
+    let index = Repo::fetch_full_index(&logged, env.repo.crypto().as_ref()).unwrap();
     assert_eq!(entries(&index), entries(&s2));
     assert_eq!(index_d_gets(&ops.lock().unwrap()), 2);
 
     let (mut repo, _) = env.open_logged(OpenOptions::new());
     let ops = Arc::new(Mutex::new(Vec::new()));
-    repo.storage = Arc::new(OpLog {
+    repo.set_storage_for_test(Arc::new(OpLog {
         inner: Arc::clone(&env.inner),
         ops: Arc::clone(&ops),
-    });
+    }));
     repo.load_chunk_index_uncached().unwrap();
     assert_eq!(entries(repo.chunk_index()), entries(&s2));
     assert_eq!(index_d_gets(&ops.lock().unwrap()), 2);
@@ -267,7 +264,7 @@ fn an_object_at_index_is_ignored() {
     let legacy = crate::tests::helpers::legacy_index_blob(
         &crate::index::LegacyChunkIndex::new(),
         7,
-        env.repo.crypto.as_ref(),
+        env.repo.crypto().as_ref(),
     );
     env.inner.put("index", &legacy).unwrap();
     let (repo, ops) = env.open_logged(OpenOptions::new().with_index());
@@ -286,7 +283,7 @@ fn prove_key_accepts_an_index_head() {
     let key = MasterKey::from_encrypted(&enc, "pw").unwrap();
     let proof = identity::prove_key(
         env.inner.as_ref(),
-        &env.repo.config,
+        env.repo.config(),
         RepoFormat::CURRENT,
         None,
         None,
@@ -298,7 +295,7 @@ fn prove_key_accepts_an_index_head() {
     let other = MasterKey::generate().unwrap();
     let proof = identity::prove_key(
         env.inner.as_ref(),
-        &env.repo.config,
+        env.repo.config(),
         RepoFormat::CURRENT,
         None,
         None,
@@ -348,15 +345,19 @@ fn encrypted_writes_round_trip() {
     ] {
         let mut env = init(format, EncryptionMode::Aes256Gcm);
         for round in 0..3u8 {
-            env.repo
-                .begin_write_session(&WriteSessionOptions::default())
-                .unwrap();
+            let mut ws = env
+                .repo
+                .begin_write_session(&WriteSessionOptions::default());
             for i in 0..5u8 {
-                env.repo
-                    .store_chunk(&[round, i, 7, 7, 7], Compression::None, PackType::Data)
-                    .unwrap();
+                ws.store_chunk(
+                    &env.repo,
+                    &[round, i, 7, 7, 7],
+                    Compression::None,
+                    PackType::Data,
+                )
+                .unwrap();
             }
-            env.repo.save_state().unwrap();
+            env.repo.unchecked_writer().save_session(ws).unwrap();
         }
         let head = env.repo.index_head().unwrap().clone();
         assert_eq!(env.repo.chunk_index().len(), 15);
@@ -366,7 +367,7 @@ fn encrypted_writes_round_trip() {
         assert_eq!(entries(repo.chunk_index()), entries(env.repo.chunk_index()));
 
         let cold = tempfile::tempdir().unwrap();
-        let repo = Repository::open(
+        let repo = Repo::open(
             Box::new(Arc::clone(&env.inner)),
             Some("pw"),
             Some(cold.path().to_path_buf()),

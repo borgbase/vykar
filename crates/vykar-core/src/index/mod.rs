@@ -178,7 +178,7 @@ impl PendingIndexJournal {
         self.packs.len()
     }
 
-    /// Remove a pack from the journal (used by dump rollback).
+    /// Remove a pack from the journal.
     pub fn remove_pack(&mut self, pack_id: &PackId) {
         self.packs.remove(pack_id);
         self.revision += 1;
@@ -265,24 +265,6 @@ pub struct RecoveredChunkEntry {
     pub pack_offset: u64,
 }
 
-/// Marker for a `IndexDelta` rollback checkpoint. Records only the length of
-/// `new_entries` at checkpoint time; reuse is rolled back through the
-/// journals of `reused` (armed by `checkpoint()`), so no set snapshot is
-/// stored.
-///
-/// Armed per streamed command dump and per segmented large file.
-#[derive(Debug)]
-pub struct IndexDeltaCheckpoint {
-    new_entries_len: usize,
-}
-
-impl IndexDeltaCheckpoint {
-    /// Create an empty checkpoint.
-    pub fn empty() -> Self {
-        Self { new_entries_len: 0 }
-    }
-}
-
 /// Records the index mutations of a write session: the entries it added and
 /// the chunks it reused.
 ///
@@ -325,33 +307,6 @@ impl IndexDelta {
     /// Returns true if this delta records neither an addition nor a reuse.
     pub fn is_empty(&self) -> bool {
         self.new_entries.is_empty() && self.reused.is_empty()
-    }
-
-    /// Arm a rollback checkpoint: `rollback()` then restores the additions
-    /// and the reused set exactly as they are now.
-    pub fn checkpoint(&mut self) -> IndexDeltaCheckpoint {
-        assert!(
-            !self.reused.is_armed(),
-            "checkpoint() called while another checkpoint is armed"
-        );
-        self.reused.checkpoint();
-        IndexDeltaCheckpoint {
-            new_entries_len: self.new_entries.len(),
-        }
-    }
-
-    /// Restore the delta to a previous checkpoint, discarding all mutations
-    /// that occurred after it was taken.
-    pub fn rollback(&mut self, cp: IndexDeltaCheckpoint) {
-        self.new_entries.truncate(cp.new_entries_len);
-        self.reused.rollback();
-    }
-
-    /// Discard the armed checkpoint without rolling back (commit path). The
-    /// in-scope mutations are kept, and the next `checkpoint()` can arm
-    /// cleanly.
-    pub fn discard_checkpoint(&mut self) {
-        self.reused.discard_checkpoint();
     }
 
     /// Record a new chunk entry.
@@ -555,111 +510,40 @@ mod tests {
         assert_eq!(wire.len(), 1);
     }
 
-    // --- IndexDelta checkpoint/rollback tests ---
+    // --- IndexDelta reuse stage tests ---
 
     #[test]
-    fn index_delta_checkpoint_rollback() {
-        let mut delta = IndexDelta::new();
-        let chunk_a = make_chunk_id(1);
-        let chunk_b = make_chunk_id(2);
-        let chunk_c = make_chunk_id(3);
-        let pack = make_pack_id(10);
-
-        // Add initial state
-        delta.add_new_entry(chunk_a, 100, pack, 0);
-        delta.reused.insert_key(&chunk_b);
-
-        // Checkpoint
-        let cp = delta.checkpoint();
-        assert_eq!(delta.new_entries.len(), 1);
-
-        // Add more mutations after checkpoint
-        delta.add_new_entry(chunk_c, 200, pack, 100);
-        delta.reused.insert_key(&chunk_a);
-        assert_eq!(delta.new_entries.len(), 2);
-        assert!(delta.reused.contains(&chunk_a));
-
-        // Rollback
-        delta.rollback(cp);
-        assert_eq!(delta.new_entries.len(), 1);
-        assert_eq!(delta.new_entries[0].chunk_id, chunk_a);
-        assert!(delta.reused.contains(&chunk_b));
-        assert!(!delta.reused.contains(&chunk_a));
-    }
-
-    #[test]
-    fn index_delta_checkpoint_empty() {
-        let cp = IndexDeltaCheckpoint::empty();
-        let mut delta = IndexDelta::new();
-        delta.add_new_entry(make_chunk_id(1), 100, make_pack_id(1), 0);
-        delta.rollback(cp);
-        assert!(delta.new_entries.is_empty());
-        assert!(delta.reused.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "checkpoint() called while another checkpoint is armed")]
-    fn index_delta_overlapping_checkpoints_panic() {
-        let mut delta = IndexDelta::new();
-        let _cp1 = delta.checkpoint();
-        let _cp2 = delta.checkpoint();
-    }
-
-    #[test]
-    fn index_delta_rollback_keeps_reuse_recorded_before_the_checkpoint() {
-        // A key reused before the checkpoint, then again in scope, is still
-        // recorded after the rollback.
+    fn index_delta_stage_keeps_reuse_recorded_before_the_stage() {
+        // A key reused before the stage, then again in it, is still
+        // recorded after the stage is dropped.
         let mut delta = IndexDelta::new();
         let chunk = make_chunk_id(1);
         delta.reused.insert_key(&chunk);
 
-        let cp = delta.checkpoint();
+        delta.reused.checkpoint();
         delta.reused.insert_key(&chunk);
-        delta.rollback(cp);
+        delta.reused.rollback();
         assert!(delta.reused.contains(&chunk));
         assert!(!delta.reused.is_armed());
     }
 
     #[test]
-    fn index_delta_rollback_removes_key_first_reused_in_scope() {
+    fn index_delta_stage_removes_key_first_reused_in_it() {
         let mut delta = IndexDelta::new();
         let chunk = make_chunk_id(1);
 
-        let cp = delta.checkpoint();
+        delta.reused.checkpoint();
         delta.reused.insert_key(&chunk);
         delta.reused.insert_key(&chunk);
         assert!(delta.reused.contains(&chunk));
 
-        delta.rollback(cp);
+        delta.reused.rollback();
         assert!(!delta.reused.contains(&chunk));
         assert!(delta.is_empty());
     }
 
-    #[test]
-    fn index_delta_commit_then_recheckpoint() {
-        // Commit path: discard_checkpoint keeps in-scope reuse and lets a
-        // second checkpoint arm without panicking.
-        let mut delta = IndexDelta::new();
-        let chunk_a = make_chunk_id(1);
-        let chunk_b = make_chunk_id(2);
-
-        let _cp1 = delta.checkpoint();
-        delta.reused.insert_key(&chunk_a);
-        // Commit the first scope.
-        delta.discard_checkpoint();
-        assert!(!delta.reused.is_armed());
-        assert!(delta.reused.contains(&chunk_a));
-
-        // Second checkpoint arms cleanly; its reuse survives commit too.
-        let _cp2 = delta.checkpoint();
-        delta.reused.insert_key(&chunk_b);
-        delta.discard_checkpoint();
-        assert!(delta.reused.contains(&chunk_a));
-        assert!(delta.reused.contains(&chunk_b));
-    }
-
     /// DELTA-1: additions only, reuse only and both are non-empty; a delta
-    /// whose only reuse was rolled back is empty.
+    /// whose only reuse was dropped with its stage is empty.
     #[test]
     fn index_delta_is_empty_matrix() {
         let id = make_chunk_id(1);
@@ -677,9 +561,9 @@ mod tests {
         assert!(!both.is_empty());
 
         let mut rolled = IndexDelta::new();
-        let cp = rolled.checkpoint();
+        rolled.reused.checkpoint();
         rolled.reused.insert_key(&id);
-        rolled.rollback(cp);
+        rolled.reused.rollback();
         assert!(rolled.is_empty());
     }
 

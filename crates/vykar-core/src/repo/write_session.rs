@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use crate::index::hasher::ChunkIdHashMap;
 use crate::index::table::{IndexState, IndexView};
-use crate::index::{
-    IndexDelta, IndexDeltaCheckpoint, LiveIndex, PendingChunkEntry, RecoveredChunkEntry,
-};
+use crate::index::{IndexDelta, LiveIndex, PendingChunkEntry, RecoveredChunkEntry};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
@@ -22,25 +20,6 @@ use super::session_journal::SessionJournal;
 use super::upload_queue::{HeldBytes, PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
-
-/// Tracks index mutations between `begin_rollback_checkpoint` and commit so
-/// they can be undone if the guarded scope (command dump, or per-file backup
-/// chunk loop) fails mid-stream.
-///
-/// The primitive is single-slot: only one tracker can be armed at a time.
-/// The backup serial consumer and the dump command never overlap.
-pub(crate) struct RollbackTracker {
-    /// Truncation point for IndexDelta.
-    pub delta_checkpoint: IndexDeltaCheckpoint,
-    /// ChunkIds inserted into `session_new` during this scope.
-    pub dedup_inserts: Vec<ChunkId>,
-    /// Entries promoted out of recovered_chunks — saved to re-insert on rollback.
-    pub promoted_recovered: Vec<(ChunkId, RecoveredChunkEntry)>,
-    /// PackIds added to PendingIndexJournal during this scope.
-    pub journal_pack_ids: Vec<PackId>,
-    /// Data pack writer target size at checkpoint time (for reset on rollback).
-    pub data_pack_target_size: usize,
-}
 
 /// Diagnostic counters of one write session, for the backup's debug summary.
 /// Updated on the thread that seals packs; `upload_put_nanos` by upload threads.
@@ -58,8 +37,6 @@ pub(crate) struct WriteMetricsSnapshot {
     pub(crate) tree_packs: u64,
     pub(crate) data_pack_bytes: u64,
     pub(crate) tree_pack_bytes: u64,
-    /// Data packs sealed early by `begin_rollback_checkpoint`.
-    pub(crate) forced_data_seals: u64,
     /// Time inside `PackWriter::seal` (pack ID hash for heap packs).
     pub(crate) seal: Duration,
     /// Time the sealing thread spent in `cap_pending_uploads` (upload backpressure).
@@ -87,7 +64,7 @@ pub(crate) fn duration_nanos(d: Duration) -> u64 {
 /// Write-path state that is active during a backup session.
 ///
 /// Composes the pack writers, the upload queue, the session's crash-recovery
-/// journal, the dedup / index-delta / rollback state and the chunks recovered
+/// journal, the dedup / index-delta state and the chunks recovered
 /// from interrupted sessions — all transient state that only exists while
 /// chunks are being written. It wires each confirmed upload into the journal.
 pub struct WriteSession {
@@ -134,10 +111,6 @@ pub struct WriteSession {
     /// Session ID for per-session pending_index files.
     /// Defaults to `"default"` for non-backup callers/tests.
     pub(crate) session_id: String,
-    /// Active rollback tracker — set during streaming command dumps and
-    /// during per-file backup chunk loops that need to survive mid-read
-    /// drift detection. Single-slot by design.
-    pub(crate) rollback_tracker: Option<RollbackTracker>,
     /// Diagnostic counters for the backup's debug summary.
     pub(crate) metrics: WriteMetrics,
     /// Accepts a pack upload an append-only server refused because the pack
@@ -189,7 +162,6 @@ impl WriteSession {
             persisted_pack_count: 0,
             session_packs_flushed: 0,
             session_id: DEFAULT_SESSION_ID.to_string(),
-            rollback_tracker: None,
             metrics: WriteMetrics::default(),
             existing_packs: None,
             finished: false,
@@ -219,12 +191,11 @@ impl WriteSession {
         self.uploads.spawn(pack_id, journal_chunks, bytes, upload);
     }
 
-    /// Join one upload and journal its pack if it succeeded and was not
-    /// rolled back. A failed upload is never journaled.
+    /// Join one upload and journal its pack if it succeeded. A failed
+    /// upload is never journaled.
     pub(crate) fn finish_upload(&mut self, upload: PendingUpload) -> Result<()> {
-        if let Some((pack_id, chunks)) = UploadQueue::finish(upload)? {
-            self.journal.entries.record_pack(pack_id, chunks);
-        }
+        let (pack_id, chunks) = UploadQueue::finish(upload)?;
+        self.journal.entries.record_pack(pack_id, chunks);
         Ok(())
     }
 
@@ -351,12 +322,10 @@ impl WriteSession {
 
     // --- Sealed entry dispatch ---
 
-    /// Record the entries of a freshly sealed pack: in `session_new`, the
-    /// session's delta and the rollback tracker, and its trailer length
-    /// (`encrypting`: whether the repository's engine encrypts, which fixes
-    /// the trailer's size). `entries` holds every blob of the pack, the ones
-    /// a later rollback drops from the delta included: what the trailer
-    /// lists.
+    /// Record the entries of a freshly sealed pack: in `session_new` and
+    /// the session's delta, and its trailer length (`encrypting`: whether
+    /// the repository's engine encrypts, which fixes the trailer's size).
+    /// `entries` holds every blob of the pack: what the trailer lists.
     pub(crate) fn apply_sealed_entries(
         &mut self,
         pack_id: PackId,
@@ -371,9 +340,6 @@ impl WriteSession {
             self.session_new.insert(chunk_id, stored_size);
             if let Some(ref mut delta) = self.index_delta {
                 delta.add_new_entry(chunk_id, stored_size, pack_id, offset);
-            }
-            if let Some(ref mut tracker) = self.rollback_tracker {
-                tracker.dedup_inserts.push(chunk_id);
             }
         }
     }
@@ -418,12 +384,6 @@ impl WriteSession {
     /// the chunk was in `recovered_chunks`, None otherwise.
     pub(crate) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let entry = self.recovered_chunks.remove(chunk_id)?;
-
-        // Record for rollback now that we own the entry.
-        if let Some(ref mut tracker) = self.rollback_tracker {
-            tracker.promoted_recovered.push((*chunk_id, entry.clone()));
-            tracker.dedup_inserts.push(*chunk_id);
-        }
 
         self.session_new.insert(*chunk_id, entry.stored_size);
         if let Some(ref mut delta) = self.index_delta {

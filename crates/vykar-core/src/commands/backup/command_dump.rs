@@ -19,7 +19,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::commit::{FileKind, FileOutcome, finish_file, start_file};
-use super::{BackupProgressEvent, ListingWriter, emit_stats_progress, with_rollback_checkpoint};
+use super::{BackupProgressEvent, ListingWriter, emit_stats_progress};
 
 /// Default timeout for command_dump execution (1 hour).
 pub(super) const COMMAND_DUMP_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -90,7 +90,9 @@ impl Drop for DumpProcessGuard {
     }
 }
 
-/// Stream a single command dump through the chunker with checkpoint/rollback.
+/// Stream a single command dump through the chunker. A failed dump fails the
+/// backup; its chunks stay in the session's packs and journal, where the next
+/// run can recover them or compact reclaims them.
 fn stream_dump_command(
     repo: &Repo,
     ws: &mut WriteSession,
@@ -100,142 +102,135 @@ fn stream_dump_command(
     timeout: Duration,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
 ) -> Result<(Vec<ChunkRef>, u64)> {
-    with_rollback_checkpoint(repo, ws, stats, |repo, ws, stats| {
-        // Spawn child with piped stdout and stderr.
-        let mut cmd = shell::command_for_script(&dump.command);
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                VykarError::Other(format!(
-                    "failed to spawn command_dump '{}': {}",
-                    dump.name, e
-                ))
-            })?;
-
-        let child_id = child.id();
-        let stdout = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        // Watchdog thread: recv_timeout-based, no polling.
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            match cancel_rx.recv_timeout(timeout) {
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    shell::terminate_process_group(child_id);
-                    true // timed out
-                }
-                _ => false, // cancelled (Disconnected) or spurious Ok
-            }
-        });
-
-        // Stderr reader with hard cap.
-        let stderr_thread = std::thread::spawn(move || -> io::Result<Vec<u8>> {
-            let mut buf = Vec::new();
-            if let Some(mut r) = stderr_handle {
-                io::Read::read_to_end(&mut io::Read::take(&mut r, MAX_STDERR as u64), &mut buf)?;
-                io::copy(&mut r, &mut io::sink())?;
-            }
-            Ok(buf)
-        });
-
-        let mut guard = DumpProcessGuard {
-            cancel_tx: Some(cancel_tx),
-            watchdog: Some(watchdog),
-            child: Some(child),
-            stderr_thread: Some(stderr_thread),
-        };
-
-        // Stream stdout through chunker.
-        let chunk_hasher = repo.crypto().chunk_hasher().clone();
-        let stdout = stdout.ok_or_else(|| {
-            VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
+    // Spawn child with piped stdout and stderr.
+    let mut cmd = shell::command_for_script(&dump.command);
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            VykarError::Other(format!(
+                "failed to spawn command_dump '{}': {}",
+                dump.name, e
+            ))
         })?;
-        let chunk_stream = chunker::chunk_stream(stdout, &repo.config().chunker_params);
 
-        let mut chunk_refs = Vec::new();
-        let mut total_size: u64 = 0;
-        const PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
-        let mut bytes_since_progress: u64 = 0;
+    let child_id = child.id();
+    let stdout = child.stdout.take();
+    let stderr_handle = child.stderr.take();
 
-        for chunk_result in chunk_stream {
-            let chunk = chunk_result.map_err(|e| match e {
-                fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                other => VykarError::Other(format!(
-                    "chunking failed for command_dump '{}': {other}",
-                    dump.name
-                )),
-            })?;
-
-            // FastCDC bounds chunk size at chunker_params.max_size (≤ 16 MiB),
-            // well below u32::MAX — the cast cannot overflow.
-            debug_assert!(chunk.data.len() <= u32::MAX as usize);
-            let size = chunk.data.len() as u32;
-            total_size += size as u64;
-            let chunk_id = ChunkId::compute(&chunk_hasher, &chunk.data);
-
-            if let Some(csize) = ws.bump_ref_if_exists(repo, &chunk_id) {
-                stats.original_size += size as u64;
-                stats.compressed_size += csize as u64;
-                chunk_refs.push(ChunkRef {
-                    id: chunk_id,
-                    size,
-                    csize,
-                });
-            } else {
-                let csize = ws.commit_chunk_inline(
-                    repo,
-                    chunk_id,
-                    &chunk.data,
-                    compression,
-                    PackType::Data,
-                )?;
-                stats.original_size += size as u64;
-                stats.compressed_size += csize as u64;
-                stats.deduplicated_size += csize as u64;
-                chunk_refs.push(ChunkRef {
-                    id: chunk_id,
-                    size,
-                    csize,
-                });
+    // Watchdog thread: recv_timeout-based, no polling.
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        match cancel_rx.recv_timeout(timeout) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                shell::terminate_process_group(child_id);
+                true // timed out
             }
-
-            bytes_since_progress += size as u64;
-            if bytes_since_progress >= PROGRESS_INTERVAL_BYTES {
-                emit_stats_progress(progress, stats, None);
-                bytes_since_progress = 0;
-            }
+            _ => false, // cancelled (Disconnected) or spurious Ok
         }
+    });
 
-        let (status, stderr, timed_out) = guard.finish()?;
-
-        if timed_out {
-            return Err(VykarError::Other(format!(
-                "command_dump '{}' timed out after {} seconds",
-                dump.name,
-                timeout.as_secs()
-            )));
+    // Stderr reader with hard cap.
+    let stderr_thread = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr_handle {
+            io::Read::read_to_end(&mut io::Read::take(&mut r, MAX_STDERR as u64), &mut buf)?;
+            io::copy(&mut r, &mut io::sink())?;
         }
+        Ok(buf)
+    });
 
-        if !status.success() {
-            let code = status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let stderr_str = String::from_utf8_lossy(&stderr);
-            return Err(VykarError::Other(format!(
-                "command_dump '{}' failed (exit code {code}): {stderr_str}",
+    let mut guard = DumpProcessGuard {
+        cancel_tx: Some(cancel_tx),
+        watchdog: Some(watchdog),
+        child: Some(child),
+        stderr_thread: Some(stderr_thread),
+    };
+
+    // Stream stdout through chunker.
+    let chunk_hasher = repo.crypto().chunk_hasher().clone();
+    let stdout = stdout.ok_or_else(|| {
+        VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
+    })?;
+    let chunk_stream = chunker::chunk_stream(stdout, &repo.config().chunker_params);
+
+    let mut chunk_refs = Vec::new();
+    let mut total_size: u64 = 0;
+    const PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+    let mut bytes_since_progress: u64 = 0;
+
+    for chunk_result in chunk_stream {
+        let chunk = chunk_result.map_err(|e| match e {
+            fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
+            other => VykarError::Other(format!(
+                "chunking failed for command_dump '{}': {other}",
                 dump.name
-            )));
+            )),
+        })?;
+
+        // FastCDC bounds chunk size at chunker_params.max_size (≤ 16 MiB),
+        // well below u32::MAX — the cast cannot overflow.
+        debug_assert!(chunk.data.len() <= u32::MAX as usize);
+        let size = chunk.data.len() as u32;
+        total_size += size as u64;
+        let chunk_id = ChunkId::compute(&chunk_hasher, &chunk.data);
+
+        if let Some(csize) = ws.bump_ref_if_exists(repo, &chunk_id) {
+            stats.original_size += size as u64;
+            stats.compressed_size += csize as u64;
+            chunk_refs.push(ChunkRef {
+                id: chunk_id,
+                size,
+                csize,
+            });
+        } else {
+            let csize =
+                ws.commit_chunk_inline(repo, chunk_id, &chunk.data, compression, PackType::Data)?;
+            stats.original_size += size as u64;
+            stats.compressed_size += csize as u64;
+            stats.deduplicated_size += csize as u64;
+            chunk_refs.push(ChunkRef {
+                id: chunk_id,
+                size,
+                csize,
+            });
         }
 
-        if chunk_refs.is_empty() {
-            warn!(name = %dump.name, "command_dump produced empty output");
+        bytes_since_progress += size as u64;
+        if bytes_since_progress >= PROGRESS_INTERVAL_BYTES {
+            emit_stats_progress(progress, stats, None);
+            bytes_since_progress = 0;
         }
+    }
 
-        Ok((chunk_refs, total_size))
-    })
+    let (status, stderr, timed_out) = guard.finish()?;
+
+    if timed_out {
+        return Err(VykarError::Other(format!(
+            "command_dump '{}' timed out after {} seconds",
+            dump.name,
+            timeout.as_secs()
+        )));
+    }
+
+    if !status.success() {
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        return Err(VykarError::Other(format!(
+            "command_dump '{}' failed (exit code {code}): {stderr_str}",
+            dump.name
+        )));
+    }
+
+    if chunk_refs.is_empty() {
+        warn!(name = %dump.name, "command_dump produced empty output");
+    }
+
+    Ok((chunk_refs, total_size))
 }
 
 /// Listing segment root of the command dumps (06 step 4): the path of the

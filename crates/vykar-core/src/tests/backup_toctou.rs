@@ -10,8 +10,9 @@
 //!   file after a deterministic byte threshold of the worker's read has
 //!   elapsed, forcing the intra-read post-fstat check to fire.
 //!
-//! Synthetic pipeline / rollback tests (Mechanism B) live next to the code
-//! they exercise in `commands/backup/pipeline/worker.rs`.
+//! Synthetic pipeline / skip tests (Mechanism B) live next to the code they
+//! exercise in `commands/backup/pipeline/segmentation.rs`; end-to-end skips
+//! of a segmented file are in `tests/backup_file_txn.rs`.
 
 // libc::geteuid for root detection; SAFETY documented per block.
 #![allow(unsafe_code)]

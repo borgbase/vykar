@@ -8,7 +8,7 @@
 //! (`commit::finish_file`), which updates stats / file-cache, appends the
 //! entry to the listing and surfaces progress events.
 //! Releases budget bytes once chunks are committed so the walker can
-//! proceed. Skip / rollback handling lives in the orchestrator, not here.
+//! proceed. Skip handling lives in the orchestrator, not here.
 
 use crate::index::table::DedupPrefilter;
 use crate::repo::file_cache::FileCache;
@@ -88,7 +88,7 @@ pub(super) fn consume_processed_entry(
             num_segments,
         } => {
             // Segment 0 announces the file before validation consumes `item`.
-            let dedup_baseline = match (segment_index, item.as_ref()) {
+            let dedup_before = match (segment_index, item.as_ref()) {
                 (0, Some(it)) => start_file(progress, stats, &it.path),
                 _ => 0,
             };
@@ -100,8 +100,7 @@ pub(super) fn consume_processed_entry(
                 pre_meta,
                 segment_index,
                 num_segments,
-                dedup_baseline,
-                repo,
+                dedup_before,
                 ws,
                 stats,
             )?;
@@ -119,14 +118,20 @@ pub(super) fn consume_processed_entry(
 
             if segment_index == num_segments - 1 {
                 // Last segment: finalize.
-                let accum = large_file_accum.take().ok_or_else(|| {
+                let LargeFileAccum {
+                    item,
+                    abs_path,
+                    metadata,
+                    txn,
+                    ..
+                } = large_file_accum.take().ok_or_else(|| {
                     VykarError::Other(
                         "BUG: large_file_accum missing at segment finalization".into(),
                     )
                 })?;
 
-                // Commit the checkpoint — all segments landed successfully.
-                ws.commit_rollback_checkpoint();
+                // All segments landed: keep the file's staged reuse.
+                let dedup_before = txn.commit(ws);
 
                 // Segment 0's pre_meta is canonical: it matches the chunks
                 // committed across all segments.
@@ -138,11 +143,11 @@ pub(super) fn consume_processed_entry(
                     progress,
                     verbose,
                     FileOutcome {
-                        item: accum.item,
-                        dedup_before: accum.dedup_baseline,
+                        item,
+                        dedup_before,
                         kind: FileKind::Read {
-                            abs_path: &accum.abs_path,
-                            pre_meta: accum.metadata,
+                            abs_path: &abs_path,
+                            pre_meta: metadata,
                             caches: FileCaches {
                                 old: old_file_cache,
                                 new: new_file_cache,

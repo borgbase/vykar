@@ -5,8 +5,8 @@ use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, RetainedHit};
 use crate::repo::pack::PackType;
 use crate::repo::{Repo, WriteSession};
-use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::{ChunkRef, Item};
+use crate::snapshot::{ByteCounterSnapshot, SnapshotStats};
 use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::{ExistingAt, WorkerChunk};
@@ -204,11 +204,48 @@ pub(super) fn start_file(
     stats.deduplicated_size
 }
 
+/// What a file committed in pieces (a segmented large file) can still take
+/// back until its last piece lands: the reuse it recorded (staged on the
+/// session) and its share of the stats byte counters. Its new chunks are not
+/// taken back: they are in the session's packs and dedup map, and a skipped
+/// file's chunks stay in the index unreferenced until a compact sweeps them.
+/// The item is appended only after [`FileTxn::commit`], by [`finish_file`].
+pub(super) struct FileTxn {
+    dedup_before: u64,
+    stats_snap: ByteCounterSnapshot,
+}
+
+impl FileTxn {
+    /// Open the file's transaction; `dedup_before` is [`start_file`]'s
+    /// result. Panics if another file's transaction is open.
+    pub(super) fn begin(ws: &mut WriteSession, stats: &SnapshotStats, dedup_before: u64) -> Self {
+        ws.stage_file_reuse();
+        Self {
+            dedup_before,
+            stats_snap: stats.snapshot_byte_counters(),
+        }
+    }
+
+    /// Every piece landed: keep the staged reuse. Returns the
+    /// `dedup_before` for the file's [`FileOutcome`].
+    pub(super) fn commit(self, ws: &mut WriteSession) -> u64 {
+        ws.keep_file_reuse();
+        self.dedup_before
+    }
+
+    /// The file is skipped: drop its staged reuse and restore the byte
+    /// counters to their values at [`FileTxn::begin`].
+    pub(super) fn abort(self, ws: &mut WriteSession, stats: &mut SnapshotStats) {
+        ws.drop_file_reuse();
+        stats.restore_byte_counters(self.stats_snap);
+    }
+}
+
 /// The per-file epilogue, run once a file's content is fully committed:
 /// counts the file, stamps its metadata, reports it, appends it to the
 /// listing (or the dump list), updates the file cache, and emits the final
-/// stats event. Knows nothing about rollback: call it only after the
-/// file's commit is final.
+/// stats event. Knows nothing about skips: call it only once the file's
+/// content is complete (after [`FileTxn::commit`] for a segmented file).
 pub(super) fn finish_file(
     repo: &Repo,
     ws: &mut WriteSession,
@@ -863,5 +900,91 @@ mod tests {
         assert_eq!(stats.nfiles, 0);
         assert_eq!(stats.original_size, 0);
         assert_eq!(stats.compressed_size, 0);
+    }
+
+    mod file_txn {
+        use super::*;
+        use crate::compress::Compression;
+        use crate::index::ChunkIndex;
+        use vykar_types::pack_id::PackId;
+
+        /// A session over a table holding one chunk; returns that chunk's ID.
+        fn session_over_one_chunk() -> (Repo, WriteSession, ChunkId) {
+            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let data = b"in the table before this session";
+            let table_chunk = ChunkId::compute(repo.crypto().chunk_hasher(), data);
+            let mut index = ChunkIndex::new();
+            index.add(table_chunk, 77, PackId::from_bytes([0x01; 32]), 0);
+            repo.set_session_table_for_test(&mut ws, &index);
+            (repo, ws, table_chunk)
+        }
+
+        fn store_new(repo: &Repo, ws: &mut WriteSession, data: &[u8]) -> ChunkId {
+            let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
+            ws.commit_chunk_inline(repo, id, data, Compression::None, PackType::Data)
+                .unwrap();
+            id
+        }
+
+        /// A skipped file's reuse is dropped and its byte counters restored;
+        /// its new chunk stays in the session (later files dedup against
+        /// it) and in the delta's additions.
+        #[test]
+        fn file_txn_abort_drops_reuse_and_keeps_chunks() {
+            let (repo, mut ws, table_chunk) = session_over_one_chunk();
+            let mut stats = SnapshotStats {
+                original_size: 10,
+                compressed_size: 20,
+                deduplicated_size: 30,
+                ..Default::default()
+            };
+
+            let txn = FileTxn::begin(&mut ws, &stats, stats.deduplicated_size);
+            assert!(ws.bump_ref_if_exists(&repo, &table_chunk).is_some());
+            assert!(ws.delta_reuses(&table_chunk));
+            let new_chunk = store_new(&repo, &mut ws, b"a skipped file's new chunk");
+            stats.original_size += 100;
+            stats.compressed_size += 100;
+            stats.deduplicated_size += 100;
+
+            txn.abort(&mut ws, &mut stats);
+            assert!(!ws.file_reuse_staged());
+            assert!(!ws.delta_reuses(&table_chunk));
+            assert_eq!(
+                (
+                    stats.original_size,
+                    stats.compressed_size,
+                    stats.deduplicated_size
+                ),
+                (10, 20, 30)
+            );
+            assert!(
+                ws.bump_ref_if_exists(&repo, &new_chunk).is_some(),
+                "the skipped file's chunk is still found"
+            );
+            ws.flush_packs(&repo).unwrap();
+            assert!(
+                ws.write_session_delta_for_test()
+                    .new_entries
+                    .iter()
+                    .any(|e| e.chunk_id == new_chunk),
+                "the skipped file's chunk is an addition"
+            );
+        }
+
+        /// A completed file keeps its staged reuse, and `commit` hands back
+        /// the `dedup_before` passed to `begin`.
+        #[test]
+        fn file_txn_commit_keeps_reuse() {
+            let (repo, mut ws, table_chunk) = session_over_one_chunk();
+            let stats = SnapshotStats::default();
+
+            let txn = FileTxn::begin(&mut ws, &stats, 42);
+            assert!(ws.bump_ref_if_exists(&repo, &table_chunk).is_some());
+            assert_eq!(txn.commit(&mut ws), 42);
+            assert!(!ws.file_reuse_staged());
+            assert!(ws.delta_reuses(&table_chunk));
+            drop(ws);
+        }
     }
 }

@@ -329,7 +329,7 @@ sources:
         command: pg_dump -U myuser mydb
 ```
 
-If a dump command exits with non-zero status, the backup is aborted. Any chunks already uploaded to packs remain on disk but are not added to the index; they are reclaimed on the next `vykar compact` run.
+If a dump command exits with non-zero status, the backup is aborted and adds nothing to the index. The packs it uploaded stay in the session journal: a following backup reuses the chunks it finds there again, and `vykar compact` reclaims the rest.
 
 See [Recipes](/recipes) for PostgreSQL, MySQL, MongoDB, and Docker examples.
 

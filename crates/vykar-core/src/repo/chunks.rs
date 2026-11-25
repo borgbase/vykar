@@ -330,11 +330,7 @@ impl WriteSession {
                 pack_offset: offset,
             })
             .collect();
-        // Record pack ID for rollback tracking (dump / per-file backup). The
-        // journal entry itself waits for the upload to be confirmed.
-        if let Some(ref mut tracker) = ws.rollback_tracker {
-            tracker.journal_pack_ids.push(pack_id);
-        }
+        // The journal entry itself waits for the upload to be confirmed.
 
         // The trailer length follows from the blob count and whether this
         // repository's engine encrypts.

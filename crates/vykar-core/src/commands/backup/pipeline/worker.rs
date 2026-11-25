@@ -45,9 +45,9 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
 /// the success variant or the skip variant — eliminating the upfront clone
 /// the previous wrapper needed.
 ///
-/// For segment N>0, the consumer performs a cross-segment rollback of the
-/// earlier segments' recorded reuse/dedup inserts before draining the rest, so
-/// it is now safe to convert soft errors at any segment index.
+/// For segment N>0 the orchestrator drops the file (its staged reuse and stats)
+/// before draining the rest, so soft errors are converted at any segment
+/// index.
 ///
 /// Budget bytes are pre-acquired by the walk thread; `pre_acquired_bytes`
 /// is wrapped in a [`BudgetGuard`] for error safety (auto-release on `?` bail).

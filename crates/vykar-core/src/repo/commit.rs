@@ -528,15 +528,15 @@ mod tests {
         delta.add_new_entry(id(3), 10, pack, 80);
         let fresh = LiveIndex::from_table(Arc::clone(&table));
         let adds = commit_additions(&delta, &fresh);
-        // CM-2: reuse a rolled-back scope recorded is gone from the record,
+        // CM-2: reuse a dropped file stage recorded is gone from the record,
         // so a chunk removed since does not fail the commit.
         let mut rolled = IndexDelta::with_table(Arc::clone(&table));
-        let cp = rolled.checkpoint();
+        rolled.reused.checkpoint();
         rolled
             .reused
             .insert_position(&id(1), table.find(&id(1)).unwrap().0);
         rolled.reused.insert_key(&id(2));
-        rolled.rollback(cp);
+        rolled.reused.rollback();
         assert!(rolled.is_empty());
         assert!(check_reused_chunks(&rolled, &now).is_ok());
         assert_eq!(adds.len(), 1);

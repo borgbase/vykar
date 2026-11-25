@@ -105,12 +105,12 @@ pub struct SnapshotStats {
     pub errors: u64,
 }
 
-/// Snapshot of byte-counter fields on `SnapshotStats`, used to roll back
-/// partial commits when a file drifts mid-read.
+/// Snapshot of byte-counter fields on `SnapshotStats`, used by `FileTxn` to
+/// drop a skipped segmented file's share of the counters.
 ///
 /// Only covers the three size counters — `nfiles` is incremented exactly
 /// once on successful commit and `errors` is bumped by the skip path, so
-/// neither needs rollback support.
+/// neither needs restoring.
 #[derive(Clone, Copy)]
 pub struct ByteCounterSnapshot {
     original_size: u64,

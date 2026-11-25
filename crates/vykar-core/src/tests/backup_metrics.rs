@@ -81,7 +81,6 @@ fn pack_counters_match_storage() {
         );
         assert_eq!(m.threads, threads);
         assert!(m.pipeline.is_some());
-        assert_eq!(w.forced_data_seals, 0, "threads {threads}");
 
         let p = m.pipeline.unwrap();
         assert_eq!(p.workers, threads);
@@ -104,11 +103,7 @@ fn pack_layout_does_not_depend_on_threads() {
         let w = backup_with_threads(dir.path(), threads, false)
             .instrumentation
             .write;
-        assert_eq!(
-            (w.data_packs, w.forced_data_seals),
-            (1, 0),
-            "threads {threads}"
-        );
+        assert_eq!(w.data_packs, 1, "threads {threads}");
         tree_packs.push(w.tree_packs);
     }
     assert!(

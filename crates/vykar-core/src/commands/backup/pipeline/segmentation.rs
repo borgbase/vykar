@@ -3,18 +3,19 @@
 //! A file larger than `segment_size` is split by the walker into
 //! `FileSegment` work entries that travel the pipeline as ordered messages.
 //! This module tracks the in-flight accumulator across segments, validates
-//! ordering / file-identity / segment-count invariants, and rolls back any
-//! partial commits when a segment is skipped or fails mid-stream.
+//! ordering / file-identity / segment-count invariants, and on a skip drops
+//! the file's staged reuse and stats (its chunks stay, unreferenced).
 
 use std::sync::Arc;
 
 use crate::platform::fs;
-use crate::repo::{Repo, WriteSession};
+use crate::repo::WriteSession;
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use vykar_types::error::{Result, VykarError};
 
 use super::super::BackupProgressEvent;
+use super::super::commit::FileTxn;
 
 /// Tracks in-progress accumulation of a segmented large file.
 pub(super) struct LargeFileAccum {
@@ -27,25 +28,26 @@ pub(super) struct LargeFileAccum {
     pub(super) metadata: fs::MetadataSummary,
     pub(super) next_expected_index: usize,
     pub(super) num_segments: usize,
-    /// Baseline `deduplicated_size` when segment 0 started (for verbose added_bytes).
-    pub(super) dedup_baseline: u64,
-    /// Stats byte-counter snapshot taken at segment 0 (restored on rollback).
-    pub(super) stats_snap: crate::snapshot::ByteCounterSnapshot,
+    /// Open from segment 0 until the file is finalized or skipped.
+    pub(super) txn: FileTxn,
 }
 
-/// Take the current segmented accumulator, roll back any commits from
-/// earlier segments, restore stats, and emit a skip warning. Returns the
-/// number of remaining segments the consumer loop should drain
+/// Take the current segmented accumulator, drop the file's staged reuse,
+/// restore stats, and emit a skip warning. Returns the number of remaining
+/// segments the consumer loop should drain
 /// (`num_segments - current_segment_index - 1`).
+///
+/// Nothing is removed from the index delta: the chunks earlier segments
+/// stored stay as entries no snapshot references, which a compact sweeps.
 ///
 /// Called by:
 /// - the main loop when the worker reports `SegmentSkipped` at
 ///   `segment_index > 0` with an active accumulator,
 /// - the main loop when a `WorkerErr` arrives soft during accumulation.
 ///
-/// The rollback checkpoint is armed for the entire lifetime of the
+/// The file's transaction is open for the entire lifetime of the
 /// accumulator, so aborting it here is unconditional.
-pub(super) fn rollback_and_skip_large_file(
+pub(super) fn skip_large_file(
     ws: &mut WriteSession,
     stats: &mut SnapshotStats,
     large_file_accum: &mut Option<LargeFileAccum>,
@@ -56,8 +58,7 @@ pub(super) fn rollback_and_skip_large_file(
     let Some(accum) = large_file_accum.take() else {
         return 0;
     };
-    ws.abort_rollback_checkpoint();
-    stats.restore_byte_counters(accum.stats_snap);
+    accum.txn.abort(ws, stats);
     stats.errors += 1;
     super::super::emit_post_commit_warning(
         progress,
@@ -68,12 +69,13 @@ pub(super) fn rollback_and_skip_large_file(
 
 /// Validate and update the segment accumulator state machine.
 ///
-/// For segment 0: arms the rollback checkpoint, snapshots stats byte
-/// counters, and installs the accumulator (errors if one already exists).
-/// Ordering matters: the overlap check runs first, then the checkpoint is
-/// armed, then the accumulator is installed. That way a nested-segmentation
-/// error cannot leave a stray checkpoint, and accumulator-present always
-/// implies checkpoint-armed.
+/// For segment 0: opens the file's [`FileTxn`] (staging its reuse and
+/// snapshotting the stats byte counters) and installs the accumulator
+/// (errors if one already exists). Ordering matters: the overlap and
+/// presence checks run first, then the transaction is opened, then the
+/// accumulator is installed. That way a nested-segmentation error cannot
+/// leave a stray stage, and accumulator-present always implies
+/// stage-open.
 ///
 /// For continuations: validates ordering, file identity, and segment count.
 /// Cross-segment metadata drift is not checked here — each segment's
@@ -87,8 +89,7 @@ pub(super) fn validate_segment_accum(
     pre_meta: Option<fs::MetadataSummary>,
     segment_index: usize,
     num_segments: usize,
-    dedup_baseline: u64,
-    repo: &Repo,
+    dedup_before: u64,
     ws: &mut WriteSession,
     stats: &SnapshotStats,
 ) -> Result<()> {
@@ -100,19 +101,16 @@ pub(super) fn validate_segment_accum(
             item.ok_or_else(|| VykarError::Other("BUG: segment 0 must carry item".into()))?;
         let pre_meta = pre_meta
             .ok_or_else(|| VykarError::Other("BUG: segment 0 must carry pre_meta".into()))?;
-        // Arm the rollback checkpoint BEFORE installing the accumulator so
-        // the invariant `accum.is_some() ⇒ checkpoint armed` holds
-        // unconditionally.
-        ws.begin_rollback_checkpoint(repo)?;
-        let stats_snap = stats.snapshot_byte_counters();
+        // Open the transaction BEFORE installing the accumulator so the
+        // invariant `accum.is_some() ⇒ stage open` holds unconditionally.
+        let txn = FileTxn::begin(ws, stats, dedup_before);
         *large_file_accum = Some(LargeFileAccum {
             item,
             abs_path,
             metadata: pre_meta,
             next_expected_index: 1,
-            dedup_baseline,
             num_segments,
-            stats_snap,
+            txn,
         });
     } else {
         let accum = large_file_accum
@@ -145,7 +143,7 @@ mod tests {
 
     #[test]
     fn segment_out_of_order() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -159,7 +157,6 @@ mod tests {
             0,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -174,7 +171,6 @@ mod tests {
             2,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -183,12 +179,12 @@ mod tests {
             err.to_string().contains("segment index mismatch"),
             "expected 'segment index mismatch', got: {err}"
         );
-        ws.abort_rollback_checkpoint();
+        ws.drop_file_reuse();
     }
 
     #[test]
     fn segment_file_identity_mismatch() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -202,7 +198,6 @@ mod tests {
             0,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -217,7 +212,6 @@ mod tests {
             1,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -226,12 +220,12 @@ mod tests {
             err.to_string().contains("segment file identity mismatch"),
             "expected 'segment file identity mismatch', got: {err}"
         );
-        ws.abort_rollback_checkpoint();
+        ws.drop_file_reuse();
     }
 
     #[test]
     fn segment_nested_start() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -245,15 +239,14 @@ mod tests {
             0,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
         .unwrap();
 
         // Feed segment 0 for file B before file A completes → error.
-        // The overlap check must fire BEFORE begin_rollback_checkpoint, so
-        // the tracker remains armed from file A only.
+        // The overlap check must fire BEFORE FileTxn::begin, so the stage
+        // stays open from file A only (and the second begin does not panic).
         let err = validate_segment_accum(
             &mut accum,
             Some(test_item("file_b")),
@@ -262,7 +255,6 @@ mod tests {
             0,
             2,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -271,12 +263,13 @@ mod tests {
             err.to_string().contains("nested large file segmentation"),
             "expected 'nested large file segmentation', got: {err}"
         );
-        ws.abort_rollback_checkpoint();
+        assert!(ws.file_reuse_staged(), "file A's stage is still open");
+        ws.drop_file_reuse();
     }
 
     #[test]
     fn segment_without_start() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
 
@@ -289,7 +282,6 @@ mod tests {
             1,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -303,7 +295,7 @@ mod tests {
 
     #[test]
     fn incomplete_accumulator_check() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -317,7 +309,6 @@ mod tests {
             0,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -330,7 +321,6 @@ mod tests {
             1,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -350,12 +340,12 @@ mod tests {
             err_msg.contains("incomplete segmented file"),
             "expected incomplete message, got: {err_msg}"
         );
-        ws.abort_rollback_checkpoint();
+        ws.drop_file_reuse();
     }
 
     #[test]
     fn segment_count_mismatch() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -369,7 +359,6 @@ mod tests {
             0,
             3,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -384,7 +373,6 @@ mod tests {
             1,
             5,
             0,
-            &repo,
             &mut ws,
             &stats,
         )
@@ -393,12 +381,12 @@ mod tests {
             err.to_string().contains("segment count mismatch"),
             "expected 'segment count mismatch', got: {err}"
         );
-        ws.abort_rollback_checkpoint();
+        ws.drop_file_reuse();
     }
 
     #[test]
     fn segment_happy_path() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -419,7 +407,6 @@ mod tests {
                 i,
                 3,
                 0,
-                &repo,
                 &mut ws,
                 &stats,
             )
@@ -432,25 +419,26 @@ mod tests {
         assert_eq!(a.num_segments, 3);
         assert_eq!(a.item.path, "file_a");
         assert_eq!(&*a.abs_path, "/tmp/file_a");
-        ws.abort_rollback_checkpoint();
+        assert!(
+            ws.file_reuse_staged(),
+            "the stage is open until the file ends"
+        );
+        ws.drop_file_reuse();
     }
 
-    /// Drives `rollback_and_skip_large_file` directly (Mechanism B): an
-    /// accumulator midway through a 4-segment file is rolled back, byte
-    /// counters are restored, and the drain count for the remaining
-    /// segments is reported correctly.
+    /// Drives `skip_large_file` directly (Mechanism B): an accumulator
+    /// midway through a 4-segment file is dropped, byte counters are
+    /// restored, and the drain count for the remaining segments is reported
+    /// correctly.
     #[test]
-    fn rollback_and_skip_large_file_drains_and_restores_stats() {
-        let (repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    fn skip_large_file_drains_and_restores_stats() {
+        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
 
-        // Arm the checkpoint just like validate_segment_accum would for
-        // segment 0.
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        assert!(ws.rollback_tracker_armed());
-
-        // Snapshot initial byte counters (all zeros), then dirty them so
-        // we can verify they get restored.
-        let stats_snap = SnapshotStats::default().snapshot_byte_counters();
+        // Open the transaction just like validate_segment_accum would for
+        // segment 0, over byte counters of all zeros; then dirty them so we
+        // can verify they get restored.
+        let txn = FileTxn::begin(&mut ws, &SnapshotStats::default(), 0);
+        assert!(ws.file_reuse_staged());
         let mut stats = SnapshotStats {
             deduplicated_size: 12345,
             original_size: 99999,
@@ -465,25 +453,17 @@ mod tests {
             metadata: test_metadata(),
             next_expected_index: 2,
             num_segments: 4,
-            dedup_baseline: 0,
-            stats_snap,
+            txn,
         };
         let mut accum = Some(accum);
         let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
 
-        let drain = rollback_and_skip_large_file(
-            &mut ws,
-            &mut stats,
-            &mut accum,
-            &mut progress,
-            2,
-            "drift",
-        );
+        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, &mut progress, 2, "drift");
 
         // 4 segments, skipped at index 2 → segments 3 remain to drain.
         assert_eq!(drain, 1, "4 segs, skipped at idx 2 → 1 remaining");
         assert!(accum.is_none(), "accumulator cleared");
-        assert!(!ws.rollback_tracker_armed(), "checkpoint must be aborted");
+        assert!(!ws.file_reuse_staged(), "the stage must be dropped");
         assert_eq!(stats.errors, 1);
         assert_eq!(
             stats.deduplicated_size, 0,
@@ -499,10 +479,10 @@ mod tests {
         );
     }
 
-    /// Idempotency: calling `rollback_and_skip_large_file` with no
-    /// accumulator is a no-op — drain count of zero, stats untouched.
+    /// Idempotency: calling `skip_large_file` with no accumulator is a
+    /// no-op — drain count of zero, stats untouched.
     #[test]
-    fn rollback_and_skip_large_file_no_accum_is_noop() {
+    fn skip_large_file_no_accum_is_noop() {
         let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
         let mut stats = SnapshotStats {
             deduplicated_size: 7,
@@ -511,14 +491,7 @@ mod tests {
         let mut accum: Option<LargeFileAccum> = None;
         let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
 
-        let drain = rollback_and_skip_large_file(
-            &mut ws,
-            &mut stats,
-            &mut accum,
-            &mut progress,
-            0,
-            "ignored",
-        );
+        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, &mut progress, 0, "ignored");
 
         assert_eq!(drain, 0);
         assert_eq!(stats.errors, 0, "no error counted when accum was empty");

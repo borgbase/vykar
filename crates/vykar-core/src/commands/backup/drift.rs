@@ -47,8 +47,8 @@ pub(super) enum ReadPlan {
 /// entry, and the post-read comparison.
 ///
 /// Kept separate from [`read_range_drift_checked`] so callers can run it
-/// *before* arming any rollback state — a failure here means nothing was
-/// committed and nothing needs unwinding.
+/// before committing anything for the file — a failure here means nothing
+/// was committed and nothing needs unwinding.
 pub(super) fn open_checked(
     path: &Path,
     walk_meta: &fs::MetadataSummary,

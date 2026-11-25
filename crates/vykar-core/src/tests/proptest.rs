@@ -657,12 +657,12 @@ mod index_delta {
             }
         }
 
-        /// Journal rollback is equivalent to snapshotting the reused set by
-        /// clone: checkpoint → arbitrary in-scope reuse → rollback restores
-        /// exactly the set (and new_entries length) captured at checkpoint
-        /// time.
+        /// Dropping a file's reuse stage is equivalent to snapshotting the
+        /// reused set by clone: stage → arbitrary in-stage reuse → drop
+        /// restores exactly the set captured when the stage opened. New
+        /// entries are not undone.
         #[test]
-        fn checkpoint_rollback_equivalent_to_clone(
+        fn reuse_stage_equivalent_to_clone(
             (mut delta, _entries) in arb_index_delta_standalone(),
             in_scope_reuse in prop::collection::vec(arb_chunk_id(), 0..40),
             extra_entry_id in arb_chunk_id(),
@@ -672,10 +672,10 @@ mod index_delta {
             let expected_reused = set(&delta);
             let expected_new_len = delta.new_entries.len();
 
-            let cp = delta.checkpoint();
+            delta.reused.checkpoint();
 
-            // Arbitrary in-scope mutations: reuse (some overlapping
-            // pre-checkpoint keys, some brand new) plus a new entry.
+            // Arbitrary in-stage mutations: reuse (some overlapping
+            // pre-stage keys, some brand new) plus a new entry.
             let pre: Vec<ChunkId> = expected_reused.iter().copied().collect();
             for id in in_scope_reuse.iter().chain(pre.iter()) {
                 delta.reused.insert_key(id);
@@ -683,9 +683,9 @@ mod index_delta {
             let pack_id = vykar_types::pack_id::PackId::from_bytes([0u8; 32]);
             delta.add_new_entry(extra_entry_id, 100, pack_id, 0);
 
-            delta.rollback(cp);
+            delta.reused.rollback();
 
-            prop_assert_eq!(delta.new_entries.len(), expected_new_len);
+            prop_assert_eq!(delta.new_entries.len(), expected_new_len + 1);
             prop_assert_eq!(set(&delta), expected_reused);
             prop_assert!(!delta.reused.is_armed());
         }

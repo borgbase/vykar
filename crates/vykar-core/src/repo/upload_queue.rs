@@ -30,9 +30,6 @@ pub(crate) struct PendingUpload {
     seq: u64,
     pub(crate) pack_id: PackId,
     pub(crate) journal_chunks: Vec<PendingChunkEntry>,
-    /// Cleared by rollback: the pack is still uploaded (an orphan for
-    /// compact) but must not enter the journal.
-    pub(crate) journal: bool,
     /// Heap bytes held by the sealed pack when queued (0 for a staged pack,
     /// whose bytes are already in a temp file); see `held_bytes` for what is
     /// still held.
@@ -71,7 +68,7 @@ impl Drop for UploadDone {
 
 /// Background pack uploads waiting to be joined, in no particular order.
 /// A confirmed upload is handed to the caller (`on_confirmed`), which
-/// journals it; a failed or rolled-back one never is.
+/// journals it; a failed one never is.
 pub(crate) struct UploadQueue {
     pending: Vec<PendingUpload>,
     /// Upload threads send their `seq` here as they finish, so a blocked
@@ -133,7 +130,6 @@ impl UploadQueue {
             seq,
             pack_id,
             journal_chunks,
-            journal: true,
             bytes,
             released,
             handle,
@@ -154,33 +150,19 @@ impl UploadQueue {
         std::mem::take(&mut self.pending)
     }
 
-    /// Keep uploads of rolled-back packs still in flight from being
-    /// journaled when they complete.
-    pub(crate) fn exclude_from_journal(&mut self, pack_ids: &[PackId]) {
-        let rolled_back: std::collections::HashSet<_> = pack_ids.iter().collect();
-        for upload in &mut self.pending {
-            if rolled_back.contains(&upload.pack_id) {
-                upload.journal = false;
-            }
-        }
-    }
-
-    /// Join one upload. `Some((pack_id, chunks))` if it succeeded and was not
-    /// rolled back; `None` if rolled back; the upload's error otherwise.
-    pub(crate) fn finish(
-        upload: PendingUpload,
-    ) -> Result<Option<(PackId, Vec<PendingChunkEntry>)>> {
+    /// Join one upload: its pack and chunks to journal if it succeeded, the
+    /// upload's error otherwise.
+    pub(crate) fn finish(upload: PendingUpload) -> Result<(PackId, Vec<PendingChunkEntry>)> {
         let PendingUpload {
             pack_id,
             journal_chunks,
-            journal,
             handle,
             ..
         } = upload;
         handle
             .join()
             .map_err(|_| VykarError::Other("pack upload thread panicked".into()))??;
-        Ok(journal.then_some((pack_id, journal_chunks)))
+        Ok((pack_id, journal_chunks))
     }
 
     /// Block until any queued upload finishes, then join it.
@@ -192,7 +174,7 @@ impl UploadQueue {
             }
             if let Some(i) = self.pending.iter().position(|u| u.handle.is_finished()) {
                 let upload = self.pending.swap_remove(i);
-                return Self::finish(upload);
+                return Self::finish(upload).map(Some);
             }
             // Every queued upload sends exactly once; messages from uploads
             // already joined elsewhere are skipped.
@@ -202,7 +184,7 @@ impl UploadQueue {
                 .map_err(|_| VykarError::Other("upload completion channel closed".into()))?;
             if let Some(i) = self.pending.iter().position(|u| u.seq == seq) {
                 let upload = self.pending.swap_remove(i);
-                return Self::finish(upload);
+                return Self::finish(upload).map(Some);
             }
         }
     }
@@ -217,9 +199,8 @@ impl UploadQueue {
         while let Some(slot) = self.pending.get(i) {
             if slot.handle.is_finished() {
                 let upload = self.pending.swap_remove(i);
-                if let Some((pack_id, chunks)) = Self::finish(upload)? {
-                    on_confirmed(pack_id, chunks);
-                }
+                let (pack_id, chunks) = Self::finish(upload)?;
+                on_confirmed(pack_id, chunks);
             } else {
                 i += 1;
             }
@@ -236,8 +217,7 @@ impl UploadQueue {
         let mut first_err: Option<VykarError> = None;
         for upload in std::mem::take(&mut self.pending) {
             match Self::finish(upload) {
-                Ok(Some((pack_id, chunks))) => on_confirmed(pack_id, chunks),
-                Ok(None) => {}
+                Ok((pack_id, chunks)) => on_confirmed(pack_id, chunks),
                 Err(e) => {
                     first_err.get_or_insert(e);
                 }
@@ -341,20 +321,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn join_all_confirms_only_journaled_successes() {
+    fn join_all_confirms_only_successes() {
         let a = PackId::from_bytes([1; 32]);
         let b = PackId::from_bytes([2; 32]);
         let c = PackId::from_bytes([3; 32]);
         let mut queue = UploadQueue::new(2);
         queue.spawn(a, Vec::new(), 0, |_| Ok(()));
         queue.spawn(b, Vec::new(), 0, |_| Ok(()));
-        queue.exclude_from_journal(&[b]);
         queue.spawn(c, Vec::new(), 0, |_| Err(VykarError::Other("x".into())));
 
         let mut confirmed = Vec::new();
         let result = queue.join_all(|id, _| confirmed.push(id));
         assert!(result.is_err());
-        assert_eq!(confirmed, vec![a]);
+        assert_eq!(confirmed, vec![a, b]);
         assert!(queue.is_empty());
     }
 

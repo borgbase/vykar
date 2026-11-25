@@ -37,7 +37,7 @@ use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
-use crate::repo::{CommitMode, HostEnv, Repo, WriteSession, WriteSessionOptions};
+use crate::repo::{CommitMode, HostEnv, Repo, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
@@ -316,38 +316,6 @@ pub(crate) fn skip_reason(e: &VykarError) -> String {
             format!("file changed during read{suffix}")
         }
         other => other.to_string(),
-    }
-}
-
-/// Run `body` inside a rollback-guarded scope.
-///
-/// Arms a rollback checkpoint on the repo and snapshots the stats byte
-/// counters. On `Ok` the checkpoint is committed; on `Err` the checkpoint
-/// is rolled back (undoing recorded reuse, dedup inserts, recovered-chunk
-/// promotion, and partial pack writer state) and the stats byte counters
-/// are restored to their pre-scope values.
-///
-/// Closure form because a drop-guard holding `&mut Repo` + `&mut
-/// SnapshotStats` can't compose with bodies that need to pass those same
-/// mutable references to helpers (the command-dump stream loop).
-pub(crate) fn with_rollback_checkpoint<R>(
-    repo: &Repo,
-    ws: &mut WriteSession,
-    stats: &mut SnapshotStats,
-    body: impl FnOnce(&Repo, &mut WriteSession, &mut SnapshotStats) -> Result<R>,
-) -> Result<R> {
-    let stats_snap = stats.snapshot_byte_counters();
-    ws.begin_rollback_checkpoint(repo)?;
-    match body(repo, ws, stats) {
-        Ok(r) => {
-            ws.commit_rollback_checkpoint();
-            Ok(r)
-        }
-        Err(e) => {
-            ws.abort_rollback_checkpoint();
-            stats.restore_byte_counters(stats_snap);
-            Err(e)
-        }
     }
 }
 

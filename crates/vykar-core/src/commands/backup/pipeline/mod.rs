@@ -10,7 +10,7 @@
 //! wraps the consumer call. The three stage-specific submodules are:
 //! - [`worker`] — chunking / hashing / encryption per file or segment.
 //! - [`consumer`] — per-entry commit: pack write, item stream, file cache, stats.
-//! - [`segmentation`] — large-file segmentation state machine (accumulator + cross-segment rollback) used by both the consumer and the orchestrator's skip-drain handling.
+//! - [`segmentation`] — large-file segmentation state machine (accumulator + skip of a partly committed file) used by both the consumer and the orchestrator's skip-drain handling.
 //!
 //! Each stage's busy and blocked time is summed into `PipelineTimings`.
 
@@ -40,7 +40,7 @@ mod segmentation;
 mod test_support;
 mod worker;
 
-use segmentation::{LargeFileAccum, rollback_and_skip_large_file};
+use segmentation::{LargeFileAccum, skip_large_file};
 
 // ---------------------------------------------------------------------------
 // Channel message types
@@ -128,8 +128,9 @@ pub(super) enum ProcessedEntry {
     /// A segment of a large file was skipped.
     ///
     /// If `segment_index == 0` nothing was committed. If `segment_index > 0`,
-    /// earlier segments may already be committed — the consumer invokes
-    /// cross-segment rollback. `segment_index` + `num_segments` together
+    /// earlier segments may already be committed — the orchestrator drops
+    /// the partly committed file (`segmentation::skip_large_file`).
+    /// `segment_index` + `num_segments` together
     /// drive the drain count for the skipped remainder.
     SegmentSkipped {
         segment_index: usize,
@@ -604,8 +605,8 @@ pub(crate) fn run_parallel_pipeline(
                             );
                             segments_to_skip = num_segments.saturating_sub(segment_index + 1);
                         } else {
-                            // Mid-accumulation skip: rollback earlier segments.
-                            segments_to_skip = rollback_and_skip_large_file(
+                            // Mid-accumulation skip: drop the file.
+                            segments_to_skip = skip_large_file(
                                 ws,
                                 stats,
                                 &mut large_file_accum,
@@ -662,15 +663,15 @@ pub(crate) fn run_parallel_pipeline(
                     Err(e) => {
                         if e.is_soft_file_error() {
                             if large_file_accum.is_some() {
-                                // Mid-accumulation soft worker error: rollback
-                                // earlier segments. `next_expected_index`
+                                // Mid-accumulation soft worker error: drop
+                                // the file. `next_expected_index`
                                 // is the segment we were about to process,
                                 // so current_segment_index is one less.
                                 let current = large_file_accum
                                     .as_ref()
                                     .map(|a| a.next_expected_index)
                                     .unwrap_or(0);
-                                segments_to_skip = rollback_and_skip_large_file(
+                                segments_to_skip = skip_large_file(
                                     ws,
                                     stats,
                                     &mut large_file_accum,

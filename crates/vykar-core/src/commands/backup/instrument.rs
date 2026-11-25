@@ -109,7 +109,6 @@ impl BackupInstrumentation {
             tree_packs = w.tree_packs,
             data_pack_bytes = w.data_pack_bytes,
             tree_pack_bytes = w.tree_pack_bytes,
-            forced_data_seals = w.forced_data_seals,
             seal_ms = ms(w.seal),
             upload_cap_wait_ms = ms(w.upload_cap_wait),
             final_upload_wait_ms = ms(w.final_upload_wait),

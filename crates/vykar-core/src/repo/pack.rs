@@ -218,11 +218,6 @@ impl PackWriter {
         }
     }
 
-    /// The content-digest algorithm this writer names its packs with.
-    pub fn hash_algorithm(&self) -> HashAlgorithm {
-        self.hash_algo
-    }
-
     /// Initialize the pack buffer on first blob: staged in `stage` if given
     /// and able to, otherwise on the heap.
     fn init_buffer(&mut self, stage: Option<&dyn StorageBackend>) -> Result<()> {

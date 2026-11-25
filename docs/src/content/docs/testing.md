@@ -30,7 +30,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | Chunker completeness & determinism | No gaps or overlaps; same input always produces same boundaries; size bounds respected; stream and slice APIs agree |
 | Backup-restore round-trip | Arbitrary nested file trees (empty, small, large files; nested directories) restore byte-identical |
 | Compression round-trip | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
-| IndexDelta state machine | Additions applied once; rollback restores the reused set and the additions exactly |
+| IndexDelta state machine | Additions applied once; a file's reuse stage restores the reused set exactly |
 
 ## Protocol Simulation
 

@@ -2,10 +2,8 @@ use tracing::warn;
 
 use super::Repo;
 use super::journal_recovery::PendingIndexRecovery;
-use super::pack::{PackType, PackWriter, compute_data_pack_target, compute_tree_pack_target};
-use super::write_session::{
-    DEFAULT_SESSION_ID, RollbackTracker, SessionView, WriteMetricsSnapshot, WriteSession,
-};
+use super::pack::{PackType, compute_data_pack_target, compute_tree_pack_target};
+use super::write_session::{DEFAULT_SESSION_ID, SessionView, WriteMetricsSnapshot, WriteSession};
 use crate::index::IndexDelta;
 use crate::index::table::DedupPrefilter;
 use vykar_storage::BackendProfile;
@@ -65,8 +63,8 @@ impl Repo {
     /// Begin a write session over this repository's index as it is now.
     ///
     /// Creates a fresh [`WriteSession`] with pack targets computed from the
-    /// current chunk index and repo config. The chunk-store, flush and
-    /// rollback methods are on the session; a save
+    /// current chunk index and repo config. The chunk-store and flush
+    /// methods are on the session; a save
     /// (`RepoWriter::save_session`) or a backup commit consumes it, and
     /// [`WriteSession::flush_on_abort`] ends it on failure.
     ///
@@ -242,97 +240,39 @@ impl WriteSession {
         )
     }
 
-    // --- Rollback checkpoint API ---
+    // --- Per-file reuse stage (FileTxn) ---
     //
-    // Used by (a) streaming command dumps and (b) per-file backup chunk
-    // loops that must survive mid-read drift detection. Single-slot: the
-    // two callers never overlap (the backup serial consumer arms and
-    // commits before any dump runs, and vice versa).
+    // A file committed in pieces (a segmented large file) stages the reuse
+    // it records, so a skip can drop it. Its new chunks are never undone:
+    // they are in the session's packs and stay in the index unreferenced
+    // (the next compact sweeps them). One stage at a time: the backup
+    // consumer is serial.
 
-    /// Begin a rollback checkpoint: flush any pending data pack, snapshot
-    /// the current `IndexDelta` state, and arm the rollback tracker so all
-    /// subsequent mutations can be undone if the guarded scope fails. Every
-    /// mutation of a session flows through its `index_delta`.
-    #[allow(
-        clippy::panic_in_result_fn,
-        reason = "asserts encode programmer invariants on internal state"
-    )]
-    pub(crate) fn begin_rollback_checkpoint(&mut self, repo: &Repo) -> Result<()> {
-        assert!(
-            self.rollback_tracker.is_none(),
-            "begin_rollback_checkpoint called while another checkpoint is armed"
-        );
-
-        // Force-flush the data pack writer to isolate the scope's data.
-        if self.data_pack_writer.has_pending() {
-            self.flush_writer_async(repo, PackType::Data)?;
-            self.metrics.counters.forced_data_seals += 1;
-        }
-
-        let delta_checkpoint = self
-            .index_delta
+    /// Open the stage: reuse first recorded from here on can be dropped.
+    /// Panics if a stage is open (see [`ReusedChunks::checkpoint`]).
+    ///
+    /// [`ReusedChunks::checkpoint`]: crate::index::reused::ReusedChunks::checkpoint
+    pub(crate) fn stage_file_reuse(&mut self) {
+        self.index_delta
             .as_mut()
             .expect("an active session has an index delta")
+            .reused
             .checkpoint();
-        let data_pack_target_size = self.data_pack_writer.target_size();
-        self.rollback_tracker = Some(RollbackTracker {
-            delta_checkpoint,
-            dedup_inserts: Vec::new(),
-            promoted_recovered: Vec::new(),
-            journal_pack_ids: Vec::new(),
-            data_pack_target_size,
-        });
-        Ok(())
     }
 
-    /// Commit a rollback checkpoint: discard the tracker (scope succeeded).
-    pub(crate) fn commit_rollback_checkpoint(&mut self) {
-        // Only discard the delta's undo log when a tracker was actually
-        // armed (mirrors `begin_rollback_checkpoint`); leave the no-tracker
-        // case untouched.
-        if self.rollback_tracker.take().is_some()
-            && let Some(ref mut delta) = self.index_delta
-        {
-            delta.discard_checkpoint();
+    /// Keep the staged reuse and close the stage. No-op without one.
+    pub(crate) fn keep_file_reuse(&mut self) {
+        if let Some(delta) = self.index_delta.as_mut() {
+            delta.reused.discard_checkpoint();
         }
     }
 
-    /// Roll back the active checkpoint: undo all index mutations that
-    /// occurred since `begin_rollback_checkpoint()`. Packs already uploaded
-    /// to storage become orphans cleaned by compact.
-    pub(crate) fn abort_rollback_checkpoint(&mut self) {
-        let Some(tracker) = self.rollback_tracker.take() else {
-            return;
-        };
-
-        // 1. Rollback IndexDelta (always Some when a checkpoint was armed).
-        if let Some(ref mut delta) = self.index_delta {
-            delta.rollback(tracker.delta_checkpoint);
+    /// Drop the reuse first recorded since [`Self::stage_file_reuse`] and
+    /// close the stage. No-op without one.
+    pub(crate) fn drop_file_reuse(&mut self) {
+        if let Some(delta) = self.index_delta.as_mut() {
+            delta.reused.rollback();
         }
-
-        // 2. Forget the chunks the scope stored or promoted.
-        for chunk_id in &tracker.dedup_inserts {
-            self.session_new.remove(chunk_id);
-        }
-
-        // 3. Re-insert promoted recovered chunks.
-        for (chunk_id, entry) in tracker.promoted_recovered {
-            self.recovered_chunks.insert(chunk_id, entry);
-        }
-
-        // 4. Remove tracked packs from the pending journal, and keep uploads
-        // still in flight from journaling them when they complete.
-        for pack_id in &tracker.journal_pack_ids {
-            self.journal.entries.remove_pack(pack_id);
-        }
-        self.uploads.exclude_from_journal(&tracker.journal_pack_ids);
-
-        // 5. Reset data pack writer (discards any partial pack buffer).
-        // Carry the algorithm over from the writer being replaced rather than
-        // re-deriving it — a reset must not be able to change a pack's name.
-        let hash_algo = self.data_pack_writer.hash_algorithm();
-        self.data_pack_writer =
-            PackWriter::new(PackType::Data, tracker.data_pack_target_size, hash_algo);
     }
 }
 
@@ -356,9 +296,11 @@ impl WriteSession {
             .is_some_and(|delta| delta.reused.contains(id))
     }
 
-    /// True if a rollback checkpoint is currently armed (for testing).
-    pub(crate) fn rollback_tracker_armed(&self) -> bool {
-        self.rollback_tracker.is_some()
+    /// True while a file's reuse is staged (for testing).
+    pub(crate) fn file_reuse_staged(&self) -> bool {
+        self.index_delta
+            .as_ref()
+            .is_some_and(|d| d.reused.is_armed())
     }
 }
 
@@ -480,30 +422,27 @@ mod tests {
     }
 
     #[test]
-    fn rollback_checkpoint_armed_and_committed_round_trips() {
-        let (repo, mut ws) = test_repo_plaintext_with_session();
-        assert!(!ws.rollback_tracker_armed());
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        assert!(ws.rollback_tracker_armed());
-        ws.commit_rollback_checkpoint();
-        assert!(!ws.rollback_tracker_armed());
+    fn file_reuse_stage_round_trips() {
+        let (_repo, mut ws) = test_repo_plaintext_with_session();
+        assert!(!ws.file_reuse_staged());
+        ws.stage_file_reuse();
+        assert!(ws.file_reuse_staged());
+        ws.keep_file_reuse();
+        assert!(!ws.file_reuse_staged());
+        ws.stage_file_reuse();
+        ws.drop_file_reuse();
+        assert!(!ws.file_reuse_staged());
     }
 
     #[test]
-    fn rollback_checkpoint_rollback_clears_tracker() {
-        let (repo, mut ws) = test_repo_plaintext_with_session();
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        ws.abort_rollback_checkpoint();
-        assert!(!ws.rollback_tracker_armed());
-    }
-
-    #[test]
-    #[should_panic(expected = "begin_rollback_checkpoint called while another checkpoint is armed")]
-    fn cannot_begin_overlapping_rollback_checkpoint() {
-        let (repo, mut ws) = test_repo_plaintext_with_session();
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        // Second begin must panic via the overlap assertion.
-        let _ = ws.begin_rollback_checkpoint(&repo);
+    #[should_panic(
+        expected = "ReusedChunks::checkpoint() called while another checkpoint is armed"
+    )]
+    fn cannot_stage_two_files() {
+        let (_repo, mut ws) = test_repo_plaintext_with_session();
+        ws.stage_file_reuse();
+        // A second stage must panic via the overlap assertion.
+        ws.stage_file_reuse();
     }
 
     /// A finished upload is journaled on the next stored chunk, not only when
@@ -541,18 +480,15 @@ mod tests {
         drop(ws);
     }
 
-    /// The write counters match what reached storage, and count the seal
-    /// forced by a rollback checkpoint.
+    /// The write counters match what reached storage.
     #[test]
-    fn write_metrics_count_seals_bytes_and_forced_seals() {
+    fn write_metrics_count_seals_and_bytes() {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
         let (repo, mut ws) = test_repo_plaintext_with_session();
         ws.store_chunk(&repo, b"first", Compression::None, PackType::Data)
             .unwrap();
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        ws.commit_rollback_checkpoint();
         ws.store_chunk(&repo, b"second", Compression::None, PackType::Data)
             .unwrap();
         ws.store_chunk(&repo, b"tree", Compression::None, PackType::Tree)
@@ -560,9 +496,8 @@ mod tests {
         ws.flush_packs(&repo).unwrap();
 
         let m = ws.write_metrics();
-        assert_eq!(m.data_packs, 2);
+        assert_eq!(m.data_packs, 1, "first and second share the pack");
         assert_eq!(m.tree_packs, 1);
-        assert_eq!(m.forced_data_seals, 1);
         assert!(m.seal > std::time::Duration::ZERO || m.upload_put > std::time::Duration::ZERO);
 
         let stored: u64 = repo
@@ -730,8 +665,8 @@ mod tests {
         drop(ws);
     }
 
-    /// Rolling back a checkpoint, or dropping the session, discards the
-    /// partially written staged pack and leaves no temp file behind.
+    /// Dropping the session discards the partially written staged pack and
+    /// leaves no temp file behind.
     #[test]
     fn discarded_staged_pack_leaves_no_temp_file() {
         use crate::compress::Compression;
@@ -744,13 +679,6 @@ mod tests {
         );
         ws.stream_data_packs = true;
 
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        ws.store_chunk(&repo, b"rolled back", Compression::None, PackType::Data)
-            .unwrap();
-        assert_eq!(staging_files(dir.path()).len(), 1);
-        ws.abort_rollback_checkpoint();
-        assert!(staging_files(dir.path()).is_empty());
-
         ws.store_chunk(&repo, b"abandoned", Compression::None, PackType::Data)
             .unwrap();
         assert_eq!(staging_files(dir.path()).len(), 1);
@@ -758,26 +686,32 @@ mod tests {
         assert!(staging_files(dir.path()).is_empty());
     }
 
-    /// A pack sealed inside a checkpoint whose upload finishes only after the
-    /// rollback must not be journaled: its chunks were rolled back.
+    /// A pack sealed while a file's reuse is staged, whose upload finishes
+    /// only after the file is dropped, is journaled like any other: the
+    /// skipped file's chunks stay in the session. A following session
+    /// recovers the pack and adopts a chunk it hits as a new entry with a
+    /// known trailer length.
     #[test]
-    fn rollback_keeps_in_flight_upload_out_of_journal() {
+    fn skipped_file_pack_is_journaled() {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
         let (mut repo, mut ws) = test_repo_plaintext_with_session();
-        let (gated, tx) =
-            crate::testutil::PackUploadBackend::gated(std::sync::Arc::clone(&repo.storage));
-        repo.storage = std::sync::Arc::new(gated);
+        // A store with mtimes: recovery adopts journal packs by their age.
+        let (gated, tx) = crate::testutil::PackUploadBackend::gated(Arc::new(
+            crate::testutil::MemoryBackend::with_mtimes(),
+        ));
+        repo.storage = Arc::new(gated);
 
-        ws.begin_rollback_checkpoint(&repo).unwrap();
-        ws.store_chunk(
-            &repo,
-            b"rolled back chunk",
-            Compression::None,
-            PackType::Data,
-        )
-        .unwrap();
+        ws.stage_file_reuse();
+        let (chunk_id, _, _) = ws
+            .store_chunk(
+                &repo,
+                b"skipped file chunk",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
         ws.flush_writer_async(&repo, PackType::Data).unwrap();
         let pack_id = {
             assert_eq!(ws.uploads.len(), 1);
@@ -788,7 +722,7 @@ mod tests {
             ws.uploads.pending()[0].pack_id
         };
 
-        ws.abort_rollback_checkpoint();
+        ws.drop_file_reuse();
         tx.send(()).unwrap();
         ws.flush_packs(&repo).unwrap();
 
@@ -798,14 +732,39 @@ mod tests {
                 .entries
                 .to_wire()
                 .iter()
-                .all(|e| e.pack_id != pack_id),
-            "rolled-back pack must not be journaled"
+                .any(|e| e.pack_id == pack_id),
+            "a skipped file's pack is journaled"
         );
+        ws.flush_on_abort(&repo);
+        assert!(repo.storage.exists("sessions/default.index").unwrap());
+
+        // The next session recovers the pack and promotes a chunk it hits.
+        let mut ws2 = repo.begin_write_session(&WriteSessionOptions {
+            session_id: "next".into(),
+            ..Default::default()
+        });
+        // The recovering session's own marker: its mtime is "now" on the
+        // store's clock, which the journal pack's age is judged against.
+        repo.storage.put("sessions/next.json", b"{}").unwrap();
+        let recovery = ws2
+            .recover_pending_index(&repo, &crate::repo::control::CancelToken::new())
+            .unwrap();
+        assert_eq!(recovery.recovered_chunks, 1);
+        assert!(ws2.bump_ref_if_exists(&repo, &chunk_id).is_some());
+        let delta = ws2.write_session_delta_for_test();
         assert!(
-            repo.storage.exists(&pack_id.storage_key()).unwrap(),
-            "the upload still completes; the pack is an orphan for compact"
+            delta
+                .new_entries
+                .iter()
+                .any(|e| e.chunk_id == chunk_id && e.pack_id == pack_id),
+            "the hit is a new entry on the recovered pack"
         );
-        drop(ws);
+        assert!(!ws2.delta_reuses(&chunk_id));
+        assert!(
+            ws2.pack_trailers.contains_key(&pack_id),
+            "the recovered pack's trailer length is known"
+        );
+        drop(ws2);
     }
 
     /// Over an unedited index a session finds existing chunks in the table

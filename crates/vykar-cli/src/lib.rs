@@ -37,7 +37,7 @@ use crate::cli::{Cli, Commands};
 use crate::config_gen::run_config_generate;
 use crate::dispatch::{dispatch_command, run_default_actions, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
-use crate::output::Output;
+use crate::output::{Output, Status};
 use crate::resolve::{
     DiffDispatch, SnapshotDispatch, classify_diff_target, classify_snapshot_target, repo_name_at,
     repo_names_at,
@@ -52,7 +52,35 @@ pub(crate) const EXIT_PARTIAL: u8 = 3;
 pub(crate) const EXIT_INTERRUPTED: u8 = 130;
 
 pub fn run() -> ExitCode {
-    run_cli(Cli::parse())
+    match Cli::try_parse() {
+        Ok(cli) => run_cli(cli),
+        Err(e) => usage_error(&e),
+    }
+}
+
+/// Report a command line clap rejected as clap does, plus with `--json` an
+/// error document whose `command` is empty, since none could be parsed.
+fn usage_error(e: &clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+
+    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    if !json || matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        e.exit();
+    }
+    // Ignored like any other stderr write: the document is what matters here.
+    let _ = e.print();
+    let mut out = Output::new(true, String::new());
+    // `Display` drops clap's ANSI styling.
+    let message = e.render().to_string();
+    let message = message.trim_end();
+    out.set_error(
+        message
+            .strip_prefix("error: ")
+            .unwrap_or(message)
+            .to_string(),
+    );
+    let code = u8::try_from(e.exit_code()).unwrap_or(EXIT_ERROR);
+    out.finish(ExitCode::from(code))
 }
 
 pub(crate) fn run_cli(cli: Cli) -> ExitCode {
@@ -64,7 +92,11 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
         .as_ref()
         .map_or_else(|| "cycle".to_string(), Commands::full_name);
     let mut out = Output::new(cli.json, command);
-    let code = run_with_output(&cli, &mut out);
+    passphrase::set_non_interactive(cli.json);
+    let code = match out.divert_stdout() {
+        Ok(()) => run_with_output(&cli, &mut out),
+        Err(e) => out.fail(format!("could not redirect stdout for --json: {e}")),
+    };
     out.finish(code)
 }
 
@@ -150,24 +182,18 @@ fn effective_repo_selector(cli: &Cli) -> Option<&str> {
 fn run_targeted(cli: &Cli, repo: &ResolvedRepo, out: &mut Output) -> ExitCode {
     out.begin_repo(repo);
     let result = run_repo_command(cli, repo, out);
-    out.end_repo(&result);
-    finish(result)
+    let status = out.end_repo(&result);
+    report_status(status, &result);
+    status.exit_code()
 }
 
-/// Reduce a single-repo command's outcome to an exit code, honoring a shutdown
-/// signal that arrived while it ran.
-fn finish(result: CliResult<bool>) -> ExitCode {
-    if signal::SHUTDOWN.load(Ordering::SeqCst) {
-        eprintln!("Interrupted");
-        return ExitCode::from(EXIT_INTERRUPTED);
-    }
-    match result {
-        Ok(true) => ExitCode::from(EXIT_PARTIAL),
-        Ok(false) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+/// Print the stderr line for a repository command that was interrupted or
+/// failed.
+fn report_status(status: Status, result: &CliResult<bool>) {
+    match (status, result) {
+        (Status::Interrupted, _) => eprintln!("Interrupted"),
+        (Status::Error, Err(e)) => eprintln!("Error: {e}"),
+        _ => {}
     }
 }
 
@@ -455,25 +481,14 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], out: &mut Output) -> ExitCo
 
         out.begin_repo(repo);
         let result = run_repo_command(cli, repo, out);
-        out.end_repo(&result);
-        if signal::SHUTDOWN.load(Ordering::SeqCst) {
-            eprintln!("Interrupted");
-            return ExitCode::from(EXIT_INTERRUPTED);
-        }
-        match result {
-            Ok(partial) => {
-                if partial {
-                    had_partial = true;
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_error = true;
-                if multi {
-                    continue;
-                }
-                return ExitCode::from(EXIT_ERROR);
-            }
+        let status = out.end_repo(&result);
+        report_status(status, &result);
+        match status {
+            Status::Interrupted => return status.exit_code(),
+            Status::Error if !multi => return status.exit_code(),
+            Status::Error => had_error = true,
+            Status::Partial => had_partial = true,
+            Status::Ok | Status::Skipped => {}
         }
     }
 
@@ -559,10 +574,11 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo, out: &mut Output) -> CliResu
             };
             run_default_actions(repo, shutdown, cli.verbose, &cli.source, unavailable, out).map(
                 |o| {
-                    if o.unavailable
-                        && let Some(reason) = &o.skipped
-                    {
-                        eprintln!("Warning: skipping '{}' — {reason}", repo.label_or_url());
+                    if let Some(reason) = &o.skipped {
+                        if o.unavailable {
+                            eprintln!("Warning: skipping '{}' — {reason}", repo.label_or_url());
+                        }
+                        out.skip_repo(reason);
                     }
                     o.partial
                 },

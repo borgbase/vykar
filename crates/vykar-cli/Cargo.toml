@@ -33,7 +33,7 @@ hex.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 tiny_http = "0.12"
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 base64 = "0.23"
 
 [dev-dependencies]

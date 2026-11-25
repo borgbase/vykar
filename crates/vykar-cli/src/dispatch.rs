@@ -17,7 +17,7 @@ use crate::cmd::compact::CompactJson;
 use crate::cmd::prune::PruneJson;
 use crate::error::{CliError, CliResult};
 use crate::format::print_backup_stats;
-use crate::output::{Output, Report};
+use crate::output::{Output, Report, Status};
 use crate::passphrase::get_passphrase;
 use vykar_common::display::format_duration_seconds;
 use vykar_types::error::VykarError;
@@ -176,7 +176,7 @@ struct CycleJson<'a> {
 #[derive(Serialize)]
 struct StepJson<'a> {
     step: &'static str,
-    status: &'static str,
+    status: Status,
     message: Option<&'a str>,
 }
 
@@ -191,10 +191,10 @@ impl Report for CycleReport<'_> {
                 .iter()
                 .map(|(step, outcome)| {
                     let (status, message) = match outcome {
-                        StepOutcome::Ok => ("ok", None),
-                        StepOutcome::Partial => ("partial", None),
-                        StepOutcome::Skipped(reason) => ("skipped", Some(reason.as_str())),
-                        StepOutcome::Failed(e) => ("error", Some(e.as_str())),
+                        StepOutcome::Ok => (Status::Ok, None),
+                        StepOutcome::Partial => (Status::Partial, None),
+                        StepOutcome::Skipped(reason) => (Status::Skipped, Some(reason.as_str())),
+                        StepOutcome::Failed(e) => (Status::Error, Some(e.as_str())),
                     };
                     StepJson {
                         step: step.command_name(),

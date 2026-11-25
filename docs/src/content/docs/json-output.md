@@ -12,7 +12,7 @@ The flag is global, so `vykar --json list` and `vykar list --json` are the same.
 
 ## Guarantees
 
-- stdout holds exactly one JSON document, also when the command fails. It is compact on a pipe and indented on a terminal.
+- stdout holds exactly one compact JSON document on one line, also when the command fails. Pipe it through `jq` to read it indented.
 - The [exit codes](/commands#exit-codes) are unchanged, and the document's `status` matches them.
 - Sizes and counts are plain integers in bytes and items. Times are RFC 3339 in UTC (`2026-01-15T14:30:00.123456789Z`). Paths are arrays of strings. A missing value is `null`, never `"-"` or `""`.
 - A command never prompts. Commands that ask for confirmation need their `--yes` flag (`--yes-delete-this-repo` for `delete`), and `config` needs `--dest`. Set `VYKAR_PASSPHRASE` or `passcommand` for encrypted repositories.

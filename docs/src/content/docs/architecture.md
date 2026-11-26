@@ -753,6 +753,8 @@ open repository without index (`open_without_index`)
   → apply directory metadata, deepest first
 ```
 
+Workers count the bytes written and the files completed with relaxed atomics; the thread that waits for them reports these totals to the caller's event sink every 100 ms and at each batch end. A library caller that passes no sink pays nothing per write and allocates no per-file counters.
+
 Everything is written inside the staging directory, so a failed restore leaves the destination empty. Batching bounds plan memory by batch size rather than by snapshot size; the cost is that a chunk shared by files in different batches is downloaded once per batch.
 
 ### Item Stream

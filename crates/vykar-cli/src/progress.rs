@@ -18,7 +18,7 @@ const DEFAULT_PROGRESS_COLUMNS: usize = 120;
 // Shared state between the progress renderer and the tracing writer
 // ---------------------------------------------------------------------------
 
-/// True while a backup progress line is being displayed on stderr.
+/// True while a progress line is being displayed on stderr.
 static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Serializes all stderr writes between the progress renderer and tracing.
@@ -254,6 +254,128 @@ impl BackupProgressRenderer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Restore progress renderer
+// ---------------------------------------------------------------------------
+
+/// The live restore line on a terminal's stderr. Only built when stderr is a
+/// terminal; without one restore passes no sink at all.
+pub(crate) struct RestoreProgressRenderer {
+    planned_files: u64,
+    planned_bytes: u64,
+    more: bool,
+    files: u64,
+    bytes: u64,
+    finishing: bool,
+    last_draw: Instant,
+    last_line_len: usize,
+    rendered_any: bool,
+}
+
+impl RestoreProgressRenderer {
+    /// Sets `PROGRESS_ACTIVE`, so tracing lines clear the progress line.
+    pub(crate) fn new() -> Self {
+        PROGRESS_ACTIVE.store(true, Relaxed);
+        Self::blank()
+    }
+
+    fn blank() -> Self {
+        Self {
+            planned_files: 0,
+            planned_bytes: 0,
+            more: false,
+            files: 0,
+            bytes: 0,
+            finishing: false,
+            last_draw: Instant::now(),
+            last_line_len: 0,
+            rendered_any: false,
+        }
+    }
+
+    pub(crate) fn on_event(&mut self, event: commands::restore::RestoreEvent) {
+        // Fields first, so a `Written` the rate limit drops still shows at
+        // the next forced redraw.
+        let force = self.apply(event);
+        self.render(force);
+    }
+
+    /// Take `event` into the counts; true when it forces a redraw.
+    fn apply(&mut self, event: commands::restore::RestoreEvent) -> bool {
+        use commands::restore::RestoreEvent;
+        match event {
+            RestoreEvent::Planned { files, bytes, more } => {
+                self.planned_files = files;
+                self.planned_bytes = bytes;
+                self.more = more;
+                true
+            }
+            RestoreEvent::Written { files, bytes } => {
+                self.files = files;
+                self.bytes = bytes;
+                false
+            }
+            RestoreEvent::Finishing => {
+                self.finishing = true;
+                true
+            }
+        }
+    }
+
+    /// Clears the progress line (no final line: the summary follows on
+    /// stdout) and resets `PROGRESS_ACTIVE`.
+    pub(crate) fn finish(&mut self) {
+        if self.rendered_any {
+            let _guard = acquire_stderr_lock();
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
+        PROGRESS_ACTIVE.store(false, Relaxed);
+        self.rendered_any = false;
+        self.last_line_len = 0;
+    }
+
+    fn render(&mut self, force: bool) {
+        if !force && self.rendered_any && self.last_draw.elapsed() < PROGRESS_REDRAW_INTERVAL {
+            return;
+        }
+        self.last_draw = Instant::now();
+
+        let columns = terminal_columns().saturating_sub(5);
+        let line = truncate_middle(&restore_progress_line(self), columns);
+        let line_len = str_display_width(&line);
+        let pad_len = self.last_line_len.saturating_sub(line_len);
+
+        {
+            let _guard = acquire_stderr_lock();
+            eprint!("\r{line}{}", " ".repeat(pad_len));
+            let _ = io::stderr().flush();
+        }
+
+        self.last_line_len = line_len;
+        self.rendered_any = true;
+    }
+}
+
+/// The restore progress line, without terminal control codes.
+fn restore_progress_line(r: &RestoreProgressRenderer) -> String {
+    if r.finishing {
+        return format!(
+            "Restoring: {} files, {} written; finishing (links, metadata)...",
+            r.files,
+            format_bytes(r.bytes)
+        );
+    }
+    let plus = if r.more { "+" } else { "" };
+    format!(
+        "Restoring: {} / {}{plus} files, {} / {}{plus}",
+        r.files,
+        r.planned_files,
+        format_bytes(r.bytes),
+        format_bytes(r.planned_bytes),
+    )
+}
+
 fn terminal_columns() -> usize {
     terminal_columns_os()
         .or_else(|| {
@@ -307,3 +429,54 @@ fn terminal_columns_os() -> Option<usize> {
 }
 
 use vykar_common::display::{str_display_width, truncate_middle};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vykar_core::commands::restore::RestoreEvent;
+
+    #[test]
+    fn restore_progress_line_shows_planned_totals_and_finishing() {
+        let mut r = RestoreProgressRenderer::blank();
+        assert!(r.apply(RestoreEvent::Planned {
+            files: 10,
+            bytes: 2048,
+            more: false,
+        }));
+        assert!(!r.apply(RestoreEvent::Written {
+            files: 3,
+            bytes: 1024,
+        }));
+        assert_eq!(
+            restore_progress_line(&r),
+            format!(
+                "Restoring: 3 / 10 files, {} / {}",
+                format_bytes(1024),
+                format_bytes(2048)
+            )
+        );
+
+        r.apply(RestoreEvent::Planned {
+            files: 20,
+            bytes: 4096,
+            more: true,
+        });
+        assert_eq!(
+            restore_progress_line(&r),
+            format!(
+                "Restoring: 3 / 20+ files, {} / {}+",
+                format_bytes(1024),
+                format_bytes(4096)
+            )
+        );
+
+        assert!(r.apply(RestoreEvent::Finishing));
+        assert_eq!(
+            restore_progress_line(&r),
+            format!(
+                "Restoring: 3 files, {} written; finishing (links, metadata)...",
+                format_bytes(1024)
+            )
+        );
+    }
+}

@@ -673,6 +673,7 @@ fn restore_reports_an_unreadable_data_chunk() {
                 continue_on_error,
                 ..Default::default()
             },
+            None,
             &CancelToken::new(),
         );
         if continue_on_error {

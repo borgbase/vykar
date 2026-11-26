@@ -16,7 +16,7 @@ use crate::commands::listing::{ListingRead, ListingView};
 use crate::config::VykarConfig;
 use crate::platform::fs;
 use crate::repo::Repo;
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
 use vykar_common::display::{format_bytes, format_count};
@@ -79,6 +79,39 @@ pub(super) const MAX_WRITE_BATCH: usize = 1024 * 1024; // 1 MiB
 /// 10M-file snapshot no longer requires gigabytes of plan state up front,
 /// and a malicious snapshot cannot DoS the host before any data is read.
 const RESTORE_BATCH_FILES: usize = 100_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Batch size override for tests (0: [`RESTORE_BATCH_FILES`]).
+    static BATCH_FILES_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: restore in batches of `n` files while the guard lives (this thread).
+#[cfg(test)]
+pub(crate) fn override_batch_files(n: usize) -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BATCH_FILES_OVERRIDE.with(|c| c.set(0));
+        }
+    }
+    BATCH_FILES_OVERRIDE.with(|c| c.set(n));
+    Guard
+}
+
+/// Regular files per restore batch.
+#[cfg(test)]
+fn batch_files() -> usize {
+    match BATCH_FILES_OVERRIDE.with(std::cell::Cell::get) {
+        0 => RESTORE_BATCH_FILES,
+        n => n,
+    }
+}
+
+#[cfg(not(test))]
+fn batch_files() -> usize {
+    RESTORE_BATCH_FILES
+}
 
 /// Upper bound on the combined number of hard-link tracking entries
 /// (`group_reps` + `pending_links`) held during a restore. `group_reps` is
@@ -148,6 +181,28 @@ pub struct DamagedFile {
     pub reason: String,
 }
 
+/// Progress of a restore, delivered on the thread that called
+/// [`run_with_options`]. Counts are cumulative over the whole restore and
+/// never decrease. [`RestoreStats`] stays the authoritative result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreEvent {
+    /// A batch of regular files was planned. `files`/`bytes`: all files
+    /// planned so far and their sizes, including files a continue-on-error
+    /// restore later reports as damaged. Sent before the batch's files are
+    /// created, so before any of its bytes are written. `more` is true when
+    /// the batch was full, so further batches may follow and the totals can
+    /// still grow.
+    Planned { files: u64, bytes: u64, more: bool },
+    /// File data written so far: `files` regular files whose data is
+    /// complete (empty files count once staged), `bytes` written to disk.
+    /// In continue-on-error mode `bytes` includes data of damaged files
+    /// written before their damage was found; such files are not counted.
+    Written { files: u64, bytes: u64 },
+    /// All file data is written; symlink metadata, hard links, the move into
+    /// the destination and directory metadata follow.
+    Finishing,
+}
+
 /// Knobs for [`run_with_options`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RestoreOptions {
@@ -190,11 +245,16 @@ pub fn run(
         dest,
         pattern,
         opts,
+        None,
         shutdown,
     )
 }
 
 /// Run `vykar restore` with explicit [`RestoreOptions`].
+///
+/// `events` receives [`RestoreEvent`]s on the calling thread; `None` costs
+/// nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_options(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -202,6 +262,7 @@ pub fn run_with_options(
     dest: &str,
     pattern: Option<&str>,
     opts: RestoreOptions,
+    events: Option<&dyn EventSink<RestoreEvent>>,
     shutdown: &CancelToken,
 ) -> Result<RestoreStats> {
     let filter = compile_pattern(pattern)?;
@@ -214,6 +275,7 @@ pub fn run_with_options(
         opts,
         pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+        events,
         shutdown,
     )
 }
@@ -249,6 +311,7 @@ pub(crate) fn run_on_repo(
         opts,
         pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+        None,
         shutdown,
     )
     .map(|(stats, _)| stats)
@@ -289,6 +352,7 @@ pub(crate) fn restore_on_repo_for_test(
                 opts,
                 scope,
                 |path| path_matches_selection(path, selected),
+                None,
                 shutdown,
             )
         }
@@ -306,6 +370,7 @@ pub(crate) fn restore_on_repo_for_test(
                 opts,
                 scope,
                 move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+                None,
                 shutdown,
             )
         }
@@ -339,6 +404,7 @@ pub fn run_selected(
         },
         selection_scope(selected_paths),
         |path| path_matches_selection(path, selected_paths),
+        None,
         shutdown,
     )
 }
@@ -538,6 +604,7 @@ fn restore_with_filter<F>(
     opts: RestoreOptions,
     scope: ReadScope,
     include_path: F,
+    events: Option<&dyn EventSink<RestoreEvent>>,
     shutdown: &CancelToken,
 ) -> Result<RestoreStats>
 where
@@ -557,6 +624,7 @@ where
         opts,
         scope,
         include_path,
+        events,
         shutdown,
     )
     .map(|(stats, _)| stats)
@@ -568,6 +636,7 @@ where
 /// A chunk missing from the index because the snapshot was deleted and
 /// compacted before the index load fails as `ChunkRemovedDuringRead`
 /// (`ReadOrigin::explain`).
+#[allow(clippy::too_many_arguments)]
 fn restore_on_repo_with_filter<F>(
     repo: &mut Repo,
     snapshot_name: &str,
@@ -575,6 +644,7 @@ fn restore_on_repo_with_filter<F>(
     opts: RestoreOptions,
     scope: ReadScope,
     include_path: F,
+    events: Option<&dyn EventSink<RestoreEvent>>,
     shutdown: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)>
 where
@@ -593,12 +663,14 @@ where
         opts,
         scope,
         include_path,
+        events,
         shutdown,
     )
     .map_err(|e| origin.explain(repo, e))
 }
 
 /// The body of [`restore_on_repo_with_filter`].
+#[allow(clippy::too_many_arguments)]
 fn restore_planned<F>(
     repo: &mut Repo,
     snapshot_name: &str,
@@ -606,6 +678,7 @@ fn restore_planned<F>(
     opts: RestoreOptions,
     scope: ReadScope,
     mut include_path: F,
+    events: Option<&dyn EventSink<RestoreEvent>>,
     shutdown: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)>
 where
@@ -746,6 +819,11 @@ where
     // time it lands at `dest_root` — no path-based reopen window.
     let mut total_bytes: u64 = 0;
     let mut total_files: u64 = 0;
+    // Progress totals (only reported with a sink): files and bytes planned,
+    // and files complete and raw bytes written, over all batches so far.
+    let (mut planned_files, mut planned_bytes) = (0u64, 0u64);
+    let (mut done_files, mut done_bytes) = (0u64, 0u64);
+    let batch_size = batch_files();
     // Ownership is reassigned only under an effective-root restore (tar/restic
     // gate); non-root restores skip chown entirely (behavior unchanged).
     let restore_as_root = fs::is_effective_root();
@@ -767,7 +845,7 @@ where
         &mut include_path,
         xattrs_enabled,
         &mut stats,
-        RESTORE_BATCH_FILES,
+        batch_size,
         &mut group_reps,
         &mut pending_links,
         shutdown,
@@ -802,12 +880,27 @@ where
                 batch_files.len(),
             );
 
+            if let Some(sink) = events {
+                planned_files += batch_files.len() as u64;
+                planned_bytes += batch_files.iter().map(|pf| pf.total_size).sum::<u64>();
+                sink.emit(RestoreEvent::Planned {
+                    files: planned_files,
+                    bytes: planned_bytes,
+                    more: batch_files.len() >= batch_size,
+                });
+            }
+
             // Phase 3: create every file of the batch exclusively.
             plan::stage_batch_files(&batch_files, &temp_root, verified_dirs, shutdown)?;
 
             // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
             // A pack a concurrent compact removed is re-resolved (04 step 7).
             let relocator = ro.relocator();
+            let progress = events.map(|sink| parallel::BatchProgress {
+                sink,
+                base_files: done_files,
+                base_bytes: done_bytes,
+            });
             let bytes = parallel::execute_parallel_restore(
                 &batch_files,
                 groups,
@@ -819,8 +912,12 @@ where
                 shutdown,
                 Some(&relocator),
                 failures.as_ref(),
+                progress.as_ref(),
             )
             .map_err(restore_error)?;
+            // Raw bytes written, damaged files included: progress must not
+            // go backwards when the count below drops them.
+            let written = bytes;
 
             let failed = failures
                 .map(parallel::BatchFailures::into_map)
@@ -838,6 +935,16 @@ where
                 batch_files.iter().map(|pf| pf.total_size).sum()
             };
 
+            // `batch_files` now holds exactly the files whose data is complete.
+            done_files += batch_files.len() as u64;
+            done_bytes += written;
+            if let Some(sink) = events {
+                sink.emit(RestoreEvent::Written {
+                    files: done_files,
+                    bytes: done_bytes,
+                });
+            }
+
             // Phase 5b: apply per-file metadata in temp_root.
             finalize::apply_file_metadata(
                 &batch_files,
@@ -854,6 +961,9 @@ where
         },
     )
     .map_err(cleanup)?;
+    if let Some(sink) = events {
+        sink.emit(RestoreEvent::Finishing);
+    }
 
     let listing_read = match source {
         RestoreSource::Subtrees { dirs, read, .. } => {
@@ -1575,6 +1685,7 @@ mod tests {
                 }
                 true
             },
+            None,
             &flag,
         )
         .unwrap_err();
@@ -1618,6 +1729,7 @@ mod tests {
             RestoreOptions::default(),
             ReadScope::Whole,
             |_path| true,
+            None,
             &flag,
         )
         .unwrap_err();
@@ -1655,6 +1767,7 @@ mod tests {
             RestoreOptions::default(),
             ReadScope::Whole,
             |_path| true,
+            None,
             &flag,
         )
         .unwrap_err();
@@ -1777,6 +1890,7 @@ mod tests {
             RestoreOptions::default(),
             ReadScope::Whole,
             |_path| true,
+            None,
             &CancelToken::new(),
         );
         // SAFETY: as above.
@@ -1786,5 +1900,174 @@ mod tests {
             let got = std::fs::read(dest.join(format!("f{i}.txt"))).unwrap();
             assert_eq!(got, format!("restore-cancel-payload-{i}").into_bytes());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress events
+    // -----------------------------------------------------------------------
+
+    /// Back up `files` (relative path, size) as snapshot `snap-progress`,
+    /// plus a symlink on Unix.
+    fn progress_fixture(tmp: &Path, files: &[(&str, usize)]) -> crate::config::VykarConfig {
+        let repo_dir = tmp.join("repo");
+        let source_dir = tmp.join("source");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let config = crate::tests::helpers::init_repo(&repo_dir);
+        for (i, (name, size)) in files.iter().enumerate() {
+            let path = source_dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![b'a' + i as u8; *size]).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target-of-link", source_dir.join("link")).unwrap();
+        crate::tests::helpers::backup_single_source(&config, &source_dir, "src", "snap-progress");
+        config
+    }
+
+    /// Restore `snap-progress` into `dest`, recording every event.
+    fn restore_recorded(
+        config: &crate::config::VykarConfig,
+        dest: &Path,
+    ) -> (RestoreStats, Vec<RestoreEvent>) {
+        let mut events = Vec::new();
+        let stats = {
+            let sink = crate::repo::control::FnMutSink::new(|e| events.push(e));
+            run_with_options(
+                config,
+                None,
+                "snap-progress",
+                dest.to_str().unwrap(),
+                None,
+                RestoreOptions::default(),
+                Some(&sink),
+                &CancelToken::new(),
+            )
+            .unwrap()
+        };
+        (stats, events)
+    }
+
+    /// The `Written` events in order; asserts they never decrease.
+    fn monotonic_written(events: &[RestoreEvent]) -> Vec<(u64, u64)> {
+        let written: Vec<(u64, u64)> = events
+            .iter()
+            .filter_map(|e| match *e {
+                RestoreEvent::Written { files, bytes } => Some((files, bytes)),
+                _ => None,
+            })
+            .collect();
+        for w in written.windows(2) {
+            assert!(
+                w[1].0 >= w[0].0 && w[1].1 >= w[0].1,
+                "Written went backwards: {events:?}"
+            );
+        }
+        written
+    }
+
+    #[test]
+    fn restore_events_cover_one_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files: &[(&str, usize)] = &[
+            ("empty.txt", 0),
+            ("small.txt", 17),
+            ("sub/mid.bin", 40_000),
+            ("sub/big.bin", 300_000),
+        ];
+        let config = progress_fixture(tmp.path(), files);
+        let sum: u64 = files.iter().map(|(_, n)| *n as u64).sum();
+
+        let (stats, events) = restore_recorded(&config, &tmp.path().join("dest"));
+        assert_eq!(
+            events.first(),
+            Some(&RestoreEvent::Planned {
+                files: files.len() as u64,
+                bytes: sum,
+                more: false,
+            }),
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&RestoreEvent::Finishing), "{events:?}");
+        let written = monotonic_written(&events);
+        assert_eq!(
+            written.last(),
+            Some(&(stats.files, stats.total_bytes)),
+            "{events:?}"
+        );
+        assert_eq!(stats.files, files.len() as u64);
+        assert_eq!(stats.total_bytes, sum);
+
+        let plain = run_with_options(
+            &config,
+            None,
+            "snap-progress",
+            tmp.path().join("dest-plain").to_str().unwrap(),
+            None,
+            RestoreOptions::default(),
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (stats.files, stats.dirs, stats.symlinks, stats.hardlinks),
+            (plain.files, plain.dirs, plain.symlinks, plain.hardlinks)
+        );
+        assert_eq!(
+            (
+                stats.hardlink_copies,
+                stats.total_bytes,
+                stats.damaged_total
+            ),
+            (
+                plain.hardlink_copies,
+                plain.total_bytes,
+                plain.damaged_total
+            )
+        );
+        assert_eq!(stats.warnings, plain.warnings);
+    }
+
+    /// Totals accumulate across batches: `Planned` grows a batch at a time
+    /// and flags every full batch, `Written` never decreases.
+    #[test]
+    fn restore_events_accumulate_across_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files: &[(&str, usize)] = &[
+            ("f0.bin", 1_000),
+            ("f1.bin", 2_000),
+            ("f2.bin", 3_000),
+            ("f3.bin", 4_000),
+            ("f4.bin", 5_000),
+        ];
+        let config = progress_fixture(tmp.path(), files);
+        let _batch = override_batch_files(2);
+
+        let (stats, events) = restore_recorded(&config, &tmp.path().join("dest"));
+        let planned: Vec<(u64, bool)> = events
+            .iter()
+            .filter_map(|e| match *e {
+                RestoreEvent::Planned { files, more, .. } => Some((files, more)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            planned,
+            vec![(2, true), (4, true), (5, false)],
+            "{events:?}"
+        );
+        let last_planned_bytes = events.iter().rev().find_map(|e| match *e {
+            RestoreEvent::Planned { bytes, .. } => Some(bytes),
+            _ => None,
+        });
+        assert_eq!(last_planned_bytes, Some(15_000));
+        let written = monotonic_written(&events);
+        assert_eq!(
+            written.last(),
+            Some(&(stats.files, stats.total_bytes)),
+            "{events:?}"
+        );
+        assert_eq!(stats.files, 5);
+        assert_eq!(events.last(), Some(&RestoreEvent::Finishing), "{events:?}");
     }
 }

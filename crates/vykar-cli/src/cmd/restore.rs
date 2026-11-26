@@ -1,12 +1,15 @@
+use std::io::IsTerminal;
+
 use vykar_core::commands;
-use vykar_core::commands::restore::RestoreOptions;
+use vykar_core::commands::restore::{RestoreEvent, RestoreOptions};
 use vykar_core::config::VykarConfig;
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, EventSink, FnMutSink};
 use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
+use crate::progress::RestoreProgressRenderer;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_restore(
@@ -25,15 +28,30 @@ pub(crate) fn run_restore(
         continue_on_error,
     };
     let stats = with_repo_passphrase(config, label, |passphrase| {
-        Ok(commands::restore::run_with_options(
-            config,
-            passphrase,
-            &snapshot_name,
-            &dest,
-            pattern.as_deref(),
-            opts,
-            shutdown,
-        )?)
+        // Built after any passphrase prompt; only a terminal gets progress.
+        let mut renderer = std::io::stderr()
+            .is_terminal()
+            .then(RestoreProgressRenderer::new);
+        let result = {
+            let sink = renderer
+                .as_mut()
+                .map(|r| FnMutSink::new(move |e| r.on_event(e)));
+            commands::restore::run_with_options(
+                config,
+                passphrase,
+                &snapshot_name,
+                &dest,
+                pattern.as_deref(),
+                opts,
+                sink.as_ref().map(|s| s as &dyn EventSink<RestoreEvent>),
+                shutdown,
+            )
+        };
+        // On errors too, so a message never lands on a half-drawn line.
+        if let Some(r) = renderer.as_mut() {
+            r.finish();
+        }
+        Ok(result?)
     })
     .map_err(|e| match e {
         // Repo-level hooks flatten the error to its message, so the hint has

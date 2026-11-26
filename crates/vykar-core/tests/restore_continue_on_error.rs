@@ -12,9 +12,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use vykar_core::commands;
-use vykar_core::commands::restore::{RestoreOptions, RestoreStats};
+use vykar_core::commands::restore::{RestoreEvent, RestoreOptions, RestoreStats};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, EventSink, FnMutSink};
 use vykar_types::chunk_decode::ChunkDecodeStage;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -98,6 +98,14 @@ impl Fixture {
     }
 
     fn restore(&self, continue_on_error: bool) -> Result<RestoreStats> {
+        self.restore_with_events(continue_on_error, None)
+    }
+
+    fn restore_with_events(
+        &self,
+        continue_on_error: bool,
+        events: Option<&dyn EventSink<RestoreEvent>>,
+    ) -> Result<RestoreStats> {
         commands::restore::run_with_options(
             &self.config,
             self.passphrase,
@@ -108,6 +116,7 @@ impl Fixture {
                 continue_on_error,
                 ..Default::default()
             },
+            events,
             &CancelToken::new(),
         )
     }
@@ -192,6 +201,49 @@ fn plaintext_corrupt_chunk_restores_the_rest() {
 #[test]
 fn encrypted_corrupt_chunk_restores_the_rest() {
     corrupt_chunk_restores_the_rest(true);
+}
+
+/// Progress never counts the damaged file, but its bytes written before the
+/// damage was found stay in `Written.bytes`, which never decreases.
+#[test]
+fn progress_skips_the_damaged_file() {
+    let fx = Fixture::new(false, FILES, |_| {});
+    let (_, b_chunk) = fx.file_chunk("b.bin");
+    fx.flip_byte_in_chunk(&b_chunk);
+
+    let mut events = Vec::new();
+    let stats = {
+        let sink = FnMutSink::new(|e| events.push(e));
+        fx.restore_with_events(true, Some(&sink)).unwrap()
+    };
+    assert_eq!(stats.damaged_total, 1);
+    assert_eq!(
+        events.first(),
+        Some(&RestoreEvent::Planned {
+            files: FILES.len() as u64,
+            bytes: FILES.len() as u64 * 64 * 1024,
+            more: false,
+        }),
+        "planned counts include the damaged file: {events:?}"
+    );
+    let written: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|e| match *e {
+            RestoreEvent::Written { files, bytes } => Some((files, bytes)),
+            _ => None,
+        })
+        .collect();
+    for w in written.windows(2) {
+        assert!(w[1].0 >= w[0].0 && w[1].1 >= w[0].1, "{events:?}");
+    }
+    let &(files, bytes) = written.last().unwrap();
+    assert_eq!(files, stats.files, "the damaged file is not counted");
+    assert!(
+        bytes >= stats.total_bytes,
+        "{bytes} < {}",
+        stats.total_bytes
+    );
+    assert_eq!(events.last(), Some(&RestoreEvent::Finishing));
 }
 
 #[test]

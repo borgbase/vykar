@@ -9,10 +9,12 @@ use std::io::{Seek, Write as IoWrite};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::repo::blob_read::{BlobReader, GroupEnd, ReadBuffers, coalesce_groups};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::relocate::{Located, MAX_RELOCATE_ROUNDS, Relocator, pack_not_found};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -21,7 +23,7 @@ use vykar_types::pack_id::PackId;
 
 use super::plan::{PlannedFile, WriteTarget};
 use super::read_groups::{PlannedBlob, ReadGroup};
-use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
+use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH, RestoreEvent};
 
 /// A restore-worker failure, classified by where it came from.
 ///
@@ -131,6 +133,87 @@ fn join_workers(
     match select_error(errors) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Progress
+// ---------------------------------------------------------------------------
+
+/// How often the coordinating thread reports a running pass.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Where [`execute_parallel_restore`] reports a batch while its workers run.
+pub(super) struct BatchProgress<'a> {
+    pub(super) sink: &'a dyn EventSink<RestoreEvent>,
+    /// Files and bytes of earlier batches (the `Written` totals so far).
+    pub(super) base_files: u64,
+    pub(super) base_bytes: u64,
+}
+
+/// Counters of one batch's write pass. Workers update them with relaxed
+/// atomics; the coordinating thread reads them for progress.
+pub(super) struct WriteCounters {
+    bytes: AtomicU64,
+    /// Bytes still to write, per `file_idx`; `None` when nobody reads file
+    /// progress (no sink), so the pass allocates nothing extra.
+    left: Option<Box<[AtomicU64]>>,
+    /// Files whose `left` reached 0, plus the batch's empty files.
+    files_done: AtomicU64,
+}
+
+impl WriteCounters {
+    /// Bytes only.
+    pub(super) fn bytes_only() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            left: None,
+            files_done: AtomicU64::new(0),
+        }
+    }
+
+    /// Bytes and per-file completion for `files`: a file counts once its
+    /// last byte is written, an empty file from the start.
+    pub(super) fn tracking(files: &[PlannedFile]) -> Self {
+        let empty = files.iter().filter(|f| f.total_size == 0).count();
+        Self {
+            bytes: AtomicU64::new(0),
+            left: Some(files.iter().map(|f| AtomicU64::new(f.total_size)).collect()),
+            files_done: AtomicU64::new(empty as u64),
+        }
+    }
+
+    /// `n` bytes of `file_idx` were written.
+    fn wrote(&self, file_idx: usize, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        if let Some(left) = self.left.as_deref().and_then(|l| l.get(file_idx))
+            && left.fetch_sub(n, Ordering::Relaxed) == n
+        {
+            self.files_done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn files_done(&self) -> u64 {
+        self.files_done.load(Ordering::Relaxed)
+    }
+}
+
+/// Raises `cancelled` when its worker unwinds, so sibling workers stop
+/// claiming groups while the coordinating thread is still waiting for them.
+struct CancelOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for CancelOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -294,6 +377,7 @@ pub(super) fn execute_parallel_restore(
     shutdown: &CancelToken,
     relocator: Option<&Relocator<'_>>,
     failures: Option<&BatchFailures>,
+    progress: Option<&BatchProgress<'_>>,
 ) -> std::result::Result<u64, ReadError> {
     shutdown.check()?;
     if groups.is_empty() {
@@ -303,20 +387,32 @@ pub(super) fn execute_parallel_restore(
     let num_threads = readers.min(groups.len());
     let buckets = partition_groups(groups, num_threads);
 
-    let bytes_written = AtomicU64::new(0);
+    let counters = if progress.is_some() {
+        WriteCounters::tracking(files)
+    } else {
+        WriteCounters::bytes_only()
+    };
     let cancelled = AtomicBool::new(false);
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(buckets.len());
+        // Disconnected once every worker has returned or unwound; nobody
+        // sends on it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
         // Each worker owns its bucket and drops every group (and its blob
         // list) as soon as it is processed, instead of the whole batch's plan
         // staying alive until the slowest worker finishes.
         for bucket in buckets {
-            let bytes_written = &bytes_written;
+            let counters = &counters;
             let cancelled = &cancelled;
+            let done = done_tx.clone();
 
             handles.push(s.spawn(move || -> std::result::Result<(), ReadError> {
+                // Bound first so it drops last: the panic guard below has
+                // raised `cancelled` by the time the waiting thread wakes.
+                let _done = done;
+                let _cancel_on_panic = CancelOnPanic(cancelled);
                 let mut bufs = ReadBuffers::default();
                 // One write accumulator for the thread, not one 1 MiB
                 // allocation per group.
@@ -331,7 +427,7 @@ pub(super) fn execute_parallel_restore(
                         files,
                         storage,
                         crypto,
-                        bytes_written,
+                        counters,
                         cancelled,
                         &mut bufs,
                         &mut pw,
@@ -353,12 +449,25 @@ pub(super) fn execute_parallel_restore(
             }));
         }
 
+        drop(done_tx);
+
+        // Report from this thread while the workers run; they only bump
+        // the counters, so the sink needs no `Sync`.
+        if let Some(p) = progress {
+            while let Err(RecvTimeoutError::Timeout) = done_rx.recv_timeout(PROGRESS_INTERVAL) {
+                p.sink.emit(RestoreEvent::Written {
+                    files: p.base_files + counters.files_done(),
+                    bytes: p.base_bytes + counters.bytes(),
+                });
+            }
+        }
+
         join_workers(handles, &cancelled, "restore worker panicked")?;
         // Workers return `Ok(())` when they stop early, so a cancellation would
         // otherwise surface as a short but successful byte count — and the
         // caller would go on to publish a partial tree.
         shutdown.check()?;
-        Ok(bytes_written.load(Ordering::Relaxed))
+        Ok(counters.bytes())
     })
 }
 
@@ -366,7 +475,7 @@ pub(super) fn execute_parallel_restore(
 struct BlobCtx<'a> {
     files: &'a [PlannedFile],
     reader: BlobReader<'a>,
-    bytes_written: &'a AtomicU64,
+    counters: &'a WriteCounters,
     cancelled: &'a AtomicBool,
     root: &'a Path,
     shutdown: &'a CancelToken,
@@ -420,7 +529,7 @@ fn process_read_group(
     files: &[PlannedFile],
     storage: &Arc<dyn StorageBackend>,
     crypto: &dyn CryptoEngine,
-    bytes_written: &AtomicU64,
+    counters: &WriteCounters,
     cancelled: &AtomicBool,
     bufs: &mut ReadBuffers,
     pw: &mut PendingWrite,
@@ -433,7 +542,7 @@ fn process_read_group(
     let ctx = BlobCtx {
         files,
         reader: BlobReader::new(storage.as_ref(), crypto, verify_chunks),
-        bytes_written,
+        counters,
         cancelled,
         root,
         shutdown,
@@ -636,7 +745,7 @@ fn process_blobs(
     bufs: &mut ReadBuffers,
     pw: &mut PendingWrite,
 ) -> std::result::Result<GroupEnd, ReadError> {
-    let (files, bytes_written, root) = (ctx.files, ctx.bytes_written, ctx.root);
+    let (files, counters, root) = (ctx.files, ctx.counters, ctx.root);
     let mut file_handles = LruHandles::new();
 
     // Write accumulator — batches consecutive same-file writes into one
@@ -662,7 +771,7 @@ fn process_blobs(
                 pw,
                 &mut file_handles,
                 files,
-                bytes_written,
+                counters,
                 root,
             )?;
             Ok(())
@@ -671,7 +780,7 @@ fn process_blobs(
 
     if matches!(end, GroupEnd::Done | GroupEnd::ReadFailed { .. }) {
         // Flush any remaining pending write.
-        flush_pending(pw, &mut file_handles, files, bytes_written, root)?;
+        flush_pending(pw, &mut file_handles, files, counters, root)?;
     }
     Ok(end)
 }
@@ -683,7 +792,7 @@ fn write_targets(
     pw: &mut PendingWrite,
     file_handles: &mut LruHandles,
     files: &[PlannedFile],
-    bytes_written: &AtomicU64,
+    counters: &WriteCounters,
     root: &Path,
 ) -> Result<()> {
     for target in &blob.targets {
@@ -702,14 +811,14 @@ fn write_targets(
                     pw.start,
                     file_handles,
                     files,
-                    bytes_written,
+                    counters,
                     root,
                 )?;
                 pw.reset();
             }
         } else {
             // Flush any active pending write first.
-            flush_pending(pw, file_handles, files, bytes_written, root)?;
+            flush_pending(pw, file_handles, files, counters, root)?;
 
             if contiguous || decompress_buf.len() >= MAX_WRITE_BATCH {
                 // Contiguous overflow or standalone large chunk — write
@@ -721,7 +830,7 @@ fn write_targets(
                     target.file_offset,
                     file_handles,
                     files,
-                    bytes_written,
+                    counters,
                     root,
                 )?;
             } else {
@@ -735,14 +844,14 @@ fn write_targets(
 }
 
 /// Write `buf` to the target file at `offset`.  Opens the (already staged)
-/// file on first access.  Increments `bytes_written`.
+/// file on first access.  Counts the bytes in `counters`.
 fn write_buf(
     buf: &[u8],
     file_idx: usize,
     offset: u64,
     file_handles: &mut LruHandles,
     files: &[PlannedFile],
-    bytes_written: &AtomicU64,
+    counters: &WriteCounters,
     root: &Path,
 ) -> Result<()> {
     if file_handles.get(file_idx).is_none() {
@@ -777,7 +886,7 @@ fn write_buf(
         fh.seek(std::io::SeekFrom::Start(offset))?;
         fh.write_all(buf)?;
     }
-    bytes_written.fetch_add(buf.len() as u64, Ordering::Relaxed);
+    counters.wrote(file_idx, buf.len() as u64);
     Ok(())
 }
 
@@ -786,7 +895,7 @@ fn flush_pending(
     pw: &mut PendingWrite,
     file_handles: &mut LruHandles,
     files: &[PlannedFile],
-    bytes_written: &AtomicU64,
+    counters: &WriteCounters,
     root: &Path,
 ) -> Result<()> {
     if pw.is_active() && !pw.buf.is_empty() {
@@ -796,7 +905,7 @@ fn flush_pending(
             pw.start,
             file_handles,
             files,
-            bytes_written,
+            counters,
             root,
         )?;
     }
@@ -814,6 +923,7 @@ mod tests {
         stage_files,
     };
     use crate::compress::Compression;
+    use crate::repo::control::FnMutSink;
     use crate::repo::format::{ChunkDecodeStage, ObjectType, pack_object_with_context};
     use crate::testutil::{MemoryBackend, test_chunk_hasher};
     use smallvec::SmallVec;
@@ -875,7 +985,7 @@ mod tests {
             }],
         };
 
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::bytes_only();
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         let err = process_read_group(
@@ -883,7 +993,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -941,7 +1051,7 @@ mod tests {
         );
 
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::tracking(&files);
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         process_read_group(
@@ -949,7 +1059,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -961,7 +1071,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes_written.load(Ordering::Relaxed), big_data.len() as u64);
+        assert_eq!(counters.bytes(), big_data.len() as u64);
+        assert_eq!(counters.files_done(), 1);
         let contents = std::fs::read(&out).unwrap();
         assert_eq!(contents, big_data);
     }
@@ -1024,7 +1135,7 @@ mod tests {
         let storage: Arc<dyn StorageBackend> = backend;
 
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::tracking(&files);
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         process_read_group(
@@ -1032,7 +1143,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -1044,7 +1155,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes_written.load(Ordering::Relaxed), total_size);
+        assert_eq!(counters.bytes(), total_size);
+        assert_eq!(counters.files_done(), 1);
         let contents = std::fs::read(&out).unwrap();
         let mut expected = chunk_a;
         expected.extend_from_slice(&chunk_b);
@@ -1119,7 +1231,7 @@ mod tests {
         let storage: Arc<dyn StorageBackend> = backend;
 
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::tracking(&files);
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         process_read_group(
@@ -1127,7 +1239,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -1140,7 +1252,8 @@ mod tests {
         .unwrap();
 
         let total = (data_a.len() + data_b.len()) as u64;
-        assert_eq!(bytes_written.load(Ordering::Relaxed), total);
+        assert_eq!(counters.bytes(), total);
+        assert_eq!(counters.files_done(), files.len() as u64);
         assert_eq!(std::fs::read(&out_a).unwrap(), data_a);
         assert_eq!(std::fs::read(&out_b).unwrap(), data_b);
     }
@@ -1193,7 +1306,7 @@ mod tests {
         let storage: Arc<dyn StorageBackend> = backend;
 
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::tracking(&files);
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         process_read_group(
@@ -1201,7 +1314,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -1213,11 +1326,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            bytes_written.load(Ordering::Relaxed),
-            expected_data.len() as u64
-        );
+        assert_eq!(counters.bytes(), expected_data.len() as u64);
         assert_eq!(std::fs::read(&out).unwrap(), expected_data);
+        assert_eq!(
+            counters.files_done(),
+            1,
+            "eight batched blobs complete one file"
+        );
     }
 
     /// `--verify` recomputes the keyed chunk ID after decode and
@@ -1259,7 +1374,7 @@ mod tests {
         );
 
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::bytes_only();
         let cancelled = AtomicBool::new(false);
         let mut bufs = ReadBuffers::default();
         process_read_group(
@@ -1267,7 +1382,7 @@ mod tests {
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &cancelled,
             &mut bufs,
             &mut PendingWrite::new(),
@@ -1291,13 +1406,13 @@ mod tests {
         root: &std::path::Path,
         verify_chunks: bool,
     ) -> Result<u64> {
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::bytes_only();
         process_read_group(
             group,
             files,
             storage,
             crypto,
-            &bytes_written,
+            &counters,
             &AtomicBool::new(false),
             &mut ReadBuffers::default(),
             &mut PendingWrite::new(),
@@ -1308,7 +1423,7 @@ mod tests {
             None,
         )
         .map_err(ReadError::into_inner)?;
-        Ok(bytes_written.load(Ordering::Relaxed))
+        Ok(counters.bytes())
     }
 
     /// Encrypted repo: a blob whose stored chunk_id disagrees with its bytes
@@ -1448,11 +1563,11 @@ mod tests {
             xattrs: None,
         }];
         let mut handles = LruHandles::new();
-        let bytes_written = AtomicU64::new(0);
-        let res = write_buf(b"evil", 0, 0, &mut handles, &files, &bytes_written, &root);
+        let counters = WriteCounters::bytes_only();
+        let res = write_buf(b"evil", 0, 0, &mut handles, &files, &counters, &root);
         assert!(res.is_err(), "write through a symlink leaf must fail");
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-        assert_eq!(bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.bytes(), 0);
     }
 
     /// Backend that raises a shared cancellation flag from inside the range read
@@ -1569,6 +1684,7 @@ mod tests {
             &shutdown,
             None,
             None,
+            None,
         )
         .map_err(ReadError::into_inner)
         .unwrap_err();
@@ -1639,6 +1755,7 @@ mod tests {
             2,
             false,
             &shutdown,
+            None,
             None,
             None,
         )
@@ -1729,13 +1846,32 @@ mod tests {
         root: &std::path::Path,
         failures: Option<&BatchFailures>,
     ) -> std::result::Result<(), ReadError> {
+        run_group_counted(
+            group,
+            files,
+            storage,
+            root,
+            failures,
+            &WriteCounters::bytes_only(),
+        )
+    }
+
+    /// [`run_group_with`] counting into `counters`.
+    fn run_group_counted(
+        group: &ReadGroup,
+        files: &[PlannedFile],
+        storage: &Arc<dyn StorageBackend>,
+        root: &std::path::Path,
+        failures: Option<&BatchFailures>,
+        counters: &WriteCounters,
+    ) -> std::result::Result<(), ReadError> {
         let crypto = PlaintextEngine::new(test_chunk_hasher());
         process_read_group(
             group,
             files,
             storage,
             &crypto,
-            &AtomicU64::new(0),
+            counters,
             &AtomicBool::new(false),
             &mut ReadBuffers::default(),
             &mut PendingWrite::new(),
@@ -1882,10 +2018,19 @@ mod tests {
     }
 
     /// A source failure and a fatal failure in concurrent workers must surface
-    /// as the fatal one, in either join order.
+    /// as the fatal one, in either join order. With a progress sink the
+    /// coordinating thread waits for the panicking worker to unwind before it
+    /// joins; the call must still return.
     #[test]
     fn concurrent_source_and_fatal_failure_reports_fatal() {
-        for swap in [false, true] {
+        let sink = |_: RestoreEvent| {};
+        let batch = BatchProgress {
+            sink: &sink,
+            base_files: 0,
+            base_bytes: 0,
+        };
+        for (swap, with_progress) in [(false, false), (true, false), (false, true), (true, true)] {
+            let progress = with_progress.then_some(&batch);
             let crypto = PlaintextEngine::new(test_chunk_hasher());
             let (pack_src, pack_fatal) = (dummy_pack_id(0x30), dummy_pack_id(0x31));
             let storage: Arc<dyn StorageBackend> = Arc::new(BarrierBackend {
@@ -1933,11 +2078,12 @@ mod tests {
                 &CancelToken::new(),
                 None,
                 None,
+                progress,
             )
             .unwrap_err();
             assert!(
                 matches!(&err, ReadError::Fatal(e) if e.to_string().contains("panicked")),
-                "swap={swap}: got {err:?}"
+                "swap={swap} progress={with_progress}: got {err:?}"
             );
         }
     }
@@ -1956,7 +2102,17 @@ mod tests {
         stage_files(temp.path(), &files);
 
         let failures = BatchFailures::default();
-        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        let counters = WriteCounters::tracking(&files);
+        run_group_counted(
+            &group,
+            &files,
+            &storage,
+            temp.path(),
+            Some(&failures),
+            &counters,
+        )
+        .unwrap();
+        assert_eq!(counters.files_done(), 2, "the damaged file is not counted");
         let map = failures.into_map();
         assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![1]);
         assert!(map[&1].contains("hash mismatch"), "got: {}", map[&1]);
@@ -2251,13 +2407,13 @@ mod tests {
         let temp = tempdir().unwrap();
         stage_files(temp.path(), &files);
 
-        let bytes_written = AtomicU64::new(0);
+        let counters = WriteCounters::bytes_only();
         process_read_group(
             &group,
             &files,
             &storage,
             &crypto,
-            &bytes_written,
+            &counters,
             &AtomicBool::new(false),
             &mut ReadBuffers::default(),
             &mut PendingWrite::new(),
@@ -2269,7 +2425,7 @@ mod tests {
         )
         .unwrap();
         assert!(shutdown.is_cancelled(), "the first piece raises the flag");
-        assert_eq!(bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.bytes(), 0);
         assert_eq!(
             std::fs::read(temp.path().join("f0.bin")).unwrap(),
             vec![0; file_offset as usize]
@@ -2454,13 +2610,14 @@ mod tests {
 
         let failures = BatchFailures::default();
         let (mut bufs, mut pw) = (ReadBuffers::default(), PendingWrite::new());
+        let counters = WriteCounters::tracking(&files);
         for g in [&group1, &group2] {
             process_read_group(
                 g,
                 &files,
                 &storage,
                 &crypto,
-                &AtomicU64::new(0),
+                &counters,
                 &AtomicBool::new(false),
                 &mut bufs,
                 &mut pw,
@@ -2473,6 +2630,11 @@ mod tests {
             .unwrap();
         }
         let map = failures.into_map();
+        assert_eq!(
+            counters.files_done(),
+            3,
+            "the damaged file is never complete"
+        );
         assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![2]);
         assert!(
             map[&2].contains("decryption failed") || map[&2].contains("Decryption"),
@@ -2485,6 +2647,228 @@ mod tests {
                 payloads[i],
                 "blob {i}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_counters_count_a_file_once_on_its_last_byte() {
+        let files = vec![file("e.bin", 0), file("a.bin", 10), file("b.bin", 5)];
+        let c = WriteCounters::tracking(&files);
+        assert_eq!(c.files_done(), 1, "the empty file counts from the start");
+        c.wrote(1, 4);
+        assert_eq!(c.files_done(), 1);
+        c.wrote(1, 0);
+        assert_eq!(c.files_done(), 1, "an empty write completes nothing");
+        c.wrote(1, 6);
+        assert_eq!(c.files_done(), 2);
+        c.wrote(2, 5);
+        assert_eq!(c.files_done(), 3);
+        assert_eq!(c.bytes(), 15);
+
+        let b = WriteCounters::bytes_only();
+        b.wrote(1, 10);
+        assert_eq!(b.bytes(), 10);
+        assert_eq!(b.files_done(), 0);
+        assert!(b.left.is_none());
+    }
+
+    /// One blob shared by two files completes both.
+    #[test]
+    fn shared_blob_completes_every_target_file() {
+        let pack_id = dummy_pack_id(0x44);
+        let payload = b"payload-shared-intact";
+        let (data, mut group, _) = pack_of(pack_id, &[payload], &[]);
+        group.blobs[0].targets.push(WriteTarget {
+            file_idx: 1,
+            file_offset: 0,
+        });
+        let files = vec![
+            file("a.bin", payload.len() as u64),
+            file("b.bin", payload.len() as u64),
+        ];
+        let storage = storage_with(&[(pack_id, &data)]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let counters = WriteCounters::tracking(&files);
+        run_group_counted(&group, &files, &storage, temp.path(), None, &counters).unwrap();
+        assert_eq!(counters.files_done(), 2);
+        assert_eq!(counters.bytes(), 2 * payload.len() as u64);
+    }
+
+    /// Lets the first range read through and holds every later one until
+    /// `gate` opens.
+    struct GateBackend {
+        inner: MemoryBackend,
+        reads: std::sync::atomic::AtomicUsize,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl vykar_storage::InnerBackend for GateBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for GateBackend;
+        except [get_range_into, open_range];
+
+        fn open_range<'a>(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &'a mut Vec<u8>,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+            vykar_storage::buffered_range(self, key, offset, length, buf)
+        }
+
+        fn get_range_into(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &mut Vec<u8>,
+        ) -> vykar_types::error::Result<bool> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                let (open, cv) = &*self.gate;
+                let (open, timeout) = cv
+                    .wait_timeout_while(open.lock().unwrap(), Duration::from_secs(30), |o| !*o)
+                    .unwrap();
+                if !*open || timeout.timed_out() {
+                    return Err(VykarError::Other("gate never opened".into()));
+                }
+            }
+            self.inner.get_range_into(key, offset, length, buf)
+        }
+    }
+
+    /// While the single worker is held before its second group, the
+    /// coordinating thread reports the first file as complete, on top of the
+    /// earlier batches' totals.
+    #[test]
+    fn execute_parallel_restore_reports_written_totals() {
+        let payloads: [&[u8]; 2] = [b"written-payload-a", b"written-payload-b"];
+        let len = payloads[0].len() as u64;
+        assert_eq!(
+            len,
+            payloads[1].len() as u64,
+            "equal sizes: either may go first"
+        );
+        let (pack_a, pack_b) = (dummy_pack_id(0x70), dummy_pack_id(0x71));
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let entries: Vec<(PackId, ChunkId, Vec<u8>)> = payloads
+            .iter()
+            .zip([pack_a, pack_b])
+            .map(|(p, pack)| {
+                let cid = chunk_id_of(p);
+                (pack, cid, pack_blob(cid, p, &crypto))
+            })
+            .collect();
+        let files: Vec<PlannedFile> = (0..2).map(|i| file(&format!("f{i}.bin"), len)).collect();
+        let groups = || -> Vec<ReadGroup> {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, (pack, cid, packed))| {
+                    single_blob_group(*pack, *cid, packed, len as u32, target(i))
+                })
+                .collect()
+        };
+
+        // Reference run without progress.
+        let plain = MemoryBackend::new();
+        for (pack, _, packed) in &entries {
+            plain.put(&pack.storage_key(), packed).unwrap();
+        }
+        let plain: Arc<dyn StorageBackend> = Arc::new(plain);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+        let expected = execute_parallel_restore(
+            &files,
+            groups(),
+            &plain,
+            &crypto,
+            temp.path(),
+            1,
+            false,
+            &CancelToken::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(expected, 2 * len);
+
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let inner = MemoryBackend::new();
+        for (pack, _, packed) in &entries {
+            inner.put(&pack.storage_key(), packed).unwrap();
+        }
+        let storage: Arc<dyn StorageBackend> = Arc::new(GateBackend {
+            inner,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            gate: gate.clone(),
+        });
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let mut events = Vec::new();
+        let got = {
+            let sink = FnMutSink::new(|e: RestoreEvent| {
+                if let RestoreEvent::Written { files: 8, .. } = e {
+                    *gate.0.lock().unwrap() = true;
+                    gate.1.notify_all();
+                }
+                events.push(e);
+            });
+            let batch = BatchProgress {
+                sink: &sink,
+                base_files: 7,
+                base_bytes: 100,
+            };
+            execute_parallel_restore(
+                &files,
+                groups(),
+                &storage,
+                &crypto,
+                temp.path(),
+                1,
+                false,
+                &CancelToken::new(),
+                None,
+                None,
+                Some(&batch),
+            )
+            .unwrap()
+        };
+        assert_eq!(got, expected);
+        assert!(
+            events.contains(&RestoreEvent::Written {
+                files: 8,
+                bytes: 100 + len,
+            }),
+            "the held worker's first file must be reported: {events:?}"
+        );
+        let mut last = (7, 100);
+        for e in &events {
+            let RestoreEvent::Written { files, bytes } = *e else {
+                panic!("only Written comes from the pass: {e:?}");
+            };
+            assert!(
+                files >= last.0 && bytes >= last.1,
+                "not monotonic: {events:?}"
+            );
+            assert!(
+                files <= 9 && bytes <= 100 + 2 * len,
+                "over the batch: {events:?}"
+            );
+            last = (files, bytes);
         }
     }
 }

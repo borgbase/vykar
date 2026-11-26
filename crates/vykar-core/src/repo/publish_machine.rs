@@ -33,8 +33,9 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
+use super::WriterMode;
 use super::ages::{HEAD_FRESHNESS_LIMIT, HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT};
-use super::index_store::{self, HeadPut, PackedObject};
+use super::index_store::{self, HeadPut, HeadWrite, PackedObject};
 use super::index_write::FoldRequest;
 use super::lock::{self, MarkerStamp, SessionMarker};
 use super::machine::{Machine, StepCx, StepKind, bad_pick};
@@ -1197,33 +1198,13 @@ fn write_step(
             Ok(())
         }
         StepKind::Fence => {
-            // The put-if-absent check (once per backend instance) runs
-            // before the fence, so the fence and the pack-age term stay the
-            // last checks before the head create. Undecided fails the write
-            // like a failed PUT; `Unsupported`, or a backend that offers no
-            // put-if-absent, falls back to a plain PUT, logged once per
-            // handle (never silently unconditional).
-            // A lock-free writer (04 step 9) holds no lock: it fails
-            // instead (O4).
-            let lock_free = repo.is_lock_free();
-            match repo.storage.conditional() {
-                Some(cond) => {
-                    if let vykar_storage::ConditionalSupport::Unsupported { reason } =
-                        cond.verify()?
-                    {
-                        if lock_free {
-                            return Err(index_store::lock_free_without_condition(Some(&reason)));
-                        }
-                        index_store::note_fallback(&mut repo.head_fallback, Some(&reason));
-                    }
-                }
-                None if lock_free => {
-                    return Err(index_store::lock_free_without_condition(None));
-                }
-                None => {
-                    index_store::note_fallback(&mut repo.head_fallback, None);
-                }
-            }
+            // Multi-writer: the put-if-absent check (once per backend
+            // instance) runs before the fence, so the fence and the pack-age
+            // term stay the last checks before the head create; a handle
+            // whose storage fails it refuses (`MultiWriterUnsupported`),
+            // whatever its commit mode, and undecided fails the write like a
+            // failed PUT. Single-writer: no check.
+            repo.require_writer_mode()?;
             fence.check()?;
             match head_check {
                 Some(check) => check.run(repo),
@@ -1246,14 +1227,14 @@ fn write_step(
                 Some(packed) => packed,
                 None => index_store::pack_head(&w.head, repo.crypto.as_ref())?,
             };
-            let lock_free = repo.is_lock_free();
-            let created = index_store::create_head(
-                repo.storage.as_ref(),
-                generation,
-                &packed,
-                &mut repo.head_fallback,
-                lock_free,
-            );
+            let write = match repo.config.writer_mode() {
+                WriterMode::Multi => HeadWrite::IfAbsent {
+                    backend: repo.backend_label(),
+                },
+                WriterMode::Single => HeadWrite::Plain,
+            };
+            let created =
+                index_store::create_head(repo.storage.as_ref(), generation, &packed, write);
             let mut outcome = match created {
                 Ok(outcome) => outcome,
                 Err(e) => {

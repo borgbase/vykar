@@ -243,7 +243,7 @@ fn v2_fixtures_upgrade_to_v6_with_blake2b() {
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
-                UpgradeOutcome::AlreadyCurrent { version: 6 }
+                UpgradeOutcome::AlreadyCurrent { version: 6, .. }
             ),
             "{mode}"
         );

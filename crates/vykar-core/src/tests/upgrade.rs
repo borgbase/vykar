@@ -17,6 +17,7 @@ use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
     DecodedConfig, EncryptionMode, OpenOptions, Repo, RepoConfig, RepoFormat, UpgradeOutcome,
+    WriterMode,
 };
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
@@ -298,6 +299,7 @@ fn upgrade_moves_the_index_to_a_base() {
             packs_mapped,
             packs_unmapped,
             resumed,
+            ..
         } = outcome
         else {
             panic!("{from:?}: {outcome:?}");
@@ -330,11 +332,10 @@ fn upgrade_moves_the_index_to_a_base() {
         drop(repo);
         fx.check_clean();
 
-        assert_eq!(
-            commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap(),
-            UpgradeOutcome::AlreadyCurrent {
-                version: to.version()
-            }
+        let again = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+        assert!(
+            matches!(again, UpgradeOutcome::AlreadyCurrent { version, .. } if version == to.version()),
+            "{again:?}"
         );
     }
 }
@@ -1004,9 +1005,10 @@ fn upgrade_interrupted_after_the_switch_finishes_the_cleanup() {
     fx.check_clean();
     fx.write("b", "bravo");
     fx.backup("s2");
-    assert_eq!(
-        commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap(),
-        UpgradeOutcome::AlreadyCurrent { version: 6 }
+    let again = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert!(
+        matches!(again, UpgradeOutcome::AlreadyCurrent { version: 6, .. }),
+        "{again:?}"
     );
     assert!(fx.legacy_bytes().is_none());
     assert!(!fx.repo_dir.join("index.gen").exists());
@@ -1515,4 +1517,280 @@ fn legacy_none_fixtures_are_refused_without_a_write() {
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls, ["get config"], "{prefix}");
     }
+}
+
+// ── The writer mode (10-single-protocol step 5) ─────────────────────────
+
+/// A backend that offers no put-if-absent, over another one.
+struct NoConditional {
+    inner: Arc<dyn StorageBackend>,
+}
+
+impl InnerBackend for NoConditional {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for NoConditional;
+    except [conditional];
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
+}
+
+impl Fixture {
+    fn writer_mode(&self) -> WriterMode {
+        match self.decoded_config() {
+            DecodedConfig::Map(c) => c.writer_mode(),
+            DecodedConfig::Positional(_) => panic!("a positional config"),
+        }
+    }
+
+    fn config_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.repo_dir.join("config")).unwrap()
+    }
+
+    /// A handle (any format) whose storage offers no put-if-absent.
+    fn open_without_conditional(&self) -> Repo {
+        Repo::open(
+            Box::new(NoConditional {
+                inner: Arc::from(self.storage()),
+            }),
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(self.cache()),
+            OpenOptions::new().legacy_format(),
+        )
+        .unwrap()
+    }
+
+    /// The upgrade's production body (maintenance lock, live sessions
+    /// refused) on a handle without put-if-absent.
+    fn upgrade_without_conditional(&self, mode: Option<WriterMode>) -> Result<UpgradeOutcome> {
+        let mut repo = self.open_without_conditional();
+        commands::util::with_maintenance_lock(&mut repo, |repo| {
+            repo.refuse_live_sessions()?;
+            repo.upgrade_index_layout_with(mode)
+        })
+    }
+
+    /// A backup whose storage offers no put-if-absent.
+    fn backup_without_conditional(&self, name: &str) -> Result<()> {
+        let source_paths = vec![self.source.to_string_lossy().to_string()];
+        let wrap = |b: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+            Box::new(NoConditional {
+                inner: Arc::from(b),
+            })
+        };
+        commands::backup::run_impl(
+            &self.config,
+            commands::backup::BackupRequest {
+                snapshot_name: name,
+                passphrase: pass(&self.config),
+                source_paths: &source_paths,
+                source_label: "src",
+                exclude_patterns: &[],
+                exclude_if_present: &[],
+                one_file_system: true,
+                git_ignore: false,
+                xattrs_enabled: false,
+                compression: crate::compress::Compression::None,
+                command_dumps: &[],
+                verbose: false,
+            },
+            None,
+            &CancelToken::new(),
+            Some(&wrap),
+            crate::repo::HostEnv::system(),
+        )
+        .map(drop)
+    }
+
+    /// A live session marker of another host under `sessions/`.
+    fn plant_live_session(&self) -> PathBuf {
+        let sessions = self.repo_dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let marker = sessions.join("deadbeef-1234-5678-9abc-def012345678.json");
+        std::fs::write(
+            &marker,
+            format!(
+                r#"{{"hostname":"other-host","pid":99999,"registered_at":"{now}","last_refresh":"{now}","elapsed_secs":0}}"#
+            ),
+        )
+        .unwrap();
+        marker
+    }
+}
+
+/// A v3 repository on storage that passes the init-time check is upgraded
+/// as multi-writer.
+#[test]
+fn upgrade_records_the_mode_the_check_decides() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    let UpgradeOutcome::Upgraded { writer_mode, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(writer_mode.mode, WriterMode::Multi);
+    assert!(writer_mode.changed && writer_mode.single_reason.is_none());
+    assert_eq!(fx.writer_mode(), WriterMode::Multi);
+    let DecodedConfig::Map(c) = fx.decoded_config() else {
+        unreachable!()
+    };
+    assert_eq!(
+        c.features,
+        vec![crate::repo::MULTI_WRITER_FEATURE.to_string()]
+    );
+    fx.check_clean();
+}
+
+/// `--commit-mode single` on a v3 repository records single-writer, with
+/// no reason (it was asked for).
+#[test]
+fn upgrade_with_commit_mode_single_records_single() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let outcome =
+        commands::upgrade::run_with_mode(&fx.config, pass(&fx.config), Some(WriterMode::Single))
+            .unwrap();
+    let UpgradeOutcome::Upgraded { writer_mode, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(writer_mode.mode, WriterMode::Single);
+    assert_eq!(writer_mode.single_reason, None);
+    assert_eq!(fx.writer_mode(), WriterMode::Single);
+    fx.backup("s2");
+    fx.check_clean();
+}
+
+/// `--commit-mode multi` on storage without put-if-absent refuses before
+/// anything is written: the config is still the positional v3 one, and no
+/// head or pack map exists.
+#[test]
+fn upgrade_with_commit_mode_multi_refuses_on_storage_without_the_condition() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let config = fx.config_bytes();
+    let err = fx
+        .upgrade_without_conditional(Some(WriterMode::Multi))
+        .unwrap_err();
+    assert!(err.to_string().contains("nothing was changed"), "{err}");
+    assert_eq!(fx.config_bytes(), config);
+    assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
+    assert!(fx.heads().is_empty());
+    assert_eq!(
+        std::fs::read_dir(fx.repo_dir.join("packmaps"))
+            .map(|d| d.count())
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// On a v6 repository a plain upgrade reports the mode and changes
+/// nothing; `--commit-mode` switches it, changing only the feature, and a
+/// switch to the current mode is a no-op.
+#[test]
+fn a_v6_upgrade_reports_the_mode_and_switches_on_request() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    let run = |mode| commands::upgrade::run_with_mode(&fx.config, pass(&fx.config), mode).unwrap();
+    let report = |outcome: UpgradeOutcome| match outcome {
+        UpgradeOutcome::AlreadyCurrent {
+            version: 6,
+            writer_mode,
+        } => writer_mode,
+        other => panic!("{other:?}"),
+    };
+    let before = fx.decoded_config().into_repo_config();
+    let r = report(run(None));
+    assert_eq!((r.mode, r.changed), (WriterMode::Multi, false));
+    assert!(!r.put_if_absent_offered);
+
+    let r = report(run(Some(WriterMode::Single)));
+    assert_eq!((r.mode, r.changed), (WriterMode::Single, true));
+    let after = fx.decoded_config().into_repo_config();
+    assert!(after.features.is_empty());
+    let mut expected = before.clone();
+    expected.features.clear();
+    assert_eq!(after, expected, "only the feature changed");
+    // A plain upgrade now says the storage could be multi-writer.
+    let r = report(run(None));
+    assert_eq!((r.mode, r.changed), (WriterMode::Single, false));
+    assert!(r.put_if_absent_offered);
+    let config = fx.config_bytes();
+    let r = report(run(Some(WriterMode::Single)));
+    assert_eq!((r.mode, r.changed), (WriterMode::Single, false));
+    assert_eq!(fx.config_bytes(), config, "a no-op writes nothing");
+    fx.backup("s2");
+
+    let r = report(run(Some(WriterMode::Multi)));
+    assert_eq!((r.mode, r.changed), (WriterMode::Multi, true));
+    assert_eq!(fx.decoded_config().into_repo_config(), before);
+    fx.backup("s3");
+    fx.check_clean();
+}
+
+/// A client whose storage lost put-if-absent: its backup refuses on the
+/// multi-writer repository; it switches the repository to single-writer
+/// through the upgrade's production body and then backs up. Its switch
+/// back to multi-writer refuses with nothing changed.
+#[test]
+fn a_client_without_the_condition_switches_to_single_and_backs_up() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    assert_eq!(fx.writer_mode(), WriterMode::Multi);
+    let err = fx.backup_without_conditional("refused").unwrap_err();
+    assert!(
+        matches!(err, VykarError::MultiWriterUnsupported { .. }),
+        "{err:?}"
+    );
+    let outcome = fx
+        .upgrade_without_conditional(Some(WriterMode::Single))
+        .unwrap();
+    assert!(
+        matches!(&outcome, UpgradeOutcome::AlreadyCurrent { writer_mode, .. }
+            if writer_mode.mode == WriterMode::Single && writer_mode.changed),
+        "{outcome:?}"
+    );
+    assert_eq!(fx.writer_mode(), WriterMode::Single);
+    fx.write("b", "bravo");
+    fx.backup_without_conditional("s2").unwrap();
+
+    let config = fx.config_bytes();
+    let err = fx
+        .upgrade_without_conditional(Some(WriterMode::Multi))
+        .unwrap_err();
+    assert!(err.to_string().contains("stays single-writer"), "{err}");
+    assert_eq!(fx.config_bytes(), config);
+    assert_eq!(fx.snapshot_names(), vec!["s1", "s2"]);
+    fx.check_clean();
+}
+
+/// The switch refuses beside a live session, under the lock, with the
+/// config unchanged.
+#[test]
+fn the_switch_refuses_beside_a_live_session() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    let config = fx.config_bytes();
+    let marker = fx.plant_live_session();
+    let err =
+        commands::upgrade::run_with_mode(&fx.config, pass(&fx.config), Some(WriterMode::Single))
+            .unwrap_err();
+    assert!(matches!(err, VykarError::ActiveSessions(_)), "{err:?}");
+    assert!(marker.exists());
+    assert_eq!(fx.config_bytes(), config);
 }

@@ -355,6 +355,27 @@ pub enum VykarError {
     )]
     AppendOnlyServer { command: &'static str },
 
+    /// The repository is multi-writer (`multi_writer` in its config): its
+    /// clients commit without a lock, which needs put-if-absent, and this
+    /// client's storage does not offer it or its check concluded it
+    /// unsupported. A write command returns it right after open, before it
+    /// writes anything; a commit whose storage withdrew put-if-absent after
+    /// the check passed returns it before its head create. `backend`: the
+    /// repository URL, or "the storage backend". `reason`: the check's
+    /// verdict.
+    // TODO(10-single-protocol step 7): single-writer no longer means the
+    // lock then; rewrite the last sentence ("one writer at a time on this
+    // storage").
+    #[error(
+        "this repository is multi-writer (its clients commit without a lock, which needs \
+         put-if-absent), but {backend} does not offer put-if-absent to this client ({reason}), \
+         so this client cannot run the command on it. If the storage supports conditional \
+         writes, check the backend's settings (on S3: s3_conditional_writes). Otherwise run \
+         `vykar upgrade --commit-mode single`: commits then take the repository lock, so \
+         concurrent backups wait for each other instead of committing side by side"
+    )]
+    MultiWriterUnsupported { backend: String, reason: String },
+
     /// Compact did not run because the live snapshots could not be marked;
     /// nothing was changed. The text starts with vykar-core's
     /// `commands::compact::MARK_REFUSED`; the simulator matches the variant.

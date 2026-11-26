@@ -195,36 +195,31 @@ pub(crate) enum HeadPut {
     Taken,
 }
 
-/// The notice a repository handle logged when its heads fell back to plain
-/// PUTs under the lock (04 "Fallback"). Kept on the handle
-/// (`Repo::head_fallback`), so every opened repository logs once: the
-/// backend's verdict holds for the backend instance, which the handle owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeadFallback {
-    /// Logged at info: the backend does not offer put-if-absent, or its
-    /// storage refuses the mechanism.
-    NotOffered,
-    /// Logged at warn: the storage accepted the creates but ignored the
-    /// condition, or an S3 endpoint with conditional writes enabled
-    /// (`s3_conditional_writes: on`, or `auto` on AWS) refused the header
-    /// or belongs to a known-bad service (IDrive e2).
-    Refused,
+/// How [`create_head`] writes: the repository's writer mode.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HeadWrite<'a> {
+    /// Single-writer: a plain PUT (until 10-single-protocol step 7 the
+    /// writer holds the repository lock, so the head it read is current).
+    Plain,
+    /// Multi-writer: put-if-absent, never a plain PUT. `backend` names the
+    /// storage in a `MultiWriterUnsupported`.
+    IfAbsent { backend: &'a str },
 }
 
-/// Create the head bytes `packed` at `head_key(generation)` (04 step 8):
-/// put-if-absent where the backend offers it, else a plain PUT (the lock
-/// protocol of 04 "Fallback").
+/// Create the head bytes `packed` at `head_key(generation)` (04 step 8).
 ///
+/// `Plain`: PUT → `Created`.
+///
+/// `IfAbsent`:
 /// - `Ok(Yes)` → `Created`.
 /// - `Ok(AlreadyExists)` → GET the key: the same bytes → `Created` (the
-///   backend's own retry after a lost reply); other bytes or none (collected since, or a soft-deleted key on
-///   S3) → `Taken`.
-/// - `Err(UnsupportedBackend)` (a check concluded the storage refuses or
-///   ignores the condition; normally seen at the fence first) → noted in
-///   `fallback` ([`note_fallback`]), then a plain PUT → `Created`. Never
-///   silently unconditional. A `lock_free` writer (04 step 9, O4: it holds
-///   no lock, so a plain PUT could replace another writer's head) fails
-///   instead, as it does when the backend offers no put-if-absent.
+///   backend's own retry after a lost reply); other bytes or none (collected
+///   since, or a soft-deleted key on S3) → `Taken`.
+/// - `Err(InvalidFormat)` passes through.
+/// - `Err(UnsupportedBackend)` (the storage withdrew put-if-absent after the
+///   check passed), or a backend that offers no put-if-absent →
+///   `MultiWriterUnsupported`, with nothing written: never a plain PUT on a
+///   multi-writer repository.
 /// - Any other `Err` (outcome unknown) → GET the key: the same bytes →
 ///   `Created`; other bytes → `Taken`; absent, or the GET fails → the
 ///   original error (the create may still land, and only at a generation
@@ -237,16 +232,24 @@ pub(crate) fn create_head(
     storage: &dyn StorageBackend,
     generation: u64,
     packed: &[u8],
-    fallback: &mut Option<HeadFallback>,
-    lock_free: bool,
+    write: HeadWrite<'_>,
 ) -> Result<HeadPut> {
     let key = head_key(generation);
-    let Some(cond) = storage.conditional() else {
-        if lock_free {
-            return Err(lock_free_without_condition(None));
+    let backend = match write {
+        HeadWrite::Plain => {
+            storage.put(&key, packed)?;
+            return Ok(HeadPut::Created);
         }
-        storage.put(&key, packed)?;
-        return Ok(HeadPut::Created);
+        HeadWrite::IfAbsent { backend } => backend,
+    };
+    let unsupported = |reason: String| VykarError::MultiWriterUnsupported {
+        backend: backend.to_string(),
+        reason,
+    };
+    let Some(cond) = storage.conditional() else {
+        return Err(unsupported(
+            super::writer_mode::NO_PUT_IF_ABSENT.to_string(),
+        ));
     };
     let compare = |storage: &dyn StorageBackend| -> Result<Option<HeadPut>> {
         Ok(storage.get(&key)?.map(|stored| {
@@ -262,66 +265,13 @@ pub(crate) fn create_head(
         Ok(vykar_storage::Created::AlreadyExists) => {
             Ok(compare(storage)?.unwrap_or(HeadPut::Taken))
         }
-        Err(VykarError::UnsupportedBackend(reason)) if lock_free => {
-            Err(lock_free_without_condition(Some(&reason)))
-        }
-        Err(VykarError::UnsupportedBackend(reason)) => {
-            note_fallback(fallback, Some(&reason));
-            storage.put(&key, packed)?;
-            Ok(HeadPut::Created)
-        }
+        Err(VykarError::UnsupportedBackend(reason)) => Err(unsupported(reason)),
         Err(VykarError::InvalidFormat(m)) => Err(VykarError::InvalidFormat(m)),
         Err(e) => match compare(storage) {
             Ok(Some(outcome)) => Ok(outcome),
             Ok(None) | Err(_) => Err(e),
         },
     }
-}
-
-/// The error of a lock-free writer (04 step 9) whose storage no longer
-/// offers put-if-absent (`reason`: the check's or the refusal's verdict):
-/// it holds no lock, so it never writes a head with a plain PUT (O4).
-pub(crate) fn lock_free_without_condition(reason: Option<&str>) -> VykarError {
-    VykarError::Other(format!(
-        "the storage no longer offers put-if-absent ({}); a lock-free commit never writes \
-         an index head with a plain PUT. Retry the backup",
-        reason.unwrap_or("not offered")
-    ))
-}
-
-/// Log that heads fall back to plain PUTs under the lock, once per handle:
-/// nothing when `noted` is already set. `reason`: the check's verdict, or
-/// `None` for a backend that does not offer put-if-absent at all. At warn
-/// when the storage ignored the condition or an S3 endpoint with
-/// conditional writes enabled refused the header (the reason names
-/// `s3_conditional_writes`), at info otherwise. Returns whether it logged.
-pub(crate) fn note_fallback(noted: &mut Option<HeadFallback>, reason: Option<&str>) -> bool {
-    if noted.is_some() {
-        return false;
-    }
-    let refused = reason.is_some_and(|r| {
-        r.contains(vykar_storage::IGNORES_CONDITION) || r.contains("s3_conditional_writes")
-    });
-    match reason {
-        Some(reason) if refused => tracing::warn!(
-            "the storage did not pass the put-if-absent check ({reason}); index heads are \
-             written with plain PUTs under the repository lock"
-        ),
-        Some(reason) => tracing::info!(
-            "put-if-absent not offered ({reason}); index heads are written with plain PUTs \
-             under the repository lock"
-        ),
-        None => tracing::info!(
-            "the storage backend offers no put-if-absent; index heads are written with plain \
-             PUTs under the repository lock"
-        ),
-    }
-    *noted = Some(if refused {
-        HeadFallback::Refused
-    } else {
-        HeadFallback::NotOffered
-    });
-    true
 }
 
 /// What the object at `index.h/<gen>` is.

@@ -1607,8 +1607,9 @@ impl<'c> Driver<'c> {
                 ) {
                     Ok(mut pending) => {
                         pending.join_background_writes();
-                        // The mode is decided with the upload (its
-                        // put-if-absent check writes probes under sessions/).
+                        // The mode was decided right after open (its
+                        // put-if-absent check wrote probes under sessions/
+                        // before the upload).
                         match pending.commit_mode() {
                             Ok(CommitMode::LockFree) => {
                                 self.actors[i].phase = Phase::Probe(Box::new(ProbeWait {

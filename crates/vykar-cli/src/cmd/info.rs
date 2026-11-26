@@ -28,6 +28,7 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
         format!("v{}", stats.format.version()),
     );
     add_kv_row(&mut t1, theme, "Hash", stats.format.chunk_hash().as_str());
+    add_kv_row(&mut t1, theme, "Commit mode", stats.writer_mode.as_str());
     if let Some(index) = stats.index {
         add_kv_row(
             &mut t1,
@@ -52,6 +53,9 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
             .format("%Y-%m-%d %H:%M:%S"),
     );
     println!("{t1}");
+    if stats.put_if_absent_offered {
+        println!("{}", crate::cmd::upgrade::MULTI_WRITER_HINT);
+    }
     println!();
 
     // Group 2: statistics

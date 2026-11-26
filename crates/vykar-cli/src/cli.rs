@@ -309,7 +309,27 @@ pub(crate) enum Commands {
         /// Skip interactive confirmation (for scripting)
         #[arg(long)]
         yes: bool,
+
+        /// Switch the repository's commit mode (multi: lock-free commits, needs put-if-absent; single: commits take the repository lock)
+        #[arg(long, value_enum)]
+        commit_mode: Option<CommitModeArg>,
     },
+}
+
+/// `vykar upgrade --commit-mode`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum CommitModeArg {
+    Single,
+    Multi,
+}
+
+impl From<CommitModeArg> for vykar_core::repo::WriterMode {
+    fn from(arg: CommitModeArg) -> Self {
+        match arg {
+            CommitModeArg::Single => Self::Single,
+            CommitModeArg::Multi => Self::Multi,
+        }
+    }
 }
 
 #[derive(Clone, clap::ValueEnum)]

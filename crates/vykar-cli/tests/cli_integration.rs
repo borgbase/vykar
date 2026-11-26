@@ -459,7 +459,8 @@ fn cli_init_writes_repository_format_v6() {
         .into_repo_config();
     assert_eq!(config.version, 6, "init must write version 6");
     assert_eq!(config.chunk_hash, "blake3");
-    assert!(config.features.is_empty());
+    // A local filesystem passes the put-if-absent check: multi-writer.
+    assert_eq!(config.features, ["multi_writer"]);
     assert!(fx.repo_dir.join("index.h").join("1").is_file());
     assert!(!fx.repo_dir.join("index").exists());
 }
@@ -563,6 +564,58 @@ fn cli_upgrade_moves_a_v3_repository_to_v6() {
 
     let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
     assert!(out.contains("already at format v6"), "{out}");
+}
+
+/// `vykar info` shows the commit mode; `vykar upgrade --commit-mode`
+/// switches it either way, and a plain upgrade then changes nothing.
+#[test]
+fn cli_upgrade_switches_the_commit_mode() {
+    let fx = CliFixture::new();
+    write_test_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let init_out = fx.run_ok(&["--config", &cfg, "init"]);
+    assert!(!init_out.contains("Commit mode"), "{init_out}");
+    let mode_row = |want: &str| {
+        let info = fx.run_ok(&["--config", &cfg, "info"]);
+        assert!(
+            info.lines()
+                .any(|l| l.contains("Commit mode") && l.contains(want)),
+            "expected a Commit mode row reading {want}, got:\n{info}"
+        );
+        info
+    };
+    let info = mode_row("multi-writer");
+    assert!(!info.contains("--commit-mode multi"), "{info}");
+
+    let out = fx.run_ok(&[
+        "--config",
+        &cfg,
+        "upgrade",
+        "--yes",
+        "--commit-mode",
+        "single",
+    ]);
+    assert!(out.contains("single-writer"), "{out}");
+    let info = mode_row("single-writer");
+    // The storage offers put-if-absent: info says how to switch back.
+    assert!(info.contains("--commit-mode multi"), "{info}");
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("already at format v6"), "{out}");
+    assert!(out.contains("--commit-mode multi"), "{out}");
+
+    let out = fx.run_ok(&[
+        "--config",
+        &cfg,
+        "upgrade",
+        "--yes",
+        "--commit-mode",
+        "multi",
+    ]);
+    assert!(out.contains("multi-writer"), "{out}");
+    mode_row("multi-writer");
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("already at format v6"), "{out}");
+    assert!(!out.contains("--commit-mode multi"), "{out}");
 }
 
 #[test]

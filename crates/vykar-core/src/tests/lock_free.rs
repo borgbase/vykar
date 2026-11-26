@@ -542,10 +542,11 @@ fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
 }
 
 /// An undecided put-if-absent check (its probe create fails) fails the
-/// backup: no guess either way, so no lock is taken (no fallback to lock
-/// mode), no head or snapshot written; what the run wrote is its session
-/// marker, its packs and journal, and the check's probe. The next backup
-/// checks again and commits lock-free.
+/// backup right after open, before the upload (10-single-protocol step 5):
+/// no guess either way, so no lock is taken (no fallback to lock mode), no
+/// pack, head or snapshot written; what the run wrote is its session
+/// marker and the check's probe. The next backup checks again and commits
+/// lock-free.
 #[test]
 fn an_undecided_put_if_absent_check_fails_the_backup() {
     let mut sim = encrypted(StoreKind::Conditional);
@@ -567,7 +568,6 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
         .filter(|r| r.op.is_mutation())
         .filter(|r| {
             !(r.key.starts_with("sessions/")
-                || r.key.starts_with("packs/")
                 || (r.key.starts_with("locks/") && !KeyMatch::LockKey.matches(&r.key)))
         })
         .collect();
@@ -726,9 +726,18 @@ fn a_backup_with_a_gap_before_its_commit_commits_under_the_lock() {
     let ra = sim.join(ra);
     ra.expect_ok();
     assert!(!ra.lock_free, "a commits under the lock");
+    let recs = records(&sim, a, ra.index);
+    assert!(!lock_writes(&recs).is_empty(), "the commit lock was taken");
+    // The head create follows the repository's mode (multi-writer), not
+    // the demoted commit mode: put-if-absent, never a plain PUT.
+    let heads: Vec<&OpRecord> = recs
+        .iter()
+        .filter(|r| r.op.is_write() && r.key.starts_with("index.h/"))
+        .collect();
+    assert!(!heads.is_empty(), "{recs:?}");
     assert!(
-        !lock_writes(&records(&sim, a, ra.index)).is_empty(),
-        "the commit lock was taken"
+        heads.iter().all(|r| r.op == OpKind::PutIfAbsent),
+        "{heads:?}"
     );
     sim.restore(a, "a1").expect_ok();
     // The next backup's record is continuous again: lock-free.

@@ -2165,111 +2165,71 @@ fn create_head_classifies_every_answer() {
     let mine: &[u8] = b"mine";
     let other: &[u8] = b"other";
     let lost = || VykarError::Other("connection reset".into());
+    let multi = HeadWrite::IfAbsent { backend: "test" };
 
     let s = scripted(None, |st, k, d| st.put(k, d).map(|_| Created::Yes));
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Created
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Created);
 
     // AlreadyExists: our own bytes (a lost reply retried), another head's,
     // or nothing any more.
     let s = scripted(Some(mine), |_, _, _| Ok(Created::AlreadyExists));
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Created
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Created);
     let s = scripted(Some(other), |_, _, _| Ok(Created::AlreadyExists));
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Taken
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Taken);
     let s = scripted(None, |_, _, _| Ok(Created::AlreadyExists));
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Taken
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Taken);
 
     // An unknown outcome: the GET decides; absent keeps the error.
     let s = scripted(None, move |st, k, d| {
         st.put(k, d)?;
         Err(lost())
     });
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Created
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Created);
     let s = scripted(None, move |_, _, _| Err(lost()));
-    let err = create_head(&s, 2, mine, &mut None, false).unwrap_err();
+    let err = create_head(&s, 2, mine, multi).unwrap_err();
     assert!(err.to_string().contains("connection reset"), "{err}");
     let s = scripted(Some(other), move |_, _, _| Err(lost()));
-    assert_eq!(
-        create_head(&s, 2, mine, &mut None, false).unwrap(),
-        HeadPut::Taken
-    );
+    assert_eq!(create_head(&s, 2, mine, multi).unwrap(), HeadPut::Taken);
 
-    // The check concluded Unsupported: today's plain PUT.
+    // The storage withdrew put-if-absent after the check passed, or offers
+    // none: multi-writer refuses and writes nothing, never a plain PUT.
     let s = scripted(None, |_, _, _| {
         Err(vykar_storage::put_if_absent_unavailable(
             "test: ignores the condition",
         ))
     });
-    let mut noted = None;
+    let err = create_head(&s, 2, mine, multi).unwrap_err();
+    assert!(
+        matches!(&err, VykarError::MultiWriterUnsupported { backend, reason }
+            if backend == "test" && reason.contains("ignores the condition")),
+        "{err:?}"
+    );
+    assert!(s.inner.get(&head_key(2)).unwrap().is_none());
+    let plain = MemoryBackend::new();
+    let err = create_head(&plain, 2, mine, multi).unwrap_err();
+    assert!(
+        matches!(err, VykarError::MultiWriterUnsupported { .. }),
+        "{err:?}"
+    );
+    assert!(plain.get(&head_key(2)).unwrap().is_none());
+
+    // Single-writer: a plain PUT, never put-if-absent.
+    let s = scripted(Some(other), |_, _, _| {
+        panic!("a single-writer head create never calls put-if-absent")
+    });
     assert_eq!(
-        create_head(&s, 2, mine, &mut noted, false).unwrap(),
+        create_head(&s, 2, mine, HeadWrite::Plain).unwrap(),
         HeadPut::Created
     );
     assert_eq!(s.inner.get(&head_key(2)).unwrap().as_deref(), Some(mine));
-    assert_eq!(noted, Some(HeadFallback::Refused));
-    // A lock-free writer (04 step 9, O4) fails instead and writes nothing.
-    let s = scripted(None, |_, _, _| {
-        Err(vykar_storage::put_if_absent_unavailable(
-            "test: ignores the condition",
-        ))
-    });
-    let mut noted = None;
-    let err = create_head(&s, 2, mine, &mut noted, true).unwrap_err();
-    assert!(err.to_string().contains("never writes"), "{err}");
-    assert!(s.inner.get(&head_key(2)).unwrap().is_none());
-    assert_eq!(noted, None);
-    let plain = MemoryBackend::new();
-    let err = create_head(&plain, 2, mine, &mut None, true).unwrap_err();
-    assert!(err.to_string().contains("never writes"), "{err}");
-    assert!(plain.get(&head_key(2)).unwrap().is_none());
 
     // Over the size cap: refused, never written unconditionally.
     let s = scripted(None, |_, _, _| {
         Err(VykarError::InvalidFormat("put-if-absent: too large".into()))
     });
     assert!(matches!(
-        create_head(&s, 2, mine, &mut None, false),
+        create_head(&s, 2, mine, multi),
         Err(VykarError::InvalidFormat(_))
     ));
     assert!(s.inner.get(&head_key(2)).unwrap().is_none());
-}
-
-/// The fallback notice: warn for a storage that ignored the condition or an
-/// S3 endpoint the user set to `on`, info for a mechanism not offered;
-/// logged once per slot (a repository handle), the first verdict kept.
-#[test]
-fn fallback_notice_is_logged_once_per_slot() {
-    let cases = [
-        (
-            Some("ignores the condition: a second create succeeded"),
-            HeadFallback::Refused,
-        ),
-        (
-            Some("S3 endpoint refuses If-None-Match (s3_conditional_writes): 501"),
-            HeadFallback::Refused,
-        ),
-        (Some("no hardlink@openssh.com"), HeadFallback::NotOffered),
-        (None, HeadFallback::NotOffered),
-    ];
-    for (reason, want) in cases {
-        let mut noted = None;
-        assert!(note_fallback(&mut noted, reason), "{reason:?}");
-        assert_eq!(noted, Some(want), "{reason:?}");
-        assert!(!note_fallback(&mut noted, Some("ignores the condition")));
-        assert_eq!(noted, Some(want), "the first verdict is kept: {reason:?}");
-    }
 }

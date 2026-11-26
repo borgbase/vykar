@@ -506,6 +506,8 @@ fn maintenance_on_a_host_without_caches_segmented() {
 fn failed_index_write_in_compact_leaves_caches_untouched() {
     for format in FORMATS {
         let env = Env::new(format);
+        // `FailIndexPut` offers no put-if-absent: lock mode.
+        crate::tests::helpers::make_single_writer(&env.repo_dir);
         let src = env.source("a", &[("one.bin", 0x11)]);
         env.backup(&src, "a", "s1");
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();

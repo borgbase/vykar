@@ -709,7 +709,10 @@ pub(crate) fn run_with_repair_on_repo(
             repair_errors: Vec::new(),
         })
     } else {
-        // Apply: maintenance lock, re-scan under lock, mutate state.
+        // Apply: maintenance lock, re-scan under lock, mutate state. A
+        // multi-writer repository whose storage this client cannot use
+        // refuses first, with nothing written.
+        repo.require_writer_mode()?;
         crate::commands::util::with_maintenance_lock(repo, |repo| {
             // Repair rebuilds or rewrites the index and deletes snapshots:
             // it does not run beside a backup.

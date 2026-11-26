@@ -50,8 +50,9 @@ mod session;
 pub use memory_budget::PackPolicy;
 pub use session::WriteSessionOptions;
 mod upgrade;
-pub use upgrade::UpgradeOutcome;
+pub use upgrade::{UpgradeOutcome, WriterModeReport};
 mod writer;
+pub(crate) mod writer_mode;
 pub(crate) use chunks::{
     ChunkInput, ExistingAt, ExistingChunk, PreparedChunk, StoredChunk, WorkerChunk,
 };
@@ -184,13 +185,45 @@ pub struct RepoConfig {
     /// [`HashAlgorithm::as_str`] of the chunk and pack hash. A string, so an
     /// unknown name is a "newer vykar" refusal, not a decode error.
     pub chunk_hash: String,
-    /// Features a reader must understand. Written empty.
+    /// Features a reader must understand: [`MULTI_WRITER_FEATURE`] on a
+    /// multi-writer repository, else empty.
     pub features: Vec<String>,
 }
 
+/// The config feature of a multi-writer repository (10-single-protocol
+/// step 5): clients commit without a lock, with put-if-absent index heads.
+/// Absent: single-writer.
+pub const MULTI_WRITER_FEATURE: &str = "multi_writer";
+
 /// Config features this binary understands. A config naming another is
 /// refused as written by a newer vykar.
-pub const KNOWN_CONFIG_FEATURES: &[&str] = &[];
+pub const KNOWN_CONFIG_FEATURES: &[&str] = &[MULTI_WRITER_FEATURE];
+
+/// A repository's commit mode as its config records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterMode {
+    /// No `multi_writer`: commits take the repository lock (until
+    /// 10-single-protocol step 7).
+    Single,
+    /// `multi_writer`: lock-free commits with put-if-absent heads.
+    Multi,
+}
+
+impl WriterMode {
+    /// "single-writer" / "multi-writer", as `vykar info` prints it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single-writer",
+            Self::Multi => "multi-writer",
+        }
+    }
+}
+
+impl std::fmt::Display for WriterMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Why `encryption.mode: none` is refused while the config is parsed. The
 /// whole file fails to load, so the text says the line must change before
@@ -223,6 +256,28 @@ pub(crate) const MAX_PACK_SIZE_LIMIT: u32 = 512 * 1024 * 1024;
 const MAP_CONFIG_VERSION: u32 = 6;
 
 impl RepoConfig {
+    /// `Multi` when `features` names [`MULTI_WRITER_FEATURE`].
+    pub fn writer_mode(&self) -> WriterMode {
+        if self.features.iter().any(|f| f == MULTI_WRITER_FEATURE) {
+            WriterMode::Multi
+        } else {
+            WriterMode::Single
+        }
+    }
+
+    /// Add or remove [`MULTI_WRITER_FEATURE`], keeping every other feature
+    /// and their order, never duplicating it.
+    pub fn set_writer_mode(&mut self, mode: WriterMode) {
+        match mode {
+            WriterMode::Multi => {
+                if self.writer_mode() != WriterMode::Multi {
+                    self.features.push(MULTI_WRITER_FEATURE.to_string());
+                }
+            }
+            WriterMode::Single => self.features.retain(|f| f != MULTI_WRITER_FEATURE),
+        }
+    }
+
     /// The v6 config of a new repository.
     pub fn new_v6(
         id: Vec<u8>,
@@ -271,6 +326,25 @@ impl RepoConfig {
             _ => Ok(DecodedConfig::Map(rmp_serde::from_slice(bytes)?)),
         }
     }
+}
+
+/// The refusal of a config naming a feature outside `known`, by name: what
+/// [`DecodedConfig::validate`] does with [`KNOWN_CONFIG_FEATURES`] (and what
+/// an older binary with a shorter list does with a newer feature).
+fn refuse_unknown_features(features: &[String], known: &[&str]) -> Result<()> {
+    let unknown: Vec<&str> = features
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !known.contains(f))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(vykar_types::error::VykarError::Other(format!(
+        "the repository config names feature(s) {}, which this vykar does not know; it was \
+         written by a newer vykar. Upgrade vykar",
+        unknown.join(", ")
+    )))
 }
 
 /// What `config` held.
@@ -323,19 +397,7 @@ impl DecodedConfig {
                         )));
                     }
                 };
-                let unknown: Vec<&str> = c
-                    .features
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|f| !KNOWN_CONFIG_FEATURES.contains(f))
-                    .collect();
-                if !unknown.is_empty() {
-                    return Err(VykarError::Other(format!(
-                        "the repository config names feature(s) {}, which this vykar does not \
-                         know; it was written by a newer vykar. Upgrade vykar",
-                        unknown.join(", ")
-                    )));
-                }
+                refuse_unknown_features(&c.features, KNOWN_CONFIG_FEATURES)?;
                 (RepoFormat::V6(hash), c.max_pack_size)
             }
             Self::Positional(c) => {
@@ -599,9 +661,12 @@ pub struct Repo {
     /// garbage collection runs only right after its caller created the
     /// latest head (`index_store::collect_index_garbage`'s precondition).
     created_head: Option<u64>,
-    /// The notice this handle logged when its heads fell back to plain PUTs
-    /// (04 "Fallback"): logged once per handle, set when logged.
-    head_fallback: Option<index_store::HeadFallback>,
+    /// The repository URL the open or init was given
+    /// (`OpenOptions::repo_url`, `InitOptions::url`); only for messages.
+    repo_url: Option<String>,
+    /// Set by init when it recorded single-writer: the init-time check's
+    /// verdict (10-single-protocol step 5).
+    single_writer_reason: Option<String>,
     /// How this handle commits, decided once (`Self::commit_mode`); `None`
     /// until a writer asked.
     commit_mode: Option<CommitMode>,
@@ -631,9 +696,9 @@ pub struct Repo {
     relocation: relocate::RelocationCache,
 }
 
-/// How a handle writes index heads (04 step 9): `LockFree` on an encrypted
-/// repository whose storage passed the put-if-absent check, `Lock` (the
-/// repository lock, 04 "Fallback") otherwise.
+/// How a handle commits (04 step 9): `LockFree` on a multi-writer
+/// repository, `Lock` (the repository lock) on a single-writer one, and for
+/// a backup demoted by [`Repo::commit_under_lock`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitMode {
     Lock,
@@ -971,14 +1036,6 @@ impl Repo {
         self.lock_store_time
     }
 
-    /// The fallback notice this handle logged, if its heads are written
-    /// with plain PUTs (04 "Fallback"); `None` until its first index write
-    /// reached the fence, and on a backend whose check passed.
-    #[cfg(test)]
-    pub(crate) fn head_fallback(&self) -> Option<index_store::HeadFallback> {
-        self.head_fallback
-    }
-
     /// Set the age below which orphan packs are kept (tests).
     #[cfg(test)]
     pub(crate) fn set_pack_grace(&mut self, grace: std::time::Duration) {
@@ -1038,34 +1095,24 @@ impl Repo {
         ages::foldable_prefix(segments, self.segment_ages.as_ref(), self.segment_grace)
     }
 
-    /// How this handle commits, decided once per handle (the put-if-absent
-    /// check once per backend instance, `vykar_storage::Verifier`):
-    /// `Lock` when the storage offers no put-if-absent or its check
-    /// concluded `Unsupported`;
-    /// `LockFree` when the check passed. An undecided check (no write
-    /// permission, a transport failure) is an error: no guess either way.
+    /// How this handle commits, decided once per handle from the
+    /// repository's mode (`config`, 10-single-protocol step 5): `LockFree`
+    /// on a multi-writer repository whose storage passed this handle's
+    /// put-if-absent check ([`Self::require_writer_mode`]), `Lock` on a
+    /// single-writer repository (no request). A multi-writer repository
+    /// whose storage fails the check refuses (`MultiWriterUnsupported`)
+    /// and never falls back; an undecided check is an error. An error is
+    /// not cached.
     pub(crate) fn commit_mode(&mut self) -> Result<CommitMode> {
         if let Some(mode) = self.commit_mode {
             return Ok(mode);
         }
-        let reason = match self.storage.conditional() {
-            None => Some(None),
-            Some(cond) => match cond.verify()? {
-                vykar_storage::ConditionalSupport::Verified => None,
-                vykar_storage::ConditionalSupport::Unsupported { reason } => Some(Some(reason)),
-            },
-        };
-        let mode = match reason {
-            None => CommitMode::LockFree,
-            Some(reason) => {
-                if index_store::note_fallback(&mut self.head_fallback, reason.as_deref()) {
-                    tracing::info!(
-                        "this client commits under the repository lock; lock-free writers on \
-                         this repository wait for it"
-                    );
-                }
-                CommitMode::Lock
+        let mode = match self.config.writer_mode() {
+            WriterMode::Multi => {
+                self.require_writer_mode()?;
+                CommitMode::LockFree
             }
+            WriterMode::Single => CommitMode::Lock,
         };
         match mode {
             CommitMode::LockFree => tracing::debug!("this client commits lock-free"),
@@ -1075,9 +1122,12 @@ impl Repo {
         Ok(mode)
     }
 
-    /// Commit under the repository lock from now on, whatever the check
+    /// Commit under the repository lock from now on, whatever the mode
     /// decided: a backup whose session marker record is not continuous
-    /// before its commit mark (`PendingCommit::commit_mode`).
+    /// before its commit mark (`PendingCommit::commit_mode`), until
+    /// 10-single-protocol step 7 replaces the demotion with the suspend
+    /// rule. Heads stay put-if-absent on a multi-writer repository
+    /// (`create_head` follows the repository's mode, not this one).
     pub(crate) fn commit_under_lock(&mut self) {
         self.commit_mode = Some(CommitMode::Lock);
     }
@@ -1273,9 +1323,59 @@ mod format_tests {
         c.features = vec!["x".into()];
         let err = decode(&c).unwrap_err().to_string();
         assert!(err.contains('x') && err.contains("newer vykar"), "{err}");
+        // `multi_writer` is known; another feature beside it is still refused.
+        let mut c = v6(HashAlgorithm::Blake3);
+        c.features = vec![MULTI_WRITER_FEATURE.into()];
+        assert!(matches!(
+            decode(&c),
+            Ok(RepoFormat::V6(HashAlgorithm::Blake3))
+        ));
+        c.features.push("y".into());
+        let err = decode(&c).unwrap_err().to_string();
+        assert!(
+            err.contains("feature(s) y,") && err.contains("newer vykar"),
+            "{err}"
+        );
+        // A development binary from before `multi_writer` (no known features)
+        // refuses a multi-writer repository by the feature's name.
+        let err = refuse_unknown_features(&[MULTI_WRITER_FEATURE.into()], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("feature(s) multi_writer,") && err.contains("written by a newer vykar"),
+            "{err}"
+        );
         let mut c = v6(HashAlgorithm::Blake3);
         c.max_pack_size = MAX_PACK_SIZE_LIMIT + 1;
         assert!(matches!(decode(&c), Err(VykarError::Config(_))));
+    }
+
+    /// `set_writer_mode` adds or removes only `multi_writer`, never twice,
+    /// and the mode survives encode, decode and validate.
+    #[test]
+    fn set_writer_mode_round_trips() {
+        let mut c = v6(HashAlgorithm::Blake3);
+        assert_eq!(c.writer_mode(), WriterMode::Single);
+        c.set_writer_mode(WriterMode::Multi);
+        c.set_writer_mode(WriterMode::Multi);
+        assert_eq!(c.features, vec![MULTI_WRITER_FEATURE.to_string()]);
+        let decoded = RepoConfig::decode(&c.encode().unwrap()).unwrap();
+        decoded.validate().unwrap();
+        let DecodedConfig::Map(back) = decoded else {
+            panic!("a map")
+        };
+        assert_eq!(back.writer_mode(), WriterMode::Multi);
+        assert_eq!(back, c);
+        // Another feature (placed directly; validate is not involved) keeps
+        // its place.
+        c.features = vec!["a".into(), MULTI_WRITER_FEATURE.into(), "b".into()];
+        c.set_writer_mode(WriterMode::Multi);
+        assert_eq!(c.features, ["a", MULTI_WRITER_FEATURE, "b"]);
+        c.set_writer_mode(WriterMode::Single);
+        assert_eq!(c.features, ["a", "b"]);
+        assert_eq!(c.writer_mode(), WriterMode::Single);
+        c.set_writer_mode(WriterMode::Single);
+        assert_eq!(c.features, ["a", "b"]);
     }
 
     /// An otherwise valid config that says mode none is refused with the

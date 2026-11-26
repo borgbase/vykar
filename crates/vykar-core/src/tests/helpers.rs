@@ -43,6 +43,22 @@ pub fn init_repo(repo_dir: &Path) -> VykarConfig {
     config
 }
 
+/// Record single-writer in the `config` of the local repository at
+/// `repo_dir` (10-single-protocol step 5). For tests whose storage wrapper
+/// offers no put-if-absent: before step 5 such a handle committed in lock
+/// mode with plain head PUTs, which a single-writer repository still does;
+/// on a multi-writer one it would refuse.
+pub(crate) fn make_single_writer(repo_dir: &Path) {
+    let path = repo_dir.join("config");
+    let crate::repo::DecodedConfig::Map(mut config) =
+        RepoConfig::decode(&std::fs::read(&path).unwrap()).unwrap()
+    else {
+        panic!("a v6 config");
+    };
+    config.set_writer_mode(crate::repo::WriterMode::Single);
+    std::fs::write(path, config.encode().unwrap()).unwrap();
+}
+
 /// The passphrase the config's repository opens with.
 pub fn pass(config: &VykarConfig) -> Option<&str> {
     config.encryption.passphrase.as_deref()

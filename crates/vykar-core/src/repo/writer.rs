@@ -9,8 +9,9 @@ use vykar_types::error::Result;
 use vykar_types::pack_id::PackId;
 
 use super::Repo;
+use super::WriterMode;
 use super::index_write::{MaintenanceWrite, OnMoved};
-use super::upgrade::UpgradeOutcome;
+use super::upgrade::{UpgradeOutcome, WriterModeReport};
 use super::write_session::WriteSession;
 use crate::index::LiveIndex;
 
@@ -205,7 +206,25 @@ impl RepoWriter<'_> {
     /// Rewrite the index into the current layout and switch the repository
     /// to the current format (`Repo::upgrade_index_layout_under`).
     pub fn upgrade_index_layout(&mut self) -> Result<UpgradeOutcome> {
-        self.repo.upgrade_index_layout_under(&self.fence)
+        self.upgrade_index_layout_with(None)
+    }
+
+    /// [`Self::upgrade_index_layout`] recording `requested` as the writer
+    /// mode (`vykar upgrade --commit-mode`); on a v6 repository a `Some`
+    /// switches the mode.
+    pub fn upgrade_index_layout_with(
+        &mut self,
+        requested: Option<WriterMode>,
+    ) -> Result<UpgradeOutcome> {
+        self.repo.upgrade_index_layout_under(&self.fence, requested)
+    }
+
+    /// Switch a v6 repository's writer mode (`Repo::set_writer_mode_under`)
+    /// under this writer's fence. The caller holds the maintenance lock and
+    /// has refused live sessions: a session that read the old mode must not
+    /// commit across the switch.
+    pub fn set_writer_mode(&mut self, want: WriterMode) -> Result<WriterModeReport> {
+        self.repo.set_writer_mode_under(want, &self.fence)
     }
 
     /// `Repo::persist_maintenance_under` with this writer's fence.

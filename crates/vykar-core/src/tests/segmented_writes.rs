@@ -1037,6 +1037,8 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     .unwrap();
     age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
 
+    // `MutLog` offers no put-if-absent: lock mode.
+    crate::tests::helpers::make_single_writer(&fx.repo_dir);
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = Box::new(MutLog {
         inner: Arc::from(fx.storage()),
@@ -1121,6 +1123,8 @@ fn faulty(
     fx: &Fixture,
     fail: impl Fn(&str, &[u8]) -> bool + Send + Sync + 'static,
 ) -> (Box<dyn StorageBackend>, Arc<Mutex<Vec<String>>>) {
+    // `FaultyPut` offers no put-if-absent: lock mode.
+    crate::tests::helpers::make_single_writer(&fx.repo_dir);
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = FaultyPut {
         inner: Arc::from(fx.storage()),

@@ -1186,3 +1186,76 @@ fn a_lost_pack_reply_on_an_append_only_server_is_recognised() {
         "alpha ".repeat(4096)
     );
 }
+
+/// The commit-mode switch rewrites `config`, which an append-only server
+/// refuses: both directions are refused before anything is written (no
+/// put-if-absent probe under `sessions/`), with `config` unchanged. On a
+/// server without append-only the switch succeeds.
+#[test]
+fn commit_mode_switch_is_refused_on_an_append_only_server() {
+    use crate::repo::{DecodedConfig, RepoConfig, WriterMode};
+    let probe_writes = |reqs: &[Request]| -> Vec<String> {
+        reqs.iter()
+            .filter(|(method, uri, _)| {
+                *method != axum::http::Method::GET
+                    && *method != axum::http::Method::HEAD
+                    && request_key(uri).starts_with(vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX)
+            })
+            .map(|(_, uri, _)| uri.clone())
+            .collect()
+    };
+    let server = Server::start(true);
+    let c = Client::init(&server);
+    c.write("a", "alpha");
+    c.backup("s1");
+    let config_path = server.data.path().join("config");
+    let mode = || match RepoConfig::decode(&std::fs::read(&config_path).unwrap()).unwrap() {
+        DecodedConfig::Map(c) => c.writer_mode(),
+        DecodedConfig::Positional(_) => panic!("positional"),
+    };
+    assert_eq!(mode(), WriterMode::Multi, "init passed the check");
+    let switch = |want| commands::upgrade::run_with_mode(&c.config, pass(&c.config), Some(want));
+
+    let before = std::fs::read(&config_path).unwrap();
+    server.take_requests();
+    let err = switch(WriterMode::Single).unwrap_err().to_string();
+    assert!(
+        err.contains("cannot be rewritten") && err.contains("append-only"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
+
+    // A single-writer repository (as one made before the feature existed)
+    // switched to multi-writer: refused before the check writes a probe.
+    let DecodedConfig::Map(mut single) = RepoConfig::decode(&before).unwrap() else {
+        unreachable!()
+    };
+    single.set_writer_mode(WriterMode::Single);
+    std::fs::write(&config_path, single.encode().unwrap()).unwrap();
+    let before = std::fs::read(&config_path).unwrap();
+    server.take_requests();
+    let err = switch(WriterMode::Multi).unwrap_err().to_string();
+    assert!(
+        err.contains("cannot be rewritten") && err.contains("append-only"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    let probes = probe_writes(&server.take_requests());
+    assert!(probes.is_empty(), "{probes:?}");
+    c.backup("s2");
+
+    let server = Server::start(false);
+    let c = Client::init(&server);
+    c.write("a", "alpha");
+    c.backup("s1");
+    let config_path = server.data.path().join("config");
+    commands::upgrade::run_with_mode(&c.config, pass(&c.config), Some(WriterMode::Single)).unwrap();
+    let DecodedConfig::Map(after) =
+        RepoConfig::decode(&std::fs::read(&config_path).unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(after.writer_mode(), WriterMode::Single);
+    c.backup("s2");
+    check_clean(&c.config);
+}

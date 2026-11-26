@@ -173,6 +173,14 @@ vykar upgrade -R <repo> --yes    # for scripts
 
 New repositories are created in the current format; there is nothing to upgrade.
 
+### Commit mode
+
+A repository is **multi-writer** or **single-writer**, as its `config` records it; `vykar info` shows which. `vykar init` (and `vykar upgrade` from v2/v3) records multi-writer when the storage passes a put-if-absent check, including a concurrent race of creates: backups then commit side by side without the repository lock. Otherwise the repository is single-writer and `vykar init` says why: commits take the repository lock, so concurrent backups wait for each other.
+
+- A multi-writer repository refuses every write (backup, compact, prune, snapshot delete, `check --repair`) from a client whose storage does not pass the check (on S3, check `s3_conditional_writes`), before it writes anything. `compact --dry-run` and `compact --report-unreferenced` refuse there too.
+- `vykar upgrade --commit-mode single` makes the repository single-writer (no check needed, so such a client can run it); `vykar upgrade --commit-mode multi` makes it multi-writer again, and runs the check first. Both run with no other client active, like the format upgrade, and are refused on an append-only `vykar-server` (they rewrite `config`).
+- Development v6 repositories made before the mode was recorded open as single-writer. When the storage offers put-if-absent, `vykar info` and a plain `vykar upgrade` say so and name `vykar upgrade --commit-mode multi`.
+
 ## Sharing one repository between hosts
 
 Several machines can back up to the same repository, but they should run

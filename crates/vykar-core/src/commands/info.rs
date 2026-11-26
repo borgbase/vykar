@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::config::VykarConfig;
-use crate::repo::{EncryptionMode, RepoFormat};
+use crate::repo::{EncryptionMode, RepoFormat, WriterMode};
 use vykar_types::error::Result;
 
 use super::list::load_snapshot_meta;
@@ -36,6 +36,12 @@ pub struct InfoStats {
     /// lacks a chunk a live snapshot needs, and no compact has marked since
     /// (nor a repair applied): [`crate::commands::compact_refusal`].
     pub compact_refused: Option<crate::commands::compact_refusal::CompactRefusal>,
+    /// As `config` records it.
+    pub writer_mode: WriterMode,
+    /// The repository is single-writer and this handle's storage offers
+    /// put-if-absent (as far as it knows without a request): `vykar upgrade
+    /// --commit-mode multi` could switch it.
+    pub put_if_absent_offered: bool,
 }
 
 /// Shape of a segmented index: its base and the segments written since.
@@ -107,5 +113,8 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
             segment_bytes: head.segments.iter().map(|s| s.size).sum(),
         }),
         compact_refused: crate::commands::compact_refusal::read(repo.cache_dir().as_deref()),
+        writer_mode: repo.writer_mode(),
+        put_if_absent_offered: repo.writer_mode() == WriterMode::Single
+            && repo.storage_offers_put_if_absent(),
     })
 }

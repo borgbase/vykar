@@ -17,6 +17,8 @@ use vykar_storage::{
 };
 use vykar_types::error::{Result, VykarError};
 
+use crate::repo::WriterMode;
+
 use super::fault::{
     ClientId, Effect, FaultAction, FaultRule, INJECTED_MARKER, OpKind, ParkedEffect, ParkedId,
     RuleId,
@@ -35,17 +37,18 @@ const TAMPER: ClientId = ClientId(1);
 pub enum StoreKind {
     /// No put-if-absent (`conditional()` is None): a backend that does not
     /// offer it (S3 off AWS with `s3_conditional_writes: auto`, SFTP without
-    /// `hardlink@openssh.com`) or whose check failed. Heads are plain PUTs
-    /// under the lock, and one with other bytes replaces the head. The
-    /// fallback; every seed recorded before 04 step 8 runs on it.
+    /// `hardlink@openssh.com`) or whose check failed. Init records a
+    /// single-writer repository: heads are plain PUTs under the lock, and
+    /// one with other bytes replaces the head. Every seed recorded before
+    /// 04 step 8 runs on it.
     #[default]
     Plain,
     /// vykar-server: honest put-if-absent; a plain PUT of an existing head
     /// with other bytes is refused (409, as vykar-server answers).
     Conditional,
-    /// Garage 2.5.0: put-if-absent overwrites and answers Yes; the client's
-    /// check concludes Unsupported and it falls back to plain PUTs, which
-    /// overwrite.
+    /// Garage 2.5.0: put-if-absent overwrites and answers Yes; init's check
+    /// concludes Unsupported, so the repository is single-writer and heads
+    /// are plain PUTs under the lock, which overwrite.
     Ignoring,
     /// IDrive e2: passes the sequential check; a delayed or duplicated
     /// create that lands later overwrites whatever is there (the
@@ -63,6 +66,18 @@ pub enum StoreKind {
 }
 
 impl StoreKind {
+    /// Whether init's check (in the simulator the sequential check only,
+    /// [`SimClient::verify_at_init`]) passes on this kind, so `config`
+    /// records `multi_writer`: Conditional, ConditionalOverwrite and
+    /// RacyRelease (its race only shows with late releases); not Plain (no
+    /// put-if-absent) or Ignoring (fails the sequential check).
+    pub fn records_multi_writer(self) -> bool {
+        matches!(
+            self,
+            StoreKind::Conditional | StoreKind::ConditionalOverwrite | StoreKind::RacyRelease
+        )
+    }
+
     // serde's `skip_serializing_if` passes a reference.
     #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn is_plain(&self) -> bool {
@@ -142,6 +157,9 @@ struct State {
     head_overwrites: Vec<(String, u64, ClientId)>,
     /// Clients whose handles offer no put-if-absent ([`SimStore::set_lock_client`]).
     lock_clients: BTreeSet<ClientId>,
+    /// Clients whose handles offer no put-if-absent and read the real
+    /// `config` ([`SimStore::set_client_without_conditional`]).
+    unconditional_clients: BTreeSet<ClientId>,
     /// Runs that wrote (or attempted) a session marker key flagged
     /// `committing` ([`SimStore::committed_lock_free_in_run`]).
     committing_runs: BTreeSet<usize>,
@@ -488,6 +506,7 @@ impl SimStore {
                     next_gate: 0,
                     head_overwrites: Vec::new(),
                     lock_clients: BTreeSet::new(),
+                    unconditional_clients: BTreeSet::new(),
                     committing_runs: BTreeSet::new(),
                     registered_runs: BTreeSet::new(),
                 }),
@@ -504,15 +523,36 @@ impl SimStore {
     }
 
     /// [`Self::fork`] with another [`StoreKind`] (a driver case's
-    /// `storage` on the template's store).
+    /// `storage` on the template's store). The template is built on Plain,
+    /// so a fork onto another kind carries the mode init would have recorded
+    /// there ([`StoreKind::records_multi_writer`]): a `config` that decodes
+    /// as a map is rewritten to that mode, keeping its mtime and writer. A
+    /// fork onto the same kind changes nothing; a `config` that does not
+    /// decode is left alone.
     pub fn fork_as(&self, kind: StoreKind) -> SimStore {
         let st = self.state();
+        let mut objects = st.objects.clone();
+        if kind != self.shared.config.kind
+            && let Some(obj) = objects.get_mut("config")
+            && let Ok(crate::repo::DecodedConfig::Map(mut config)) =
+                crate::repo::RepoConfig::decode(&obj.data)
+        {
+            let want = if kind.records_multi_writer() {
+                WriterMode::Multi
+            } else {
+                WriterMode::Single
+            };
+            if config.writer_mode() != want {
+                config.set_writer_mode(want);
+                obj.data = config.encode().expect("a decoded v6 config encodes");
+            }
+        }
         Self::from_parts(
             SimConfig {
                 kind,
                 ..self.shared.config.clone()
             },
-            st.objects.clone(),
+            objects,
             st.step,
             st.clock,
             st.names.clone(),
@@ -568,12 +608,22 @@ impl SimStore {
     }
 
     /// Storage handle for `client`: logged, faultable. A lock client's
-    /// ([`Self::set_lock_client`]) offers no put-if-absent, as
-    /// [`Self::handle_without_conditional`]: every handle the harness builds
-    /// comes from here, so the client falls back in every run.
+    /// ([`Self::set_lock_client`]) offers no put-if-absent and reads
+    /// `config` as single-writer; a client named by
+    /// [`Self::set_client_without_conditional`] offers no put-if-absent and
+    /// reads the real `config`. Every handle the harness builds comes from
+    /// here, so this holds in every run.
     pub fn handle(&self, client: ClientId) -> SimClient {
-        let lock_client = self.state().lock_clients.contains(&client);
-        self.new_handle(client, lock_client)
+        let (lock_client, unconditional) = {
+            let st = self.state();
+            (
+                st.lock_clients.contains(&client),
+                st.unconditional_clients.contains(&client),
+            )
+        };
+        let mut handle = self.new_handle(client, lock_client || unconditional);
+        handle.stale_single = lock_client;
+        handle
     }
 
     /// A handle for `client` whose `conditional()` is None on every store
@@ -584,9 +634,20 @@ impl SimStore {
         self.new_handle(client, true)
     }
 
-    /// Every later [`Self::handle`] of `client` offers no put-if-absent.
+    /// Every later [`Self::handle`] of `client` offers no put-if-absent and
+    /// reads `config` as single-writer: a client that read `config` before
+    /// a switch to multi-writer, the one way lock mode and lock-free commits
+    /// still meet on one repository after 10-single-protocol step 5 besides
+    /// the suspend demotion. Step 10 removes lock clients.
     pub fn set_lock_client(&self, client: ClientId) {
         self.state().lock_clients.insert(client);
+    }
+
+    /// Every later [`Self::handle`] of `client` offers no put-if-absent but
+    /// reads the real `config`: on a multi-writer repository its writes
+    /// refuse (`MultiWriterUnsupported`).
+    pub fn set_client_without_conditional(&self, client: ClientId) {
+        self.state().unconditional_clients.insert(client);
     }
 
     /// The clients [`set_lock_client`](Self::set_lock_client) named.
@@ -604,6 +665,7 @@ impl SimStore {
             client,
             observer: false,
             no_conditional,
+            stale_single: false,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -615,6 +677,7 @@ impl SimStore {
             client: OBSERVER,
             observer: true,
             no_conditional: false,
+            stale_single: false,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -740,6 +803,16 @@ impl SimStore {
     /// Admin read (unlogged).
     pub fn object(&self, key: &str) -> Option<StoredObject> {
         self.state().objects.get(key).cloned()
+    }
+
+    /// The writer mode the stored `config` records (unlogged); `None`
+    /// without a `config` that decodes as a map.
+    pub fn writer_mode(&self) -> Option<WriterMode> {
+        let obj = self.object("config")?;
+        match crate::repo::RepoConfig::decode(&obj.data) {
+            Ok(crate::repo::DecodedConfig::Map(c)) => Some(c.writer_mode()),
+            _ => None,
+        }
     }
 
     /// Admin listing (unlogged), sorted.
@@ -1173,6 +1246,9 @@ pub struct SimClient {
     /// `conditional()` is None whatever the store's kind
     /// ([`SimStore::handle_without_conditional`]).
     no_conditional: bool,
+    /// Reads `config` as single-writer (a lock client,
+    /// [`SimStore::set_lock_client`]).
+    stale_single: bool,
     /// The put-if-absent check's cache, as a production backend instance
     /// has one: shared by this handle's clones (one per run).
     cond: Arc<Verifier>,
@@ -1226,9 +1302,26 @@ impl ConditionalWrite for SimClient {
         self.cond.verify(self, &|k, d| self.raw_create(k, d))
     }
 
+    /// [`Self::verify`]: deterministic, so the init run's op log is
+    /// reproducible. The simulator does not model a race failure at init
+    /// (RacyRelease records multi-writer); real backends run the threaded
+    /// race.
     fn verify_at_init(&self) -> Result<ConditionalSupport> {
-        self.cond
-            .verify_at_init(self, &|k, d| self.raw_create(k, d))
+        self.verify()
+    }
+}
+
+/// `config` bytes as a lock client reads them: a map without
+/// `multi_writer`; anything that does not decode as a map unchanged.
+fn as_single_writer(data: Vec<u8>) -> Vec<u8> {
+    match crate::repo::RepoConfig::decode(&data) {
+        Ok(crate::repo::DecodedConfig::Map(mut config))
+            if config.writer_mode() == WriterMode::Multi =>
+        {
+            config.set_writer_mode(WriterMode::Single);
+            config.encode().unwrap_or(data)
+        }
+        _ => data,
     }
 }
 
@@ -1249,11 +1342,15 @@ fn found_or_not<T>(v: Option<T>, len: Option<u64>) -> (Result<Option<T>>, OpOutc
 
 impl vykar_storage::StorageBackend for SimClient {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.read(OpKind::Get, key, |m| {
+        let got = self.read(OpKind::Get, key, |m| {
             let v = m.get(key).map(|o| o.data.clone());
             let len = v.as_ref().map(|d| d.len() as u64);
             found_or_not(v, len)
-        })
+        })?;
+        if self.stale_single && key == "config" {
+            return Ok(got.map(as_single_writer));
+        }
+        Ok(got)
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -2145,23 +2242,156 @@ mod tests {
         assert!(store.head_overwrites().is_empty());
     }
 
+    /// The simulator's `verify_at_init` is the sequential check
+    /// (deterministic; no race keys), cached as `verify` caches it.
     #[test]
-    fn verify_at_init_races_on_a_conditional_store() {
+    fn verify_at_init_is_the_sequential_check() {
         let (store, a, _) = of_kind(StoreKind::Conditional);
         let cond = a.conditional().expect("offered");
         assert_eq!(cond.verify_at_init().unwrap(), ConditionalSupport::Verified);
-        let creates = |s: &SimStore| {
-            s.log()
-                .iter()
-                .filter(|r| r.op == OpKind::PutIfAbsent)
-                .count()
-        };
-        assert_eq!(
-            creates(&store),
-            2 + vykar_storage::INIT_RACE_ROUNDS * vykar_storage::INIT_RACE_WRITERS
-        );
+        assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
+        let creates = store
+            .log()
+            .iter()
+            .filter(|r| r.op == OpKind::PutIfAbsent)
+            .count();
+        assert_eq!(creates, 2, "one sequential check, cached");
+        assert!(!store.log().iter().any(|r| r.key.contains("-race")));
         assert!(store.keys("sessions/").is_empty(), "every probe deleted");
         assert!(a.conditional().is_some());
+    }
+
+    const KINDS: [StoreKind; 5] = [
+        StoreKind::Plain,
+        StoreKind::Conditional,
+        StoreKind::Ignoring,
+        StoreKind::RacyRelease,
+        StoreKind::ConditionalOverwrite,
+    ];
+
+    /// Init on every kind records what `records_multi_writer` says, the
+    /// model `fork_as` relies on.
+    #[test]
+    fn init_records_what_records_multi_writer_says() {
+        for kind in KINDS {
+            let sim = crate::sim::Sim::with_config(SimConfig {
+                kind,
+                ..SimConfig::default()
+            });
+            let want = if kind.records_multi_writer() {
+                WriterMode::Multi
+            } else {
+                WriterMode::Single
+            };
+            assert_eq!(sim.store().writer_mode(), Some(want), "{kind:?}");
+        }
+    }
+
+    /// A template built on Plain forked onto another kind carries the mode
+    /// init records there; `fork()` keeps the bytes identical.
+    #[test]
+    fn fork_as_carries_the_mode_of_the_kind() {
+        let sim = crate::sim::Sim::with_config(SimConfig::default());
+        let template = sim.store();
+        assert_eq!(template.writer_mode(), Some(WriterMode::Single));
+        for kind in KINDS {
+            let fork = template.fork_as(kind);
+            let want = if kind.records_multi_writer() {
+                WriterMode::Multi
+            } else {
+                WriterMode::Single
+            };
+            assert_eq!(fork.writer_mode(), Some(want), "{kind:?}");
+            let (before, after) = (template.object("config"), fork.object("config"));
+            let (before, after) = (before.unwrap(), after.unwrap());
+            assert_eq!((before.mtime, before.writer), (after.mtime, after.writer));
+            // Forking back gives the template's bytes.
+            assert_eq!(
+                fork.fork_as(StoreKind::Plain)
+                    .object("config")
+                    .unwrap()
+                    .data,
+                before.data,
+                "{kind:?}"
+            );
+            assert_eq!(
+                fork.fork().object("config").unwrap().data,
+                after.data,
+                "{kind:?}: fork keeps the bytes"
+            );
+        }
+    }
+
+    /// Two inits on the same kind log the same operations (probe keys are
+    /// random, so keys are compared by class).
+    #[test]
+    fn init_op_log_is_deterministic() {
+        let init_log = || {
+            let sim = crate::sim::Sim::with_config(SimConfig {
+                kind: StoreKind::Conditional,
+                ..SimConfig::default()
+            });
+            sim.store()
+                .log()
+                .into_iter()
+                .filter(|r| r.run == Some(0))
+                .map(|r| {
+                    let class = if r
+                        .key
+                        .starts_with(vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX)
+                    {
+                        "probe".to_string()
+                    } else {
+                        r.key.clone()
+                    };
+                    (r.op, class, r.outcome)
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = init_log();
+        assert!(
+            first
+                .iter()
+                .any(|(op, class, _)| *op == OpKind::PutIfAbsent && class == "probe"),
+            "{first:?}"
+        );
+        assert_eq!(first, init_log());
+    }
+
+    /// On a multi-writer repository a lock client reads `config` as
+    /// single-writer; the observer and a client without put-if-absent read
+    /// the real one.
+    #[test]
+    fn lock_client_reads_config_as_single_writer() {
+        let sim = crate::sim::Sim::with_config(SimConfig {
+            kind: StoreKind::Conditional,
+            ..SimConfig::default()
+        });
+        let store = sim.store();
+        let (l, u) = (store.register_client("l"), store.register_client("u"));
+        store.set_lock_client(l);
+        store.set_client_without_conditional(u);
+        let mode = |h: &SimClient| match crate::repo::RepoConfig::decode(
+            &h.get("config").unwrap().unwrap(),
+        )
+        .unwrap()
+        {
+            crate::repo::DecodedConfig::Map(c) => c.writer_mode(),
+            other => panic!("{other:?}"),
+        };
+        let lock = store.handle(l);
+        assert_eq!(mode(&lock), WriterMode::Single);
+        assert!(lock.conditional().is_none());
+        assert_eq!(last(store).op, OpKind::Get, "logged as the same GET");
+        assert_eq!(mode(&store.observer()), WriterMode::Multi);
+        let without = store.handle(u);
+        assert_eq!(mode(&without), WriterMode::Multi);
+        assert!(without.conditional().is_none());
+        assert_eq!(
+            store.writer_mode(),
+            Some(WriterMode::Multi),
+            "nothing written"
+        );
     }
 
     #[test]

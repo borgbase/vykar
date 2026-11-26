@@ -499,8 +499,8 @@ impl PendingCommit {
         &mut self.repo
     }
 
-    /// The handle's commit mode ([`Repo::commit_mode`]), decided after
-    /// the upload and before any commit write; `Lock` for a session whose
+    /// The handle's commit mode ([`Repo::commit_mode`]), decided right
+    /// after open (`backup::upload`); `Lock` for a session whose
     /// marker record is already not [continuous](lock::MarkerReport::continuous)
     /// here (a machine suspended over `MARKER_GAP_LIMIT`, marker writes
     /// failing that long, a slow marker write, a miss). A lock holder may

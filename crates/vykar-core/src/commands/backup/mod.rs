@@ -585,8 +585,15 @@ fn upload_prepared(
     let opts = super::util::with_identity_context(opts, &open_req);
     let open_result = Repo::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
     let mut repo = match open_result {
-        Ok(r) => {
+        Ok(mut r) => {
             if let Err(e) = super::util::verify_repo_identity(&open_req, &r) {
+                lock::deregister_session(backend.as_ref(), &session_id, &host_env);
+                return Err(e);
+            }
+            // The mode is decided before any upload: a multi-writer
+            // repository whose storage this client cannot use refuses with
+            // nothing but its marker written (and removed).
+            if let Err(e) = r.commit_mode() {
                 lock::deregister_session(backend.as_ref(), &session_id, &host_env);
                 return Err(e);
             }

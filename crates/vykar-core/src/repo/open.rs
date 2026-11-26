@@ -10,10 +10,11 @@ use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::tree_cache::TreeChunkCache;
+use super::writer_mode::{ModeCheck, init_time_check};
 use super::{
     ChunkerParams, EncryptionMode, HostEnv, InitOptions, KEY_PRIMARY, KEY_SECONDARY,
-    MAX_PACK_SIZE_LIMIT, OpenOptions, Repo, RepoConfig, RepoFormat, default_max_pack_size,
-    default_min_pack_size,
+    MAX_PACK_SIZE_LIMIT, OpenOptions, Repo, RepoConfig, RepoFormat, WriterMode,
+    default_max_pack_size, default_min_pack_size,
 };
 use crate::index::LiveIndex;
 use crate::index::head::IndexHead;
@@ -147,7 +148,7 @@ impl Repo {
             )));
         }
 
-        let repo_config = RepoConfig::new_v6(
+        let mut repo_config = RepoConfig::new_v6(
             repo_id,
             chunker_params.clone(),
             encryption.clone(),
@@ -218,6 +219,34 @@ impl Repo {
             None => false,
         };
 
+        // The probe keys of the init-time check live under `sessions/`
+        // (vykar_storage::PROBE_DIR). A server-side init leaves the
+        // directory to the server, whose PUT creates it.
+        if !server_did_init {
+            storage.create_dir(super::lock::SESSIONS_PREFIX)?;
+        }
+        // The verdict is permanent (only `vykar upgrade --commit-mode`
+        // changes it), so init runs the strict check: sequential plus the
+        // concurrent race. It is the first put-if-absent on this backend
+        // instance. Undecided fails the init before `config` exists.
+        let check = init_time_check(storage.as_ref()).map_err(|e| {
+            VykarError::Other(format!(
+                "could not decide whether the storage honours put-if-absent ({e}); the \
+                 repository was not created (no config was written). Retry `vykar init`"
+            ))
+        })?;
+        let single_writer_reason = match check {
+            ModeCheck::Multi => {
+                tracing::debug!("init: the storage passed the put-if-absent check; multi-writer");
+                repo_config.set_writer_mode(WriterMode::Multi);
+                None
+            }
+            ModeCheck::Single { reason } => {
+                tracing::info!("init: the repository is single-writer ({reason})");
+                Some(reason)
+            }
+        };
+
         // Store config (unencrypted)
         let config_data = repo_config.encode()?;
         storage.put("config", &config_data)?;
@@ -241,10 +270,8 @@ impl Repo {
         // that predates them refuses to start with the directories present.
         storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         storage.create_dir(index_store::HEAD_PREFIX)?;
-        // A plain PUT (04 step 8 D5): nothing can contend before the
-        // repository has a config, and a put-if-absent check here would
-        // write under `sessions/` and decide the mode, which step 5 of
-        // 10-single-protocol records. The first commit checks.
+        // A plain PUT (04 step 8 D5), whatever the mode: nothing can contend
+        // before the repository has a config.
         let head = IndexHead::initial();
         index_store::put_head(storage.as_ref(), &head, crypto.as_ref())?;
         let index_generation = head.generation;
@@ -284,7 +311,8 @@ impl Repo {
             fold_policy: Default::default(),
             fold_requested: super::index_write::FoldRequest::None,
             created_head: None,
-            head_fallback: None,
+            repo_url: init_opts.and_then(|o| o.url.clone()),
+            single_writer_reason,
             commit_mode: None,
             pending_sweep: None,
             index_gc_grace: index_store::IndexGcGrace::DEFAULT,
@@ -493,7 +521,8 @@ impl Repo {
             fold_policy: Default::default(),
             fold_requested: super::index_write::FoldRequest::None,
             created_head: None,
-            head_fallback: None,
+            repo_url: opts.repo_url.clone(),
+            single_writer_reason: None,
             commit_mode: None,
             pending_sweep: None,
             index_gc_grace: index_store::IndexGcGrace::DEFAULT,

@@ -384,6 +384,12 @@ impl Sim {
         self.store.set_lock_client(c);
     }
 
+    /// Every later handle of `c` offers no put-if-absent but reads the
+    /// real `config` ([`SimStore::set_client_without_conditional`]).
+    pub fn set_client_without_conditional(&self, c: ClientId) {
+        self.store.set_client_without_conditional(c);
+    }
+
     pub fn history(&self) -> &History {
         &self.history
     }

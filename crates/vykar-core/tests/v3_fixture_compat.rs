@@ -300,7 +300,7 @@ fn v3_fixtures_upgrade_to_v6() {
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
-                UpgradeOutcome::AlreadyCurrent { version: 6 }
+                UpgradeOutcome::AlreadyCurrent { version: 6, .. }
             ),
             "{mode}"
         );

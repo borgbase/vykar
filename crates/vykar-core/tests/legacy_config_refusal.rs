@@ -315,7 +315,7 @@ fn old_releases_refuse_a_v6_map_by_version() {
     for (release, gate) in RELEASES {
         for mode in MODES {
             for hash in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
-                for features in [&[][..], &["some-future-feature"][..]] {
+                for features in [&[][..], &["multi_writer"][..], &["some-future-feature"][..]] {
                     let bytes = real_v6(&probe(6, mode.clone()), hash, features);
                     expect_version_refusal(
                         release,

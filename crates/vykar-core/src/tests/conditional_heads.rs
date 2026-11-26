@@ -1,6 +1,6 @@
 //! Index heads created with put-if-absent (04 step 8, phase F part 9): the
 //! create, a lost reply, a taken generation and the backup's retry, the
-//! fallback of a backend that ignores the condition, the index garbage
+//! mode init records on a backend that ignores the condition, the index garbage
 //! collection's claim, and invariant 12 of the simulator's checker. On the
 //! simulator's conditional store (`StoreKind::Conditional`) unless named.
 
@@ -15,7 +15,7 @@ use crate::repo::host_env::{Clock, HostEnv, StopSignal};
 use crate::repo::index_store;
 use crate::repo::machine::{Machine, StepCx, StepKind};
 use crate::repo::pack::PackType;
-use crate::repo::{BackupCommit, Fence, OpenOptions, Repo, WriteSessionOptions};
+use crate::repo::{BackupCommit, Fence, OpenOptions, Repo, WriteSessionOptions, WriterMode};
 use crate::sim::checker::open_observer;
 use crate::sim::history::{AllowedError, ErrorClass};
 use crate::sim::{
@@ -189,12 +189,29 @@ fn unknown_outcome_fails_and_a_late_create_is_harmless() {
     }
 }
 
-/// A backend that ignores the condition (Garage) fails the check; heads
-/// fall back to plain PUTs, and the backup commits. The warning itself is
-/// observed in `the_fallback_is_noted_once_per_handle`.
+/// A backend that ignores the condition (Garage) fails init's check: the
+/// repository is single-writer, its heads are plain PUTs under the lock,
+/// and no backup run checks again (10-single-protocol step 5).
 #[test]
-fn ignoring_backend_falls_back_with_a_warning() {
+fn init_records_single_writer_on_an_ignoring_backend() {
     let mut sim = sim_of(StoreKind::Ignoring);
+    assert_eq!(sim.store().writer_mode(), Some(WriterMode::Single));
+    let init: Vec<OpRecord> = sim
+        .store()
+        .log()
+        .into_iter()
+        .filter(|r| r.run == Some(0))
+        .collect();
+    assert_eq!(
+        init.iter()
+            .filter(|r| {
+                r.op == OpKind::PutIfAbsent && r.key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)
+            })
+            .count(),
+        2,
+        "the sequential check only: {init:?}"
+    );
+    assert!(!init.iter().any(|r| r.key.contains("-race")), "{init:?}");
     let a = sim.client("a");
     for name in ["a1", "a2"] {
         let run = sim.backup(a, name, &tree(name));
@@ -207,14 +224,12 @@ fn ignoring_backend_falls_back_with_a_warning() {
                 .count(),
             1
         );
-        // Each run (process) checks once.
-        assert_eq!(
-            recs.iter()
-                .filter(|r| {
-                    r.op == OpKind::PutIfAbsent && r.key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)
-                })
-                .count(),
-            2
+        // A single-writer repository's clients make no check.
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r.key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)),
+            "{recs:?}"
         );
     }
     assert!(sim.store().keys(PUT_IF_ABSENT_PROBE_PREFIX).is_empty());
@@ -755,33 +770,57 @@ fn gc_needs_the_callers_own_head() {
     );
 }
 
-/// The fallback notice (04 "Fallback", never silently unconditional): a
-/// handle on a store that ignores the condition notes it at warn on its
-/// first index write and not again; another handle on the same store notes
-/// it again (once per opened repository, not per process). A backend
-/// without put-if-absent from the start is noted at info; a store that
-/// passes the check notes nothing.
+/// Init records the mode its check decides, and says why on the handle it
+/// returns: single-writer on a store that ignores the condition or offers
+/// no put-if-absent, multi-writer on one that passes. A later open reads
+/// the same mode and gives no reason.
 #[test]
-fn the_fallback_is_noted_once_per_handle() {
-    use crate::repo::index_store::HeadFallback;
+fn init_records_the_mode_the_check_decides() {
+    use crate::repo::writer_mode::NO_PUT_IF_ABSENT;
     let cases = [
-        (StoreKind::Ignoring, Some(HeadFallback::Refused)),
-        (StoreKind::Plain, Some(HeadFallback::NotOffered)),
-        (StoreKind::Conditional, None),
+        (StoreKind::Ignoring, WriterMode::Single),
+        (StoreKind::Plain, WriterMode::Single),
+        (StoreKind::Conditional, WriterMode::Multi),
     ];
     for (kind, want) in cases {
-        let mut sim = sim_of(kind);
-        let (a, b) = (sim.client("a"), sim.client("b"));
-        let mut ra = open(&sim, a, sim.host_env(a));
-        assert_eq!(ra.head_fallback(), None, "{kind:?}: before any write");
-        commit_whole(&mut ra, "a1", &[b"chunk a1"]);
-        assert_eq!(ra.head_fallback(), want, "{kind:?}");
-        commit_whole(&mut ra, "a2", &[b"chunk a2"]);
-        assert_eq!(ra.head_fallback(), want, "{kind:?}: kept");
-        let mut rb = open(&sim, b, sim.host_env(b));
-        assert_eq!(rb.head_fallback(), None, "{kind:?}: a new handle");
-        commit_whole(&mut rb, "b1", &[b"chunk b1"]);
-        assert_eq!(rb.head_fallback(), want, "{kind:?}: noted by b too");
+        let store = crate::sim::SimStore::new(SimConfig {
+            kind,
+            ..SimConfig::default()
+        });
+        let (i, b) = (store.register_client("init"), store.register_client("b"));
+        let repo = crate::repo::with_cheap_kdf(|| {
+            Repo::init(
+                Box::new(store.handle(i)),
+                crate::repo::EncryptionMode::Aes256Gcm,
+                crate::repo::ChunkerParams::default(),
+                store.passphrase(),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        assert_eq!(repo.writer_mode(), want, "{kind:?}");
+        match kind {
+            StoreKind::Ignoring => assert!(
+                repo.single_writer_reason()
+                    .is_some_and(|r| r.contains(vykar_storage::IGNORES_CONDITION)),
+                "{:?}",
+                repo.single_writer_reason()
+            ),
+            StoreKind::Plain => assert_eq!(repo.single_writer_reason(), Some(NO_PUT_IF_ABSENT)),
+            _ => assert_eq!(repo.single_writer_reason(), None),
+        }
+        assert_eq!(store.writer_mode(), Some(want), "{kind:?}");
+        let cache = tempfile::tempdir().unwrap();
+        let later = Repo::open(
+            Box::new(store.handle(b)),
+            store.passphrase(),
+            Some(cache.path().to_path_buf()),
+            OpenOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(later.writer_mode(), want, "{kind:?}");
+        assert_eq!(later.single_writer_reason(), None, "{kind:?}");
     }
 }
 
@@ -989,10 +1028,10 @@ fn checker_exempts_a_repair_head() {
     );
 }
 
-// ── A lock-free writer never falls back (04 step 9, O4) ────────────────
+// ── A multi-writer repository never falls back (10-single-protocol step 5) ──
 
 /// A backend whose put-if-absent check passes and whose later creates are
-/// refused as "unsupported", reaching `create_head`'s fallback branch
+/// refused as "unsupported", reaching `create_head`'s refusal branch
 /// directly (`vykar_storage::Verifier` would turn such a refusal into a
 /// failed write first).
 struct RefusesAfterCheck {
@@ -1032,9 +1071,10 @@ impl vykar_storage::ConditionalWrite for RefusesAfterCheck {
     }
 }
 
-/// O4: an encrypted repository whose storage passed the check commits
-/// lock-free; a create refused after that fails the commit, and no head is
-/// written with a plain PUT (there is no lock to make one safe).
+/// O4: a multi-writer repository whose storage passed the check commits
+/// lock-free; a create refused after that fails the commit with
+/// `MultiWriterUnsupported`, and no head is written with a plain PUT (there
+/// is no lock to make one safe).
 #[test]
 fn a_refusal_after_a_passed_check_fails_the_commit() {
     let mut sim = Sim::with_config(SimConfig {
@@ -1067,7 +1107,10 @@ fn a_refusal_after_a_passed_check_fails_the_commit() {
         crate::repo::CommitMode::LockFree,
     );
     let err = step_until(&mut repo, &mut m, |_| false).unwrap_err();
-    assert!(err.to_string().contains("never writes"), "{err}");
+    assert!(
+        matches!(err, VykarError::MultiWriterUnsupported { .. }),
+        "{err:?}"
+    );
     m.into_write_session().flush_on_abort(&repo);
     let ops = ops_after(&sim, a, before);
     assert!(

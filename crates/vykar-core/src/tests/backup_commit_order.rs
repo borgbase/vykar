@@ -294,6 +294,8 @@ fn setup() -> (
     fs::write(src_dir.join("a.bin"), vec![0x5au8; 64 * 1024]).unwrap();
     fs::write(src_dir.join("b.txt"), b"hello").unwrap();
     let config = crate::tests::helpers::init_repo(&repo_dir);
+    // The recording wrapper offers no put-if-absent: lock mode.
+    crate::tests::helpers::make_single_writer(&repo_dir);
     (dir, config, src_dir)
 }
 
@@ -540,6 +542,7 @@ fn pack_deleted_before_commit_fails_backup_many_packs() {
     config.repository.min_pack_size = 1;
     config.repository.max_pack_size = 4 * 1024;
     crate::commands::init::run(&config, pass(&config)).unwrap();
+    crate::tests::helpers::make_single_writer(&repo_dir);
 
     assert_missing_pack_fails_commit(&config, &src);
 }
@@ -564,6 +567,7 @@ fn many_pack_backup_commits() {
     config.repository.min_pack_size = 1;
     config.repository.max_pack_size = 4 * 1024;
     crate::commands::init::run(&config, pass(&config)).unwrap();
+    crate::tests::helpers::make_single_writer(&repo_dir);
 
     run_backup(&config, &src, &Shared::default()).unwrap();
     assert!(
@@ -744,6 +748,7 @@ fn setup_encrypted() -> (
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
     config.encryption.mode = crate::config::EncryptionModeConfig::Aes256Gcm;
     crate::commands::init::run(&config, Some("right")).unwrap();
+    crate::tests::helpers::make_single_writer(&repo_dir);
     (dir, config, src_dir)
 }
 

@@ -2,24 +2,42 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
-use vykar_core::repo::UpgradeOutcome;
+use vykar_core::repo::{UpgradeOutcome, WriterMode, WriterModeReport};
 
 use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
-pub(crate) fn run_upgrade(config: &VykarConfig, label: Option<&str>, yes: bool) -> CliResult<()> {
+/// The line `vykar info` and a plain `vykar upgrade` add for a single-writer
+/// repository whose storage offers put-if-absent.
+pub(crate) const MULTI_WRITER_HINT: &str = "This storage offers put-if-absent: \
+     `vykar upgrade --commit-mode multi` lets backups commit side by side (it checks the \
+     storage first).";
+
+pub(crate) fn run_upgrade(
+    config: &VykarConfig,
+    label: Option<&str>,
+    yes: bool,
+    mode: Option<WriterMode>,
+) -> CliResult<()> {
     if !yes {
         if !io::stdin().is_terminal() {
             return Err(CliError::from(
                 "upgrade is one-way; pass --yes to run it non-interactively",
             ));
         }
-        eprintln!(
-            "This upgrades the repository to the v6 repository format. It is one-way:\n\
-             vykar releases before 0.25 can no longer read or write it. Stop every other\n\
-             client of this repository first, and upgrade vykar on all of them."
-        );
+        match mode {
+            Some(mode) => eprintln!(
+                "This switches the repository's commit mode to {mode} (or records it when the\n\
+                 repository is upgraded from v2/v3). Stop every other client of this repository\n\
+                 first."
+            ),
+            None => eprintln!(
+                "This upgrades the repository to the v6 repository format. It is one-way:\n\
+                 vykar releases before 0.25 can no longer read or write it. Stop every other\n\
+                 client of this repository first, and upgrade vykar on all of them."
+            ),
+        }
         eprint!("Type 'upgrade' to proceed: ");
         io::stderr().flush()?;
         let mut input = String::new();
@@ -31,12 +49,28 @@ pub(crate) fn run_upgrade(config: &VykarConfig, label: Option<&str>, yes: bool) 
     }
 
     let outcome = with_repo_passphrase(config, label, |passphrase| {
-        Ok(commands::upgrade::run(config, passphrase)?)
+        Ok(commands::upgrade::run_with_mode(config, passphrase, mode)?)
     })?;
 
     match outcome {
-        UpgradeOutcome::AlreadyCurrent { version } => {
-            println!("Repository is already at format v{version}; nothing to do.");
+        UpgradeOutcome::AlreadyCurrent {
+            version,
+            writer_mode:
+                WriterModeReport {
+                    mode: current,
+                    changed,
+                    put_if_absent_offered,
+                    ..
+                },
+        } => {
+            if changed {
+                println!("Switched the repository to {current}.");
+            } else {
+                println!("Repository is already at format v{version} ({current}); nothing to do.");
+                if mode.is_none() && put_if_absent_offered {
+                    println!("{MULTI_WRITER_HINT}");
+                }
+            }
         }
         UpgradeOutcome::Upgraded {
             from,
@@ -47,6 +81,7 @@ pub(crate) fn run_upgrade(config: &VykarConfig, label: Option<&str>, yes: bool) 
             packs_mapped,
             packs_unmapped,
             resumed,
+            writer_mode,
         } => {
             if resumed {
                 println!("Completed an interrupted upgrade.");
@@ -57,6 +92,10 @@ pub(crate) fn run_upgrade(config: &VykarConfig, label: Option<&str>, yes: bool) 
                 chunk_hash.as_str(),
                 format_bytes(base_bytes)
             );
+            match writer_mode.single_reason {
+                Some(reason) => println!("Commit mode: {} ({reason})", writer_mode.mode),
+                None => println!("Commit mode: {}", writer_mode.mode),
+            }
             if packs_unmapped > 0 {
                 eprintln!(
                     "Warning: {packs_unmapped} pack(s) hold more entries than a pack map can \

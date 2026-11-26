@@ -4,7 +4,11 @@
 //!
 //! 1. Probe the server capabilities and PUT the stored `config` bytes back
 //!    unchanged: a server that refuses overwrites (append-only) fails here,
-//!    with the repository untouched.
+//!    with the repository untouched. Then decide the writer mode the switch
+//!    records (10-single-protocol step 5): `--commit-mode single` without a
+//!    check, otherwise the init-time put-if-absent check (`--commit-mode
+//!    multi` refuses unless it passes). Undecided stops here, with nothing
+//!    but the check's probes under `sessions/` written.
 //! 2. GET `index` and decode the legacy index. While `config` is
 //!    positional, this blob is the repository's index; heads and bases
 //!    already under `index.h/` and `index.d/` are debris of an earlier
@@ -17,8 +21,9 @@
 //!    reported; one the index describes inconsistently stops the upgrade).
 //! 5. Write the base under `index.d/` and a head at
 //!    `index.h/<highest listed + 1>`. `index` is not touched.
-//! 6. Rewrite `config` as the v6 map. From here every older binary refuses
-//!    the repository by version.
+//! 6. Rewrite `config` as the v6 map, with `multi_writer` when step 1
+//!    decided multi-writer. From here every older binary refuses the
+//!    repository by version.
 //! 7. Delete `index`, `index.gen` and the local copy of the legacy index
 //!    blob, best-effort.
 //!
@@ -39,7 +44,8 @@ use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::index_store;
 use super::index_write::PendingSweep;
-use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat};
+use super::writer_mode::{ModeCheck, init_time_check};
+use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat, WriterMode};
 use crate::compress;
 use std::sync::Arc;
 
@@ -49,11 +55,30 @@ use crate::index::{IndexBlob, LegacyChunkIndex, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
+/// The writer mode a [`UpgradeOutcome`] leaves the repository in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterModeReport {
+    /// The mode `config` records after this run.
+    pub mode: WriterMode,
+    /// This run wrote it (the v2/v3 switch, or `--commit-mode` changing it).
+    pub changed: bool,
+    /// Why the repository is single-writer when the init-time check decided
+    /// it (not when `--commit-mode single` asked for it).
+    pub single_reason: Option<String>,
+    /// The repository is single-writer and this handle's storage offers
+    /// put-if-absent (as far as it knows without a request): `vykar upgrade
+    /// --commit-mode multi` could switch it.
+    pub put_if_absent_offered: bool,
+}
+
 /// What [`super::RepoWriter::upgrade_index_layout`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeOutcome {
     /// The repository already uses the current format.
-    AlreadyCurrent { version: u32 },
+    AlreadyCurrent {
+        version: u32,
+        writer_mode: WriterModeReport,
+    },
     Upgraded {
         from: u32,
         to: u32,
@@ -71,7 +96,17 @@ pub enum UpgradeOutcome {
         /// An interrupted upgrade was completed: a head or a pack map was
         /// already in place.
         resumed: bool,
+        /// The mode the switch recorded.
+        writer_mode: WriterModeReport,
     },
+}
+
+/// The error of a put-if-absent check that could not decide.
+fn undecided(e: VykarError, what: &str) -> VykarError {
+    VykarError::Other(format!(
+        "could not decide whether the storage honours put-if-absent ({e}); nothing was \
+         changed. Retry {what}"
+    ))
 }
 
 /// The error every open except `vykar upgrade` returns for v2/v3.
@@ -116,16 +151,26 @@ impl Repo {
     /// The caller holds the maintenance lock, whose fence is `fence`
     /// (`RepoWriter::upgrade_index_layout`). One-way: older binaries cannot
     /// read the repository afterwards.
+    ///
+    /// `requested`: the writer mode to record (`--commit-mode`); `None`:
+    /// the init-time check decides. On a v6 repository a `Some` switches
+    /// the mode ([`Self::set_writer_mode_under`]).
     pub(super) fn upgrade_index_layout_under(
         &mut self,
         fence: &super::Fence,
+        requested: Option<WriterMode>,
     ) -> Result<UpgradeOutcome> {
         let from = self.format;
         let Some(target) = from.upgrade_target() else {
             // An upgrade interrupted after its switch left these behind.
             self.remove_legacy_index();
+            let writer_mode = match requested {
+                None => self.writer_mode_report(false, None),
+                Some(want) => self.set_writer_mode_under(want, fence)?,
+            };
             return Ok(UpgradeOutcome::AlreadyCurrent {
                 version: from.version(),
+                writer_mode,
             });
         };
 
@@ -162,6 +207,29 @@ impl Repo {
                  append-only for the upgrade. Nothing was changed."
             ))
         })?;
+        // The writer mode `switch_version` records (10-single-protocol step
+        // 5), decided before anything else is written. The upgrade's own
+        // head below is a plain PUT: the positional config makes the handle
+        // single-writer, and the maintenance lock is held.
+        let (mode, single_reason) = match requested {
+            Some(WriterMode::Single) => (WriterMode::Single, None),
+            Some(WriterMode::Multi) => match init_time_check(self.storage.as_ref()) {
+                Ok(ModeCheck::Multi) => (WriterMode::Multi, None),
+                Ok(ModeCheck::Single { reason }) => {
+                    return Err(VykarError::Other(format!(
+                        "the storage does not pass the put-if-absent check ({reason}), so the \
+                         repository cannot be multi-writer; nothing was changed. Run without \
+                         --commit-mode multi to upgrade it as single-writer"
+                    )));
+                }
+                Err(e) => return Err(undecided(e, "the upgrade")),
+            },
+            None => match init_time_check(self.storage.as_ref()) {
+                Ok(ModeCheck::Multi) => (WriterMode::Multi, None),
+                Ok(ModeCheck::Single { reason }) => (WriterMode::Single, Some(reason)),
+                Err(e) => return Err(undecided(e, "the upgrade")),
+            },
+        };
 
         // 2. The legacy index: while `config` is positional, the index.
         let data = self.storage.get("index")?;
@@ -234,7 +302,7 @@ impl Repo {
         )?;
 
         // 6. The version switch.
-        self.switch_version(target, fence)?;
+        self.switch_version(target, mode, fence)?;
         // 7. Leftovers.
         self.remove_legacy_index();
 
@@ -251,7 +319,97 @@ impl Repo {
             packs_mapped: maps.packs_mapped,
             packs_unmapped: maps.packs_skipped_too_many,
             resumed,
+            writer_mode: self.writer_mode_report(true, single_reason),
         })
+    }
+
+    /// The report of the mode `config` now records.
+    fn writer_mode_report(&self, changed: bool, single_reason: Option<String>) -> WriterModeReport {
+        let mode = self.writer_mode();
+        WriterModeReport {
+            mode,
+            changed,
+            single_reason,
+            put_if_absent_offered: mode == WriterMode::Single
+                && self.storage_offers_put_if_absent(),
+        }
+    }
+
+    /// Switch a v6 repository's writer mode to `want` (`vykar upgrade
+    /// --commit-mode`, 10-single-protocol step 5). The caller holds the
+    /// maintenance lock, whose fence is `fence`, and has refused live
+    /// sessions. A no-op (nothing written, no check) when the mode already
+    /// matches. To multi-writer the init-time check must pass on this
+    /// handle; to single-writer no check runs, so a client whose storage
+    /// fails it can switch. Only the one feature of `config` changes.
+    ///
+    /// # Errors
+    ///
+    /// An append-only server (refused before any write), a failed or
+    /// undecided check, a config changed since open, a lost fence, a failed
+    /// `config` PUT; nothing was changed in each case.
+    pub(super) fn set_writer_mode_under(
+        &mut self,
+        want: WriterMode,
+        fence: &super::Fence,
+    ) -> Result<WriterModeReport> {
+        if self.writer_mode() == want {
+            return Ok(self.writer_mode_report(false, None));
+        }
+        // Before the check, so the switch writes no probe there.
+        if self.storage.server_ops().is_some_and(|s| s.append_only()) {
+            return Err(VykarError::Other(
+                "the repository config cannot be rewritten: the repository server is \
+                 append-only (it refuses overwrites). Switching the commit mode rewrites \
+                 config; disable append-only for the switch. Nothing was changed"
+                    .into(),
+            ));
+        }
+        if want == WriterMode::Multi {
+            match init_time_check(self.storage.as_ref()) {
+                Ok(ModeCheck::Multi) => {}
+                Ok(ModeCheck::Single { reason }) => {
+                    return Err(VykarError::Other(format!(
+                        "the storage does not pass the put-if-absent check ({reason}); the \
+                         repository stays single-writer. Nothing was changed"
+                    )));
+                }
+                Err(e) => return Err(undecided(e, "the switch")),
+            }
+        }
+        let stored = self
+            .storage
+            .get("config")?
+            .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
+        let unchanged = matches!(
+            RepoConfig::decode(&stored),
+            Ok(DecodedConfig::Map(c)) if c.id == self.config.id
+                && c.writer_mode() == self.writer_mode()
+        );
+        if !unchanged {
+            return Err(VykarError::Other(
+                "the repository config changed after it was opened; retry".into(),
+            ));
+        }
+        let mut config = self.config.clone();
+        config.set_writer_mode(want);
+        let bytes = config.encode()?;
+        fence.check()?;
+        self.storage.put("config", &bytes).map_err(|e| {
+            VykarError::Other(format!(
+                "the repository config cannot be rewritten ({e}). Switching the commit mode \
+                 rewrites config; on an append-only server, disable append-only for the \
+                 switch. Nothing was changed"
+            ))
+        })?;
+        info!(
+            mode = want.as_str(),
+            "switched the repository's commit mode"
+        );
+        self.config = config;
+        // The cached decision no longer applies.
+        self.commit_mode = None;
+        Ok(self.writer_mode_report(true, None))
     }
 
     /// The v2/v3 index at `index`, on a handle opened with
@@ -277,12 +435,19 @@ impl Repo {
     }
 
     /// Step 6: the version switch. Fence check, then the `config` PUT of
-    /// the handle's config as the v6 map (its hash is already the target's).
-    fn switch_version(&mut self, target: RepoFormat, fence: &super::Fence) -> Result<()> {
+    /// the handle's config as the v6 map (its hash is already the target's)
+    /// recording `mode`.
+    fn switch_version(
+        &mut self,
+        target: RepoFormat,
+        mode: WriterMode,
+        fence: &super::Fence,
+    ) -> Result<()> {
         let mut config = self.config.clone();
         config.version = target.version();
         config.chunk_hash = target.chunk_hash().as_str().to_string();
         config.features = Vec::new();
+        config.set_writer_mode(mode);
         let bytes = config.encode()?;
         fence.check()?;
         self.storage.put("config", &bytes)?;

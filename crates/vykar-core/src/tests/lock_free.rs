@@ -497,11 +497,7 @@ fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
         .into_iter()
         .filter(|k| k.ends_with(".json"))
         .collect();
-    let c_reap = sim.gate(GateRule::new(
-        c,
-        OpMatch::AnyDelete,
-        KeyMatch::Prefix("sessions/".into()),
-    ));
+    let c_reap = sim.gate(GateRule::new(c, OpMatch::AnyDelete, KeyMatch::SessionKey));
     let rc = sim.spawn(c, Call::Compact);
     sim.expect_paused(c_reap, "c's reap of f's stale marker");
     // The refresh writes n + 1 and finds the listed keys present.
@@ -557,7 +553,7 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
     sim.fault(
         FaultRule::new(
             OpMatch::Kind(OpKind::PutIfAbsent),
-            KeyMatch::Prefix("locks/".into()),
+            KeyMatch::Prefix(crate::repo::ages::PUT_IF_ABSENT_PROBE_PREFIX.into()),
             FaultAction::Fail,
         )
         .client(a),

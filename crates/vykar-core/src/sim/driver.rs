@@ -323,7 +323,15 @@ const FIRST_PACK_SHARD: &str = "packs/00/";
 /// acquired the lock compact had found free, and back off only at its next
 /// step. The raw lock protocol op by op is `tests::sim_exhaustive`'s
 /// gate-stepped search.
+///
+/// A probe (`crate::repo::ages::is_probe_key`: the put-if-absent check's
+/// `sessions/vykar-probe-*`, the clock probes) is never a step, wherever it
+/// lives: the check runs inside the step that needs it, as it did when its
+/// probe lived under `locks/`.
 pub fn is_maintenance_step(op: OpKind, key: &str) -> bool {
+    if crate::repo::ages::is_probe_key(key) {
+        return false;
+    }
     if key.starts_with("locks/") {
         return op == OpKind::Exists;
     }
@@ -1239,9 +1247,13 @@ impl<'c> Driver<'c> {
             };
             // Lock faults land on lock keys only, never on a clock probe
             // (`locks/vykar-clock-*`), so the count of a class's writes
-            // is the same with and without contention.
+            // is the same with and without contention. Session faults
+            // likewise never land on a probe (`sessions/vykar-probe-*`,
+            // `sessions/vykar-clock-*`), so a seed's nth session write is
+            // the same marker write as before the probes moved there.
             let key = match f.class {
                 KeyClass::Lock => KeyMatch::LockKey,
+                KeyClass::Session => KeyMatch::SessionKey,
                 class => KeyMatch::Prefix(class.prefix().into()),
             };
             sim.fault(
@@ -1596,7 +1608,7 @@ impl<'c> Driver<'c> {
                     Ok(mut pending) => {
                         pending.join_background_writes();
                         // The mode is decided with the upload (its
-                        // put-if-absent check writes probes under locks/).
+                        // put-if-absent check writes probes under sessions/).
                         match pending.commit_mode() {
                             Ok(CommitMode::LockFree) => {
                                 self.actors[i].phase = Phase::Probe(Box::new(ProbeWait {

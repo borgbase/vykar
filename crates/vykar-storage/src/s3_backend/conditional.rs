@@ -8,10 +8,13 @@ use rusty_s3::S3Action;
 use vykar_types::error::{Result, VykarError};
 
 use super::multipart::{classify_s3_error, parse_s3_error_code};
+use super::services::ServiceStatus;
 use super::{PRESIGN_DURATION, S3Backend, s3_error};
 use crate::conditional::{after_verified, check_args};
 use crate::retry::HttpRetryError;
-use crate::{ConditionalSupport, ConditionalWrite, Created, S3ConditionalWrites};
+use crate::{
+    ConditionalSupport, ConditionalWrite, Created, S3ConditionalWrites, put_if_absent_unavailable,
+};
 
 pub(super) const OCTET_STREAM: &str = "application/octet-stream";
 
@@ -53,16 +56,6 @@ pub(crate) fn s3_refuses_mechanism(status: u16, code: Option<&str>) -> bool {
         || (status == 400 && matches!(code, Some("InvalidArgument" | "InvalidRequest")))
 }
 
-/// Whether `endpoint` is an AWS S3 endpoint: its host lies under
-/// `amazonaws.com` or `amazonaws.com.cn`. A custom domain in front of AWS
-/// reads as non-AWS, which is the conservative answer for `auto`.
-pub(super) fn is_aws_endpoint(endpoint: &str) -> bool {
-    url::Url::parse(endpoint)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".amazonaws.com.cn"))
-}
-
 /// How S3 answered a conditional PutObject.
 enum Answer {
     Created,
@@ -72,11 +65,32 @@ enum Answer {
 }
 
 impl S3Backend {
+    /// Why put-if-absent is refused on this endpoint without a request: its
+    /// host belongs to a known-bad service. `None` otherwise.
+    fn known_bad(&self) -> Option<String> {
+        let s = self
+            .service
+            .filter(|s| s.status == ServiceStatus::KnownBad)?;
+        Some(format!(
+            "S3 endpoint is {} ({}), which lets two concurrent creates of one key both \
+             succeed ({}); put-if-absent is refused there whatever s3_conditional_writes says",
+            s.name, s.hosts, s.evidence
+        ))
+    }
+
+    /// The check's answer on a known-bad host, cached as a failed check's
+    /// would be, so `conditional()` turns `None`. No request is sent.
+    fn refuse_known_bad(&self) -> Option<ConditionalSupport> {
+        self.known_bad().map(|reason| self.cond.refuse(reason))
+    }
+
     /// Whether `conditional()` offers put-if-absent, before any check.
+    /// `On` stays true on a known-bad host, so the refusal surfaces with its
+    /// reason (the check answers `Unsupported`).
     pub(super) fn conditional_offered(&self) -> bool {
         match self.conditional_mode {
             S3ConditionalWrites::On => true,
-            S3ConditionalWrites::Auto => self.aws_endpoint,
+            S3ConditionalWrites::Auto => self.service.is_some_and(|s| s.status.offered_by_auto()),
             S3ConditionalWrites::Off => false,
         }
     }
@@ -148,13 +162,27 @@ const LABEL: &str = "S3 (s3_conditional_writes)";
 impl ConditionalWrite for S3Backend {
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
         check_args(key, data)?;
+        if let Some(ConditionalSupport::Unsupported { reason }) = self.refuse_known_bad() {
+            return Err(put_if_absent_unavailable(format_args!("{LABEL}: {reason}")));
+        }
         self.cond
             .require(LABEL, self, &|k, d| self.put_if_absent_raw(k, d))?;
         after_verified(self.put_if_absent_raw(key, data))
     }
 
     fn verify(&self) -> Result<ConditionalSupport> {
+        if let Some(answer) = self.refuse_known_bad() {
+            return Ok(answer);
+        }
         self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        if let Some(answer) = self.refuse_known_bad() {
+            return Ok(answer);
+        }
+        self.cond
+            .verify_at_init(self, &|k, d| self.put_if_absent_raw(k, d))
     }
 }
 
@@ -173,29 +201,6 @@ pub(super) fn parse_s3_time(s: &str) -> Option<std::time::SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aws_endpoint_detection() {
-        for host in [
-            "https://s3.amazonaws.com",
-            "https://s3.eu-west-1.amazonaws.com",
-            "https://s3.dualstack.us-east-1.amazonaws.com",
-            "https://s3.cn-north-1.amazonaws.com.cn",
-            "https://S3.EU-WEST-1.AMAZONAWS.COM",
-        ] {
-            assert!(is_aws_endpoint(host), "{host}");
-        }
-        for host in [
-            "http://minio.local:9000",
-            "https://s3.example.com",
-            "https://amazonaws.com.evil.com",
-            "https://amazonaws.com",
-            "",
-            "not a url",
-        ] {
-            assert!(!is_aws_endpoint(host), "{host}");
-        }
-    }
 
     #[test]
     fn refusal_rule() {

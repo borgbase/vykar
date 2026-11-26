@@ -238,6 +238,15 @@ impl vykar_storage::ConditionalWrite for ThrottledStorageBackend {
             }),
         }
     }
+
+    fn verify_at_init(&self) -> Result<vykar_storage::ConditionalSupport> {
+        match self.inner.conditional() {
+            Some(inner) => inner.verify_at_init(),
+            None => Ok(vykar_storage::ConditionalSupport::Unsupported {
+                reason: format!("put-if-absent: {WITHDRAWN}"),
+            }),
+        }
+    }
 }
 
 /// Set the nice value of every thread in this process. One-way: unprivileged
@@ -593,6 +602,9 @@ mod tests {
             fn verify(&self) -> Result<ConditionalSupport> {
                 Ok(ConditionalSupport::Verified)
             }
+            fn verify_at_init(&self) -> Result<ConditionalSupport> {
+                self.verify()
+            }
         }
 
         let limiter = Arc::new(ByteRateLimiter::new(u64::MAX));
@@ -608,6 +620,7 @@ mod tests {
             .conditional()
             .expect("offered like the inner backend");
         assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
+        assert_eq!(cond.verify_at_init().unwrap(), ConditionalSupport::Verified);
         assert_eq!(
             cond.put_if_absent("locks/k", &[0u8; 100]).unwrap(),
             Created::Yes

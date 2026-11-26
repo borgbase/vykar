@@ -254,6 +254,47 @@ fn commit_window_ops_stay_in_machine_steps() {
     assert_ne!(orders[0], orders[2], "the probe-last order was not taken");
 }
 
+/// A lock-mode backup whose last fence (before its snapshot PUT; a jump
+/// before the head's fence makes the head create slow) runs past the lock
+/// refresh interval after it took its lock: the fence rewrites the lock
+/// key, inside the step's declared ops.
+#[test]
+fn a_late_fence_refreshes_the_lock_inside_its_step() {
+    let t = Template::new();
+    let c = case(
+        HostPlan::Distinct,
+        vec![vec![Command::Backup {
+            shared: false,
+            fold: false,
+        }]],
+        vec![],
+    );
+    let probe = run_case(&t, &c);
+    let at = probe
+        .trace
+        .entries
+        .iter()
+        .rposition(|e| e.action == (Action::Step { client: 0, pick: 0 }) && e.label == "fence")
+        .unwrap_or_else(|| panic!("no fence step:\n{}", probe.trace.render()));
+    let jump = Action::Advance { secs: 10860 };
+    let advance = probe.trace.entries[at]
+        .actions
+        .iter()
+        .position(|a| *a == jump)
+        .unwrap_or_else(|| panic!("{jump:?} not offered at fence:\n{}", probe.trace.render()));
+    let c = with_choice(&c, at, u16::try_from(advance).unwrap());
+    let o = run_case(&t, &c);
+    check_guard("late fence", &o);
+    assert!(o.report.is_clean(), "{}", o.trace.render());
+    assert!(
+        o.sim.store().log().iter().any(|r| r.label == Some("fence")
+            && r.op == OpKind::Put
+            && r.key.starts_with("locks/")),
+        "the fence did not refresh the lock:\n{}",
+        o.trace.render()
+    );
+}
+
 #[test]
 fn driver_default_schedule_matches_production() {
     let t = Template::new();

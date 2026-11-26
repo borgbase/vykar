@@ -1225,6 +1225,11 @@ impl ConditionalWrite for SimClient {
     fn verify(&self) -> Result<ConditionalSupport> {
         self.cond.verify(self, &|k, d| self.raw_create(k, d))
     }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        self.cond
+            .verify_at_init(self, &|k, d| self.raw_create(k, d))
+    }
 }
 
 /// Whether a session marker body carries `"committing": true`.
@@ -2125,14 +2130,56 @@ mod tests {
         assert!(!last(&store).applied());
         assert_eq!(store.object("index.h/2").unwrap().data, b"a");
         // Each handle ran the check once: its probe is gone.
+        assert!(store.keys("sessions/").is_empty());
         assert!(store.keys("locks/").is_empty());
         let probes = store
             .log()
             .iter()
-            .filter(|r| r.key.starts_with("locks/vykar-probe-") && r.op == OpKind::PutIfAbsent)
+            .filter(|r| {
+                r.key
+                    .starts_with(crate::repo::ages::PUT_IF_ABSENT_PROBE_PREFIX)
+                    && r.op == OpKind::PutIfAbsent
+            })
             .count();
         assert_eq!(probes, 4, "two creates per handle's check");
         assert!(store.head_overwrites().is_empty());
+    }
+
+    #[test]
+    fn verify_at_init_races_on_a_conditional_store() {
+        let (store, a, _) = of_kind(StoreKind::Conditional);
+        let cond = a.conditional().expect("offered");
+        assert_eq!(cond.verify_at_init().unwrap(), ConditionalSupport::Verified);
+        let creates = |s: &SimStore| {
+            s.log()
+                .iter()
+                .filter(|r| r.op == OpKind::PutIfAbsent)
+                .count()
+        };
+        assert_eq!(
+            creates(&store),
+            2 + vykar_storage::INIT_RACE_ROUNDS * vykar_storage::INIT_RACE_WRITERS
+        );
+        assert!(store.keys("sessions/").is_empty(), "every probe deleted");
+        assert!(a.conditional().is_some());
+    }
+
+    #[test]
+    fn verify_at_init_on_an_ignoring_store_stops_at_the_sequential_check() {
+        let (store, a, _) = of_kind(StoreKind::Ignoring);
+        let cond = a.conditional().expect("offered until checked");
+        assert!(matches!(
+            cond.verify_at_init().unwrap(),
+            ConditionalSupport::Unsupported { .. }
+        ));
+        let creates = store
+            .log()
+            .iter()
+            .filter(|r| r.op == OpKind::PutIfAbsent)
+            .count();
+        assert_eq!(creates, 2, "no race keys written");
+        assert!(!store.log().iter().any(|r| r.key.contains("-race")));
+        assert!(a.conditional().is_none());
     }
 
     #[test]

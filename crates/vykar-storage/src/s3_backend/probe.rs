@@ -18,9 +18,9 @@ use super::conditional::{OCTET_STREAM, PreparedPut, prepare_put};
 use super::multipart::parse_s3_error_code;
 use super::{PRESIGN_DURATION, S3Backend};
 use crate::probe::{
-    CREATE, CaseResult, Cleanup, Ledger, MPU_COMPLETE_RETRY, MPU_ON_EXISTING, OVERWRITE_CONTROL,
-    Outcome, ProbeOptions, REPEAT_OTHER, REPEAT_SAME, RaceResult, Report, TOMBSTONE, is_created,
-    is_exists, payload,
+    CREATE, CaseResult, Cleanup, LIST_AFTER_WRITE, Ledger, MPU_COMPLETE_RETRY, MPU_ON_EXISTING,
+    OVERWRITE_CONTROL, Outcome, ProbeOptions, REPEAT_OTHER, REPEAT_SAME, RaceResult, Report,
+    TOMBSTONE, is_created, is_exists, is_listed, listing_outcome, payload,
 };
 use crate::{ParsedUrl, RetryConfig, StorageBackend, StorageConfig};
 
@@ -51,20 +51,25 @@ pub fn run_s3(cfg: &StorageConfig, opts: &ProbeOptions) -> Result<Report> {
         .as_deref()
         .ok_or_else(|| VykarError::Config("probe s3: no secret access key".into()))?;
     let scrub = Scrub { key_id, secret };
-    let backend = S3Backend::new(
-        &bucket,
-        region,
-        &root,
-        &endpoint,
-        key_id,
-        secret,
-        RetryConfig::default(),
-        // Soft delete hides zero-byte objects from `get` and `list`; the
-        // tombstone case and the leftover listing must see them.
-        false,
-        cfg.max_connections,
-    )
-    .map_err(|e| VykarError::Config(scrub.text(&e.to_string())))?;
+    let build = || {
+        S3Backend::new(
+            &bucket,
+            region,
+            &root,
+            &endpoint,
+            key_id,
+            secret,
+            RetryConfig::default(),
+            // Soft delete hides zero-byte objects from `get` and `list`; the
+            // tombstone case and the leftover listing must see them.
+            false,
+            cfg.max_connections,
+        )
+        .map_err(|e| VykarError::Config(scrub.text(&e.to_string())))
+    };
+    let backend = build()?;
+    // The list-after-write case lists through its own agent and connections.
+    let lister = build()?;
     let transport = if endpoint.to_ascii_lowercase().starts_with("http://") {
         "http"
     } else {
@@ -76,12 +81,15 @@ pub fn run_s3(cfg: &StorageConfig, opts: &ProbeOptions) -> Result<Report> {
         location.push('/');
         location.push_str(root);
     }
-    run_with_backend(&backend, &location, transport, opts)
+    run_with_backend(&backend, &lister, &location, transport, opts)
 }
 
 /// Same, on an already built backend (tests use this with a mock endpoint).
+/// `lister` is a second backend on the same bucket and root, for the
+/// list-after-write case.
 pub(crate) fn run_with_backend(
     b: &S3Backend,
+    lister: &S3Backend,
     location: &str,
     transport: &str,
     opts: &ProbeOptions,
@@ -102,6 +110,9 @@ pub(crate) fn run_with_backend(
         race: (0..opts.rounds())
             .map(|r| ledger.key(&format!("race-{r}")))
             .collect::<Result<_>>()?,
+        list: (0..opts.list_rounds())
+            .map(|r| ledger.key(&format!("list-{r}")))
+            .collect::<Result<_>>()?,
     };
 
     let existing = b.list(&format!("{prefix}/")).map_err(preflight)?;
@@ -120,6 +131,7 @@ pub(crate) fn run_with_backend(
 
     let mut run = Run {
         b,
+        lister,
         scrub,
         ledger,
         notes: Vec::new(),
@@ -147,6 +159,7 @@ struct Keys {
     mpu: String,
     tomb: String,
     race: Vec<String>,
+    list: Vec<String>,
 }
 
 /// The set rusty-s3 percent-encodes in query values such as `X-Amz-Credential`.
@@ -470,6 +483,7 @@ fn abort_mpu_raw(
 
 struct Run<'a> {
     b: &'a S3Backend,
+    lister: &'a S3Backend,
     scrub: Scrub<'a>,
     ledger: Ledger,
     notes: Vec<String>,
@@ -660,7 +674,37 @@ impl Run<'_> {
                 &format!("writing the zero-byte object: {}", outcome_text(&setup)),
             ));
         }
+        cases.push(self.list_after_write(&keys.list));
         cases
+    }
+
+    /// Plain PUTs through `b`, each followed by a LIST of the prefix through
+    /// `lister`, which must show the key.
+    fn list_after_write(&mut self, keys: &[String]) -> CaseResult {
+        let result = |outcome| {
+            CaseResult::expect(LIST_AFTER_WRITE, "listed", is_listed, outcome, None, false)
+        };
+        let dir = format!("{}/", self.ledger.prefix());
+        let mut missed = 0;
+        for key in keys {
+            let o = self.put(key, b"l", false);
+            if !is_created(&o) {
+                return result(o);
+            }
+            match self.lister.list(&dir) {
+                Ok(listed) => {
+                    if !listed.contains(key) {
+                        missed += 1;
+                    }
+                }
+                Err(e) => {
+                    return result(Outcome::Transport {
+                        detail: self.scrub.text(&format!("list: {e}")),
+                    });
+                }
+            }
+        }
+        result(listing_outcome(missed, keys.len()))
     }
 
     fn race(&mut self, keys: &[String], writers: usize) -> RaceResult {
@@ -747,7 +791,9 @@ fn outcome_text(o: &Outcome) -> String {
         | Outcome::Conflict { detail }
         | Outcome::Rejected { detail }
         | Outcome::Transport { detail }
-        | Outcome::Info { detail } => detail.clone(),
+        | Outcome::Info { detail }
+        | Outcome::Listed { detail }
+        | Outcome::NotListed { detail } => detail.clone(),
     }
 }
 
@@ -941,7 +987,8 @@ mod tests {
             race_rounds: 1,
             ..ProbeOptions::default()
         };
-        let report = run_with_backend(&backend, "http://mock/test-bucket", "http", &opts).unwrap();
+        let report =
+            run_with_backend(&backend, &backend, "http://mock/test-bucket", "http", &opts).unwrap();
         let case = |name: &str| report.cases.iter().find(|c| c.name == name).unwrap();
         assert_eq!(case(CREATE).outcome, Outcome::Created);
         assert_eq!(case(CREATE).content_ok, Some(false));
@@ -969,7 +1016,8 @@ mod tests {
             race_rounds: 1,
             ..ProbeOptions::default()
         };
-        let report = run_with_backend(&backend, "http://mock/test-bucket", "http", &opts).unwrap();
+        let report =
+            run_with_backend(&backend, &backend, "http://mock/test-bucket", "http", &opts).unwrap();
         assert_eq!(report.verdict, Verdict::Inconclusive);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("SignatureDoesNotMatch"), "{json}");
@@ -978,7 +1026,7 @@ mod tests {
 
         let port = signature_mock("AKID", true);
         let backend = s3_backend(port, no_retry(), false);
-        let err = run_with_backend(&backend, "http://mock/test-bucket", "http", &opts)
+        let err = run_with_backend(&backend, &backend, "http://mock/test-bucket", "http", &opts)
             .unwrap_err()
             .to_string();
         assert!(err.contains("SignatureDoesNotMatch"), "{err}");

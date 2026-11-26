@@ -679,6 +679,11 @@ impl ConditionalWrite for RestBackend {
     fn verify(&self) -> Result<ConditionalSupport> {
         self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
     }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        self.cond
+            .verify_at_init(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
 }
 
 impl RestBackend {

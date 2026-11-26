@@ -206,7 +206,8 @@ pub(crate) enum HeadFallback {
     NotOffered,
     /// Logged at warn: the storage accepted the creates but ignored the
     /// condition, or an S3 endpoint with conditional writes enabled
-    /// (`s3_conditional_writes: on`, or `auto` on AWS) refused the header.
+    /// (`s3_conditional_writes: on`, or `auto` on AWS) refused the header
+    /// or belongs to a known-bad service (IDrive e2).
     Refused,
 }
 

@@ -8,8 +8,9 @@ use tempfile::NamedTempFile;
 use vykar_types::error::{Result, VykarError};
 
 use super::{
-    CREATE, CaseResult, Cleanup, Ledger, Outcome, ProbeOptions, REPEAT_OTHER, REPEAT_SAME,
-    RaceResult, Report, UNSUPPORTED_DETAIL, is_created, is_exists, payload,
+    CREATE, CaseResult, Cleanup, LIST_AFTER_WRITE, Ledger, Outcome, ProbeOptions, REPEAT_OTHER,
+    REPEAT_SAME, RaceResult, Report, UNSUPPORTED_DETAIL, is_created, is_exists, is_listed,
+    listing_outcome, payload,
 };
 
 const BODY_LEN: usize = 1024;
@@ -205,6 +206,8 @@ fn run_cases(
         }
     }
 
+    cases.push(list_after_write(root, &dir, opts, ledger));
+
     let race = race(root, &dir, opts, ledger, &prefix, &mut notes);
 
     let mut note = format!("os {}", std::env::consts::OS);
@@ -217,6 +220,53 @@ fn run_cases(
         None,
     ));
     (cases, Some(race), notes)
+}
+
+/// Plain writes of fresh keys, each followed by a fresh `read_dir` of the
+/// prefix directory, which must show it. A local filesystem has no second
+/// handle beyond that new directory read.
+fn list_after_write(
+    root: &Path,
+    dir: &Path,
+    opts: &ProbeOptions,
+    ledger: &mut Ledger,
+) -> CaseResult {
+    let n = opts.list_rounds();
+    let result =
+        |outcome| CaseResult::expect(LIST_AFTER_WRITE, "listed", is_listed, outcome, None, false);
+    let mut keys = Vec::with_capacity(n);
+    for r in 0..n {
+        match ledger.key(&format!("list-{r}")) {
+            Ok(k) => keys.push(k),
+            Err(e) => {
+                return result(Outcome::Rejected {
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+    let mut missed = 0;
+    for key in &keys {
+        let path = path_of(root, key);
+        if let Err(e) = std::fs::write(&path, b"l") {
+            return result(Outcome::Rejected {
+                detail: format!("write: {}", describe(&e)),
+            });
+        }
+        let name = path.file_name().map(std::ffi::OsStr::to_os_string);
+        let listed = match std::fs::read_dir(dir) {
+            Ok(entries) => entries.flatten().any(|e| Some(e.file_name()) == name),
+            Err(e) => {
+                return result(Outcome::Rejected {
+                    detail: format!("list: {}", describe(&e)),
+                });
+            }
+        };
+        if !listed {
+            missed += 1;
+        }
+    }
+    result(listing_outcome(missed, n))
 }
 
 fn race(
@@ -358,6 +408,12 @@ mod tests {
         std::fs::write(dir.path().join("keep.txt"), b"keep").unwrap();
         let report = run_local(dir.path(), &opts()).unwrap();
         assert_eq!(report.verdict, Verdict::Works, "{report:#?}");
+        let list = report
+            .cases
+            .iter()
+            .find(|c| c.name == LIST_AFTER_WRITE)
+            .unwrap();
+        assert!(is_listed(&list.outcome), "{list:?}");
         assert!(report.cleanup.leftovers.is_empty(), "{:?}", report.cleanup);
         assert!(report.cleanup.errors.is_empty(), "{:?}", report.cleanup);
         assert_eq!(report.exit_code(), 0);

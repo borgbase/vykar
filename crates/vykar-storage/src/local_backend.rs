@@ -432,6 +432,11 @@ impl ConditionalWrite for LocalBackend {
     fn verify(&self) -> Result<ConditionalSupport> {
         self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
     }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        self.cond
+            .verify_at_init(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
 }
 
 /// A range opened by [`LocalBackend::open_range`]: each piece is one
@@ -1206,9 +1211,14 @@ mod tests {
     fn conformance_suite_passes() {
         let dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let second = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
         assert!(backend.conditional().is_some());
-        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
-            .unwrap();
+        crate::conformance::run(
+            &backend,
+            &second,
+            &crate::conformance::ConformanceOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -108,18 +108,35 @@ pub(crate) const SLOW_INDEX_WRITE_TEXT: &str = "the index write took longer than
 pub(crate) const HEAD_FRESHNESS_LIMIT: Duration =
     Duration::from_secs(T_IDX.as_secs() - MARGIN.as_secs());
 
-/// Key prefix of a clock probe. Not `.json`, so no lock reader (this
-/// binary's `is_lock_key`, or 0.24's `list_lock_keys`) takes it for a lock.
-pub(crate) const CLOCK_PROBE_PREFIX: &str = "locks/vykar-clock-";
-/// Key prefix of the put-if-absent check's probe (vykar-storage's
-/// `sequential_check`). Not `.json`, as [`CLOCK_PROBE_PREFIX`]; one left
-/// by a failed delete is removed by age like a clock probe.
-pub(crate) const PUT_IF_ABSENT_PROBE_PREFIX: &str = "locks/vykar-probe-";
+/// Clock probe of the existing-pack check (`existing_pack`): neither
+/// `.json` nor `.index`, so no marker or journal reader (this binary's
+/// or 0.24's) takes it for one.
+pub(crate) const CLOCK_PROBE_PREFIX: &str = "sessions/vykar-clock-";
+/// Clock probe of a contended lock wait (`NowSource::Probe`), which
+/// lists the directory it judges. Not `.json`, so no lock reader (this
+/// binary's `is_lock_key`, or 0.24's `list_lock_keys`) takes it for a
+/// lock. Goes with the lock (10-single-protocol step 9).
+pub(crate) const LOCK_CLOCK_PROBE_PREFIX: &str = "locks/vykar-clock-";
+/// The put-if-absent check's probe
+/// (`vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX`); one left by a failed
+/// delete is removed by age like a clock probe.
+pub(crate) const PUT_IF_ABSENT_PROBE_PREFIX: &str = vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX;
+/// Where the put-if-absent probe lived before 10-single-protocol step 4;
+/// debris of a failed delete there is still removed.
+pub(crate) const LEGACY_PUT_IF_ABSENT_PROBE_PREFIX: &str = "locks/vykar-probe-";
 
-/// Whether `key` is a probe under `locks/` (a clock probe or the
-/// put-if-absent check's), which lock readers skip and old ones are debris.
+/// Whether `key` is a probe (clock or put-if-absent, either directory):
+/// skipped by lock and session readers, debris once older than
+/// [`CLOCK_PROBE_DEBRIS_AGE`].
 pub(crate) fn is_probe_key(key: &str) -> bool {
-    key.starts_with(CLOCK_PROBE_PREFIX) || key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)
+    [
+        CLOCK_PROBE_PREFIX,
+        LOCK_CLOCK_PROBE_PREFIX,
+        PUT_IF_ABSENT_PROBE_PREFIX,
+        LEGACY_PUT_IF_ABSENT_PROBE_PREFIX,
+    ]
+    .iter()
+    .any(|p| key.starts_with(p))
 }
 /// A probe older than this is debris of a failed delete.
 pub(crate) const CLOCK_PROBE_DEBRIS_AGE: Duration = Duration::from_secs(3600);
@@ -130,23 +147,23 @@ pub(crate) const CLOCK_PROBE_DEBRIS_AGE: Duration = Duration::from_secs(3600);
 /// extrapolated "now" ahead of it.
 pub(crate) const STORE_READING_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
-/// The clock probe key of a process: one random suffix per process, ending
-/// in `pid` (32 hex digits in all). A re-probe lands on the same key, so on
+/// The clock probe key of a process under `prefix`: one random suffix per
+/// process, ending in `pid` (32 hex digits in all). A re-probe lands on the same key, so on
 /// a store that keeps a tombstone per deleted key (`s3_soft_delete`)
 /// probes leave one per process, not one per attempt. Two threads of one
 /// process that probe at once can delete each other's probe; the loser
 /// reads "now unknown" and its attempt ends `Locked` (fail closed).
-fn clock_probe_key(pid: u32) -> String {
+fn clock_probe_key(prefix: &str, pid: u32) -> String {
     static SUFFIX: OnceLock<u128> = OnceLock::new();
     let suffix = *SUFFIX.get_or_init(rand::random::<u128>) >> 32;
-    format!("{CLOCK_PROBE_PREFIX}{suffix:024x}{pid:08x}")
+    format!("{prefix}{suffix:024x}{pid:08x}")
 }
 
 /// "Now" on the store's clock from a probe: PUT
-/// `locks/vykar-clock-<32 hex>` (`clock_probe_key`), LIST `locks/` with
-/// mtimes, DELETE the probe (best effort, debug log). Returns the reading
-/// (`None` if the probe is not listed or has no mtime) and the listing
-/// without the probe.
+/// `<prefix><32 hex>` (`clock_probe_key`), LIST the prefix's directory
+/// with mtimes, DELETE the probe (best effort, debug log). Returns the
+/// reading (`None` if the probe is not listed or has no mtime) and the
+/// listing without the probe.
 ///
 /// # Errors
 ///
@@ -155,11 +172,13 @@ fn clock_probe_key(pid: u32) -> String {
 pub(crate) fn probe_store_now(
     storage: &dyn StorageBackend,
     env: &HostEnv,
+    prefix: &'static str,
 ) -> Result<(Option<StoreNow>, Vec<ListedObject>)> {
-    let key = clock_probe_key(env.host.pid);
+    let key = clock_probe_key(prefix, env.host.pid);
+    let dir = prefix.rfind('/').map_or("", |i| &prefix[..=i]);
     let listed = storage
         .put(&key, b"vykar clock probe")
-        .and_then(|()| storage.list_meta("locks/"));
+        .and_then(|()| storage.list_meta(dir));
     if let Err(e) = storage.delete(&key) {
         debug!(key = %key, error = %e, "could not delete the clock probe");
     }
@@ -171,16 +190,38 @@ pub(crate) fn probe_store_now(
 
 /// One wait's reading of the store's clock: the lock attempts of one wait
 /// (`acquire_lock_with_deadline`, the simulator's lock phase) share it, so
-/// the wait probes once rather than once per attempt.
-#[derive(Debug, Default)]
+/// the wait probes once rather than once per attempt. The existing-pack
+/// check has its own (`in_sessions`).
+#[derive(Debug)]
 pub(crate) struct StoreClock {
     /// The last reading and the local monotonic time just after it.
     reading: Option<(StoreNow, Instant)>,
+    /// Key prefix of this clock's probe; its directory is what the probe lists.
+    pub(super) prefix: &'static str,
+}
+
+impl Default for StoreClock {
+    /// A lock wait's clock: its probe lives under `locks/`, the directory
+    /// the lock reaper judges.
+    fn default() -> Self {
+        Self {
+            reading: None,
+            prefix: LOCK_CLOCK_PROBE_PREFIX,
+        }
+    }
 }
 
 impl StoreClock {
-    /// "Now" on the store's clock, and the listing of `locks/` when this
-    /// call probed. Within [`STORE_READING_MAX_AGE`] of the last reading it
+    /// A clock whose probe lives under `sessions/` (the existing-pack check).
+    pub(crate) fn in_sessions() -> Self {
+        Self {
+            reading: None,
+            prefix: CLOCK_PROBE_PREFIX,
+        }
+    }
+
+    /// "Now" on the store's clock, and the listing of the probe's directory
+    /// (`locks/` for a lock wait's clock) when this call probed. Within [`STORE_READING_MAX_AGE`] of the last reading it
     /// extrapolates: reading + monotonic time elapsed since. Otherwise, or
     /// when there is no reading (none yet, or the last probe failed), it
     /// probes; a failed probe is "now unknown" (`None`).
@@ -207,7 +248,7 @@ impl StoreClock {
                 return (Some(StoreNow::at(at.time() + elapsed)), None);
             }
         }
-        match probe_store_now(storage, env) {
+        match probe_store_now(storage, env, self.prefix) {
             Ok((now, listing)) => {
                 let mark = env.clock.monotonic();
                 self.reading = now.map(|n| (n, mark));

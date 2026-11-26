@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
 use crate::index::head::IndexHead;
+use crate::repo::ages::{LEGACY_PUT_IF_ABSENT_PROBE_PREFIX, PUT_IF_ABSENT_PROBE_PREFIX};
 use crate::repo::control::CommitEvent;
 use crate::repo::host_env::{Clock, HostEnv, StopSignal};
 use crate::repo::index_store;
@@ -84,7 +85,7 @@ fn planted(sim: &Sim, head: &IndexHead, generation: u64) -> Vec<u8> {
 
 /// A backup creates its head with one put-if-absent; the run's first create
 /// runs the check (two creates, one GET and one DELETE of a probe under
-/// `locks/`), which leaves nothing behind.
+/// `sessions/`), which leaves nothing behind.
 #[test]
 fn backup_creates_its_head() {
     let mut sim = sim_of(StoreKind::Conditional);
@@ -104,13 +105,18 @@ fn backup_creates_its_head() {
     );
     let probe = |op: OpKind| {
         recs.iter()
-            .filter(|r| r.op == op && r.key.starts_with("locks/vykar-probe-"))
+            .filter(|r| r.op == op && r.key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX))
             .count()
     };
     assert_eq!(probe(OpKind::PutIfAbsent), 2);
     assert_eq!(probe(OpKind::Get), 1);
     assert_eq!(probe(OpKind::Delete), 1);
-    assert!(sim.store().keys("locks/vykar-probe-").is_empty());
+    assert!(sim.store().keys(PUT_IF_ABSENT_PROBE_PREFIX).is_empty());
+    assert!(
+        sim.store()
+            .keys(LEGACY_PUT_IF_ABSENT_PROBE_PREFIX)
+            .is_empty()
+    );
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
@@ -204,17 +210,25 @@ fn ignoring_backend_falls_back_with_a_warning() {
         // Each run (process) checks once.
         assert_eq!(
             recs.iter()
-                .filter(|r| r.op == OpKind::PutIfAbsent && r.key.starts_with("locks/"))
+                .filter(|r| {
+                    r.op == OpKind::PutIfAbsent && r.key.starts_with(PUT_IF_ABSENT_PROBE_PREFIX)
+                })
                 .count(),
             2
         );
     }
-    assert!(sim.store().keys("locks/vykar-probe-").is_empty());
+    assert!(sim.store().keys(PUT_IF_ABSENT_PROBE_PREFIX).is_empty());
+    assert!(
+        sim.store()
+            .keys(LEGACY_PUT_IF_ABSENT_PROBE_PREFIX)
+            .is_empty()
+    );
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// On a local repository (LocalBackend: no-clobber rename) a backup creates
-/// its head and its check leaves no probe under `locks/`.
+/// its head and its check leaves no probe under `sessions/` (nor under
+/// `locks/`, where it lived before).
 #[test]
 fn local_backup_leaves_no_probe() {
     let tmp = tempfile::tempdir().unwrap();
@@ -224,14 +238,16 @@ fn local_backup_leaves_no_probe() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("a"), "alpha").unwrap();
     crate::tests::helpers::backup_single_source(&config, &source, "src", "s1");
-    let locks: Vec<String> = std::fs::read_dir(repo_dir.join("locks"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        !locks.iter().any(|n| n.starts_with("vykar-probe-")),
-        "{locks:?}"
-    );
+    for dir in ["sessions", "locks"] {
+        let names: Vec<String> = std::fs::read_dir(repo_dir.join(dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("vykar-probe-")),
+            "{dir}: {names:?}"
+        );
+    }
     assert!(
         repo_dir
             .join("index.h")
@@ -1010,6 +1026,9 @@ impl vykar_storage::ConditionalWrite for RefusesAfterCheck {
     }
     fn verify(&self) -> vykar_types::error::Result<vykar_storage::ConditionalSupport> {
         Ok(vykar_storage::ConditionalSupport::Verified)
+    }
+    fn verify_at_init(&self) -> vykar_types::error::Result<vykar_storage::ConditionalSupport> {
+        self.verify()
     }
 }
 

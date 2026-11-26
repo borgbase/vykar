@@ -2810,6 +2810,118 @@ mod store_clock {
         assert_eq!(left, vec![young.to_string()]);
     }
 
+    /// Probes under `sessions/` (the put-if-absent check's, the existing-pack
+    /// clock's) left by a failed delete are removed by maintenance's session
+    /// reap once an hour old; young ones, live sessions, and everything when
+    /// "now" is unknown are kept. A backup's commit-lock yield removes none.
+    /// A session's marker or journal is never probe debris, whatever its ID.
+    #[test]
+    fn reap_removes_old_session_probes_only() {
+        let (dir, storage) = local();
+        let old_probe = "sessions/vykar-probe-1700000000-0123456789abcdef0123456789abcdef";
+        let old_clock = "sessions/vykar-clock-0123456789abcdef0123456789abcdef";
+        let young = "sessions/vykar-probe-1700000001-fedcba9876543210fedcba9876543210";
+        for key in [old_probe, old_clock, young] {
+            storage.put(key, b"probe").unwrap();
+        }
+        age(dir.path(), old_probe, 2 * HOUR);
+        age(dir.path(), old_clock, 2 * HOUR);
+        age(dir.path(), young, Duration::from_secs(10 * 60));
+        marker(&storage, "live", Utc::now());
+        storage.put("sessions/live.index", b"journal").unwrap();
+        age(dir.path(), "sessions/live.index", 2 * HOUR);
+        // A live session whose ID starts like a probe: its old generation-0
+        // marker and its old journal are no probe debris.
+        let probe_named = [
+            "sessions/vykar-probe-x.json",
+            "sessions/vykar-probe-x.index",
+        ];
+        marker(&storage, "vykar-probe-x", Utc::now());
+        storage.put(probe_named[1], b"journal").unwrap();
+        storage
+            .put(
+                "sessions/vykar-probe-x.1.json",
+                &storage.get(probe_named[0]).unwrap().unwrap(),
+            )
+            .unwrap();
+        for key in probe_named {
+            age(dir.path(), key, 2 * HOUR);
+        }
+        let all = |s: &LocalBackend| {
+            let mut keys = s.list("sessions/").unwrap();
+            keys.sort();
+            keys
+        };
+        let before = all(&storage);
+
+        let env = HostEnv::system();
+        let max_age = default_stale_session_duration();
+        // "Now" unknown: nothing is old.
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, None).unwrap();
+        assert!(cleaned.is_empty(), "{cleaned:?}");
+        assert_eq!(all(&storage), before);
+
+        // A backup's yield (it holds its own session) skips the second pass.
+        let guard = acquire_lock(&storage, &env).unwrap();
+        crate::repo::lock::yield_to_lock_free_writers(
+            &storage,
+            &env,
+            guard.store_time(),
+            Some("own"),
+        )
+        .unwrap();
+        for key in [old_probe, old_clock, young] {
+            assert!(storage.exists(key).unwrap(), "{key}");
+        }
+
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        assert!(cleaned.is_empty(), "no session was stale: {cleaned:?}");
+        assert!(!storage.exists(old_probe).unwrap());
+        assert!(!storage.exists(old_clock).unwrap());
+        assert!(storage.exists(young).unwrap());
+        assert!(storage.exists("sessions/live.json").unwrap());
+        assert!(storage.exists("sessions/live.index").unwrap());
+        for key in probe_named {
+            assert!(storage.exists(key).unwrap(), "{key}");
+        }
+        release_lock(&storage, guard).unwrap();
+    }
+
+    /// A probe under `sessions/` is no session: listings, the reap and the
+    /// committing check skip it.
+    #[test]
+    fn session_probes_are_not_sessions() {
+        let (_dir, storage) = local();
+        let probe = "sessions/vykar-probe-1700000000-0123456789abcdef0123456789abcdef";
+        let clock = "sessions/vykar-clock-0123456789abcdef0123456789abcdef";
+        storage.put(probe, b"probe").unwrap();
+        storage.put(clock, b"vykar clock probe").unwrap();
+        marker(&storage, "live", Utc::now());
+
+        let env = HostEnv::system();
+        let ids = crate::repo::lock::list_sessions(&storage).unwrap();
+        assert_eq!(ids, vec!["live".to_string()]);
+        let entries = crate::repo::lock::list_session_entries(&storage).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let (cleaned, kept) = crate::repo::lock::cleanup_stale_sessions_keeping(
+            &storage,
+            default_stale_session_duration(),
+            &env,
+            None,
+        )
+        .unwrap();
+        assert!(cleaned.is_empty(), "{cleaned:?}");
+        let kept: Vec<&str> = kept.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(kept, vec!["live"]);
+        assert!(
+            crate::repo::lock::committing_sessions(&storage, "own")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(storage.exists(probe).unwrap());
+        assert!(storage.exists(clock).unwrap());
+    }
+
     /// `break-lock` also removes clock probes, which are not locks and are
     /// not counted.
     #[test]

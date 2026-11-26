@@ -480,11 +480,11 @@ fn a_backup_against_an_append_only_server_issues_no_refused_delete() {
 }
 
 /// 04 step 8: a backup through vykar-server creates its head with
-/// `If-None-Match: *`, in normal and in append-only mode (`locks/*` is
+/// `If-None-Match: *`, in normal and in append-only mode (`sessions/*` is
 /// ephemeral there: the probe may be created and deleted). The in-process
 /// harness logs no request headers; what shows the conditional path is the
 /// check's second create of its probe answered 412, its DELETE answered
-/// with success, the head's create answered 201, and `locks/` holding no
+/// with success, the head's create answered 201, and `sessions/` holding no
 /// probe afterwards.
 #[test]
 fn backup_creates_heads_with_if_none_match() {
@@ -503,11 +503,11 @@ fn backup_creates_heads_with_if_none_match() {
         };
         let ctx = format!("append_only={append_only}: {reqs:?}");
         assert_eq!(
-            answers(axum::http::Method::PUT, "locks/vykar-probe-"),
+            answers(axum::http::Method::PUT, "sessions/vykar-probe-"),
             vec![201, 412],
             "{ctx}"
         );
-        let deletes = answers(axum::http::Method::DELETE, "locks/vykar-probe-");
+        let deletes = answers(axum::http::Method::DELETE, "sessions/vykar-probe-");
         assert_eq!(deletes.len(), 1, "{ctx}");
         assert!((200..300).contains(&deletes[0]), "{ctx}");
         assert_eq!(
@@ -515,7 +515,7 @@ fn backup_creates_heads_with_if_none_match() {
             vec![201],
             "{ctx}"
         );
-        let probes: Vec<String> = std::fs::read_dir(server.data.path().join("locks"))
+        let probes: Vec<String> = std::fs::read_dir(server.data.path().join("sessions"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("vykar-probe-"))
@@ -736,26 +736,32 @@ fn find(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// The put-if-absent and `list_meta` conformance suite through `RestBackend`
-/// against the server, in both modes. `locks/` is ephemeral, so the suite's
-/// deletes are allowed in append-only mode too.
+/// against the server, in both modes, with a second client for the listing
+/// case. `sessions/` is ephemeral, so the suite's deletes are allowed in
+/// append-only mode too.
 #[test]
 fn conditional_conformance_suite_passes() {
     use vykar_storage::StorageBackend;
     for append_only in [false, true] {
         let server = Server::start(append_only);
-        let backend = vykar_storage::rest_backend::RestBackend::new(
-            &server.url,
-            Some(TOKEN),
-            vykar_storage::RetryConfig {
-                max_retries: 0,
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
+        let client = || {
+            vykar_storage::rest_backend::RestBackend::new(
+                &server.url,
+                Some(TOKEN),
+                vykar_storage::RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+        };
+        let backend = client();
+        let second = client();
         assert!(backend.conditional().is_some(), "the server advertises it");
         vykar_storage::conformance::run(
             &backend,
+            &second,
             &vykar_storage::conformance::ConformanceOptions::default(),
         )
         .unwrap_or_else(|e| panic!("append_only={append_only}: {e}"));

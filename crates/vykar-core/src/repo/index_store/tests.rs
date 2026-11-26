@@ -2137,6 +2137,9 @@ impl vykar_storage::ConditionalWrite for ScriptedCreate {
     fn verify(&self) -> Result<vykar_storage::ConditionalSupport> {
         Ok(vykar_storage::ConditionalSupport::Verified)
     }
+    fn verify_at_init(&self) -> Result<vykar_storage::ConditionalSupport> {
+        self.verify()
+    }
 }
 
 fn scripted(

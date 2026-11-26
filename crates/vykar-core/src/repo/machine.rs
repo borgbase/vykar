@@ -46,7 +46,7 @@ pub(crate) enum StepKind {
     /// PUT a base `index.d/<name>`.
     PutBase,
     /// Compound: the put-if-absent check on a handle's first index write
-    /// (two creates, a GET and a DELETE of a probe under `locks/`), then
+    /// (two creates, a GET and a DELETE of a probe under `sessions/`), then
     /// EXISTS the lock key, PUT it when the refresh is due.
     Fence,
     /// Compound: create `index.h/<gen>` (put-if-absent where offered and
@@ -159,7 +159,17 @@ impl StepKind {
             StepKind::PutSweepRecord | StepKind::PutSegment | StepKind::PutBase => {
                 &[(Write, "index.d/")]
             }
-            StepKind::Fence => &[(Read, "locks/"), (Write, "locks/"), (Delete, "locks/")],
+            // The lock fence reads `locks/` and rewrites its lock key when
+            // the refresh is due; the put-if-absent check (once per backend
+            // instance) runs in this step for writers other than a backup,
+            // and its probe lives under `sessions/`.
+            StepKind::Fence => &[
+                (Read, "locks/"),
+                (Write, "locks/"),
+                (Read, "sessions/"),
+                (Write, "sessions/"),
+                (Delete, "sessions/"),
+            ],
             StepKind::PutHead => PUT_HEAD,
             StepKind::CollectGarbage => &[
                 (List, "index.h/"),

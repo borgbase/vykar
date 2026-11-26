@@ -208,9 +208,9 @@ pub fn release_lock(storage: &dyn StorageBackend, guard: LockGuard) -> Result<()
 ///
 /// This is a recovery mechanism for stale locks left by killed processes.
 /// No passphrase is needed — lock files are unencrypted JSON.
-/// Returns the number of locks removed. Clock probes left under `locks/`
-/// (`locks/vykar-clock-*`, `locks/vykar-probe-*`; not locks) are deleted too
-/// and not counted.
+/// Returns the number of locks removed. Probes left under `locks/` (a lock
+/// wait's clock probes `locks/vykar-clock-*` and legacy put-if-absent probes
+/// `locks/vykar-probe-*`; not locks) are deleted too and not counted.
 pub fn break_lock(storage: &dyn StorageBackend) -> Result<usize> {
     let mut removed: usize = 0;
 
@@ -438,7 +438,11 @@ impl NowSource<'_> {
                     }
                 }
             }
-            Self::Probe(clock) => clock.now(storage, env),
+            Self::Probe(clock) => {
+                // The fresher listing replaces the reaper's `locks/` one.
+                debug_assert_eq!(clock.prefix, super::ages::LOCK_CLOCK_PROBE_PREFIX);
+                clock.now(storage, env)
+            }
             Self::Known(now) => (now, None),
         }
     }
@@ -1941,7 +1945,9 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// can recover uploaded-but-uncommitted chunks via `recover_pending_index()`.
 /// Orphaned `.index` files from a *prior* cleanup run (no companion `.json`
 /// and not cleaned this invocation) are deleted — they already had their
-/// grace period.
+/// grace period. With `now` known, probes under `sessions/` (the
+/// put-if-absent check's, the existing-pack clock's) older than an hour
+/// (debris of a failed delete) are removed too, best effort.
 ///
 /// `env` gives the fallback time and enables same-host detection: if
 /// `same_host` finds the session was left by a dead process or an earlier
@@ -1961,7 +1967,7 @@ pub fn cleanup_stale_sessions(
 /// ascending session ID order, from the same listing and GETs of each
 /// session's newest key: one whose newest key is malformed, or gone since
 /// the LIST, has `entry: None` (no horizon). Maintenance uses it so
-/// `sessions/` is listed once.
+/// `sessions/` is listed once. Removes old probe debris as that does.
 pub(crate) fn cleanup_stale_sessions_keeping(
     storage: &dyn StorageBackend,
     max_age: Duration,
@@ -2007,8 +2013,9 @@ pub(crate) fn reap_sessions_registered(
 /// [`cleanup_stale_sessions_keeping`]; `delete_orphan_journals`: whether its
 /// second pass runs (a backup's commit-lock yield skips it, so a crashed
 /// session's journal keeps its grace until the next maintenance, as before
-/// backups listed sessions at their lock). Also returns the "now" it judged
-/// ages by.
+/// backups listed sessions at their lock). The second pass also removes
+/// probe debris older than [`CLOCK_PROBE_DEBRIS_AGE`] when "now" is known.
+/// Also returns the "now" it judged ages by.
 fn reap_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
@@ -2143,6 +2150,19 @@ fn reap_sessions(
             && !cleaned_ids.contains(id)
         {
             storage.delete(key)?;
+        }
+        if let Some(now) = now
+            && is_probe_key(key)
+            && !key.ends_with(".json")
+            && !key.ends_with(".index")
+            && mtimes
+                .get(key.as_str())
+                .copied()
+                .flatten()
+                .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
+            && let Err(e) = storage.delete(key)
+        {
+            debug!(key, error = %e, "could not delete an old probe");
         }
     }
 

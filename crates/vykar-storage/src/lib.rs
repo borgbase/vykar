@@ -32,9 +32,11 @@ pub use delegate::__macro_support;
 pub use delegate::InnerBackend;
 
 pub use conditional::{
-    ConditionalSupport, ConditionalWrite, Created, IGNORES_CONDITION, MAX_PUT_IF_ABSENT_BYTES,
-    RawPut, Verifier, put_if_absent_unavailable,
+    ConditionalSupport, ConditionalWrite, Created, IGNORES_CONDITION, INIT_RACE_ROUNDS,
+    INIT_RACE_WRITERS, MAX_PUT_IF_ABSENT_BYTES, PROBE_DIR, PUT_IF_ABSENT_PROBE_KEY_PREFIX, RawPut,
+    Verifier, put_if_absent_unavailable,
 };
+pub use s3_backend::services::{S3_SERVICES, S3Service, ServiceStatus, s3_service_of};
 // `S3ConditionalWrites` is defined below, next to `StorageConfig`.
 
 #[cfg(feature = "backend-sftp")]
@@ -955,13 +957,15 @@ Use HTTPS, or set repository.allow_insecure_http: true to permit plaintext HTTP 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum S3ConditionalWrites {
-    /// Only for AWS endpoints (host under `amazonaws.com` or
-    /// `amazonaws.com.cn`), and only once the sequential check passes. Every
-    /// other endpoint: off.
+    /// Only on hosts of a tested or documented service in [`S3_SERVICES`]
+    /// (today AWS: host under `amazonaws.com` or `amazonaws.com.cn`), and
+    /// only once the sequential check passes. Every other endpoint: off.
     #[default]
     Auto,
     /// The user asserts the service honours the condition atomically. The
     /// sequential check still runs and refuses a service that ignores it.
+    /// On a host of a known-bad service (IDrive e2) put-if-absent is refused
+    /// without a request.
     On,
     /// Never offered.
     Off,

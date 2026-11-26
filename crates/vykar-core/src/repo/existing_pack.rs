@@ -26,7 +26,8 @@
 //!
 //! Known costs and limits:
 //! - Each accepted pack costs one listing of its shard, and a clock probe
-//!   when the shared reading is older than five minutes or failed.
+//!   under `sessions/` when the shared reading is older than five minutes
+//!   or failed.
 //! - A 403 on a part upload turns the REST backend's parts path off for the
 //!   rest of the process, so later packs of that backup go as whole PUTs.
 //! - The stored marker carries the pull-back only from its next refresh. A
@@ -66,7 +67,7 @@ impl ExistingPacks {
         Self {
             env,
             marker: OnceLock::new(),
-            clock: Mutex::new(StoreClock::default()),
+            clock: Mutex::new(StoreClock::in_sessions()),
         }
     }
 
@@ -241,6 +242,29 @@ mod tests {
         let elapsed = marker.elapsed(&crate::repo::host_env::SystemClock);
         assert!(elapsed >= 7 * HOUR, "{elapsed:?}");
         assert!(elapsed < 8 * HOUR, "{elapsed:?}");
+    }
+
+    /// The clock probe that reads the stored pack's age is written under
+    /// `sessions/` (not `locks/`): its reading comes from a `sessions/`
+    /// listing, and the probe is deleted.
+    #[test]
+    fn the_clock_probe_lives_under_sessions() {
+        let storage = store_with_pack(Some(7 * HOUR), true);
+        let (existing, marker) = with_marker(&storage);
+        let prefix = existing.clock.lock().unwrap().prefix;
+        assert_eq!(prefix, crate::repo::ages::CLOCK_PROBE_PREFIX);
+        assert!(prefix.starts_with("sessions/"));
+        let err = refusal(&storage);
+        existing.settle_refused(&storage, KEY, 100, err).unwrap();
+        // The age was read on the store's clock, so the probe was listed.
+        let elapsed = marker.elapsed(&crate::repo::host_env::SystemClock);
+        assert!(elapsed >= 7 * HOUR && elapsed < 8 * HOUR, "{elapsed:?}");
+        let left: Vec<String> = ["sessions/", "locks/"]
+            .iter()
+            .flat_map(|d| storage.list(d).unwrap())
+            .filter(|k| k.contains("vykar-clock-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// Another size, a server that does not advertise append-only mode, a

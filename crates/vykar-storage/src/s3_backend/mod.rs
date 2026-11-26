@@ -29,6 +29,7 @@ mod batch_delete;
 pub(crate) mod conditional;
 mod multipart;
 pub(crate) mod probe;
+pub mod services;
 
 /// Duration for presigned URL validity.
 const PRESIGN_DURATION: Duration = Duration::from_secs(3600);
@@ -59,8 +60,9 @@ pub struct S3Backend {
     transfer_width: usize,
     /// `s3_conditional_writes`; see [`Self::with_conditional_writes`].
     conditional_mode: S3ConditionalWrites,
-    /// The endpoint's host is an AWS one (what `auto` trusts).
-    aws_endpoint: bool,
+    /// The known service the endpoint's host belongs to (what `auto`
+    /// trusts, and what is refused whatever the mode).
+    service: Option<&'static services::S3Service>,
     /// Cache of the put-if-absent check.
     cond: Verifier,
 }
@@ -121,14 +123,17 @@ impl S3Backend {
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
             conditional_mode: S3ConditionalWrites::Auto,
-            aws_endpoint: conditional::is_aws_endpoint(endpoint),
+            service: services::s3_service_of(endpoint),
             cond: Verifier::new(),
         })
     }
 
     /// Whether `conditional()` offers put-if-absent: `Auto` (the default)
-    /// only on AWS endpoints, `On` on any, `Off` never. The check on first
-    /// use still runs in every mode that offers it.
+    /// only on hosts of a tested or documented service in
+    /// [`S3_SERVICES`](crate::S3_SERVICES) (today AWS), `On` on any endpoint
+    /// except a known-bad one (its check answers `Unsupported` without a
+    /// request), `Off` never. The check on first use still runs in every
+    /// mode that offers it.
     #[must_use]
     pub fn with_conditional_writes(mut self, mode: S3ConditionalWrites) -> Self {
         self.conditional_mode = mode;
@@ -2092,6 +2097,64 @@ mod tests {
         );
     }
 
+    /// A known-bad host (IDrive e2) refuses put-if-absent even with `on`,
+    /// without a request: the backend points at a loopback mock with the
+    /// service set by hand, and the mock must see nothing.
+    #[test]
+    fn known_bad_service_refuses_on_without_a_request() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = n.clone();
+        let port = serve(move |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ("200 OK", String::new())
+        });
+        let idrive = crate::S3_SERVICES
+            .iter()
+            .find(|s| s.status == crate::ServiceStatus::KnownBad)
+            .expect("a known-bad entry");
+        let bad = |mode| {
+            let mut b = s3_backend(port, no_retry(), true).with_conditional_writes(mode);
+            b.service = Some(idrive);
+            b
+        };
+        assert!(bad(S3ConditionalWrites::Auto).conditional().is_none());
+
+        let backend = bad(S3ConditionalWrites::On);
+        let cond = backend.conditional().expect("on offers it until the check");
+        let ConditionalSupport::Unsupported { reason } = cond.verify().unwrap() else {
+            panic!("a known-bad host must be Unsupported");
+        };
+        assert!(reason.contains("IDrive e2"), "{reason}");
+        assert!(reason.contains("s3_conditional_writes"), "{reason}");
+        assert!(backend.conditional().is_none());
+        assert!(matches!(
+            backend.verify_at_init().unwrap(),
+            ConditionalSupport::Unsupported { reason: r } if r == reason
+        ));
+        match backend.put_if_absent("index.h/1", b"x") {
+            Err(VykarError::UnsupportedBackend(m)) => assert!(m.contains("IDrive e2"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Each entry point refuses on a fresh instance too.
+        let fresh = bad(S3ConditionalWrites::On);
+        assert!(matches!(
+            fresh.verify_at_init().unwrap(),
+            ConditionalSupport::Unsupported { .. }
+        ));
+        let fresh = bad(S3ConditionalWrites::On);
+        assert!(matches!(
+            fresh.put_if_absent("index.h/1", b"x"),
+            Err(VykarError::UnsupportedBackend(_))
+        ));
+        assert!(fresh.conditional().is_none());
+        assert_eq!(
+            n.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no request, so no soft-delete tombstone either"
+        );
+    }
+
     #[test]
     fn over_cap_put_if_absent_sends_nothing() {
         let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2142,9 +2205,16 @@ mod tests {
 
     #[test]
     fn conformance_against_the_stateful_mock() {
-        let backend = conditional_backend(stateful_s3(), no_retry());
-        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
-            .unwrap();
+        let port = stateful_s3();
+        let backend = conditional_backend(port, no_retry());
+        // Own agent and connections; the mock's objects are shared.
+        let second = conditional_backend(port, no_retry());
+        crate::conformance::run(
+            &backend,
+            &second,
+            &crate::conformance::ConformanceOptions::default(),
+        )
+        .unwrap();
     }
 
     /// Opt-in run against a real S3 service (MinIO, AWS). Returns at once when
@@ -2183,12 +2253,14 @@ mod tests {
             url,
         };
         let backend = crate::backend_from_config(&cfg).unwrap();
+        let second = crate::backend_from_config(&cfg).unwrap();
         assert!(
             backend.conditional().is_some(),
             "{mode:?} offers put-if-absent"
         );
         crate::conformance::run(
             &*backend,
+            &*second,
             &crate::conformance::ConformanceOptions::default(),
         )
         .unwrap();

@@ -1,7 +1,7 @@
 //! Probe put-if-absent on one storage target and print a Markdown result row.
 //!
 //! ```text
-//! put_if_absent_probe [--label TEXT] [--json PATH] [--race-writers N] [--race-rounds N] [--allow-repo-root] <target>
+//! put_if_absent_probe [--label TEXT] [--json PATH] [--race-writers N] [--race-rounds N] [--list-rounds N] [--allow-repo-root] <target>
 //!   local <DIR>
 //!   s3 [URL] [--credentials-file PATH] [--root ROOT] [--region R] [--allow-insecure-http]
 //!         URL: s3://endpoint[:port]/bucket[/root] | s3+http://...; if omitted, built from the
@@ -15,7 +15,8 @@
 //! still says which `vykar-probe-…` names to remove.
 //!
 //! Exit codes: 0 works, 1 ignores the condition, 2 unsupported, 3 inconclusive
-//! or a pre-flight error, 4 works but cleanup left names or errors. A failed
+//! or a pre-flight error, 4 works but cleanup left names or errors, 5 stale
+//! listing (a LIST started after a write did not show the key). A failed
 //! `--json` write is reported on stderr and does not change the exit code.
 //!
 //! Build: `cargo build --release -p vykar-storage --features backend-sftp --example put_if_absent_probe`.
@@ -44,6 +45,9 @@ struct Cli {
     /// Race rounds, each on a fresh key (1..=100).
     #[arg(long, global = true, default_value_t = 10)]
     race_rounds: usize,
+    /// List-after-write rounds, each on a fresh key (1..=100).
+    #[arg(long, global = true, default_value_t = 10)]
+    list_rounds: usize,
     /// Probe a root that holds a `config` object.
     #[arg(long, global = true)]
     allow_repo_root: bool,
@@ -151,6 +155,7 @@ fn run(cli: Cli) -> Result<Report, String> {
         label: cli.label,
         race_writers: cli.race_writers,
         race_rounds: cli.race_rounds,
+        list_rounds: cli.list_rounds,
         allow_repo_root: cli.allow_repo_root,
         sftp_root_relative_to_home: false,
         prefix: Some(probe::new_prefix()),

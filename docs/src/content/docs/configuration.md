@@ -130,7 +130,7 @@ name. Two entries that resolve to the same name are rejected at load time. Two
 | `access_key_id` | — | string | S3 access key ID (required for S3) |
 | `secret_access_key` | — | string | S3 secret access key (required for S3) |
 | `s3_soft_delete` | `false` | bool | Use soft delete for S3 Object Lock compatibility |
-| `s3_conditional_writes` | `auto` | `auto` \| `on` \| `off` | Put-if-absent (`If-None-Match: *`), used to create index heads. `auto` offers it on AWS endpoints only; `on` asserts that your S3-compatible service honours it atomically, also for concurrent requests (vykar's own check only catches a service that ignores it); `off` never. See [Conditional writes](/backends#conditional-writes) |
+| `s3_conditional_writes` | `auto` | `auto` \| `on` \| `off` | Put-if-absent (`If-None-Match: *`), used to create index heads. `auto` offers it on hosts of a tested or documented service only (today AWS); `on` asserts that your S3-compatible service honours it atomically, also for concurrent requests (vykar's own check only catches a service that ignores it), and is overridden on a known-bad service (IDrive e2), where put-if-absent is refused; `off` never. See [Conditional writes](/backends#conditional-writes) |
 
 **SFTP fields:**
 

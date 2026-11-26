@@ -152,8 +152,9 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         summary: "a store that passes the sequential put-if-absent check but lets a late \
                   create overwrite (IDrive e2): two writers both believe they created \
                   the generation; a head is replaced (invariant 12)",
-        fixed_by: "not planned: s3_conditional_writes: on is the user's assertion \
-                   (03 step 4 open decision); harmless while the lock is held",
+        fixed_by: "IDrive e2 is refused put-if-absent whatever s3_conditional_writes says \
+                   (10-single-protocol step 4); on another such store on stays the user's \
+                   assertion; harmless while the lock is held",
         run: h_racy,
         conditional: OnConditional::OwnKind,
     },

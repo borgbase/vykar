@@ -1822,6 +1822,11 @@ impl ConditionalWrite for SftpBackend {
     fn verify(&self) -> Result<ConditionalSupport> {
         self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
     }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        self.cond
+            .verify_at_init(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
 }
 
 #[cfg(test)]
@@ -2514,10 +2519,52 @@ mod tests {
     fn conformance_suite_passes() {
         let server = FaultServer::start();
         let backend = server.backend(0);
-        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
-            .unwrap();
+        // Its own connection: `backend` builds a fresh `SftpBackend`.
+        let second = server.backend(0);
+        crate::conformance::run(
+            &backend,
+            &second,
+            &crate::conformance::ConformanceOptions::default(),
+        )
+        .unwrap();
         // Every temp of the suite is gone.
-        assert!(server.temps_next_to("locks/x").is_empty());
+        assert!(server.temps_next_to("sessions/x").is_empty());
+    }
+
+    /// Opt-in run against a real SFTP server (OpenSSH). Returns at once when
+    /// `VYKAR_TEST_SFTP_URL` (`sftp://user@host[:port]/path`) is unset;
+    /// `VYKAR_TEST_SFTP_KEY` and `VYKAR_TEST_SFTP_KNOWN_HOSTS` are optional.
+    #[test]
+    #[ignore = "set VYKAR_TEST_SFTP_URL to run against a real SFTP server"]
+    fn conformance_real_sftp() {
+        let Ok(url) = std::env::var("VYKAR_TEST_SFTP_URL") else {
+            return;
+        };
+        let cfg = crate::StorageConfig {
+            allow_insecure_http: false,
+            region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            sftp_key: std::env::var("VYKAR_TEST_SFTP_KEY").ok(),
+            sftp_agent: None,
+            sftp_known_hosts: std::env::var("VYKAR_TEST_SFTP_KNOWN_HOSTS").ok(),
+            max_connections: None,
+            sftp_timeout: None,
+            access_token: None,
+            retry: crate::RetryConfig::default(),
+            s3_soft_delete: false,
+            s3_conditional_writes: crate::S3ConditionalWrites::Auto,
+            cancel: CancelToken::new(),
+            url,
+        };
+        let backend = crate::backend_from_config(&cfg).unwrap();
+        let second = crate::backend_from_config(&cfg).unwrap();
+        crate::conformance::run(
+            &*backend,
+            &*second,
+            &crate::conformance::ConformanceOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2532,7 +2579,7 @@ mod tests {
         };
         assert!(reason.contains("hardlink@openssh.com"), "{reason}");
         assert!(backend.conditional().is_none());
-        assert!(server.temps_next_to("locks/x").is_empty());
+        assert!(server.temps_next_to("sessions/x").is_empty());
     }
 
     /// Advertised but refused for an absent target: the capability is off
@@ -2554,7 +2601,7 @@ mod tests {
             1,
             "not retried"
         );
-        assert!(server.temps_next_to("locks/x").is_empty());
+        assert!(server.temps_next_to("sessions/x").is_empty());
     }
 
     /// A link whose reply is lost is retried; the retry finds the caller's

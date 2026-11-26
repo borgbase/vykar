@@ -243,7 +243,8 @@ impl Repo {
         storage.create_dir(index_store::HEAD_PREFIX)?;
         // A plain PUT (04 step 8 D5): nothing can contend before the
         // repository has a config, and a put-if-absent check here would
-        // write under `locks/` before it exists. The first commit checks.
+        // write under `sessions/` and decide the mode, which step 5 of
+        // 10-single-protocol records. The first commit checks.
         let head = IndexHead::initial();
         index_store::put_head(storage.as_ref(), &head, crypto.as_ref())?;
         let index_generation = head.generation;

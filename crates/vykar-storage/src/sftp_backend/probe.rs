@@ -15,8 +15,8 @@ use super::{
     status_detail,
 };
 use crate::probe::{
-    CREATE, CaseResult, Cleanup, Ledger, Outcome, ProbeOptions, REPEAT_OTHER, REPEAT_SAME,
-    RaceResult, Report, is_created, is_exists, payload,
+    CREATE, CaseResult, Cleanup, LIST_AFTER_WRITE, Ledger, Outcome, ProbeOptions, REPEAT_OTHER,
+    REPEAT_SAME, RaceResult, Report, is_created, is_exists, is_listed, listing_outcome, payload,
 };
 use crate::runtime::ASYNC_RUNTIME;
 use crate::{ParsedUrl, StorageConfig};
@@ -449,6 +449,8 @@ impl Run {
             }
         }
 
+        cases.push(self.list_after_write(opts.list_rounds()).await);
+
         let race = if self.sessions.len() >= 2 {
             Some(self.race(opts.rounds(), &prefix).await)
         } else {
@@ -457,6 +459,44 @@ impl Run {
             None
         };
         (cases, race)
+    }
+
+    /// Plain writes of fresh files through the first session, each followed by
+    /// a `readdir` of the prefix directory through the second, which must
+    /// show it. Needs 2 sessions.
+    async fn list_after_write(&mut self, rounds: usize) -> CaseResult {
+        let result = |outcome| {
+            CaseResult::expect(LIST_AFTER_WRITE, "listed", is_listed, outcome, None, false)
+        };
+        let sessions = Arc::clone(&self.sessions);
+        let (Some(writer), Some(lister)) = (sessions.first(), sessions.get(1)) else {
+            return CaseResult::skipped(LIST_AFTER_WRITE, "listed", "fewer than 2 sessions");
+        };
+        let mut names = Vec::with_capacity(rounds);
+        for r in 0..rounds {
+            let name = format!("list-{r}");
+            if let Err(e) = self.key(&name) {
+                return result(Outcome::Rejected { detail: e });
+            }
+            names.push(name);
+        }
+        let dir = self.path(self.ledger.prefix());
+        let mut missed = 0;
+        for name in &names {
+            let path = posix_join(&dir, name);
+            if let Err(o) = write_new(writer, &path, b"l").await {
+                return result(o);
+            }
+            match lister.read_dir(dir.as_str()).await {
+                Ok(entries) => {
+                    if !entries.into_iter().any(|e| e.file_name() == *name) {
+                        missed += 1;
+                    }
+                }
+                Err(e) => return result(outcome_of("readdir", &e)),
+            }
+        }
+        result(listing_outcome(missed, rounds))
     }
 
     async fn race(&mut self, rounds: usize, prefix: &str) -> RaceResult {
@@ -644,6 +684,12 @@ mod tests {
         let report = run_with_backend(&server.backend(0), "fault server", &opts()).unwrap();
         assert_eq!(report.verdict, Verdict::Works, "{report:#?}");
         assert_eq!(report.exit_code(), 0, "{:?}", report.cleanup);
+        let list = report
+            .cases
+            .iter()
+            .find(|c| c.name == LIST_AFTER_WRITE)
+            .unwrap();
+        assert!(is_listed(&list.outcome), "{list:?}");
         let race = report.race.as_ref().unwrap();
         assert_eq!((race.rounds, race.writers), (3, 4));
         let repeat = report.cases.iter().find(|c| c.name == REPEAT_SAME).unwrap();

@@ -21,7 +21,8 @@ pub use crate::s3_backend::probe::run_s3;
 pub use crate::sftp_backend::probe::{run_sftp, run_sftp_sessions};
 
 /// Version of the probe's case list and report shape. Bump when a case changes.
-pub const PROBE_VERSION: u32 = 1;
+/// 2: the list_after_write case and the stale_listing verdict.
+pub const PROBE_VERSION: u32 = 2;
 /// First component of every name the probe creates.
 pub const PROBE_PREFIX: &str = "vykar-probe-";
 
@@ -33,6 +34,9 @@ pub(crate) const OVERWRITE_CONTROL: &str = "overwrite_control";
 pub(crate) const MPU_ON_EXISTING: &str = "mpu_on_existing";
 pub(crate) const MPU_COMPLETE_RETRY: &str = "mpu_complete_retry";
 pub(crate) const TOMBSTONE: &str = "tombstone";
+/// A key written through one handle is listed by a LIST another handle
+/// starts afterwards. Counted, but only for [`Verdict::StaleListing`].
+pub(crate) const LIST_AFTER_WRITE: &str = "list_after_write";
 
 /// Cases whose outcome is recorded but never counted against the verdict.
 const INFORMATIONAL: &[&str] = &[
@@ -59,6 +63,8 @@ pub struct ProbeOptions {
     pub race_writers: usize,
     /// Race rounds, each on a fresh key (default 10, clamped to 1..=100).
     pub race_rounds: usize,
+    /// Rounds of the list-after-write case (default 10, clamped to 1..=100).
+    pub list_rounds: usize,
     /// Probe a root that already holds a `config` object (a repository). Default false.
     pub allow_repo_root: bool,
     /// SFTP only: the root path is relative to the login directory, resolved with
@@ -76,6 +82,7 @@ impl Default for ProbeOptions {
             label: String::new(),
             race_writers: 8,
             race_rounds: 10,
+            list_rounds: 10,
             allow_repo_root: false,
             sftp_root_relative_to_home: false,
             prefix: None,
@@ -92,6 +99,11 @@ impl ProbeOptions {
     /// `race_rounds` clamped to 1..=100.
     pub fn rounds(&self) -> usize {
         self.race_rounds.clamp(1, 100)
+    }
+
+    /// `list_rounds` clamped to 1..=100.
+    pub fn list_rounds(&self) -> usize {
+        self.list_rounds.clamp(1, 100)
     }
 }
 
@@ -113,6 +125,10 @@ pub enum Outcome {
     Transport { detail: String },
     /// Informational case; never counted against the verdict.
     Info { detail: String },
+    /// Every listing started after a write showed the key.
+    Listed { detail: String },
+    /// A listing started after a write's reply did not show the key.
+    NotListed { detail: String },
 }
 
 impl Outcome {
@@ -125,6 +141,8 @@ impl Outcome {
             Self::Rejected { detail } => format!("rejected ({detail})"),
             Self::Transport { detail } => format!("transport ({detail})"),
             Self::Info { detail } => detail.clone(),
+            Self::Listed { detail } => format!("listed ({detail})"),
+            Self::NotListed { detail } => format!("NOT listed ({detail})"),
         }
     }
 }
@@ -190,6 +208,24 @@ pub(crate) fn is_created(o: &Outcome) -> bool {
 
 pub(crate) fn is_exists(o: &Outcome) -> bool {
     matches!(o, Outcome::AlreadyExists { .. })
+}
+
+pub(crate) fn is_listed(o: &Outcome) -> bool {
+    matches!(o, Outcome::Listed { .. })
+}
+
+/// The outcome of a list-after-write case in which `missed` of `rounds`
+/// listings did not show a key written before them.
+pub(crate) fn listing_outcome(missed: usize, rounds: usize) -> Outcome {
+    if missed == 0 {
+        Outcome::Listed {
+            detail: format!("{rounds} of {rounds} listings"),
+        }
+    } else {
+        Outcome::NotListed {
+            detail: format!("{missed} of {rounds} listings missed a key written before them"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -263,6 +299,9 @@ pub enum Verdict {
     IgnoresCondition,
     Unsupported,
     Inconclusive,
+    /// Every create case and the race passed, but a listing started after a
+    /// write did not show the key.
+    StaleListing,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -296,7 +335,7 @@ pub struct Report {
 const MARKDOWN_HEADER: &str = "| Target | Transport | Mechanism | create | repeat same | repeat other \
 | race (rounds, one winner / rounds, max winners, 409s) \
 | extra cases (MPU absent / MPU retry / MPU on existing / tombstone; or hardlink codes: \
-missing source / missing dir / plain rename) | cleanup | verdict |\n\
+missing source / missing dir / plain rename; list after write) | cleanup | verdict |\n\
 |---|---|---|---|---|---|---|---|---|---|";
 
 impl Report {
@@ -397,7 +436,7 @@ impl Report {
     }
 
     /// 0 Works and clean; 1 IgnoresCondition; 2 Unsupported; 3 Inconclusive;
-    /// 4 verdict Works but cleanup left names or errors.
+    /// 4 verdict Works but cleanup left names or errors; 5 StaleListing.
     pub fn exit_code(&self) -> i32 {
         match self.verdict {
             Verdict::Works
@@ -409,6 +448,7 @@ impl Report {
             Verdict::IgnoresCondition => 1,
             Verdict::Unsupported => 2,
             Verdict::Inconclusive => 3,
+            Verdict::StaleListing => 5,
         }
     }
 }
@@ -647,6 +687,9 @@ fn is_mechanism_refusal(detail: &str) -> bool {
 }
 
 /// Verdict from the case list and race, plus one line per deviation.
+/// Precedence: IgnoresCondition, Unsupported, Inconclusive (a create case or
+/// the race failed, or the list case did not run cleanly), StaleListing,
+/// Works.
 pub(crate) fn decide(cases: &[CaseResult], race: Option<&RaceResult>) -> (Verdict, Vec<String>) {
     let mut deviations = Vec::new();
     let find = |name: &str| cases.iter().find(|c| c.name == name);
@@ -691,7 +734,7 @@ pub(crate) fn decide(cases: &[CaseResult], race: Option<&RaceResult>) -> (Verdic
     let cases_ok = find(CREATE).is_some()
         && cases
             .iter()
-            .filter(|c| !INFORMATIONAL.contains(&c.name))
+            .filter(|c| !INFORMATIONAL.contains(&c.name) && c.name != LIST_AFTER_WRITE)
             .all(|c| c.ok);
     let race_ok = race.is_some_and(|r| {
         r.writers >= 2
@@ -701,7 +744,24 @@ pub(crate) fn decide(cases: &[CaseResult], race: Option<&RaceResult>) -> (Verdic
             && r.content_matches_winner == r.rounds
     });
     if cases_ok && race_ok {
-        return (Verdict::Works, deviations);
+        return match find(LIST_AFTER_WRITE) {
+            None => {
+                deviations.push("list_after_write not run".into());
+                (Verdict::Inconclusive, deviations)
+            }
+            Some(c) if c.ok => (Verdict::Works, deviations),
+            Some(CaseResult {
+                outcome: Outcome::NotListed { detail },
+                ..
+            }) => {
+                deviations.push(format!("list_after_write: {detail}"));
+                (Verdict::StaleListing, deviations)
+            }
+            Some(c) => {
+                deviations.push(format!("list_after_write: {}", c.outcome.short()));
+                (Verdict::Inconclusive, deviations)
+            }
+        };
     }
     match race {
         None => deviations.push("race not run".into()),
@@ -767,7 +827,17 @@ mod tests {
             case(CREATE, Outcome::Created, Some(true), true),
             case(REPEAT_SAME, exists(), Some(true), true),
             case(REPEAT_OTHER, exists(), Some(true), true),
+            case(LIST_AFTER_WRITE, listing_outcome(0, 10), None, true),
         ]
+    }
+
+    fn not_listed() -> CaseResult {
+        case(LIST_AFTER_WRITE, listing_outcome(1, 10), None, false)
+    }
+
+    fn without_list(mut cases: Vec<CaseResult>) -> Vec<CaseResult> {
+        cases.retain(|c| c.name != LIST_AFTER_WRITE);
+        cases
     }
 
     fn good_race() -> RaceResult {
@@ -960,6 +1030,59 @@ mod tests {
     }
 
     #[test]
+    fn decide_stale_listing() {
+        let mut cases = without_list(good_cases());
+        cases.push(not_listed());
+        let (v, d) = decide(&cases, Some(&good_race()));
+        assert_eq!(v, Verdict::StaleListing);
+        assert_eq!(
+            d,
+            ["list_after_write: 1 of 10 listings missed a key written before them"]
+        );
+        assert_eq!(report(v, cases, Cleanup::default()).exit_code(), 5);
+    }
+
+    #[test]
+    fn decide_stale_listing_below_inconclusive() {
+        let mut cases = without_list(good_cases());
+        cases[1] = case(
+            REPEAT_SAME,
+            Outcome::Transport {
+                detail: "reset".into(),
+            },
+            None,
+            false,
+        );
+        cases.push(not_listed());
+        assert_eq!(decide(&cases, Some(&good_race())).0, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn decide_ignored_beats_stale_listing() {
+        let mut cases = without_list(good_cases());
+        cases[2] = case(REPEAT_OTHER, Outcome::Created, Some(true), false);
+        cases.push(not_listed());
+        assert_eq!(
+            decide(&cases, Some(&good_race())).0,
+            Verdict::IgnoresCondition
+        );
+    }
+
+    #[test]
+    fn decide_missing_list_case_is_inconclusive() {
+        let (v, d) = decide(&without_list(good_cases()), Some(&good_race()));
+        assert_eq!(v, Verdict::Inconclusive);
+        assert_eq!(d, ["list_after_write not run"]);
+        let mut cases = without_list(good_cases());
+        cases.push(CaseResult::skipped(
+            LIST_AFTER_WRITE,
+            "listed",
+            "fewer than 2 sessions",
+        ));
+        assert_eq!(decide(&cases, Some(&good_race())).0, Verdict::Inconclusive);
+    }
+
+    #[test]
     fn exit_codes() {
         let clean = Cleanup::default();
         assert_eq!(
@@ -983,6 +1106,10 @@ mod tests {
             ..Cleanup::default()
         };
         assert_eq!(report(Verdict::Works, good_cases(), dirty).exit_code(), 4);
+        assert_eq!(
+            report(Verdict::StaleListing, good_cases(), Cleanup::default()).exit_code(),
+            5
+        );
     }
 
     fn cell_count(line: &str) -> usize {

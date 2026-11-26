@@ -226,9 +226,9 @@ pub struct RepositoryConfig {
     /// preserves previous versions for the configured retention period.
     #[serde(default)]
     pub s3_soft_delete: bool,
-    /// Put-if-absent on S3: `auto` (AWS endpoints only, after a check), `on`
-    /// (assert the service supports it; still checked), `off`. See
-    /// backends.md.
+    /// Put-if-absent on S3: `auto` (hosts of a tested or documented service,
+    /// today AWS, after a check), `on` (assert the service supports it; still
+    /// checked; refused on a known-bad service), `off`. See backends.md.
     #[serde(default)]
     pub s3_conditional_writes: S3ConditionalWrites,
 }

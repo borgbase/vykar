@@ -573,10 +573,7 @@ mod tests {
         assert_eq!(entries[0].pack_id, pack_id);
         assert_eq!(
             ws.pack_trailers.get(&pack_id).copied(),
-            Some(crate::repo::pack_trailer::trailer_frame_len(
-                1,
-                repo.crypto.is_encrypting()
-            ))
+            Some(crate::repo::pack_trailer::trailer_frame_len(1))
         );
         let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
         assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);

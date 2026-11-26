@@ -170,8 +170,11 @@ fn kind(write: &str) -> String {
 }
 
 fn interrupted_at_every_write(prefix: &str, mode: &str, version: u64, hash: &str) {
-    // The probe run counts the upgrade's writes.
+    // The probe run counts the upgrade's writes. It reads the legacy index
+    // first, as every run below does: that open backfills the second key
+    // copy a v2 fixture lacks, so the upgrade does not write it.
     let fx = fixtures::extract(prefix, mode, version);
+    legacy_entries(&fx);
     let (result, writes) = upgrade_through(&fx, 0, false);
     result.unwrap();
     let switch = writes
@@ -221,8 +224,7 @@ fn v3_upgrade_interrupted_at_every_write_completes() {
     interrupted_at_every_write("v3", "aes256gcm", 3, "blake3");
 }
 
-// Plaintext-only: 10-single-protocol step 3 moves this to an encrypted v2 fixture.
 #[test]
 fn v2_upgrade_interrupted_at_every_write_completes() {
-    interrupted_at_every_write("v2", "none", 2, "blake2b");
+    interrupted_at_every_write("v2", "aes256gcm", 2, "blake2b");
 }

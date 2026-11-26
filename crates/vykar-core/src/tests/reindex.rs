@@ -25,7 +25,7 @@ struct Fixture {
     config: VykarConfig,
 }
 
-/// A plaintext repository on a local directory, with its own cache dir.
+/// A repository on a local directory, with its own cache dir.
 /// `small_packs`: every chunk in a pack of its own.
 fn fixture(small_packs: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();

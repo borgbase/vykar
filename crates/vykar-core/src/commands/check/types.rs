@@ -17,8 +17,7 @@ pub struct CheckResult {
     pub snapshots_checked: usize,
     /// Repository key copies read back and compared. Reported even on a clean
     /// run — a `check` that *says* the key was verified is most of the point.
-    /// `None` for unencrypted repositories, which have no key file.
-    pub key_files_checked: Option<usize>,
+    pub key_files_checked: usize,
     pub items_checked: usize,
     pub chunks_existence_checked: usize,
     pub packs_existence_checked: usize,

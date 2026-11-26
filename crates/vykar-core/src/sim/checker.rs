@@ -374,8 +374,8 @@ enum ChunkFault {
     Unreadable(String),
 }
 
-/// Present in the index, pack present, and readable (`read_chunk` verifies
-/// the plaintext chunk ID on an unencrypted repository).
+/// Present in the index, pack present, and readable (`read_chunk`
+/// authenticates the blob).
 fn chunk_fault(
     repo: &mut Repo,
     store: &SimStore,

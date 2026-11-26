@@ -1471,64 +1471,6 @@ mod tests {
         );
     }
 
-    /// Plaintext repo: a flipped payload byte survives decode (no AEAD, no
-    /// compression, same length) and must be caught by the always-on chunk ID
-    /// check even with `verify_chunks = false`.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn process_read_group_plaintext_rejects_corrupt_payload_without_verify() {
-        let payload = b"plaintext-payload-that-gets-corrupted";
-        let crypto = vykar_crypto::PlaintextEngine::new(test_chunk_hasher());
-        let cid = chunk_id_of(payload);
-        let mut packed = pack_blob(cid, payload, &crypto);
-        let pos = packed
-            .windows(payload.len())
-            .position(|w| w == payload)
-            .expect("plaintext payload is stored verbatim");
-        packed[pos + payload.len() / 2] ^= 0x01;
-
-        let files = vec![PlannedFile {
-            rel_path: PathBuf::from("bad.bin").into(),
-            total_size: payload.len() as u64,
-            mode: 0o644,
-            mtime: 0,
-            uid: 0,
-            gid: 0,
-            xattrs: None,
-        }];
-
-        let pack_id = dummy_pack_id(10);
-        let backend = Arc::new(MemoryBackend::new());
-        backend.put(&pack_id.storage_key(), &packed).unwrap();
-        let storage: Arc<dyn StorageBackend> = backend;
-
-        let group = single_blob_group(
-            pack_id,
-            cid,
-            &packed,
-            payload.len() as u32,
-            smallvec::smallvec![WriteTarget {
-                file_idx: 0,
-                file_offset: 0,
-            }],
-        );
-
-        let temp = tempdir().unwrap();
-        stage_files(temp.path(), &files);
-        let err = run_group(&group, &files, &storage, &crypto, temp.path(), false).unwrap_err();
-        assert!(
-            matches!(&err, VykarError::ChunkDecode(e)
-                if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
-                    && e.to_string().contains("hash mismatch")),
-            "expected hash mismatch error, got: {err}"
-        );
-        assert_eq!(
-            std::fs::read(temp.path().join("bad.bin")).unwrap(),
-            vec![0u8; payload.len()],
-            "nothing may be written for a corrupt chunk"
-        );
-    }
-
     /// `write_buf` never follows a symlink at the leaf (`O_NOFOLLOW`), even
     /// without staging in front of it.
     #[cfg(unix)]

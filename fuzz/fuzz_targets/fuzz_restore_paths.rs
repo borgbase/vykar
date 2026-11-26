@@ -1,7 +1,7 @@
 #![no_main]
-//! Restore's path sanitizer and symlink audit over an item stream. In a
-//! plaintext repository the chunk-ID key comes from the public `repo_id`,
-//! so anyone who can write to storage can forge items.
+//! Restore's path sanitizer and symlink audit over an item stream. Anyone
+//! who holds the repository key can write any items, so restore does not
+//! trust them.
 //!
 //! Both are checked against an independent model over the path bytes
 //! (Unix semantics, the restore host's).

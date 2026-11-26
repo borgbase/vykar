@@ -348,13 +348,7 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let mut accepted = verify_journal_packs_trailers(
-        storage,
-        crypto.is_encrypting(),
-        &wire,
-        persisted_packs,
-        width,
-    );
+    let mut accepted = verify_journal_packs_trailers(storage, &wire, persisted_packs, width);
     // 04 "Crash-recovery journals": only packs at most T_pack/2 old on the
     // store's clock; unknown age is too old (fail closed).
     let ids: Vec<PackId> = accepted.keys().copied().collect();

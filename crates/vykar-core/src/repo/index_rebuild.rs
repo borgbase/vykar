@@ -21,7 +21,6 @@ use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
-use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
 use super::bounded::try_for_each_bounded;
@@ -152,11 +151,9 @@ struct Described {
 /// machine's tables (`local_tables`, called at most once, only for a
 /// pack neither describes). Storage errors and a trailer of a newer
 /// vykar abort; damage makes a pack uncovered.
-#[allow(clippy::too_many_arguments)]
 fn describe_packs(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    hash: HashAlgorithm,
     maps: PackMapScan,
     slots: &[(u32, &ListedPack)],
     local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
@@ -166,7 +163,6 @@ fn describe_packs(
     let found: Mutex<Vec<Found>> = Mutex::new(Vec::new());
     // trailer_len by pack slot, for packs described by their trailer.
     let trailers: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::new());
-    let encrypting = crypto.is_encrypting();
     let outcomes: Mutex<Vec<(u32, Outcome)>> = Mutex::new(Vec::with_capacity(slots.len()));
     let record = |slot: u32, outcome: Outcome| {
         outcomes
@@ -221,7 +217,7 @@ fn describe_packs(
                 trailers
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(slot, trailer_frame_len(t.entries.len(), encrypting));
+                    .insert(slot, trailer_frame_len(t.entries.len()));
                 let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
                 found.extend(
                     t.entries
@@ -233,47 +229,18 @@ fn describe_packs(
             }
             TrailerRead::PackMissing => record(slot, Outcome::Vanished),
             TrailerRead::Damaged(e @ VykarError::UnsupportedVersion(_)) => {
-                // Under an encrypting engine only a newer writer produces
-                // this, so the pack is not read. Without encryption one
-                // flipped byte can; the pack ID names the pack's bytes,
-                // trailer included, and tells the two apart.
-                let bytes = if crypto.is_encrypting() {
-                    None
-                } else {
-                    let Some(bytes) = storage.get(&pack.key)? else {
-                        record(slot, Outcome::Vanished);
-                        return Ok(());
-                    };
-                    Some(bytes)
-                };
-                if bytes
-                    .as_ref()
-                    .is_none_or(|b| PackId::compute(b, hash) == pack.pack_id)
-                {
-                    warn!(
-                        "the trailer of pack {} was written by a newer vykar ({e})",
-                        pack.pack_id
-                    );
-                    return Err(VykarError::Other(format!(
-                        "the trailer of pack {} was written by a newer vykar ({e}); upgrade \
-                         vykar to repair this repository",
-                        pack.key
-                    )));
-                }
-                drop(bytes);
+                // The AEAD authenticates the trailer, so a flipped byte reads
+                // as damage, never as a version: only a newer writer
+                // produces this. The pack is not read.
                 warn!(
-                    "the trailer of pack {} reads as a newer version ({e}), but the pack does \
-                     not match its ID: damaged",
+                    "the trailer of pack {} was written by a newer vykar ({e})",
                     pack.pack_id
                 );
-                let why = format!("trailer: {e}, and the pack does not match its ID");
-                record(
-                    slot,
-                    Outcome::Undescribed(
-                        reason.map_or(why.clone(), |r| format!("{r}; {why}")),
-                        len,
-                    ),
-                );
+                return Err(VykarError::Other(format!(
+                    "the trailer of pack {} was written by a newer vykar ({e}); upgrade \
+                     vykar to repair this repository",
+                    pack.key
+                )));
             }
             TrailerRead::Damaged(e) => {
                 warn!("the trailer of pack {} cannot be read: {e}", pack.pack_id);
@@ -399,12 +366,10 @@ fn describe_packs(
 
 /// Rebuild the chunk index from the packs. `local_tables` is called at most
 /// once, only when some pack has neither a usable map nor a usable trailer,
-/// and returns verified chunk tables of this machine. `hash` is the
-/// repository's pack ID hash.
+/// and returns verified chunk tables of this machine.
 pub(crate) fn rebuild_index_from_packs(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    hash: HashAlgorithm,
     local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
     anchor: &Path,
     width: usize,
@@ -419,16 +384,7 @@ pub(crate) fn rebuild_index_from_packs(
         mut counts,
         uncovered,
         from_local_tables,
-    } = describe_packs(
-        storage,
-        crypto,
-        hash,
-        maps,
-        &slots,
-        local_tables,
-        width,
-        cancel,
-    )?;
+    } = describe_packs(storage, crypto, maps, &slots, local_tables, width, cancel)?;
 
     // The lowest (pack ID, offset) of each chunk.
     found.sort_unstable_by_key(|&(id, slot, offset, _)| (*id.as_bytes(), slot, offset));
@@ -502,11 +458,9 @@ pub(crate) struct Recovered {
 ///
 /// A chunk whose entry was lost while its pack still has entries in the
 /// index is not found: that would need every pack's trailer, i.e. a rebuild.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn recover_unindexed_entries(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    hash: HashAlgorithm,
     named: &HashSet<PackId>,
     lacks: impl Fn(&ChunkId) -> bool,
     local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
@@ -526,16 +480,7 @@ pub(crate) fn recover_unindexed_entries(
         mut counts,
         uncovered,
         from_local_tables: _,
-    } = describe_packs(
-        storage,
-        crypto,
-        hash,
-        maps,
-        &slots,
-        local_tables,
-        width,
-        cancel,
-    )?;
+    } = describe_packs(storage, crypto, maps, &slots, local_tables, width, cancel)?;
     found.retain(|f| lacks(&f.0));
     found.sort_unstable_by_key(|&(id, slot, offset, _)| (*id.as_bytes(), slot, offset));
     found.dedup_by_key(|e| e.0);
@@ -665,7 +610,6 @@ mod tests {
         rebuild_index_from_packs(
             storage,
             crypto,
-            HashAlgorithm::Blake2b,
             || tables,
             &dir.path().join("anchor"),
             2,
@@ -822,7 +766,6 @@ mod tests {
         let rebuilt = rebuild_index_from_packs(
             &storage,
             &det(),
-            HashAlgorithm::Blake2b,
             Vec::new,
             &dir.path().join("anchor"),
             2,
@@ -832,7 +775,7 @@ mod tests {
         let table = ChunkTable::install(rebuilt.body, None, None).unwrap();
         assert_eq!(
             table.pack_trailer_len(&by_trailer),
-            Some(crate::repo::pack_trailer::trailer_frame_len(3, true))
+            Some(crate::repo::pack_trailer::trailer_frame_len(3))
         );
         assert_eq!(table.pack_trailer_len(&by_map), Some(0));
         let bytes = storage.get(&by_trailer.storage_key()).unwrap().unwrap();
@@ -906,31 +849,6 @@ mod tests {
             .to_string();
         assert!(err.contains("written by a newer vykar"), "{err}");
         assert!(err.contains(&newer), "{err}");
-    }
-
-    /// Without encryption one flipped byte makes a trailer read as a newer
-    /// version. The same bytes under the old ID: the version byte rotted, so
-    /// the pack is uncovered and the rebuild goes on.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn rebuild_reports_a_rotted_version_byte_as_uncovered() {
-        let plain = vykar_crypto::PlaintextEngine::new(chunk_hasher_for([0xAA; 32]));
-        let storage = MemoryBackend::new();
-        let (id, _) = put_pack_with(&storage, &[1, 2], &plain);
-        let (_, other) = put_pack_with(&storage, &[3], &plain);
-        // The body version: [u32 L][object tag][codec tag][version].
-        rewrite(&storage, id, |b, start| b[start + 6] = 2);
-        let (rebuilt, locs) = rebuild_by(&storage, Vec::new(), &plain).unwrap();
-        assert_eq!(locs, other);
-        assert_eq!(rebuilt.uncovered.len(), 1);
-        assert_eq!(rebuilt.uncovered[0].pack_id, id);
-        assert!(
-            rebuilt.uncovered[0]
-                .reason
-                .contains("does not match its ID"),
-            "{:?}",
-            rebuilt.uncovered
-        );
     }
 
     /// Fails range reads of one key, and lists a pack that does not exist.
@@ -1017,7 +935,6 @@ mod tests {
         recover_unindexed_entries(
             storage,
             &det(),
-            HashAlgorithm::Blake2b,
             &named.iter().copied().collect(),
             lacks,
             Vec::new,
@@ -1114,10 +1031,7 @@ mod tests {
         let storage = MemoryBackend::new();
         let (p, _) = put_pack(&storage, &[1, 2, 3]);
         let r = recover(&storage, &[], |_| true).unwrap();
-        assert_eq!(
-            r.trailer_lens,
-            HashMap::from([(p, trailer_frame_len(3, true))])
-        );
+        assert_eq!(r.trailer_lens, HashMap::from([(p, trailer_frame_len(3))]));
         assert_eq!(r.counts.from_trailers, 1);
     }
 }

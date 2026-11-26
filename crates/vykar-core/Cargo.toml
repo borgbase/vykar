@@ -26,9 +26,8 @@ rmp = "0.8"
 rmp-serde.workspace = true
 
 # Crypto
-blake2.workspace = true
-# `derive_key` for the format-v3 plaintext chunk-ID key. Chunk/pack digests
-# themselves live in vykar-types.
+# Auxiliary hashes (item cut points, cache keys, simulator digests). Chunk/pack
+# digests themselves live in vykar-types.
 blake3.workspace = true
 rand.workspace = true
 zeroize.workspace = true
@@ -124,6 +123,8 @@ flate2 = "1"
 vykar-server = { path = "../vykar-server" }
 axum = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+# BLAKE2b-256 of the frozen v2 fixtures' pack bytes (tests/common/fixtures.rs).
+blake2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

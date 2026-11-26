@@ -813,7 +813,7 @@ mod tests {
         assert!(is_newer_object(&err), "{err}");
     }
 
-    /// A plaintext repository whose index holds `packs` packs of `per_pack`
+    /// A repository whose index holds `packs` packs of `per_pack`
     /// entries each.
     fn repo_with_packs(packs: u8, per_pack: usize) -> Repo {
         let mut repo = test_repo();

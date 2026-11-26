@@ -131,7 +131,6 @@ fn describe_selection(state: KeyCopyState) -> String {
             "Verified {good}; exported from it. {bad} disagrees with it — run \
              `vykar check --repair` to rewrite {bad}."
         ),
-        KeyCopyState::NotApplicable => "Verified.".to_string(),
     }
 }
 

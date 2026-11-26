@@ -411,7 +411,7 @@ mod tests {
         let yaml = "repositories:\n  \
                       - url: /backups/nas\n    label: nas\n  \
                       - url: /backups/remote\n\
-                    encryption:\n  mode: none\nsources: []\n";
+                    encryption:\n  mode: aes256gcm\n  passphrase: gui-test\nsources: []\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -447,7 +447,7 @@ mod tests {
             std::fs::create_dir_all(&source).unwrap();
             format!(
                 "repositories:\n  - url: '{}'\n    label: nas\n\
-                 encryption:\n  mode: none\n\
+                 encryption:\n  mode: aes256gcm\n  passphrase: gui-test\n\
                  cache_dir: '{}'\n\
                  hooks:\n  before_backup: {before_backup}\n\
                  sources:\n  - path: '{}'\n    label: src\n",

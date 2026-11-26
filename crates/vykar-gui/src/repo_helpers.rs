@@ -45,12 +45,12 @@ fn resolve_passphrase_tracked(
 pub(crate) enum PassphraseRun<T> {
     /// The operation ran and returned a value.
     Ran(T),
-    /// The repo is encrypted and the user dismissed the passphrase prompt.
+    /// The user dismissed the passphrase prompt.
     Canceled,
 }
 
 /// A repo located by [`find_repo_for_snapshot`] together with the passphrase
-/// (if any) validated for it — `None` for a plaintext repo.
+/// validated for it.
 pub(crate) type FoundRepo<'a> = (&'a ResolvedRepo, Option<zeroize::Zeroizing<String>>);
 
 /// What [`with_passphrase_retry`] needs of an operation's error.
@@ -80,8 +80,7 @@ impl PassphraseError for OpsError {
 /// passphrase could explain (see [`PassphraseError::is_passphrase_failure`]) and the
 /// passphrase came from the interactive dialog, the cache stays clean and the
 /// user is re-prompted (up to `attempts` total). A wrong *configured* passphrase fails immediately. If the
-/// user dismisses the prompt for an encrypted repo, returns
-/// [`PassphraseRun::Canceled`].
+/// user dismisses the prompt, returns [`PassphraseRun::Canceled`].
 pub(crate) fn with_passphrase_retry<T, E: PassphraseError>(
     repo: &ResolvedRepo,
     cache: &mut HashMap<String, zeroize::Zeroizing<String>>,
@@ -89,10 +88,8 @@ pub(crate) fn with_passphrase_retry<T, E: PassphraseError>(
     f: impl FnMut(Option<&str>) -> Result<T, E>,
 ) -> Result<PassphraseRun<T>, E> {
     let key = repo.config.repository.url.clone();
-    let encrypted = repo.config.encryption.mode != config::EncryptionModeConfig::None;
     with_passphrase_retry_inner(
         &key,
-        encrypted,
         cache,
         attempts,
         |error_line| {
@@ -109,7 +106,6 @@ pub(crate) fn with_passphrase_retry<T, E: PassphraseError>(
 /// the passphrase and whether it came from an interactive dialog).
 fn with_passphrase_retry_inner<T, E: PassphraseError>(
     key: &str,
-    encrypted: bool,
     cache: &mut HashMap<String, zeroize::Zeroizing<String>>,
     attempts: usize,
     mut resolve: impl FnMut(&str) -> Result<(Option<zeroize::Zeroizing<String>>, bool), VykarError>,
@@ -135,8 +131,8 @@ fn with_passphrase_retry_inner<T, E: PassphraseError>(
     for attempt in 0..attempts {
         let (pass, from_dialog) = resolve(&error_line).map_err(E::from)?;
 
-        // Encrypted repo with no passphrase → the user dismissed the prompt.
-        if encrypted && pass.is_none() {
+        // No passphrase → the user dismissed the prompt.
+        if pass.is_none() {
             return Ok(PassphraseRun::Canceled);
         }
 
@@ -180,7 +176,7 @@ pub(crate) fn select_repos<'a>(
 /// values are never cached, and a stale cached value is evicted (self-healing).
 ///
 /// Returns [`PassphraseRun::Canceled`] if the user dismisses the prompt for the
-/// matching encrypted repo. Candidate repos whose metadata lookup reports
+/// matching repo. Candidate repos whose metadata lookup reports
 /// [`VykarError::SnapshotNotFound`] are skipped; other errors propagate.
 pub(crate) fn find_repo_for_snapshot<'a>(
     repos: &'a [ResolvedRepo],
@@ -196,8 +192,8 @@ pub(crate) fn find_repo_for_snapshot<'a>(
 
         match outcome {
             Ok(PassphraseRun::Ran(())) => {
-                // The passphrase (if any) is now validated and cached; read it
-                // back to hand to the caller. `None` for plaintext repos.
+                // The passphrase is now validated and cached; read it back to
+                // hand to the caller.
                 let pass = passphrases.get(&key).cloned();
                 return Ok(PassphraseRun::Ran((repo, pass)));
             }
@@ -434,7 +430,6 @@ mod tests {
         let responses = [(Some("wrong"), true), (Some("right"), true)];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -460,7 +455,6 @@ mod tests {
         let responses = [(Some("cfg"), false)];
         let result: Result<PassphraseRun<()>, _> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -532,7 +526,6 @@ mod tests {
         ];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -562,7 +555,6 @@ mod tests {
         let responses = [(Some("right-passphrase"), true)];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -607,7 +599,6 @@ mod tests {
         let responses = [(Some("right-passphrase"), true), (Some("again"), true)];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -643,7 +634,6 @@ mod tests {
         let responses = [(Some("right-passphrase"), true), (Some("again"), true)];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -662,7 +652,6 @@ mod tests {
         let responses = [(None, true)];
         let result: Result<PassphraseRun<()>, VykarError> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -678,7 +667,6 @@ mod tests {
         cache.insert(KEY.to_string(), zeroize::Zeroizing::new("good".to_string()));
         let result: Result<_, VykarError> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             |_e| unreachable!("resolver must not run when cached"),
@@ -704,7 +692,6 @@ mod tests {
         let responses = [(Some("right"), true)];
         let result = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -728,7 +715,6 @@ mod tests {
         let responses = [(Some("a"), true), (Some("b"), true), (Some("c"), true)];
         let result: Result<PassphraseRun<()>, _> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -737,27 +723,6 @@ mod tests {
         assert!(matches!(result, Err(VykarError::DecryptionFailed)));
         assert_eq!(calls.get(), 3, "should prompt exactly `attempts` times");
         assert!(cache.is_empty());
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn unencrypted_repo_runs_with_none_passphrase() {
-        let mut cache = HashMap::new();
-        let calls = std::cell::Cell::new(0);
-        let responses = [(None, false)];
-        let result: Result<_, VykarError> = with_passphrase_retry_inner(
-            KEY,
-            false, // not encrypted
-            &mut cache,
-            3,
-            scripted_resolver(&responses, &calls),
-            |pass| {
-                assert_eq!(pass, None);
-                Ok("done")
-            },
-        );
-        assert!(matches!(result, Ok(PassphraseRun::Ran("done"))));
-        assert!(cache.is_empty(), "None passphrase is never cached");
     }
 
     /// A skip from the operation is returned as is: no re-prompt, nothing cached.
@@ -769,7 +734,6 @@ mod tests {
         let responses = [(Some("a"), true), (Some("b"), true)];
         let result: Result<PassphraseRun<()>, OpsError> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),
@@ -793,7 +757,6 @@ mod tests {
         let responses = [(Some("wrong"), true), (Some("right"), true)];
         let result: Result<_, OpsError> = with_passphrase_retry_inner(
             KEY,
-            true,
             &mut cache,
             3,
             scripted_resolver(&responses, &calls),

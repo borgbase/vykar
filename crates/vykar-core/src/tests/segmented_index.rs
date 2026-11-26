@@ -7,7 +7,7 @@ use crate::repo::format::ObjectType;
 use crate::repo::identity::{self, KeyProof};
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::index_store::tests::{Writer, entries, index_with};
-use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat, derive_plaintext_chunk_id_key};
+use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat};
 use crate::testutil::MemoryBackend;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
@@ -315,25 +315,6 @@ fn prove_key_accepts_an_index_head() {
     w.fold();
     let (repo, _) = env.open_logged(OpenOptions::new().with_index());
     assert_eq!(entries(repo.chunk_index()), entries(&s1));
-}
-
-/// The plaintext chunk-ID key follows the chunk hash: a v2 repository keeps
-/// its key as v6 with BLAKE2b, a v3 one as v6 with BLAKE3.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_key_follows_the_chunk_hash() {
-    let id = [0x42u8; 32];
-    assert_eq!(
-        derive_plaintext_chunk_id_key(
-            &id,
-            RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b)
-        ),
-        derive_plaintext_chunk_id_key(&id, RepoFormat::V2)
-    );
-    assert_eq!(
-        derive_plaintext_chunk_id_key(&id, RepoFormat::CURRENT),
-        derive_plaintext_chunk_id_key(&id, RepoFormat::V3)
-    );
 }
 
 /// Writes on an encrypted repository: a session's chunks land in a segment

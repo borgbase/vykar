@@ -25,8 +25,8 @@
 //! the write's own segment when it is not foldable (a backup's own segment
 //! never is at the production grace); the fold limits count only the
 //! prefix, and a fold with nothing to fold writes a plain segment. A write
-//! without a head, `check --repair`'s fold and a plaintext repeat fold
-//! every segment (a *full* fold). Nothing is deleted before the head PUT.
+//! without a head and `check --repair`'s fold fold every segment (a *full*
+//! fold). Nothing is deleted before the head PUT.
 //! After it, old heads and unreferenced `index.d/` objects are deleted by
 //! age ([`index_store::collect_index_garbage`]), so a reader still on a
 //! recent head can finish and a concurrent writer's fresh object survives;
@@ -470,8 +470,7 @@ impl Repo {
 
     /// Publish `seg` as the successor of `prev`: as a segment, or with a
     /// fold. A full fold (every segment into the base) when there is no
-    /// `prev`, a full fold was requested (`check --repair`) or the packed
-    /// segment's name is already named by `prev` (plaintext repeat); a fold
+    /// `prev` or a full fold was requested (`check --repair`); a fold
     /// of the foldable prefix (04 step 7) when a fold was requested or the
     /// prefix reaches the hard limit and something is foldable, keeping the
     /// young backup segments after the new base and `seg` after them when it
@@ -775,7 +774,6 @@ impl Repo {
         let rebuilt = index_rebuild::rebuild_index_from_packs(
             self.storage.as_ref(),
             self.crypto.as_ref(),
-            self.content_hash(),
             local_tables,
             &anchor,
             self.request_width(),
@@ -828,7 +826,6 @@ impl Repo {
         index_rebuild::recover_unindexed_entries(
             self.storage.as_ref(),
             self.crypto.as_ref(),
-            self.content_hash(),
             &named,
             |id| !self.chunk_index.contains(id),
             self.local_tables_for_repair(),

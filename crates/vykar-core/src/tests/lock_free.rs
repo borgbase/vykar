@@ -2,7 +2,7 @@
 //! backups commit without a lock; a lock-free commit waits for a held lock
 //! and a lock holder yields to a committing backup (the marker
 //! handshake); a crashed committing marker blocks lock holders until it is
-//! stale; plaintext repositories keep the lock. Lock holders list
+//! stale. Lock holders list
 //! sessions only after their lock is confirmed; a marker reaped by age
 //! beside its refresh, an undecided put-if-absent check and a cancel during
 //! the wait each fail the backup as they should. A backup whose marker
@@ -285,25 +285,6 @@ fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
     let rl = sim.backup(l, "l1", &tree("l1"));
     rl.expect_ok();
     assert!(!rl.lock_free);
-    sim.check_invariants(Invariant::STEP8).assert_clean();
-}
-
-/// A plaintext repository never commits lock-free (O1): on a store that
-/// offers put-if-absent its backups still take the commit lock.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_repositories_commit_under_the_lock() {
-    let mut sim = Sim::with_config(SimConfig {
-        kind: StoreKind::Conditional,
-        encrypted: false,
-        ..SimConfig::default()
-    });
-    let a = sim.client("a");
-    let run = sim.backup(a, "a1", &tree("a1"));
-    run.expect_ok();
-    assert!(!run.lock_free);
-    let recs = records(&sim, a, run.index);
-    assert!(!lock_writes(&recs).is_empty(), "the commit lock was taken");
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 

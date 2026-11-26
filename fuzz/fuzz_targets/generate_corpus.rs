@@ -25,9 +25,7 @@ use vykar_core::index::{
     encode_pending_journal,
 };
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
-use vykar_core::repo::format::{
-    ObjectType, pack_object_with_context, unpack_object_expect_with_context,
-};
+use vykar_core::repo::format::{ObjectType, unpack_object_expect_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
@@ -36,7 +34,6 @@ use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_core::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
 use vykar_crypto::testing::DeterministicEngine;
-use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
@@ -715,14 +712,18 @@ fn seed_sweep_record() {
 }
 
 /// A positional (v2/v3, or a refused development version) config.
-fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u32) -> Vec<u8> {
+fn repo_config(
+    version: u32,
+    encryption: EncryptionMode,
+    chunker: ChunkerParams,
+    min_pack: u32,
+    max_pack: u32,
+) -> Vec<u8> {
     rmp_serde::to_vec(&LegacyRepoConfig {
         version,
         id: vec![0x42; 32],
         chunker_params: chunker,
-        // Plaintext-only: 10-single-protocol step 3 removes this (a config
-        // codec value).
-        encryption: EncryptionMode::None,
+        encryption,
         created: fixed_time(),
         min_pack_size: min_pack,
         max_pack_size: max_pack,
@@ -733,6 +734,7 @@ fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u3
 /// A v6 (map) config.
 fn repo_config_v6(
     hash: HashAlgorithm,
+    encryption: EncryptionMode,
     chunker: ChunkerParams,
     min_pack: u32,
     max_pack: u32,
@@ -740,9 +742,7 @@ fn repo_config_v6(
     RepoConfig::new_v6(
         vec![0x42; 32],
         chunker,
-        // Plaintext-only: 10-single-protocol step 3 removes this (a config
-        // codec value).
-        EncryptionMode::None,
+        encryption,
         fixed_time(),
         min_pack,
         max_pack,
@@ -759,11 +759,13 @@ fn seed_repo_config() {
         avg_size: 4096,
         max_size: 16384,
     };
+    let aes = || EncryptionMode::Aes256Gcm;
     let seeds = [
         (
             "v6_default",
             repo_config_v6(
                 HashAlgorithm::Blake3,
+                aes(),
                 ChunkerParams::default(),
                 32 * MIB,
                 192 * MIB,
@@ -771,21 +773,40 @@ fn seed_repo_config() {
         ),
         (
             "v6_blake2b_small",
-            repo_config_v6(HashAlgorithm::Blake2b, small.clone(), MIB, 4 * MIB),
+            repo_config_v6(HashAlgorithm::Blake2b, aes(), small.clone(), MIB, 4 * MIB),
+        ),
+        // Unencrypted: refused by `validate`.
+        (
+            "v6_none",
+            repo_config_v6(
+                HashAlgorithm::Blake3,
+                EncryptionMode::None,
+                ChunkerParams::default(),
+                32 * MIB,
+                192 * MIB,
+            ),
+        ),
+        (
+            "v2_none",
+            repo_config(2, EncryptionMode::None, small.clone(), MIB, 4 * MIB),
         ),
         (
             "v5_default",
-            repo_config(5, ChunkerParams::default(), 32 * MIB, 192 * MIB),
+            repo_config(5, aes(), ChunkerParams::default(), 32 * MIB, 192 * MIB),
         ),
-        ("v2_small", repo_config(2, small.clone(), MIB, 4 * MIB)),
+        (
+            "v2_small",
+            repo_config(2, aes(), small.clone(), MIB, 4 * MIB),
+        ),
         (
             "v4_min_above_max",
-            repo_config(4, small, 64 * MIB, 32 * MIB),
+            repo_config(4, aes(), small, 64 * MIB, 32 * MIB),
         ),
         (
             "v3_odd_chunker",
             repo_config(
                 3,
+                aes(),
                 ChunkerParams {
                     min_size: 257,
                     avg_size: 1024,
@@ -961,51 +982,6 @@ fn seed_metadata_msgpack() {
     }
 }
 
-/// Chunk-ID key of `fuzz_plaintext_read`.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-const PLAINTEXT_CHUNK_ID_KEY: [u8; 32] = [0x5A; 32];
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-fn seed_plaintext_read() {
-    let plaintext: &[u8] = b"plaintext chunk read path, plaintext chunk read path";
-    let frame = ZSTD_EMPTY_COMPRESSED_BLOCK;
-    for (name, algorithm, plaintext, compressed) in [
-        (
-            "blake2b_lz4",
-            HashAlgorithm::Blake2b,
-            plaintext,
-            compress(Compression::Lz4, plaintext).unwrap(),
-        ),
-        (
-            "blake3_zstd",
-            HashAlgorithm::Blake3,
-            plaintext,
-            compress(Compression::Zstd { level: 3 }, plaintext).unwrap(),
-        ),
-        (
-            "blake3_zstd_empty_compressed_block",
-            HashAlgorithm::Blake3,
-            &frame[frame.len() - 6..],
-            frame.to_vec(),
-        ),
-    ] {
-        let engine = PlaintextEngine::new(ChunkHasher::new(algorithm, PLAINTEXT_CHUNK_ID_KEY));
-        let id = ChunkId::compute(engine.chunk_hasher(), plaintext);
-        let blob =
-            pack_object_with_context(ObjectType::ChunkData, id.as_bytes(), &compressed, &engine)
-                .unwrap();
-        let mut pw = PackWriter::new(PackType::Data, usize::MAX, algorithm);
-        pw.add_blob(id, blob).unwrap();
-        let sealed = pw.seal(&engine).unwrap();
-
-        let mut data = vec![u8::from(algorithm == HashAlgorithm::Blake3)];
-        data.extend_from_slice(id.as_bytes());
-        data.extend_from_slice(&u32::try_from(plaintext.len()).unwrap().to_le_bytes());
-        data.extend_from_slice(sealed.data.as_bytes().expect("heap-buffered pack"));
-        write_seed("fuzz_plaintext_read", name, &data);
-    }
-}
-
 fn main() {
     println!("Generating fuzz corpus seeds...");
 
@@ -1068,9 +1044,6 @@ fn main() {
 
     seed_metadata_msgpack();
     println!("  fuzz_metadata_msgpack: done");
-
-    seed_plaintext_read();
-    println!("  fuzz_plaintext_read: done");
 
     println!("All corpus seeds written to {CORPUS_DIR}");
 }

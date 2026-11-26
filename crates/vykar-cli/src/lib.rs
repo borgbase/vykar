@@ -341,7 +341,7 @@ fn dispatch_diff(
     snapshot_a: &str,
     snapshot_b: &str,
 ) -> ExitCode {
-    // Emit REST/plaintext warnings before probing backends.
+    // Emit REST warnings before probing backends.
     for repo in repos {
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
     }
@@ -395,7 +395,7 @@ fn dispatch_diff(
 /// Probe the repositories for `snap` and run the command in the one that holds
 /// it, or explain why that could not be determined.
 fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode {
-    // Emit REST/plaintext warnings before probing backends.
+    // Emit REST warnings before probing backends.
     for repo in repos {
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
     }

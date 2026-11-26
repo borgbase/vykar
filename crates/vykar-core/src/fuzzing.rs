@@ -85,11 +85,6 @@ pub fn read_zstd_metadata(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `repo::open::derive_plaintext_chunk_id_key`.
-pub fn plaintext_chunk_id_key(repo_id: &[u8], format: crate::repo::RepoFormat) -> [u8; 32] {
-    crate::repo::derive_plaintext_chunk_id_key(repo_id, format)
-}
-
 /// Chunk lengths backup cuts `data` into (`chunker::ChunkReader`, bounded
 /// by the input length as backup bounds it by the file size).
 pub fn chunk_lengths(data: &[u8], config: &ChunkerParams) -> std::io::Result<Vec<usize>> {

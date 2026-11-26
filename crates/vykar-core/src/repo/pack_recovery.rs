@@ -39,11 +39,10 @@ pub(crate) fn expected_pack_len(entry: &PendingPackEntry) -> Option<u64> {
 }
 
 /// The lengths a pack of `entry` may have: without a trailer, and with the
-/// trailer frame listing exactly its chunks (`encrypting`: whether the
-/// repository's engine encrypts, which fixes the trailer's size).
-fn accepted_pack_lens(entry: &PendingPackEntry, encrypting: bool) -> Option<[u64; 2]> {
+/// trailer frame listing exactly its chunks.
+fn accepted_pack_lens(entry: &PendingPackEntry) -> Option<[u64; 2]> {
     let end = expected_pack_len(entry)?;
-    let frame = 4 + trailer_blob_len(entry.chunks.len(), encrypting) as u64;
+    let frame = 4 + trailer_blob_len(entry.chunks.len()) as u64;
     Some([end, end.checked_add(frame)?])
 }
 
@@ -55,12 +54,11 @@ fn accepted_pack_lens(entry: &PendingPackEntry, encrypting: bool) -> Option<[u64
 #[cfg(test)]
 pub(crate) fn verify_journal_packs(
     storage: &dyn StorageBackend,
-    encrypting: bool,
     entries: &[PendingPackEntry],
     persisted_packs: usize,
     width: usize,
 ) -> HashSet<PackId> {
-    verify_journal_packs_with(storage, encrypting, entries, persisted_packs, width, None)
+    verify_journal_packs_with(storage, entries, persisted_packs, width, None)
         .into_keys()
         .collect()
 }
@@ -70,18 +68,16 @@ pub(crate) fn verify_journal_packs(
 /// index records for it.
 pub(crate) fn verify_journal_packs_trailers(
     storage: &dyn StorageBackend,
-    encrypting: bool,
     entries: &[PendingPackEntry],
     persisted_packs: usize,
     width: usize,
 ) -> HashMap<PackId, u32> {
-    verify_journal_packs_with(storage, encrypting, entries, persisted_packs, width, None)
+    verify_journal_packs_with(storage, entries, persisted_packs, width, None)
 }
 
 /// [`verify_journal_packs`] with an optional forced strategy (tests).
 fn verify_journal_packs_with(
     storage: &dyn StorageBackend,
-    encrypting: bool,
     entries: &[PendingPackEntry],
     persisted_packs: usize,
     width: usize,
@@ -89,7 +85,7 @@ fn verify_journal_packs_with(
 ) -> HashMap<PackId, u32> {
     let mut sized: Vec<(&PendingPackEntry, [u64; 2])> = Vec::with_capacity(entries.len());
     for entry in entries {
-        match accepted_pack_lens(entry, encrypting) {
+        match accepted_pack_lens(entry) {
             Some(len) => sized.push((entry, len)),
             None => warn!(
                 pack_id = %entry.pack_id,
@@ -233,7 +229,7 @@ mod tests {
                     let storage = make();
                     let (entries, exact) = fixture(&storage);
                     assert_eq!(
-                        verify_journal_packs_with(&storage, false, &entries, 0, width, force)
+                        verify_journal_packs_with(&storage, &entries, 0, width, force)
                             .into_keys()
                             .collect::<HashSet<_>>(),
                         exact,
@@ -256,7 +252,7 @@ mod tests {
                 .put(&e.pack_id.storage_key(), &vec![0u8; len])
                 .unwrap();
         }
-        let accepted = verify_journal_packs(&storage, false, &entries, 10_000, 6);
+        let accepted = verify_journal_packs(&storage, &entries, 10_000, 6);
         assert_eq!(accepted, entries.iter().map(|e| e.pack_id).collect());
         assert_eq!(Probe::count(&storage.lists), 0);
         assert_eq!(Probe::count(&storage.sizes), 2);
@@ -274,7 +270,7 @@ mod tests {
             .map(|e| e.pack_id)
             .collect();
         assert_eq!(
-            verify_journal_packs(&storage, false, &entries, 1_000_000, 6),
+            verify_journal_packs(&storage, &entries, 1_000_000, 6),
             exact
         );
         assert_eq!(Probe::count(&storage.lists), 0);
@@ -282,7 +278,7 @@ mod tests {
 
         let storage = Probe::new();
         let (entries, exact) = fixture(&storage);
-        assert_eq!(verify_journal_packs(&storage, false, &entries, 0, 6), exact);
+        assert_eq!(verify_journal_packs(&storage, &entries, 0, 6), exact);
         assert_eq!(Probe::count(&storage.lists), 40);
     }
 
@@ -291,7 +287,7 @@ mod tests {
     fn batch_answers_every_pack_in_one_request() {
         let storage = Probe::with_batch();
         let (entries, exact) = fixture(&storage);
-        assert_eq!(verify_journal_packs(&storage, false, &entries, 0, 6), exact);
+        assert_eq!(verify_journal_packs(&storage, &entries, 0, 6), exact);
         assert_eq!(Probe::count(&storage.batches), 1);
         assert_eq!(Probe::count(&storage.lists), 0);
         assert_eq!(Probe::count(&storage.sizes), 0);
@@ -304,7 +300,7 @@ mod tests {
             ..Probe::new()
         };
         let (entries, exact) = fixture(&storage);
-        assert_eq!(verify_journal_packs(&storage, false, &entries, 0, 6), exact);
+        assert_eq!(verify_journal_packs(&storage, &entries, 0, 6), exact);
         assert_eq!(Probe::count(&storage.batches), 0);
         assert_eq!(Probe::count(&storage.lists), 40);
         assert_eq!(Probe::count(&storage.sizes), 0);
@@ -330,7 +326,7 @@ mod tests {
         ] {
             let (entries, exact) = fixture(&storage);
             assert_eq!(
-                verify_journal_packs(&storage, false, &entries, 0, 6),
+                verify_journal_packs(&storage, &entries, 0, 6),
                 exact,
                 "{name}"
             );
@@ -344,7 +340,7 @@ mod tests {
     fn unsized_listing_sizes_each_listed_pack() {
         let storage = Probe::new();
         let (entries, exact) = fixture(&storage);
-        assert_eq!(verify_journal_packs(&storage, false, &entries, 0, 6), exact);
+        assert_eq!(verify_journal_packs(&storage, &entries, 0, 6), exact);
         assert_eq!(Probe::count(&storage.sizes), 99);
     }
 
@@ -355,7 +351,7 @@ mod tests {
             ..Probe::new()
         };
         let (entries, exact) = fixture(&storage);
-        assert_eq!(verify_journal_packs(&storage, false, &entries, 0, 6), exact);
+        assert_eq!(verify_journal_packs(&storage, &entries, 0, 6), exact);
         assert_eq!(Probe::count(&storage.lists), 40);
         assert_eq!(Probe::count(&storage.sizes), 100);
     }
@@ -370,7 +366,7 @@ mod tests {
             ..Probe::new()
         };
         let (entries, _) = fixture(&storage);
-        assert!(verify_journal_packs(&storage, false, &entries, 0, 6).is_empty());
+        assert!(verify_journal_packs(&storage, &entries, 0, 6).is_empty());
         assert_eq!(Probe::count(&storage.sizes), 100);
     }
 
@@ -381,7 +377,7 @@ mod tests {
             pack_id: pack(1),
             chunks: Vec::new(),
         }];
-        assert!(verify_journal_packs(&storage, false, &entries, 0, 6).is_empty());
+        assert!(verify_journal_packs(&storage, &entries, 0, 6).is_empty());
         assert_eq!(Probe::count(&storage.batches), 0);
         assert_eq!(Probe::count(&storage.lists), 0);
         assert_eq!(Probe::count(&storage.sizes), 0);
@@ -417,55 +413,36 @@ mod tests {
     }
 
     /// A pack ending in the trailer frame for its chunk count is adopted;
-    /// one byte more or less is not, and neither is the length of a
-    /// plaintext trailer.
+    /// one byte more or less is not.
     #[test]
     fn trailer_pack_is_adopted_by_exact_length() {
         let aes = vykar_crypto::aes_gcm::Aes256GcmEngine::new(
             &[0x11; 32],
             crate::testutil::chunk_hasher_for([0x22; 32]),
         );
-        let engines: [(&dyn vykar_crypto::CryptoEngine, bool); 1] = [(&aes, true)];
-        for (crypto, encrypting) in engines {
-            let (entry, data) = sealed_pack(crypto);
-            let full = data.len();
-            for (len, accepted_as, accepted_as_other) in [
-                (full, true, false),
-                (full - 1, false, false),
-                (full + 1, false, false),
-            ] {
-                let storage = Probe::new();
-                let mut bytes = data.clone();
-                bytes.resize(len, 0);
-                storage
-                    .inner
-                    .put(&entry.pack_id.storage_key(), &bytes)
-                    .unwrap();
-                let entries = std::slice::from_ref(&entry);
-                let got = verify_journal_packs(&storage, encrypting, entries, 0, 1);
-                assert_eq!(
-                    got.contains(&entry.pack_id),
-                    accepted_as,
-                    "{encrypting}/{len}"
-                );
-                let got = verify_journal_packs(&storage, !encrypting, entries, 0, 1);
-                assert_eq!(
-                    got.contains(&entry.pack_id),
-                    accepted_as_other,
-                    "{encrypting}/{len}"
-                );
-            }
-            // The same entry without its trailer (a pack from before trailers).
+        let (entry, data) = sealed_pack(&aes);
+        let full = data.len();
+        for (len, accepted) in [(full, true), (full - 1, false), (full + 1, false)] {
             let storage = Probe::new();
-            let end = expected_pack_len(&entry).unwrap() as usize;
+            let mut bytes = data.clone();
+            bytes.resize(len, 0);
             storage
                 .inner
-                .put(&entry.pack_id.storage_key(), &data[..end])
+                .put(&entry.pack_id.storage_key(), &bytes)
                 .unwrap();
-            let got =
-                verify_journal_packs(&storage, encrypting, std::slice::from_ref(&entry), 0, 1);
-            assert!(got.contains(&entry.pack_id), "{encrypting}: no trailer");
+            let entries = std::slice::from_ref(&entry);
+            let got = verify_journal_packs(&storage, entries, 0, 1);
+            assert_eq!(got.contains(&entry.pack_id), accepted, "{len}");
         }
+        // The same entry without its trailer (a pack from before trailers).
+        let storage = Probe::new();
+        let end = expected_pack_len(&entry).unwrap() as usize;
+        storage
+            .inner
+            .put(&entry.pack_id.storage_key(), &data[..end])
+            .unwrap();
+        let got = verify_journal_packs(&storage, std::slice::from_ref(&entry), 0, 1);
+        assert!(got.contains(&entry.pack_id), "no trailer");
     }
 
     #[test]

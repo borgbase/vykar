@@ -88,8 +88,8 @@ pub(super) fn handle_start_mount(
             });
             match outcome {
                 Ok(PassphraseRun::Ran(_)) => {
-                    // Passphrase (if any) is now validated and cached; read it
-                    // back to hand to the mount thread. `None` for plaintext repos.
+                    // The passphrase is now validated and cached; read it back
+                    // to hand to the mount thread.
                     let pass = ctx.passphrases.get(&repo.config.repository.url).cloned();
                     (repo.config.clone(), pass)
                 }

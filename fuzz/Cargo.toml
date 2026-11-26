@@ -128,11 +128,6 @@ path = "fuzz_targets/fuzz_metadata_msgpack.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_plaintext_read"
-path = "fuzz_targets/fuzz_plaintext_read.rs"
-doc = false
-
-[[bin]]
 name = "generate_corpus"
 path = "fuzz_targets/generate_corpus.rs"
 required-features = []

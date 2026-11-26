@@ -20,8 +20,8 @@ use vykar_types::error::{Result, VykarError};
 ///
 /// # Errors
 ///
-/// `EncryptionMode::None` has no master key and is an error here; callers
-/// handle the plaintext engine themselves.
+/// `EncryptionMode::None` is an error ([`super::UNENCRYPTED_REPOSITORY_REFUSAL`]);
+/// it is refused by `validate` and `init` before this.
 pub(super) fn build_engine(
     mode: &EncryptionMode,
     format: RepoFormat,
@@ -29,8 +29,8 @@ pub(super) fn build_engine(
 ) -> Result<Arc<dyn CryptoEngine>> {
     let hasher = ChunkHasher::new(format.chunk_hash(), key.chunk_id_key);
     match mode {
-        EncryptionMode::None => Err(VykarError::Config(
-            "repository is unencrypted; there is no repository key".into(),
+        EncryptionMode::None => Err(VykarError::Other(
+            super::UNENCRYPTED_REPOSITORY_REFUSAL.into(),
         )),
         EncryptionMode::Aes256Gcm => Ok(Arc::new(crypto::aes_gcm::Aes256GcmEngine::new(
             &key.encryption_key,

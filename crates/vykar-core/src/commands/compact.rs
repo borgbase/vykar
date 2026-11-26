@@ -386,12 +386,6 @@ fn report_under_lock(repo: &mut Repo, cancel: &CancelToken) -> Result<Unreferenc
 /// sweep or repack removed it and S's commit re-checks
 /// (`StaleChunksDuringCommit`). The older order (sessions, head, packs)
 /// was correct only through the registration probe against the lock.
-/// One consequence under the lock (D-a2 accepts it): on a plaintext
-/// repository a live backup's re-PUT, during the mark, of a pack whose
-/// bytes, hence key, equal those of a pack the listing showed as an old
-/// orphan no longer renews the mtime this run judges by, so compact deletes
-/// the pack and that backup's commit fails with the typed "missing from
-/// storage" error.
 ///
 /// The same order holds for a lock-free compact (04 step 9: an encrypted
 /// repository whose storage passed the put-if-absent check, see
@@ -399,9 +393,7 @@ fn report_under_lock(repo: &mut Repo, cancel: &CancelToken) -> Result<Unreferenc
 /// (`writes_heads`) instead of taking the lock, and reads "now" from its
 /// own marker key in the session listing. The argument above needs no lock
 /// once its conditions hold: object names a writer cannot re-create after
-/// the listing saw them (encrypted repositories, random nonces; a
-/// plaintext pack or index object is named by its content, which is why
-/// plaintext repositories keep the lock, O1); listings that show every
+/// the listing saw them (random nonces); listings that show every
 /// object PUT before them (the storage contract); and a session whose
 /// marker was reaped while it still commits left to the post-PUT pack-age
 /// check (I8) and to the lock-free commit's marker probe before its
@@ -1269,9 +1261,9 @@ fn compact_packs(
         ..CompactStats::default()
     };
     let mut deleted: HashSet<PackId> = HashSet::new();
-    // Packs this run wrote. A repack's output can have the ID of a pack the
-    // listing showed as an orphan (the same blobs repacked by an earlier,
-    // interrupted run): that pack is live now and is never deleted.
+    // Packs this run wrote. With random nonces a repack's output never has
+    // the ID of a pack the listing showed as an orphan; kept as a guard: such
+    // a pack would be live now and is never deleted.
     let mut written: HashSet<PackId> = HashSet::new();
 
     // Phase 1: Analyze live/dead space using the chunk index + pack sizes.
@@ -1715,7 +1707,7 @@ fn compact_packs(
         let (new_pack_id, new_entries) =
             writer.flush(repo.storage().as_ref(), repo.crypto().as_ref())?;
         written.insert(new_pack_id);
-        let trailer_len = trailer_frame_len(new_entries.len(), repo.crypto().is_encrypting());
+        let trailer_len = trailer_frame_len(new_entries.len());
         repo.chunk_index_mut()
             .set_pack_trailer(new_pack_id, trailer_len);
 
@@ -1988,10 +1980,9 @@ fn try_server_side_repack(
     // The server never deletes: sources are removed below, after the index
     // pointing at their replacements is persisted. A lost or timed-out
     // response therefore leaves only unreferenced new packs behind.
-    let encrypting = repo.crypto().is_encrypting();
     let operations: Vec<PlannedOp<'_>> = analyses
         .iter()
-        .map(|analysis| PlannedOp::new(analysis, encrypting))
+        .map(|analysis| PlannedOp::new(analysis))
         .collect();
 
     // A single operation over one of the server's caps cannot be split
@@ -2229,7 +2220,7 @@ fn apply_repack_result(
     }
 
     // The operation carried the trailer of its live blobs.
-    let trailer_len = trailer_frame_len(analysis.live_entries.len(), repo.crypto().is_encrypting());
+    let trailer_len = trailer_frame_len(analysis.live_entries.len());
     repo.chunk_index_mut()
         .set_pack_trailer(new_pack_id, trailer_len);
     for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {
@@ -2261,12 +2252,12 @@ struct PlannedOp<'a> {
 }
 
 impl<'a> PlannedOp<'a> {
-    fn new(analysis: &'a PackAnalysis, encrypting: bool) -> Self {
+    fn new(analysis: &'a PackAnalysis) -> Self {
         let live = &analysis.live_entries;
         let trailer_len = if live.is_empty() {
             0
         } else {
-            trailer_blob_len(live.len(), encrypting) as u64
+            trailer_blob_len(live.len()) as u64
         };
         Self {
             analysis,
@@ -2404,7 +2395,7 @@ mod repack_chunk_tests {
     }
 
     fn planned(analyses: &[PackAnalysis]) -> Vec<PlannedOp<'_>> {
-        analyses.iter().map(|a| PlannedOp::new(a, true)).collect()
+        analyses.iter().map(PlannedOp::new).collect()
     }
 
     #[test]
@@ -2455,7 +2446,7 @@ mod repack_chunk_tests {
     #[test]
     fn output_budget_counts_trailers() {
         let blobs = 1000usize;
-        let trailer_frame = 4 + trailer_blob_len(blobs, true) as u64;
+        let trailer_frame = 4 + trailer_blob_len(blobs) as u64;
         let pack_overhead = 9 + 4 * blobs as u64;
         // Payload per op so that 2 * (overhead + payload) == cap - 2.
         let payload = MAX_REPACK_OUTPUT_BYTES / 2 - 1 - pack_overhead;
@@ -2510,7 +2501,7 @@ mod repack_chunk_tests {
     #[test]
     fn delete_only_op_has_no_trailer() {
         let empty = analysis(0, 0);
-        let op = PlannedOp::new(&empty, true);
+        let op = PlannedOp::new(&empty);
         assert_eq!(op.trailer_len, 0);
         assert_eq!(op.output_size(), 0);
         let engine =
@@ -2518,17 +2509,14 @@ mod repack_chunk_tests {
         assert!(op.into_request(&engine).unwrap().trailer.is_none());
     }
 
-    /// The trailer attached to an operation has the predicted length under
-    /// either engine kind, and an engine of the other kind is refused.
+    /// The trailer attached to an operation has the predicted length.
     #[test]
     fn attached_trailer_matches_its_estimate() {
         let a = analysis(3, 50);
         let engine =
             vykar_crypto::testing::DeterministicEngine::new(crate::testutil::test_chunk_hasher());
-        let request = PlannedOp::new(&a, true).into_request(&engine).unwrap();
-        assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3, true));
-        let err = PlannedOp::new(&a, false).into_request(&engine).unwrap_err();
-        assert!(err.to_string().contains("estimate"), "{err}");
+        let request = PlannedOp::new(&a).into_request(&engine).unwrap();
+        assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3));
     }
 }
 

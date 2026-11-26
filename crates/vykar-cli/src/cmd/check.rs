@@ -202,15 +202,9 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
         println!();
     }
 
-    // Unencrypted repositories have no key file; "0 key copies" would read
-    // like a finding.
-    let key_copies = match result.key_files_checked {
-        Some(n) => format!("{n} key copies, "),
-        None => String::new(),
-    };
     println!(
-        "Check complete: {}{} snapshots, {} items, {} packs existence-checked ({} chunks), {} chunks data-verified, {} errors",
-        key_copies,
+        "Check complete: {} key copies, {} snapshots, {} items, {} packs existence-checked ({} chunks), {} chunks data-verified, {} errors",
+        result.key_files_checked,
         result.snapshots_checked,
         result.items_checked,
         result.packs_existence_checked,

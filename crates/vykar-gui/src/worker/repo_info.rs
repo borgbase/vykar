@@ -218,7 +218,6 @@ fn init_repo_interactive(
     );
 
     let init_pass: Option<zeroize::Zeroizing<String>> = match outcome {
-        Ok(passphrase::InitPassphrase::NotRequired) => None,
         Ok(passphrase::InitPassphrase::Provided(p)) => Some(p),
         // Dismissing either dialog, or leaving the first one blank, means "don't
         // create the repository" — log-only, so the footer stays clean.

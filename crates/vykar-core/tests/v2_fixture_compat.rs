@@ -29,9 +29,8 @@ use crate::common::fixtures::{self, Fixture, read_tree};
 use crate::common::{backup_source, exercise_pack_naming};
 use vykar_types::hash::HashAlgorithm;
 
-/// One fixture per encryption mode.
-// Plaintext-only: 10-single-protocol step 3 removes "none".
-const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
+/// The fixtures of the encryption modes this vykar opens.
+const MODES: &[&str] = &["aes256gcm", "chacha20poly1305"];
 
 fn extract(mode: &str) -> Fixture {
     fixtures::extract("v2", mode, 2)
@@ -148,7 +147,7 @@ fn v2_fixtures_verify_data_is_clean() {
 /// `vykar upgrade` takes each v2 fixture to v6 with BLAKE2b in place (UPG-1:
 /// a map config naming `blake2b`, a layout-3 head at `index.h/1` naming a
 /// base, a pack map for every pack, no `index` or `index.gen`): same chunk IDs (the
-/// plaintext key follows the chunk hash), the same index, every snapshot
+/// chunk hash stays BLAKE2b), the same index, every snapshot
 /// still restores byte-identical, and a new backup dedups against the chunks
 /// the pre-change binary wrote.
 #[test]
@@ -351,7 +350,7 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
     }
 }
 
-/// The v2 half of the `{none, aes256gcm} x {v2, v3}` lifecycle matrix that
+/// The v2 half of the `{aes256gcm, chacha20poly1305} x {v2, v3}` lifecycle matrix that
 /// `lifecycle_integration.rs` covers for v6 (every repo it creates is v6 now).
 /// The encrypted fixtures must still reject a wrong passphrase the same way
 /// on the upgrade's open. Every other open refuses v2 before the key check.
@@ -359,9 +358,6 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
 fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
     for mode in MODES {
         let fx = extract(mode);
-        if fx.passphrase().is_none() {
-            continue; // plaintext fixture: no passphrase to get wrong
-        }
         let config = fx.config();
         let wrong = Some("definitely-not-the-fixture-passphrase");
 

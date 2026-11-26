@@ -17,6 +17,7 @@ use vykar_core::repo::{
 };
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
+use vykar_types::error::VykarError;
 
 use crate::common::{
     backup_source, init_test_environment, make_test_config, open_local_repo_cached,
@@ -3009,63 +3010,6 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 1 verification: plaintext chunk_id_key consistency across init/open
-// ---------------------------------------------------------------------------
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_chunk_id_key_consistent_across_init_and_open() {
-    init_test_environment();
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-
-    let data = b"hello world";
-
-    // Init a plaintext repo and compute a ChunkId
-    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repo::init(
-        storage,
-        EncryptionMode::None,
-        ChunkerParams::default(),
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    let hasher_init = repo.crypto().chunk_hasher().clone();
-    let id_init = vykar_types::chunk_id::ChunkId::compute(&hasher_init, data);
-    drop(repo);
-
-    // Re-open the same repo and compute the ChunkId for the same data
-    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repo::open(
-        storage,
-        Some(common::TEST_PASSPHRASE),
-        None,
-        OpenOptions::new(),
-    )
-    .unwrap();
-    let hasher_open = repo.crypto().chunk_hasher().clone();
-    let id_open = vykar_types::chunk_id::ChunkId::compute(&hasher_open, data);
-
-    assert_eq!(
-        hasher_init.key(),
-        hasher_open.key(),
-        "chunk-ID key must be identical after init and open"
-    );
-    assert_eq!(
-        hasher_init.algorithm(),
-        hasher_open.algorithm(),
-        "chunk-ID algorithm must be identical after init and open"
-    );
-    assert_eq!(
-        id_init, id_open,
-        "ChunkId for same data must match across init and open"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Bug 2, since 04 step 7: maintenance runs beside a live SessionGuard
 // ---------------------------------------------------------------------------
 
@@ -3165,33 +3109,17 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     assert!(remaining.is_empty(), "no sessions should remain");
 }
 
-/// Lock mode without the marker handshake: on an encrypted repository the
-/// lock holder's handshake counts a malformed marker as flagged (fail
-/// closed) and yields.
-// Plaintext only to reach lock mode here: 10-single-protocol step 3 moves
-// this to an encrypted repository on a store without put-if-absent, or
-// deletes it with a reason.
+/// The lock holder's half of the marker handshake counts a young
+/// malformed marker as flagged (fail closed): maintenance yields with
+/// `Locked` naming it, and the marker stays.
 #[test]
-fn maintenance_runs_beside_a_malformed_session_marker() {
+fn maintenance_yields_to_a_young_malformed_session_marker() {
     use vykar_core::commands::util::with_maintenance_lock;
 
-    init_test_environment();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-
-    // Init a plaintext repo.
-    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repo::init(
-        storage,
-        EncryptionMode::None,
-        ChunkerParams::default(),
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-    drop(repo);
+    drop(common::init_local_repo(&repo_dir));
 
     // Plant a malformed marker — unparseable JSON.
     let sessions_dir = repo_dir.join("sessions");
@@ -3199,11 +3127,13 @@ fn maintenance_runs_beside_a_malformed_session_marker() {
     let marker_path = sessions_dir.join("corrupt-session.json");
     std::fs::write(&marker_path, b"this is not json at all").unwrap();
 
-    // Maintenance proceeds (04 step 7). The marker is unreadable and young
-    // by its mtime, so it is kept, and compact's horizon is unknown: no
-    // orphan pack goes in that run (once 45 min old it is reaped).
-    let mut repo2 = open_local_repo_cached(&repo_dir, None);
-    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
+    let mut repo2 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
+    match with_maintenance_lock(&mut repo2, |_| Ok(())) {
+        Err(VykarError::Locked(holder)) => {
+            assert_eq!(holder.key, "sessions/corrupt-session.json");
+        }
+        other => panic!("expected Locked, got {:?}", other.err()),
+    }
 
     // Marker must still be on disk — cleanup does not delete it.
     assert!(

@@ -335,10 +335,11 @@ pub struct EncryptionConfig {
     pub passcommand: Option<String>,
 }
 
+pub use crate::repo::PLAINTEXT_MODE_REFUSAL;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EncryptionModeName")]
 pub enum EncryptionModeConfig {
-    #[serde(rename = "none")]
-    None,
     #[serde(rename = "auto")]
     Auto,
     #[serde(rename = "aes256gcm")]
@@ -350,10 +351,36 @@ pub enum EncryptionModeConfig {
 impl EncryptionModeConfig {
     pub fn as_str(self) -> &'static str {
         match self {
-            EncryptionModeConfig::None => "none",
             EncryptionModeConfig::Auto => "auto",
             EncryptionModeConfig::Aes256Gcm => "aes256gcm",
             EncryptionModeConfig::Chacha20Poly1305 => "chacha20poly1305",
+        }
+    }
+}
+
+/// What `encryption.mode` may say in YAML, `none` included so that it is
+/// refused with [`PLAINTEXT_MODE_REFUSAL`] rather than a variant list.
+#[derive(Deserialize)]
+enum EncryptionModeName {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "aes256gcm")]
+    Aes256Gcm,
+    #[serde(rename = "chacha20poly1305")]
+    Chacha20Poly1305,
+}
+
+impl TryFrom<EncryptionModeName> for EncryptionModeConfig {
+    type Error = &'static str;
+
+    fn try_from(name: EncryptionModeName) -> Result<Self, Self::Error> {
+        match name {
+            EncryptionModeName::None => Err(PLAINTEXT_MODE_REFUSAL),
+            EncryptionModeName::Auto => Ok(Self::Auto),
+            EncryptionModeName::Aes256Gcm => Ok(Self::Aes256Gcm),
+            EncryptionModeName::Chacha20Poly1305 => Ok(Self::Chacha20Poly1305),
         }
     }
 }

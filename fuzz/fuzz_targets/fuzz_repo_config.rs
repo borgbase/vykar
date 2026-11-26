@@ -37,7 +37,6 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(again.validate().unwrap(), format);
         assert_eq!(again.into_repo_config(), config);
     }
-    let _ = vykar_core::fuzzing::plaintext_chunk_id_key(&config.id, format);
 
     for packs in [0, 1, 50, 10_000, usize::MAX] {
         let target = compute_data_pack_target(packs, config.min_pack_size, config.max_pack_size);

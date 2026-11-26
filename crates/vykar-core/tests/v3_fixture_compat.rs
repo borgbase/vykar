@@ -27,9 +27,12 @@ use vykar_storage::local_backend::LocalBackend;
 use crate::common::backup_source;
 use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
 
-/// One fixture per encryption mode.
-// Plaintext-only: 10-single-protocol step 3 removes "none".
-const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
+/// The fixtures of the encryption modes this vykar opens.
+const MODES: &[&str] = &["aes256gcm", "chacha20poly1305"];
+
+/// Every archive, the unencrypted one too (refused by its config, still
+/// pinned).
+const ARCHIVE_MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
 
 /// BLAKE3 of each archive as committed. A mismatch means the archive was
 /// regenerated or replaced.
@@ -96,7 +99,7 @@ fn assert_restores_source(fx: &Fixture, dest_name: &str, label: &str) {
 #[test]
 fn v3_fixture_archives_are_frozen() {
     let mut mismatches = Vec::new();
-    for mode in MODES {
+    for mode in ARCHIVE_MODES {
         let path = archive_path("v3", mode);
         let file = path.file_name().unwrap().to_str().unwrap().to_string();
         let actual = blake3::hash(&std::fs::read(&path).unwrap())

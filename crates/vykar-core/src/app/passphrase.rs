@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{EncryptionModeConfig, VykarConfig};
+use crate::config::VykarConfig;
 use crate::platform::shell;
 use vykar_types::error::{Result, VykarError};
 
@@ -125,10 +125,6 @@ pub fn resolve_passphrase<F>(
 where
     F: FnMut(PassphrasePrompt) -> Result<Option<Zeroizing<String>>>,
 {
-    if config.encryption.mode == EncryptionModeConfig::None {
-        return Ok(None);
-    }
-
     if let Some(pass) = configured_passphrase(config)? {
         return Ok(Some(pass));
     }
@@ -156,8 +152,6 @@ pub enum InitPromptStage {
 /// report as a failure.
 #[derive(Debug)]
 pub enum InitPassphrase {
-    /// `encryption.mode: none` — the repository takes no passphrase.
-    NotRequired,
     Provided(Zeroizing<String>),
     /// The user dismissed either prompt.
     Cancelled,
@@ -196,10 +190,6 @@ pub fn resolve_init_passphrase<F>(
 where
     F: FnMut(InitPromptStage, &PassphrasePrompt) -> Result<Option<Zeroizing<String>>>,
 {
-    if config.encryption.mode == EncryptionModeConfig::None {
-        return Ok(InitPassphrase::NotRequired);
-    }
-
     let provided = |pass: Zeroizing<String>| {
         if pass.is_empty() {
             Err(VykarError::EmptyPassphrase)

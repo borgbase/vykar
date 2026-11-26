@@ -66,8 +66,7 @@ pub(super) struct ScanOptions<'a> {
 #[derive(Debug, Default)]
 pub(super) struct ScanCounters {
     pub(super) snapshots_checked: usize,
-    /// `None` for unencrypted repositories, which have no key file.
-    pub(super) key_files_checked: Option<usize>,
+    pub(super) key_files_checked: usize,
     pub(super) items_checked: usize,
     pub(super) chunks_existence_checked: usize,
     pub(super) packs_existence_checked: usize,
@@ -118,8 +117,7 @@ pub(super) struct ScanResult {
 /// Outcome of the repository-key phase.
 #[derive(Default)]
 struct KeyScan {
-    /// `None` when the repository is unencrypted.
-    checked: Option<usize>,
+    checked: usize,
     issues: Vec<IntegrityIssue>,
     /// The stored copy still holding the bytes that unwrapped at open.
     source: Option<String>,
@@ -150,10 +148,7 @@ enum KeyCopyFinding {
 /// The blob already unwrapped at open, so comparing bytes proves the stored
 /// objects are still intact at neither cost.
 fn scan_key_copies(repo: &Repo) -> KeyScan {
-    // Unencrypted repositories have no key file at all.
-    let Some(winner) = repo.key_blob() else {
-        return KeyScan::default();
-    };
+    let winner = repo.key_blob();
 
     let mut checked = 0usize;
     let mut findings: Vec<(String, KeyCopyFinding)> = Vec::new();
@@ -183,7 +178,7 @@ fn scan_key_copies(repo: &Repo) -> KeyScan {
         .map(|(key, _)| key.clone());
 
     let mut scan = KeyScan {
-        checked: Some(checked),
+        checked,
         source: source.clone(),
         ..KeyScan::default()
     };

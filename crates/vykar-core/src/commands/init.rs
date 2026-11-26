@@ -20,7 +20,6 @@ pub fn run_at_format(
         storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
 
     let encryption = match config.encryption.mode {
-        EncryptionModeConfig::None => EncryptionMode::None,
         EncryptionModeConfig::Auto => match select::select_best_aead() {
             AutoAeadMode::Aes256Gcm => EncryptionMode::Aes256Gcm,
             AutoAeadMode::Chacha20Poly1305 => EncryptionMode::Chacha20Poly1305,

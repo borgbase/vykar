@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use vykar_core::app::passphrase::configured_passphrase;
 use vykar_core::app::preflight::UnavailableRepo;
 use vykar_core::app::scheduler::{SchedulePlan, SchedulerLock};
-use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo, ScheduleConfig};
+use vykar_core::config::{self, ConfigSource, ResolvedRepo, ScheduleConfig};
 use vykar_types::error::VykarError;
 
 use crate::dispatch::{run_default_actions, warn_if_untrusted_rest};
@@ -130,20 +130,18 @@ fn load_daemon_config(source: &ConfigSource) -> CliResult<Vec<ResolvedRepo>> {
     // disabled — they still take part in SIGUSR1 cycles and the status page.
     for repo in &repos {
         let label = repo.label_or_url();
-        if repo.config.encryption.mode != EncryptionModeConfig::None {
-            match configured_passphrase(&repo.config) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return Err(CliError::from(format!(
-                        "encrypted repository '{label}' has no non-interactive passphrase source; \
-                         configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
-                    )));
-                }
-                Err(e) => {
-                    return Err(CliError::from(format!(
-                        "failed to validate passphrase for '{label}': {e}"
-                    )));
-                }
+        match configured_passphrase(&repo.config) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(CliError::from(format!(
+                    "encrypted repository '{label}' has no non-interactive passphrase source; \
+                     configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
+                )));
+            }
+            Err(e) => {
+                return Err(CliError::from(format!(
+                    "failed to validate passphrase for '{label}': {e}"
+                )));
             }
         }
     }

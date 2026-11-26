@@ -123,8 +123,7 @@ pub fn pack_object_with_context(
 ///
 /// Like `pack_object`, but avoids allocating separate plaintext + ciphertext
 /// buffers.  The `write_plaintext` callback writes serialized data directly
-/// into the output buffer, which is then encrypted in-place (for encrypting
-/// engines) or left as-is (for `PlaintextEngine`).
+/// into the output buffer, which is then encrypted in place.
 ///
 /// Wire format is identical to `pack_object` — `unpack_object` / `unpack_object_expect`
 /// can read the result.
@@ -168,35 +167,26 @@ fn pack_object_streaming_inner<F>(
 where
     F: FnOnce(&mut Vec<u8>) -> Result<()>,
 {
-    if crypto.is_encrypting() {
-        // Layout: [tag][nonce 12][plaintext → ciphertext][tag 16]
-        let mut buf = Vec::with_capacity(1 + 12 + estimated_plaintext_size + 16);
-        buf.push(tag);
-        // Reserve 12 bytes for the nonce (filled after encryption)
-        buf.extend_from_slice(&[0u8; 12]);
-        // Let the caller write plaintext starting at offset 13
-        write_plaintext(&mut buf)?;
-        // Encrypt the plaintext region in-place. The buffer was primed
-        // with `push(tag)` + `extend_from_slice(&[0u8; 12])`, so
-        // `buf.len() >= 13` and `buf[plaintext_start..]` / `buf[1..13]`
-        // are in bounds.
-        let plaintext_start = 1 + 12;
-        #[allow(clippy::indexing_slicing)]
-        let (nonce, gcm_tag) =
-            crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], aad)?;
-        // Fill in the nonce
-        #[allow(clippy::indexing_slicing)]
-        buf[1..13].copy_from_slice(&nonce);
-        // Append the authentication tag
-        buf.extend_from_slice(&gcm_tag);
-        Ok(buf)
-    } else {
-        // Plaintext engine: [tag][plaintext]
-        let mut buf = Vec::with_capacity(1 + estimated_plaintext_size);
-        buf.push(tag);
-        write_plaintext(&mut buf)?;
-        Ok(buf)
-    }
+    // Layout: [tag][nonce 12][plaintext → ciphertext][tag 16]
+    let mut buf = Vec::with_capacity(1 + 12 + estimated_plaintext_size + 16);
+    buf.push(tag);
+    // Reserve 12 bytes for the nonce (filled after encryption)
+    buf.extend_from_slice(&[0u8; 12]);
+    // Let the caller write plaintext starting at offset 13
+    write_plaintext(&mut buf)?;
+    // Encrypt the plaintext region in-place. The buffer was primed
+    // with `push(tag)` + `extend_from_slice(&[0u8; 12])`, so
+    // `buf.len() >= 13` and `buf[plaintext_start..]` / `buf[1..13]`
+    // are in bounds.
+    let plaintext_start = 1 + 12;
+    #[allow(clippy::indexing_slicing)]
+    let (nonce, gcm_tag) = crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], aad)?;
+    // Fill in the nonce
+    #[allow(clippy::indexing_slicing)]
+    buf[1..13].copy_from_slice(&nonce);
+    // Append the authentication tag
+    buf.extend_from_slice(&gcm_tag);
+    Ok(buf)
 }
 
 /// Deserialize and decrypt a repo object.
@@ -304,8 +294,7 @@ pub use vykar_types::chunk_decode::{BlobLocation, ChunkDecodeError, ChunkDecodeS
 
 /// Decode one stored chunk blob into `out`: decrypt `raw` in place, one-shot
 /// decompress, check the length against `hint` when one is given, and check
-/// the chunk ID when `verify` is set or the engine does not encrypt (without
-/// an AEAD tag the keyed chunk ID is the only checksum).
+/// the chunk ID when `verify` is set; the AEAD authenticates the blob.
 ///
 /// `raw` is overwritten whether this succeeds or fails, so it must not be
 /// decoded again: callers that decode several ranges of one shared buffer
@@ -340,7 +329,7 @@ pub fn decode_chunk_into(
             actual: out.len(),
         }));
     }
-    if verify || !crypto.is_encrypting() {
+    if verify {
         let actual = ChunkId::compute(crypto.chunk_hasher(), out);
         if actual != at.chunk_id {
             return Err(fail(ChunkDecodeStage::IdMismatch { actual }));

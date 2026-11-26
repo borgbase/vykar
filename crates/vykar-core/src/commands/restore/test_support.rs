@@ -19,7 +19,7 @@ pub(super) fn dummy_chunk_id(byte: u8) -> ChunkId {
 }
 
 /// The real chunk ID of `data` under `test_chunk_hasher()`. Needed for any blob
-/// that is decoded through a non-encrypting engine, which always verifies it.
+/// that is decoded with `verify` set.
 pub(super) fn chunk_id_of(data: &[u8]) -> ChunkId {
     ChunkId::compute(&crate::testutil::test_chunk_hasher(), data)
 }

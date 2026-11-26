@@ -140,12 +140,7 @@ fn gate_0_24_0(bytes: &[u8]) -> Result<(), Refusal> {
 
 const RELEASES: &[(&str, Gate)] = &[("v0.19.1", gate_0_19_1), ("v0.24.0", gate_0_24_0)];
 
-// Plaintext-only: 10-single-protocol step 3 removes None (a config codec value).
-const MODES: &[EncryptionMode] = &[
-    EncryptionMode::None,
-    EncryptionMode::Aes256Gcm,
-    EncryptionMode::Chacha20Poly1305,
-];
+const MODES: &[EncryptionMode] = &[EncryptionMode::Aes256Gcm, EncryptionMode::Chacha20Poly1305];
 
 // ── Probe encoder ──────────────────────────────────────────────────────────
 
@@ -376,7 +371,7 @@ fn the_probe_decodes_as_the_real_encoder_does() {
 #[test]
 fn old_releases_refuse_upgraded_fixtures_by_version() {
     for (prefix, version) in [("v2", 2u64), ("v3", 3)] {
-        for mode in ["none", "aes256gcm", "chacha20poly1305"] {
+        for mode in ["aes256gcm", "chacha20poly1305"] {
             let fx = fixtures::extract(prefix, mode, version);
             vykar_core::commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
             let bytes = std::fs::read(fx.repo_dir().join("config")).unwrap();
@@ -392,9 +387,8 @@ fn old_releases_refuse_upgraded_fixtures_by_version() {
 fn old_releases_refuse_a_new_repository_by_version() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    let config = common::make_plaintext_config(&repo_dir);
-    vykar_core::commands::init::run(&config, None).unwrap();
+    let config = common::make_test_config(&repo_dir);
+    common::init_repo(&config);
     let bytes = std::fs::read(repo_dir.join("config")).unwrap();
     assert_eq!(bytes[0], 0x89, "a nine-entry map");
     for (release, gate) in RELEASES {
@@ -722,8 +716,8 @@ fn old_release_binaries_refuse_v6_map_by_version() {
     let map = real_v6(&p, HashAlgorithm::Blake3, &[]);
     let positional = positional_v6(&p);
 
-    // An upgraded v3 (BLAKE3) and v2 (BLAKE2b) fixture, and a plaintext
-    // repository this build initialised and backed up into.
+    // An upgraded v3 (BLAKE3) and v2 (BLAKE2b) fixture, and a repository
+    // this build initialised and backed up into.
     let upgraded: Vec<(&str, fixtures::Fixture)> =
         [("v3", "aes256gcm", 3u64), ("v2", "aes256gcm", 2)]
             .into_iter()
@@ -738,10 +732,16 @@ fn old_release_binaries_refuse_v6_map_by_version() {
     let fresh_src = fresh.path().join("src");
     std::fs::create_dir_all(&fresh_src).unwrap();
     std::fs::write(fresh_src.join("file.txt"), b"fresh").unwrap();
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    let fresh_config = common::make_plaintext_config(&fresh_repo);
-    vykar_core::commands::init::run(&fresh_config, None).unwrap();
-    common::backup_source(&fresh_config, &fresh_src, "src", "s1", None, false);
+    let fresh_config = common::make_test_config(&fresh_repo);
+    common::init_repo(&fresh_config);
+    common::backup_source(
+        &fresh_config,
+        &fresh_src,
+        "src",
+        "s1",
+        common::pass(&fresh_config),
+        false,
+    );
 
     let refused_by_version = |release: &str, what: &str, (ok, stderr): (bool, String)| {
         eprintln!("{release} {what}: {}", stderr.trim());
@@ -771,7 +771,7 @@ fn old_release_binaries_refuse_v6_map_by_version() {
         refused_by_version(
             release,
             "a new repository",
-            run_info_on(bin, &fresh_repo, "probe"),
+            run_info_on(bin, &fresh_repo, common::TEST_PASSPHRASE),
         );
 
         let (ok, stderr) = run_info(bin, &positional);

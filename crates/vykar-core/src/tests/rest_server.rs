@@ -3,11 +3,11 @@
 //! all is the positive path of the `segmented_index` capability check.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
     PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, pass, set_store_now,
-    try_backup_single_source,
 };
 use crate::commands;
 use crate::config::VykarConfig;
@@ -32,6 +32,9 @@ struct Server {
     url: String,
     data: tempfile::TempDir,
     requests: Arc<Mutex<Vec<Request>>>,
+    /// While set, the next `PUT packs/..` is stored and then answered 503,
+    /// as a proxy does when the server's reply is lost (the flag clears).
+    lose_next_pack_reply: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -57,12 +60,21 @@ impl Server {
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
         let log = requests.clone();
+        let lose_next_pack_reply: Arc<AtomicBool> = Arc::default();
+        let lose = lose_next_pack_reply.clone();
         let app = vykar_server::handlers::router(state).layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let log = log.clone();
+                let (log, lose) = (log.clone(), lose.clone());
                 async move {
                     let (method, uri) = (req.method().clone(), req.uri().to_string());
-                    let resp = next.run(req).await;
+                    let lost = method == axum::http::Method::PUT
+                        && request_key(&uri).starts_with("packs/")
+                        && lose.swap(false, Ordering::SeqCst);
+                    let mut resp = next.run(req).await;
+                    if lost {
+                        use axum::response::IntoResponse;
+                        resp = axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
                     log.lock()
                         .unwrap()
                         .push((method, uri, resp.status().as_u16()));
@@ -78,6 +90,7 @@ impl Server {
             url,
             data,
             requests,
+            lose_next_pack_reply,
         }
     }
 
@@ -162,23 +175,6 @@ impl Client {
         let config = client(server, tmp.path(), "cache");
         let repo = commands::init::run(&config, pass(&config)).unwrap();
         assert_eq!(repo.format(), RepoFormat::CURRENT);
-        Self {
-            tmp,
-            source,
-            config,
-        }
-    }
-
-    /// [`Client::init`] on a plaintext repository.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    fn init_plaintext(server: &Server) -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("src");
-        std::fs::create_dir_all(&source).unwrap();
-        let mut config = client(server, tmp.path(), "cache");
-        config.encryption.mode = crate::config::EncryptionModeConfig::None;
-        config.encryption.passphrase = None;
-        commands::init::run(&config, None).unwrap();
         Self {
             tmp,
             source,
@@ -1130,124 +1126,57 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     backup_single_source(&cold, &c.source, "src", "s4");
 }
 
-/// Every file under `packs/` on the server, made `age` old by its mtime.
-fn age_server_packs(server: &Server, age: std::time::Duration) -> Vec<PathBuf> {
-    let mut packs = Vec::new();
-    for shard in std::fs::read_dir(server.data.path().join("packs")).unwrap() {
-        let shard = shard.unwrap().path();
-        if !shard.is_dir() {
-            continue;
-        }
-        for pack in std::fs::read_dir(&shard).unwrap() {
-            let pack = pack.unwrap().path();
-            std::fs::File::options()
-                .write(true)
-                .open(&pack)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - age)
-                .unwrap();
-            packs.push(pack);
-        }
-    }
-    packs
-}
-
-/// 04 "Crash-recovery journals" on an append-only server: a backup that
-/// uploaded its packs and wrote its journal ends without committing; seven
-/// hours later its journal is too old to adopt, so the next backup of the
-/// same plaintext tree seals the same packs again and the server refuses
-/// their PUTs (the keys exist). The stored packs have the sealed size, so
-/// the backup uses them and commits, and the snapshot restores. When a
-/// stored pack has another size, the refusal stays the backup's error.
-/// Only plaintext packs repeat their bytes.
-// Plaintext-only: 10-single-protocol step 3 removes this.
+/// A pack PUT whose reply is lost on an append-only server (04
+/// "Crash-recovery journals"): the server stored the pack, the backend
+/// retries the PUT, and the server refuses the retry (403, the key exists)
+/// before reading its body. The stored pack has the sealed size, so the
+/// backup uses it and commits, and the snapshot restores.
 #[test]
-fn a_pack_the_append_only_server_already_holds_is_used() {
-    for tampered in [false, true] {
-        let server = Server::start(true);
-        let c = Client::init_plaintext(&server);
-        c.write("a", &"alpha ".repeat(4096));
-        let source_paths = vec![c.source.to_string_lossy().into_owned()];
-        let req = commands::backup::BackupRequest {
-            snapshot_name: "s1",
-            passphrase: None,
-            source_paths: &source_paths,
-            source_label: "src",
-            exclude_patterns: &[],
-            exclude_if_present: &[],
-            one_file_system: true,
-            git_ignore: false,
-            xattrs_enabled: false,
-            compression: crate::compress::Compression::None,
-            command_dumps: &[],
-            verbose: false,
-        };
-        let pending = commands::backup::upload(
-            &c.config,
-            &req,
-            &mut None,
-            &CancelToken::new(),
-            None,
-            crate::repo::HostEnv::system(),
-        )
-        .map_err(|(_, e)| e)
-        .unwrap();
-        pending.abandon();
-        let journals: Vec<_> = std::fs::read_dir(server.data.path().join("sessions"))
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".index")
-            })
-            .collect();
-        assert_eq!(journals.len(), 1, "the abandoned backup's journal");
-        let packs = age_server_packs(&server, std::time::Duration::from_secs(7 * 3600));
-        assert!(!packs.is_empty());
-        if tampered {
-            for pack in &packs {
-                let mut bytes = std::fs::read(pack).unwrap();
-                bytes.push(0);
-                std::fs::write(pack, bytes).unwrap();
-            }
-        }
-        server.take_requests();
+fn a_lost_pack_reply_on_an_append_only_server_is_recognised() {
+    let server = Server::start(true);
+    let mut c = Client::init(&server);
+    c.config.repository.retry.retry_delay_ms = 10;
+    c.config.repository.retry.retry_max_delay_ms = 50;
+    c.write("a", &"alpha ".repeat(4096));
+    server.take_requests();
+    server.lose_next_pack_reply.store(true, Ordering::SeqCst);
 
-        let result = try_backup_single_source(&c.config, &c.source, "src", "s2");
-        let refused_packs: Vec<_> = server
-            .take_requests()
-            .into_iter()
-            .filter(|(m, uri, status)| {
-                *m == axum::http::Method::PUT
-                    && request_key(uri).starts_with("packs/")
-                    && *status == 403
-            })
-            .collect();
-        assert!(!refused_packs.is_empty(), "tampered={tampered}");
-        if tampered {
-            let err = result.unwrap_err();
-            assert!(err.to_string().contains("403"), "{err}");
-            continue;
-        }
-        result.unwrap();
-        check_clean(&c.config);
-        let dest = c.tmp.path().join("restore");
-        commands::restore::run(
-            &c.config,
-            pass(&c.config),
-            "s2",
-            dest.to_str().unwrap(),
-            None,
-            false,
-            true,
-            &CancelToken::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(find(&dest, "a")).unwrap(),
-            "alpha ".repeat(4096)
-        );
-    }
+    backup_single_source(&c.config, &c.source, "src", "s1");
+    assert!(!server.lose_next_pack_reply.load(Ordering::SeqCst));
+    let pack_puts: Vec<(String, u16)> = server
+        .take_requests()
+        .into_iter()
+        .filter(|(m, uri, _)| {
+            *m == axum::http::Method::PUT && request_key(uri).starts_with("packs/")
+        })
+        .map(|(_, uri, status)| (request_key(&uri).to_string(), status))
+        .collect();
+    let (lost, _) = pack_puts
+        .iter()
+        .find(|(_, status)| *status == 503)
+        .expect("a pack PUT answered 503");
+    let statuses: Vec<u16> = pack_puts
+        .iter()
+        .filter(|(key, _)| key == lost)
+        .map(|(_, status)| *status)
+        .collect();
+    assert_eq!(statuses, vec![503, 403], "{pack_puts:?}");
+
+    check_clean(&c.config);
+    let dest = c.tmp.path().join("restore");
+    commands::restore::run(
+        &c.config,
+        pass(&c.config),
+        "s1",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(find(&dest, "a")).unwrap(),
+        "alpha ".repeat(4096)
+    );
 }

@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use crate::progress::BackupProgressRenderer;
 use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
 use vykar_core::app::preflight::{self, Availability, UnavailableRepo};
-use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
+use vykar_core::config::{ResolvedRepo, VykarConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_storage::{ParsedUrl, parse_repo_url};
 
@@ -26,11 +26,6 @@ pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) 
     };
 
     let repo_name = label.unwrap_or(&config.repository.url);
-    if config.encryption.mode == EncryptionModeConfig::None {
-        eprintln!(
-            "Warning: repository '{repo_name}' uses REST with plaintext mode (encryption.mode=none)."
-        );
-    }
     if url.starts_with("http://") {
         eprintln!(
             "Warning: repository '{repo_name}' uses non-HTTPS REST URL '{url}'. Transport is not TLS-protected."

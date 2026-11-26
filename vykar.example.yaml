@@ -201,7 +201,7 @@ compression:
 # Encryption defaults to mode: auto.
 #
 # encryption:
-#   mode: auto                     # auto|aes256gcm|chacha20poly1305|none
+#   mode: auto                     # auto|aes256gcm|chacha20poly1305
 #   # passphrase: "inline-secret"
 #   # passcommand: "pass show vykar"
 #   # Shell quoting is supported (executed via sh -c on Unix):

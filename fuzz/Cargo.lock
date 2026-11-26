@@ -2036,7 +2036,6 @@ dependencies = [
 name = "vykar-core"
 version = "0.24.0"
 dependencies = [
- "blake2",
  "blake3",
  "chrono",
  "croner",

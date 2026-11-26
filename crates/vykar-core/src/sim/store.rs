@@ -57,8 +57,8 @@ pub enum StoreKind {
     /// an identical re-PUT of an `index.d/` or `index.h/` key renews its
     /// mtime (and writer), as these backends do: a duplicated plain head
     /// PUT of a lock client makes that head younger, which keeps it from
-    /// the index GC longer, and only a plaintext repository re-creates
-    /// identical object names, which never commits lock-free.
+    /// the index GC longer. With random nonces no client re-creates an
+    /// identical object name.
     ConditionalOverwrite,
 }
 
@@ -86,12 +86,6 @@ pub struct SimConfig {
     /// `batch_delete()` offered (REST/S3-like) instead of None.
     pub batch_delete: bool,
     pub kind: StoreKind,
-    /// The repository the harness initialises on it is encrypted (phase F
-    /// part 10b: the lock-free path exists only there), with a cheap KDF
-    /// and the passphrase [`SIM_PASSPHRASE`]. The default since
-    /// 10-single-protocol step 2; `false` only in the plaintext-only tests
-    /// until step 3 removes plaintext repositories.
-    pub encrypted: bool,
 }
 
 /// The passphrase of every encrypted simulator repository.
@@ -109,7 +103,6 @@ impl Default for SimConfig {
             append_only: false,
             batch_delete: false,
             kind: StoreKind::Plain,
-            encrypted: true,
         }
     }
 }
@@ -556,7 +549,7 @@ impl SimStore {
 
     /// The passphrase of the repository the harness initialised here.
     pub fn passphrase(&self) -> Option<&'static str> {
-        self.shared.config.encrypted.then_some(SIM_PASSPHRASE)
+        Some(SIM_PASSPHRASE)
     }
 
     pub fn register_client(&self, name: &str) -> ClientId {

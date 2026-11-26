@@ -49,10 +49,73 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
 
     let expanded = expand_env_placeholders(&contents, path, &env_overlay)?;
     let raw: ConfigDocument = crate::config::yaml::from_str(&expanded).map_err(|e| {
-        vykar_types::error::VykarError::Config(format!("invalid config '{}': {e}", path.display()))
+        let text = e.to_string();
+        let named = if text.contains(PLAINTEXT_MODE_REFUSAL) {
+            unencrypted_repositories(&expanded)
+        } else {
+            String::new()
+        };
+        vykar_types::error::VykarError::Config(format!(
+            "invalid config '{}': {named}{text}",
+            path.display()
+        ))
     })?;
 
     resolve_document(raw)
+}
+
+/// `"repository 'x': "` for the repositories whose own `encryption.mode`
+/// is `none`, by label or url, read leniently from `yaml`, naming the
+/// top-level section too when it says `none` as well; empty when no
+/// repository entry does (only the top-level mode says it) or the file
+/// cannot be read that way.
+fn unencrypted_repositories(yaml: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        encryption: Option<ProbeEncryption>,
+        #[serde(default)]
+        repositories: Vec<ProbeRepo>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ProbeRepo {
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        encryption: Option<ProbeEncryption>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ProbeEncryption {
+        #[serde(default)]
+        mode: Option<String>,
+    }
+
+    let Ok(probe) = crate::config::yaml::from_str::<Probe>(yaml) else {
+        return String::new();
+    };
+    let says_none = |e: &Option<ProbeEncryption>| {
+        e.as_ref()
+            .is_some_and(|e| e.mode.as_deref() == Some("none"))
+    };
+    let top = if says_none(&probe.encryption) {
+        "the top-level encryption section and "
+    } else {
+        ""
+    };
+    let names: Vec<String> = probe
+        .repositories
+        .into_iter()
+        .filter(|r| says_none(&r.encryption))
+        .filter_map(|r| r.label.or(r.url))
+        .map(|name| format!("'{name}'"))
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => format!("{top}repository {one}: "),
+        _ => format!("{top}repositories {}: ", names.join(", ")),
+    }
 }
 
 pub(super) fn resolve_document(
@@ -306,7 +369,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn test_load_config_empty_repos() {
-        let yaml = "repositories: []\nencryption:\n  mode: none\n";
+        let yaml = "repositories: []\nencryption:\n  mode: aes256gcm\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         fs::write(&path, yaml).unwrap();
@@ -325,7 +388,7 @@ repositories:
   - url: /tmp/repo
     label: main
 encryption:
-  mode: none
+  mode: aes256gcm
 sources:
   - /home/user
 "#;
@@ -337,7 +400,7 @@ sources:
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].label.as_deref(), Some("main"));
         assert_eq!(repos[0].config.repository.url, "/tmp/repo");
-        assert_eq!(repos[0].config.encryption.mode, "none");
+        assert_eq!(repos[0].config.encryption.mode, "aes256gcm");
         assert_eq!(repos[0].sources.len(), 1);
         assert_eq!(repos[0].sources[0].paths, vec!["/home/user"]);
         assert_eq!(repos[0].sources[0].label, "user");
@@ -766,7 +829,7 @@ repositories:
     fn test_missing_repositories_returns_empty_vec() {
         let yaml = r#"
 encryption:
-  mode: none
+  mode: aes256gcm
 "#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -777,6 +840,57 @@ encryption:
             result.is_empty(),
             "expected empty vec when repositories key is missing"
         );
+    }
+
+    fn load_err(yaml: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+        load_and_resolve(&path).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_encryption_mode_none_is_refused() {
+        let err = load_err("repositories:\n  - url: /tmp/repo\nencryption:\n  mode: none\n");
+        assert!(
+            err.contains("no longer supported") && err.contains("new repository"),
+            "{err}"
+        );
+    }
+
+    /// One repository's override saying mode none fails the whole file, and
+    /// the error names that repository.
+    #[test]
+    fn test_encryption_mode_none_on_one_repository_names_it() {
+        let err = load_err(
+            "repositories:\n  - url: /backups/a\n    label: good\n  - url: /backups/b\n    \
+             label: old\n    encryption:\n      mode: none\nencryption:\n  mode: aes256gcm\n",
+        );
+        assert!(err.contains("no longer supported"), "{err}");
+        assert!(err.contains("'old'"), "{err}");
+        assert!(!err.contains("'good'"), "{err}");
+    }
+
+    /// Both the top-level section and one override say mode none: the error
+    /// names both, so one edit does not lead to the same refusal again.
+    #[test]
+    fn test_encryption_mode_none_at_both_levels_names_both() {
+        let err = load_err(
+            "repositories:\n  - url: /backups/a\n    label: good\n  - url: /backups/b\n    \
+             label: old\n    encryption:\n      mode: none\nencryption:\n  mode: none\n",
+        );
+        assert!(err.contains("no longer supported"), "{err}");
+        assert!(
+            err.contains("the top-level encryption section and repository 'old': "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_encryption_mode_keeps_the_serde_error() {
+        let err = load_err("repositories:\n  - url: /tmp/repo\nencryption:\n  mode: rot13\n");
+        assert!(err.contains("unknown variant"), "{err}");
+        assert!(!err.contains("no longer supported"), "{err}");
     }
 
     #[test]

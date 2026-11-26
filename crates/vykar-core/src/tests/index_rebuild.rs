@@ -10,7 +10,7 @@ use crate::commands;
 use crate::commands::check::{
     IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode, RepairPlan, RepairResult,
 };
-use crate::config::{EncryptionModeConfig, VykarConfig};
+use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 use crate::repo::format::ObjectType;
 use crate::repo::index_store::INDEX_OBJECT_DIR;
@@ -33,26 +33,12 @@ struct Fx {
 impl Fx {
     /// A repository with its passphrase in its config.
     fn new() -> Self {
-        Self::with_mode(EncryptionModeConfig::Aes256Gcm)
-    }
-
-    /// A plaintext repository.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    fn plaintext() -> Self {
-        Self::with_mode(EncryptionModeConfig::None)
-    }
-
-    fn with_mode(mode: EncryptionModeConfig) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         let source = tmp.path().join("src");
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::create_dir_all(&source).unwrap();
         let mut config = make_test_config(&repo_dir);
-        if mode == EncryptionModeConfig::None {
-            config.encryption.mode = mode;
-            config.encryption.passphrase = None;
-        }
         commands::init::run(&config, pass(&config)).unwrap();
         config.cache_dir = Some(tmp.path().join("cache").to_string_lossy().into_owned());
         Self {
@@ -605,36 +591,6 @@ fn rebuild_refuses_objects_of_a_newer_vykar() {
             assert_eq!(fx.state(), before, "{newer_map}");
         }
     }
-}
-
-/// Without encryption one flipped byte makes a trailer read as a newer
-/// version. The pack no longer matches its ID, so it is damaged: uncovered,
-/// and the repair goes on.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn rebuild_treats_a_rotted_trailer_version_as_damage() {
-    let mut fx = Fx::plaintext();
-    fx.write("a.bin", &data(1, 200_000));
-    fx.backup("s1");
-    let pack = fx.pack_of_largest();
-    let pack_id = fx.pack_id_of(&pack);
-    edit_pack(&pack, |b, start| b[start + 6] = 2);
-    fx.delete_index();
-
-    let cold = fx.cold("cold");
-    let shown = repair(&cold, false, RepairMode::PlanOnly).unwrap().plan;
-    let (_, counts) = rebuilt(&shown);
-    assert_eq!(counts.uncovered, 1);
-    assert_eq!(shown.uncovered_packs[0].pack_id, pack_id);
-    assert!(
-        shown.uncovered_packs[0]
-            .reason
-            .contains("does not match its ID"),
-        "{:?}",
-        shown.uncovered_packs
-    );
-    let applied = repair(&cold, false, RepairMode::Apply).unwrap();
-    assert_eq!(rebuilt(&applied.plan).1.uncovered, 1);
 }
 
 /// A pack whose trailer is damaged and whose map lacks one indexed entry is

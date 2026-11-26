@@ -81,18 +81,7 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
     }
 }
 
-/// [`make_test_config`] for a plaintext repository (mode none, no
-/// passphrase), for the tests whose subject is plaintext.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-pub fn make_plaintext_config(repo_dir: &Path) -> VykarConfig {
-    let mut config = make_test_config(repo_dir);
-    config.encryption.mode = EncryptionModeConfig::None;
-    config.encryption.passphrase = None;
-    config
-}
-
-/// The passphrase the config's repository opens with (None only for the
-/// plaintext-only tests that set mode none).
+/// The passphrase the config's repository opens with.
 pub fn pass(config: &VykarConfig) -> Option<&str> {
     config.encryption.passphrase.as_deref()
 }

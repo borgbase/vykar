@@ -445,7 +445,6 @@ impl WriteSession {
         self.wait_for_pack_room(&repo.storage, &repo.crypto, incoming)?;
         let cap_wait = cap_start.elapsed();
 
-        let encrypting = repo.crypto.is_encrypting();
         let ws = &mut *self;
         let seal_start = Instant::now();
         let ClosedPack {
@@ -454,8 +453,8 @@ impl WriteSession {
             trailer_len,
             tail,
         } = match pack_type {
-            PackType::Data => ws.data_pack_writer.close(encrypting)?,
-            PackType::Tree => ws.tree_pack_writer.close(encrypting)?,
+            PackType::Data => ws.data_pack_writer.close()?,
+            PackType::Tree => ws.tree_pack_writer.close()?,
         };
         let seal_time = seal_start.elapsed();
         ws.memory.set_open(pack_type, 0);

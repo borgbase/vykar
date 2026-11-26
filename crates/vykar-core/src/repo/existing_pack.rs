@@ -1,14 +1,11 @@
 //! A pack upload an append-only vykar-server refused because the key
 //! exists already (04 "Crash-recovery journals").
 //!
-//! A pack's key is the hash of its bytes, in every repository mode, so an
-//! object stored under it is the same pack. In a plaintext repository pack
-//! bytes are deterministic, so a backup that uploads chunks again (their
-//! journal was too old to adopt, or was never written) can seal the very
-//! pack an interrupted backup left as an orphan. A server in normal mode
-//! replaces it, which renews its mtime. An append-only server refuses the
-//! overwrite (403) before reading the body, and compact does not run there,
-//! so without this every later backup would fail on the same key.
+//! A pack's key is the hash of its bytes, so an object stored under it is
+//! the same pack. A pack PUT whose reply was lost (the server stored it) is
+//! retried by the backend; an append-only vykar-server refuses the retry
+//! (403, the key exists) before reading the body, and without this the
+//! backup would fail on a pack that is stored.
 //!
 //! The refused pack counts as uploaded when the server advertises
 //! append-only mode, the error reads as a write refusal, the key class
@@ -123,8 +120,8 @@ impl ExistingPacks {
         warn!(
             key,
             age_secs = age.map(|a| a.as_secs()),
-            "the append-only server already holds this pack (left by an interrupted backup); \
-             using the stored copy"
+            "the append-only server already holds this pack (an earlier attempt whose reply \
+             was lost); using the stored copy"
         );
         Ok(())
     }

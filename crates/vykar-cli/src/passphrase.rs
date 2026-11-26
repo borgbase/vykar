@@ -8,7 +8,7 @@ use crate::prompt::prompt_hidden;
 use vykar_core::app::passphrase::{
     InitPassphrase, InitPromptStage, resolve_init_passphrase, resolve_passphrase,
 };
-use vykar_core::config::{EncryptionModeConfig, VykarConfig};
+use vykar_core::config::VykarConfig;
 
 /// Process-level passphrase cache keyed by repository URL.
 /// Avoids double interactive prompts when probe-then-dispatch opens the same
@@ -29,12 +29,6 @@ pub(crate) fn get_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
 ) -> CliResult<Option<Zeroizing<String>>> {
-    // Unencrypted repos never have a passphrase — return before touching the
-    // cache so they don't leave a `None` entry keyed by their URL.
-    if config.encryption.mode == EncryptionModeConfig::None {
-        return Ok(None);
-    }
-
     let cache_key = config.repository.url.clone();
 
     // Check cache first (avoids double interactive prompt during probe+dispatch)
@@ -75,10 +69,8 @@ pub(crate) fn get_init_passphrase(
     label: Option<&str>,
 ) -> CliResult<Option<Zeroizing<String>>> {
     // `encryption.passphrase` is first in the resolution order, so its presence
-    // on an encrypted repo means it is the value being used.
-    if config.encryption.mode != EncryptionModeConfig::None
-        && config.encryption.passphrase.is_some()
-    {
+    // means it is the value being used.
+    if config.encryption.passphrase.is_some() {
         tracing::warn!(
             "using plaintext encryption.passphrase from config; prefer encryption.passcommand or VYKAR_PASSPHRASE"
         );
@@ -94,7 +86,6 @@ pub(crate) fn get_init_passphrase(
     })?;
 
     match outcome {
-        InitPassphrase::NotRequired => Ok(None),
         InitPassphrase::Provided(p) => Ok(Some(p)),
         // Unreachable from a terminal: `prompt_hidden` never reports a
         // cancellation (Ctrl-C terminates the process, EOF is an I/O error).
@@ -105,7 +96,7 @@ pub(crate) fn get_init_passphrase(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vykar_core::config::{EncryptionConfig, RepositoryConfig};
+    use vykar_core::config::{EncryptionConfig, EncryptionModeConfig, RepositoryConfig};
 
     fn config(passphrase: &str) -> VykarConfig {
         VykarConfig {

@@ -66,7 +66,7 @@ pub trait CryptoEngine: Send + Sync {
     /// decrypted unauthenticated bytes into it); callers must discard them.
     ///
     /// The default decrypts into a new buffer and copies the plaintext back;
-    /// the AEAD engines and `PlaintextEngine` override it without a copy.
+    /// the AEAD engines override it without a copy.
     ///
     /// # Errors
     ///
@@ -79,10 +79,6 @@ pub trait CryptoEngine: Send + Sync {
         out.copy_from_slice(&plaintext);
         Ok(out)
     }
-
-    /// Whether this engine actually encrypts data.
-    /// `PlaintextEngine` returns false; real ciphers return true.
-    fn is_encrypting(&self) -> bool;
 
     /// The keyed hasher used for computing chunk IDs.
     ///
@@ -255,10 +251,6 @@ macro_rules! impl_aead_engine {
                 Ok((nonce_bytes, tag_bytes))
             }
 
-            fn is_encrypting(&self) -> bool {
-                true
-            }
-
             fn chunk_hasher(&self) -> &::vykar_types::chunk_id::ChunkHasher {
                 &self.chunk_hasher
             }
@@ -272,53 +264,6 @@ pub mod chacha20_poly1305;
 #[doc(hidden)]
 pub mod testing;
 
-/// No-encryption engine. Still computes deterministic chunk IDs.
-pub struct PlaintextEngine {
-    chunk_hasher: ChunkHasher,
-}
-
-impl PlaintextEngine {
-    pub fn new(chunk_hasher: ChunkHasher) -> Self {
-        Self { chunk_hasher }
-    }
-}
-
-impl CryptoEngine for PlaintextEngine {
-    fn encrypt(&self, plaintext: &[u8], _aad: &[u8]) -> Result<Vec<u8>> {
-        Ok(plaintext.to_vec())
-    }
-
-    fn decrypt(&self, data: &[u8], _aad: &[u8]) -> Result<Vec<u8>> {
-        Ok(data.to_vec())
-    }
-
-    fn decrypt_into(&self, data: &[u8], _aad: &[u8], output: &mut Vec<u8>) -> Result<()> {
-        output.clear();
-        output.extend_from_slice(data);
-        Ok(())
-    }
-
-    fn decrypt_in_place<'a>(&self, data: &'a mut [u8], _aad: &[u8]) -> Result<&'a mut [u8]> {
-        Ok(data)
-    }
-
-    fn encrypt_in_place_detached(
-        &self,
-        _buffer: &mut [u8],
-        _aad: &[u8],
-    ) -> Result<([u8; 12], [u8; 16])> {
-        Ok(([0u8; 12], [0u8; 16]))
-    }
-
-    fn is_encrypting(&self) -> bool {
-        false
-    }
-
-    fn chunk_hasher(&self) -> &ChunkHasher {
-        &self.chunk_hasher
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,54 +272,6 @@ mod tests {
 
     fn hasher(key: [u8; 32]) -> ChunkHasher {
         ChunkHasher::new(HashAlgorithm::Blake2b, key)
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_encrypt_is_identity() {
-        let engine = PlaintextEngine::new(hasher([0xAA; 32]));
-        let data = b"hello plaintext";
-        let encrypted = engine.encrypt(data, b"aad").unwrap();
-        assert_eq!(encrypted, data);
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_decrypt_is_identity() {
-        let engine = PlaintextEngine::new(hasher([0xAA; 32]));
-        let data = b"hello plaintext";
-        let decrypted = engine.decrypt(data, b"aad").unwrap();
-        assert_eq!(decrypted, data);
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_chunk_hasher_round_trips() {
-        let key = [0xBB; 32];
-        let engine = PlaintextEngine::new(hasher(key));
-        assert_eq!(engine.chunk_hasher().key(), &key);
-        assert_eq!(engine.chunk_hasher().algorithm(), HashAlgorithm::Blake2b);
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_roundtrip_ignores_aad() {
-        let engine = PlaintextEngine::new(hasher([0xCC; 32]));
-        let data = b"test data";
-        let encrypted = engine.encrypt(data, b"aad1").unwrap();
-        let decrypted = engine.decrypt(&encrypted, b"different_aad").unwrap();
-        assert_eq!(decrypted, data);
-    }
-
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_decrypt_in_place_is_identity() {
-        let engine = PlaintextEngine::new(hasher([0xCC; 32]));
-        let mut data = b"test data".to_vec();
-        let ptr = data.as_ptr();
-        let out = engine.decrypt_in_place(&mut data, b"aad").unwrap();
-        assert_eq!(out, b"test data");
-        assert_eq!(out.as_ptr(), ptr);
     }
 
     /// An engine that relies on the trait's default `decrypt_in_place`.
@@ -393,9 +290,6 @@ mod tests {
             aad: &[u8],
         ) -> Result<([u8; 12], [u8; 16])> {
             self.0.encrypt_in_place_detached(buffer, aad)
-        }
-        fn is_encrypting(&self) -> bool {
-            true
         }
         fn chunk_hasher(&self) -> &ChunkHasher {
             self.0.chunk_hasher()

@@ -24,12 +24,8 @@
 //! backup segment is younger than [`T_PACK`], compact's sweep leaves the
 //! entries it adds and no fold writes it into a base. Unknown is young: an
 //! object the listing lacks, one listed without an mtime, or no "now".
-//! Caveat (plaintext repositories only): an identical re-PUT of an
-//! `index.d/` key keeps the first PUT's mtime on vykar-server (and in the
-//! simulator's store) and renews it on S3, local and SFTP; a backup segment
-//! whose bytes equal an older unnamed object then reads as old as that
-//! object. Encrypted segments get a fresh nonce, so a new segment always
-//! has a new name and a new mtime.
+//! Every segment gets a fresh nonce, so a new segment always has a new name
+//! and a new mtime.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

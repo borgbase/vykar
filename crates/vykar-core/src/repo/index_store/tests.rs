@@ -1898,18 +1898,16 @@ fn classify_head_tells_damage_from_newer_heads() {
         let half = packed[..packed.len() / 2].to_vec();
         let mut damaged_cases = vec![vec![0u8; 10], flipped, nil, half];
         // A head under v4/v5's context does not authenticate under
-        // index.h's (a plaintext repository authenticates nothing).
-        if c.is_encrypting() {
-            damaged_cases.push(
-                pack_object_with_context(
-                    ObjectType::IndexHead,
-                    b"index",
-                    &initial.encode().unwrap(),
-                    c,
-                )
-                .unwrap(),
-            );
-        }
+        // index.h's.
+        damaged_cases.push(
+            pack_object_with_context(
+                ObjectType::IndexHead,
+                b"index",
+                &initial.encode().unwrap(),
+                c,
+            )
+            .unwrap(),
+        );
         for damaged in damaged_cases {
             assert!(
                 matches!(classify_head(1, &damaged, c), StoredHead::Unreadable(_)),

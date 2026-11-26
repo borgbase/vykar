@@ -143,8 +143,8 @@ pub(crate) struct BlobReader<'a> {
 }
 
 impl<'a> BlobReader<'a> {
-    /// `verify` checks every chunk ID; without it only a non-encrypting engine
-    /// does (see [`decode_chunk_into`]).
+    /// `verify` checks every chunk ID; without it the AEAD alone
+    /// authenticates each blob (see [`decode_chunk_into`]).
     pub(crate) fn new(
         storage: &'a dyn StorageBackend,
         crypto: &'a dyn CryptoEngine,
@@ -553,49 +553,44 @@ mod tests {
 
     #[test]
     fn raw_sink_sees_stored_bytes_of_decoded_blobs_only() {
-        let aes = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
-        let engines: [&dyn CryptoEngine; 1] = [&aes];
-        for crypto in engines {
-            let payloads = payloads(3);
-            let (mut data, blobs) = pack(crypto, &payloads);
-            let mid = &blobs[1];
-            // The middle blob's last byte: the AEAD tag.
-            data[(mid.offset + u64::from(mid.size) - 1) as usize] ^= 0x01;
-            let storage = store(&data);
-            let stored = |b: &Blob| data[b.offset as usize..][..b.size as usize].to_vec();
+        let crypto = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let payloads = payloads(3);
+        let (mut data, blobs) = pack(&crypto, &payloads);
+        let mid = &blobs[1];
+        // The middle blob's last byte: the AEAD tag.
+        data[(mid.offset + u64::from(mid.size) - 1) as usize] ^= 0x01;
+        let storage = store(&data);
+        let stored = |b: &Blob| data[b.offset as usize..][..b.size as usize].to_vec();
 
-            let sunk = std::sync::Mutex::new(Vec::new());
-            let sink = |id: &ChunkId, raw: &[u8]| sunk.lock().unwrap().push((*id, raw.to_vec()));
-            let mut visited = 0;
-            let (start, len) = span(&blobs);
-            let end = BlobReader::new(&storage, crypto, false)
-                .with_raw_sink(&sink)
-                .read_range(
-                    &pack_id(),
-                    start,
-                    len,
-                    &blobs,
-                    &mut ReadBuffers::default(),
-                    || false,
-                    |_, _| {
-                        visited += 1;
-                        Ok::<(), ()>(())
-                    },
-                )
-                .unwrap();
-            let enc = crypto.is_encrypting();
-            assert!(matches!(end, GroupEnd::Done), "encrypting={enc}: {end:?}");
-            assert_eq!(visited, 3);
-            let sunk = sunk.into_inner().unwrap();
-            assert_eq!(
-                sunk,
-                vec![
-                    (blobs[0].id, stored(&blobs[0])),
-                    (blobs[2].id, stored(&blobs[2]))
-                ],
-                "encrypting={enc}"
-            );
-        }
+        let sunk = std::sync::Mutex::new(Vec::new());
+        let sink = |id: &ChunkId, raw: &[u8]| sunk.lock().unwrap().push((*id, raw.to_vec()));
+        let mut visited = 0;
+        let (start, len) = span(&blobs);
+        let end = BlobReader::new(&storage, &crypto, false)
+            .with_raw_sink(&sink)
+            .read_range(
+                &pack_id(),
+                start,
+                len,
+                &blobs,
+                &mut ReadBuffers::default(),
+                || false,
+                |_, _| {
+                    visited += 1;
+                    Ok::<(), ()>(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(end, GroupEnd::Done), "{end:?}");
+        assert_eq!(visited, 3);
+        let sunk = sunk.into_inner().unwrap();
+        assert_eq!(
+            sunk,
+            vec![
+                (blobs[0].id, stored(&blobs[0])),
+                (blobs[2].id, stored(&blobs[2]))
+            ]
+        );
     }
 
     #[test]

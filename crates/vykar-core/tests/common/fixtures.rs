@@ -53,8 +53,9 @@ impl Fixture {
         // The fixture's own passphrase is passed explicitly (`passphrase()`).
         config.encryption.passphrase = None;
         config.encryption.mode = match self.mode.as_str() {
-            // Plaintext-only: 10-single-protocol step 3 moves the "none" fixtures.
-            "none" => EncryptionModeConfig::None,
+            // The client's mode does not matter for an existing repository:
+            // a "none" fixture's own config is refused.
+            "none" => EncryptionModeConfig::Auto,
             "aes256gcm" => EncryptionModeConfig::Aes256Gcm,
             "chacha20poly1305" => EncryptionModeConfig::Chacha20Poly1305,
             other => panic!("unknown fixture encryption mode {other}"),
@@ -64,7 +65,6 @@ impl Fixture {
 
     pub fn expected_encryption(&self) -> EncryptionMode {
         match self.mode.as_str() {
-            // Plaintext-only: 10-single-protocol step 3 moves the "none" fixtures.
             "none" => EncryptionMode::None,
             "aes256gcm" => EncryptionMode::Aes256Gcm,
             "chacha20poly1305" => EncryptionMode::Chacha20Poly1305,

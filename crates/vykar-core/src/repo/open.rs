@@ -17,50 +17,10 @@ use super::{
 };
 use crate::index::LiveIndex;
 use crate::index::head::IndexHead;
+use vykar_crypto::CryptoEngine;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
-use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
-use vykar_types::hash::HashAlgorithm;
-
-/// Domain-separation context for the format-v3 plaintext chunk-ID key.
-///
-/// `derive_key` rather than `blake3::hash`: it is a distinct BLAKE3 mode with
-/// its own flag bits, so this key lives in a different domain from the chunk
-/// digests (keyed mode) and the pack digests (unkeyed mode) instead of sharing
-/// one with `blake3::hash`.
-const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
-    "vykar 2026-01-01 plaintext repository chunk-id key v1";
-
-/// Derive the deterministic chunk-ID key for a plaintext repository.
-///
-/// **Format-dependent, and the only auxiliary hash that is.** This value *is*
-/// the chunk-ID key, so a v2 repository must reproduce it byte-identically or
-/// lose its entire dedup index.
-///
-/// The key is not secret: `repo_id` is stored unencrypted in the repository
-/// `config`. It exists so plaintext repositories use the same keyed hashing
-/// path as encrypted ones, which buys corruption detection, not tamper
-/// resistance.
-pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
-    // Follows the chunk hash, not the version: a v2 repository keeps its key
-    // as v6 with BLAKE2b.
-    match format.chunk_hash() {
-        // Frozen: RustCrypto BLAKE2b-256, exactly as v2 repositories were
-        // written. Do not "modernise" this to blake2b_simd without checking
-        // it byte-for-byte. `Blake2b256` sets the same digest length in the
-        // BLAKE2b parameter block as the `Blake2bVar::new(32)` this replaced,
-        // so the output is unchanged; `v2_fixture_compat` is the guard.
-        HashAlgorithm::Blake2b => {
-            use blake2::{Blake2b256, Digest};
-            let mut hasher = Blake2b256::new();
-            hasher.update(repo_id);
-            hasher.finalize().into()
-        }
-        HashAlgorithm::Blake3 => blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, repo_id),
-    }
-}
 
 /// Best-effort repository label for the capability-probe error message.
 fn storage_label(init_opts: Option<&InitOptions>) -> String {
@@ -145,6 +105,9 @@ impl Repo {
         cache_dir: Option<PathBuf>,
         format: RepoFormat,
     ) -> Result<Self> {
+        if encryption == EncryptionMode::None {
+            return Err(VykarError::Config(super::PLAINTEXT_MODE_REFUSAL.into()));
+        }
         if format.is_upgrade_only() {
             return Err(VykarError::Config(format!(
                 "format v{} repositories can no longer be created",
@@ -195,24 +158,12 @@ impl Repo {
         );
 
         // Generate master key and crypto engine
-        let (crypto, encrypted_key): (Arc<dyn CryptoEngine>, Option<EncryptedKey>) =
-            match &encryption {
-                EncryptionMode::None => {
-                    let chunk_hasher = ChunkHasher::new(
-                        format.chunk_hash(),
-                        derive_plaintext_chunk_id_key(&repo_config.id, format),
-                    );
-                    (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
-                }
-                mode => {
-                    let master_key = MasterKey::generate()?;
-                    let pass = passphrase.ok_or_else(|| {
-                        VykarError::Config("passphrase required for encrypted repository".into())
-                    })?;
-                    let enc_key = wrap_master_key(&master_key, pass)?;
-                    (key::build_engine(mode, format, &master_key)?, Some(enc_key))
-                }
-            };
+        let master_key = MasterKey::generate()?;
+        let pass = passphrase.ok_or_else(|| {
+            VykarError::Config("passphrase required for encrypted repository".into())
+        })?;
+        let enc_key = wrap_master_key(&master_key, pass)?;
+        let crypto: Arc<dyn CryptoEngine> = key::build_engine(&encryption, format, &master_key)?;
 
         // Pre-flight: refuse to create a repository the server cannot serve.
         //
@@ -271,22 +222,18 @@ impl Repo {
         let config_data = repo_config.encode()?;
         storage.put("config", &config_data)?;
 
-        // Store encrypted key if applicable, in two copies.
+        // Store the encrypted key, in two copies.
         //
         // The same serialized bytes go to both keys, deliberately: a second
         // `to_encrypted` call would produce a different salt and nonce, and
         // comparing the two copies byte-for-byte is what makes corruption
         // distinguishable from a wrong passphrase later.
-        let mut key_blob: Option<Vec<u8>> = None;
-        if let Some(enc_key) = &encrypted_key {
-            if !server_did_init {
-                storage.create_dir("keys/")?;
-            }
-            let key_data = rmp_serde::to_vec(enc_key)?;
-            storage.put(KEY_PRIMARY, &key_data)?;
-            storage.put(KEY_SECONDARY, &key_data)?;
-            key_blob = Some(key_data);
+        if !server_did_init {
+            storage.create_dir("keys/")?;
         }
+        let key_blob = rmp_serde::to_vec(&enc_key)?;
+        storage.put(KEY_PRIMARY, &key_blob)?;
+        storage.put(KEY_SECONDARY, &key_blob)?;
 
         let manifest = Manifest::new();
         let chunk_index = LiveIndex::empty();
@@ -429,12 +376,6 @@ impl Repo {
         }
         let repo_config = decoded.into_repo_config();
 
-        if opts.require_encryption && repo_config.encryption == EncryptionMode::None {
-            return Err(VykarError::PlaintextRepository(
-                opts.repo_url.clone().unwrap_or_default(),
-            ));
-        }
-
         // Tell the backend which upload-integrity header to send. It was
         // constructed before the config could be read, so this is the first
         // moment the algorithm is known.
@@ -443,40 +384,23 @@ impl Repo {
         // Build crypto engine. `key::load_master_key` is the single place the
         // key copies are read, so corroboration, diagnosis and backfill live
         // in exactly one place.
-        let (crypto, key_blob): (Arc<dyn CryptoEngine>, Option<Vec<u8>>) =
-            match &repo_config.encryption {
-                EncryptionMode::None => {
-                    let chunk_hasher = ChunkHasher::new(
-                        format.chunk_hash(),
-                        derive_plaintext_chunk_id_key(&repo_config.id, format),
-                    );
-                    (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
-                }
-                mode => {
-                    let ctx = KeyProofCtx {
-                        repo_config: &repo_config,
-                        format,
-                        // `--trust-repo` waives the pin, so the pin must not be
-                        // consulted at all in that case.
-                        url: if opts.trust_repo {
-                            None
-                        } else {
-                            opts.repo_url.as_deref()
-                        },
-                        cache_dir: cache_dir.as_deref(),
-                    };
-                    let loaded = key::load_master_key(
-                        storage.as_ref(),
-                        passphrase,
-                        &ctx,
-                        !opts.skip_key_backfill,
-                    )?;
-                    (
-                        key::build_engine(mode, format, &loaded.master_key)?,
-                        Some(loaded.blob),
-                    )
-                }
-            };
+        let ctx = KeyProofCtx {
+            repo_config: &repo_config,
+            format,
+            // `--trust-repo` waives the pin, so the pin must not be
+            // consulted at all in that case.
+            url: if opts.trust_repo {
+                None
+            } else {
+                opts.repo_url.as_deref()
+            },
+            cache_dir: cache_dir.as_deref(),
+        };
+        let loaded =
+            key::load_master_key(storage.as_ref(), passphrase, &ctx, !opts.skip_key_backfill)?;
+        let crypto: Arc<dyn CryptoEngine> =
+            key::build_engine(&repo_config.encryption, format, &loaded.master_key)?;
+        let key_blob = loaded.blob;
 
         // Load the file cache from local disk (not from the repo) while the
         // round trips below run. Spawned only now that the crypto engine
@@ -681,31 +605,5 @@ mod tests {
             .unwrap();
         drop(open());
         assert!(!second.exists());
-    }
-
-    /// Pins the plaintext chunk-ID key derivation for both formats, through
-    /// the production helper. This value *is* the dedup identity of every
-    /// unencrypted repository, so changing either digest silently invalidates
-    /// their indexes. Do not regenerate.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn plaintext_key_derivation_known_answers() {
-        let repo_id = [0x11u8; 32];
-        assert_eq!(
-            hex::encode(derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V2)),
-            "d4ffaeeac45aa41825e0bc3f875570af061acbf0b950ad752ff0f9463fe13ad5"
-        );
-        assert_eq!(
-            hex::encode(derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)),
-            "947392f5ba41ab94ef39cc84b74bbb5a0c578bf7841b6b6cf76b17ad4a9e5b67"
-        );
-        assert_eq!(
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6(HashAlgorithm::Blake2b)),
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V2)
-        );
-        assert_eq!(
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6(HashAlgorithm::Blake3)),
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)
-        );
     }
 }

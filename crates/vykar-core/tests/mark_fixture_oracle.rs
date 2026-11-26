@@ -22,8 +22,7 @@ use vykar_types::chunk_id::ChunkId;
 
 use crate::common::fixtures::{self, Fixture};
 
-// Plaintext-only: 10-single-protocol step 3 removes "none".
-const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
+const MODES: &[&str] = &["aes256gcm", "chacha20poly1305"];
 
 /// Every index entry a sequential walk over every snapshot reaches: the
 /// tree chunks and the chunk references of regular files.

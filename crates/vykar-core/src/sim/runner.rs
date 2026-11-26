@@ -307,22 +307,15 @@ impl Sim {
     /// Creates the store, registers client "init" and runs Init as run 0.
     /// The repository is AES-256-GCM with the passphrase [`SIM_PASSPHRASE`]
     /// and a cheap KDF (`repo::with_cheap_kdf`; Init runs inline, on this
-    /// thread), unless `config.encrypted` is false (plaintext-only tests).
+    /// thread).
     pub fn with_config(config: SimConfig) -> Self {
-        let encrypted = config.encrypted;
         let mut sim = Self::from_store(SimStore::new(config));
         let init = sim.client("init");
         sim.run_inline(init, ClientOp::Init, |store, cfg, _, _, _| {
-            let mode = if encrypted {
-                EncryptionMode::Aes256Gcm
-            } else {
-                // Plaintext-only: 10-single-protocol step 3 removes this.
-                EncryptionMode::None
-            };
             let repo = crate::repo::with_cheap_kdf(|| {
                 Repo::init(
                     Box::new(store.handle(init)),
-                    mode,
+                    EncryptionMode::Aes256Gcm,
                     ChunkerParams::default(),
                     cfg.encryption.passphrase.as_deref(),
                     Some(&cfg.repository.init_options()),
@@ -870,19 +863,10 @@ impl Sim {
                 url: self.repo_url.clone(),
                 ..Default::default()
             },
-            encryption: if self.store.config().encrypted {
-                EncryptionConfig {
-                    mode: EncryptionModeConfig::Aes256Gcm,
-                    passphrase: Some(SIM_PASSPHRASE.to_string()),
-                    passcommand: None,
-                }
-            } else {
-                // Plaintext-only: 10-single-protocol step 3 removes this.
-                EncryptionConfig {
-                    mode: EncryptionModeConfig::None,
-                    passphrase: None,
-                    passcommand: None,
-                }
+            encryption: EncryptionConfig {
+                mode: EncryptionModeConfig::Aes256Gcm,
+                passphrase: Some(SIM_PASSPHRASE.to_string()),
+                passcommand: None,
             },
             cache_dir: Some(
                 self.client_dir(c)

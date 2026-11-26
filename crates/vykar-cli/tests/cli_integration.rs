@@ -324,16 +324,6 @@ fn write_test_config(config_path: &Path, repo_dir: &Path) {
     std::fs::write(config_path, config).unwrap();
 }
 
-/// [`write_test_config`] for a plaintext repository.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-fn write_plaintext_config(config_path: &Path, repo_dir: &Path) {
-    let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\n",
-        yaml_quote_path(repo_dir)
-    );
-    std::fs::write(config_path, config).unwrap();
-}
-
 fn write_sources_config(
     config_path: &Path,
     repo_dir: &Path,
@@ -927,56 +917,6 @@ fn cli_check_verify_data_detects_tampered_pack() {
     let (stdout_err, _stderr_err) = fx.run_err(&["--config", &cfg, "check", "--verify-data"]);
     assert!(stdout_err.contains("Errors found:"));
     assert!(stdout_err.contains("missing from storage"));
-}
-
-/// Plaintext repos verify chunk IDs on every read, so a same-length bit flip in
-/// a pack fails `restore` even without `--verify`.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn cli_restore_detects_flipped_byte_in_plaintext_pack() {
-    let fx = CliFixture::new();
-    let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\ncompression:\n  algorithm: none\nsources: []\n",
-        yaml_quote_path(&fx.repo_dir)
-    );
-    std::fs::write(&fx.config_path, config).unwrap();
-    let content = b"plaintext-pack-corruption-marker-0123456789abcdef\n";
-    std::fs::write(fx.source_a.join("flip.txt"), content).unwrap();
-
-    let cfg = fx.config_path.to_string_lossy().to_string();
-    let source = fx.source_a.to_string_lossy().to_string();
-    let restore = fx._tmp.path().join("restore-flip");
-    let restore_str = restore.to_string_lossy().to_string();
-
-    fx.run_ok(&["--config", &cfg, "init"]);
-    fx.run_ok(&["--config", &cfg, "backup", &source]);
-
-    let pack_path = std::fs::read_dir(fx.repo_dir.join("packs"))
-        .unwrap()
-        .flatten()
-        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
-        .map(|e| e.path())
-        .find(|p| {
-            std::fs::read(p)
-                .unwrap()
-                .windows(content.len())
-                .any(|w| w == content)
-        })
-        .expect("uncompressed plaintext content must appear verbatim in a pack");
-    let mut pack = std::fs::read(&pack_path).unwrap();
-    let pos = pack
-        .windows(content.len())
-        .position(|w| w == content)
-        .unwrap();
-    pack[pos + content.len() / 2] ^= 0x01;
-    std::fs::write(&pack_path, pack).unwrap();
-
-    let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "restore", "latest", &restore_str]);
-    assert!(
-        stderr.contains("hash mismatch"),
-        "expected hash mismatch diagnostic, got:\n{stderr}"
-    );
-    assert!(!restore.join("flip.txt").exists());
 }
 
 /// Strict restore of a damaged repo exits 1 with a hint; `--continue-on-error`
@@ -1604,7 +1544,7 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
 #[test]
 fn cli_empty_config_exits_with_error() {
     let fx = CliFixture::new();
-    let yaml = "encryption:\n  mode: none\n";
+    let yaml = "encryption:\n  mode: aes256gcm\n";
     std::fs::write(&fx.config_path, yaml).unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -2190,7 +2130,7 @@ fn cli_daemon_sighup_empty_repos_rejected() {
     // Overwrite config with empty repositories
     std::fs::write(
         &fx.config_path,
-        "encryption:\n  mode: none\nschedule:\n  enabled: true\n  every: \"1h\"\n",
+        "encryption:\n  mode: aes256gcm\nschedule:\n  enabled: true\n  every: \"1h\"\n",
     )
     .unwrap();
 
@@ -2518,7 +2458,7 @@ fn cli_daemon_trust_repo_rejected() {
 #[test]
 fn cli_daemon_empty_config_startup_rejected() {
     let fx = CliFixture::new();
-    let config = "encryption:\n  mode: none\nschedule:\n  enabled: true\n  every: \"1h\"\n";
+    let config = "encryption:\n  mode: aes256gcm\nschedule:\n  enabled: true\n  every: \"1h\"\n";
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
@@ -3171,16 +3111,21 @@ fn cli_key_export_writes_the_armor_to_stdout() {
     assert!(!err.contains("BEGIN VYKAR REPOSITORY KEY"), "{err}");
 }
 
-// Plaintext-only: 10-single-protocol step 3 removes this.
+/// `encryption.mode: none` is refused while the config is parsed: `init`
+/// fails with the targeted message and writes no repository.
 #[test]
-fn cli_key_export_refuses_an_unencrypted_repository() {
+fn cli_init_refuses_encryption_mode_none() {
     let fx = CliFixture::new();
-    write_plaintext_config(&fx.config_path, &fx.repo_dir);
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir)
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
 
-    let (_out, err) = fx.run_err(&["--config", &cfg, "key", "export"]);
-    assert!(err.contains("unencrypted"), "{err}");
+    let (_out, err) = fx.run_err(&["--config", &cfg, "init"]);
+    assert!(err.contains("no longer supported"), "{err}");
+    assert!(!fx.repo_dir.join("config").exists());
 }
 
 #[test]

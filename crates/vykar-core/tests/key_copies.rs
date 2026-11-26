@@ -467,7 +467,7 @@ fn a_corrupt_copy_does_not_stop_the_open_and_check_reports_it() {
     fx.open().expect("the good copy must carry the open");
 
     let result = commands::check::run(&fx.config, Some(PASS), false, false).unwrap();
-    assert_eq!(result.key_files_checked, Some(2));
+    assert_eq!(result.key_files_checked, 2);
     assert!(
         result
             .errors
@@ -698,26 +698,6 @@ fn dry_run_repair_does_not_backfill_the_missing_copy() {
         fx.secondary().exists(),
         "an ordinary open must still backfill"
     );
-}
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn unencrypted_repositories_skip_the_key_phase() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    let source_dir = tmp.path().join("source");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    std::fs::create_dir_all(&source_dir).unwrap();
-    std::fs::write(source_dir.join("a.txt"), b"plaintext").unwrap();
-
-    let config = crate::common::make_plaintext_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
-    backup_source(&config, &source_dir, "src", "snap1", None, false);
-
-    let result = commands::check::run(&config, None, false, false).unwrap();
-    assert_eq!(result.key_files_checked, None);
-    assert!(!repo_dir.join("keys").join("repokey").exists());
-    assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,7 +1144,7 @@ fn check_reports_an_unreadable_copy_without_promising_a_rewrite() {
     make_unreadable_via_fs(&fx.secondary());
 
     let result = commands::check::run(&fx.config, Some(PASS), false, false).unwrap();
-    assert_eq!(result.key_files_checked, Some(1));
+    assert_eq!(result.key_files_checked, 1);
     let issue = result
         .errors
         .iter()

@@ -255,66 +255,6 @@ fn client_repack_records_the_output_trailer_length() {
     assert!(seg.pack_trailers.contains(&(pack, 4 + blob_len)), "{seg:?}");
 }
 
-/// A repack's output with the ID of a pack the listing showed as an orphan
-/// (the same blobs repacked by an earlier, interrupted run) is live once the
-/// repack has written it: the compact that wrote it does not delete it.
-/// Only a plaintext trailer repeats its bytes, so only there can a repack
-/// reproduce an orphan's ID.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn compact_keeps_an_orphan_its_repack_rewrote() {
-    let (mut repo, _) = crate::testutil::plaintext_repo_with_session();
-    let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.unchecked_writer().chunk_index_mut().remove(&id_a);
-    repo.unchecked_writer().save_state().unwrap();
-
-    // PUT the pack the repack of the source will write, as an orphan.
-    let src = repo.chunk_index().get(&id_b).unwrap();
-    let blob = repo
-        .storage()
-        .get_range(
-            &src.pack_id.storage_key(),
-            src.pack_offset,
-            u64::from(src.stored_size),
-        )
-        .unwrap()
-        .unwrap();
-    let mut writer = crate::repo::pack::PackWriter::new_repack(
-        repo.config().min_pack_size as usize,
-        repo.content_hash(),
-    );
-    writer.add_blob(id_b, blob).unwrap();
-    let (orphan, _) = writer
-        .flush(repo.storage().as_ref(), repo.crypto().as_ref())
-        .unwrap();
-    assert_ne!(orphan, src.pack_id);
-    let key = orphan.storage_key();
-    assert!(repo.storage().exists(&key).unwrap());
-
-    let stats = compact_repo_without_mark(
-        &mut repo.unchecked_writer(),
-        1.0,
-        None,
-        false,
-        4,
-        &CancelToken::new(),
-    )
-    .unwrap();
-    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
-    assert_eq!(stats.packs_orphan, 1, "{stats:?}");
-
-    assert_eq!(repo.chunk_index().get(&id_b).unwrap().pack_id, orphan);
-    assert!(
-        repo.storage().exists(&key).unwrap(),
-        "the repack output was deleted"
-    );
-    assert!(!repo.storage().exists(&src.pack_id.storage_key()).unwrap());
-    assert_eq!(
-        repo.read_chunk(&id_b).unwrap(),
-        b"chunk-b-data-for-compact-test"
-    );
-}
-
 #[test]
 fn compact_after_delete_repacks() {
     let mut repo = test_repo();

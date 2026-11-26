@@ -20,9 +20,7 @@ use crate::repo::lock;
 use crate::repo::machine::{Machine, StepKind};
 use crate::repo::machine::{StepCx, drive_blocking};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{
-    BackupCommit, CommitMode, Committed, EncryptionMode, Fence, HostEnv, Repo, WriteSession,
-};
+use crate::repo::{BackupCommit, CommitMode, Committed, Fence, HostEnv, Repo, WriteSession};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_common::display::{format_bytes, format_count};
 use vykar_storage::StorageBackend;
@@ -535,12 +533,6 @@ impl PendingCommit {
         Ok(CommitMode::Lock)
     }
 
-    /// Whether lock holders run the marker handshake's yield here: only an
-    /// encrypted repository can have lock-free writers.
-    fn yields_to_flagged(&self) -> bool {
-        self.repo.config().encryption != EncryptionMode::None
-    }
-
     /// Production, lock mode: wait for the commit lock
     /// (`COMMIT_LOCK_MAX_WAIT`, with backoff), reporting "waiting for commit
     /// lock" once contended. On an encrypted repository a confirmed lock is
@@ -559,7 +551,7 @@ impl PendingCommit {
             500,
             cancel,
             &self.session.id,
-            self.yields_to_flagged(),
+            true,
             |_| {
                 emit_progress(
                     progress,
@@ -582,13 +574,7 @@ impl PendingCommit {
         let storage = self.repo.storage().as_ref();
         let env = self.repo.host_env();
         let guard = lock::acquire_lock_reading(storage, env, store_clock)?;
-        lock::commit_lock_yield(
-            storage,
-            env,
-            guard,
-            &self.session.id,
-            self.yields_to_flagged(),
-        )
+        lock::commit_lock_yield(storage, env, guard, &self.session.id, true)
     }
 
     /// Production, lock-free (04 step 9): mark the session marker

@@ -100,10 +100,6 @@ impl CryptoEngine for DeterministicEngine {
         Ok((nonce, tag_bytes))
     }
 
-    fn is_encrypting(&self) -> bool {
-        true
-    }
-
     fn chunk_hasher(&self) -> &ChunkHasher {
         self.open.chunk_hasher()
     }

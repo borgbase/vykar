@@ -14,8 +14,7 @@ use std::path::PathBuf;
 use crate::config::VykarConfig;
 use crate::repo::identity::{self, KeyProof};
 use crate::repo::{
-    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, KeyCopyState, RepoConfig, RepoFormat,
-    select_repository_key,
+    KEY_PRIMARY, KEY_SECONDARY, KeyCopyState, RepoConfig, RepoFormat, select_repository_key,
 };
 use crate::{limits, storage};
 use vykar_crypto::key::MasterKey;
@@ -80,8 +79,8 @@ impl ImportReport {
     }
 }
 
-/// Open raw storage and read the repository `config`, refusing unencrypted
-/// repositories up front — they have no key to export or import.
+/// Open raw storage and read the repository `config`; `validate` refuses
+/// an unencrypted repository up front, before any key is read.
 fn open_raw(config: &VykarConfig) -> Result<(Box<dyn StorageBackend>, RepoConfig, RepoFormat)> {
     let backend =
         storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
@@ -92,11 +91,6 @@ fn open_raw(config: &VykarConfig) -> Result<(Box<dyn StorageBackend>, RepoConfig
     let decoded = RepoConfig::decode(&data)?;
     let format = decoded.validate()?;
     let repo_config = decoded.into_repo_config();
-    if repo_config.encryption == EncryptionMode::None {
-        return Err(VykarError::Config(
-            "this repository is unencrypted (mode: none), so it has no repository key".into(),
-        ));
-    }
     Ok((backend, repo_config, format))
 }
 
@@ -137,7 +131,7 @@ fn require_passphrase<'a>(passphrase: Option<&'a str>, what: &str) -> Result<&'a
 /// # Errors
 ///
 /// Anything `Repo::open` would refuse the key for, plus a missing
-/// passphrase, an unencrypted repository, or an identity mismatch.
+/// passphrase, or an identity mismatch.
 pub fn export(config: &VykarConfig, passphrase: Option<&str>) -> Result<ExportedKey> {
     let (backend, repo_config, format) = open_raw(config)?;
     let passphrase = require_passphrase(passphrase, "export")?;

@@ -2179,12 +2179,13 @@ fn compact_dry_run_counts_young_entries() {
     );
 }
 
-/// D14, documented: on a plaintext repository an identical re-PUT of an
-/// `index.d/` key keeps its first mtime in the simulator's store (as on
-/// vykar-server), so a segment whose bytes repeat an older unnamed object
-/// reads as old as that object. Part 9 owns this (forward note 3).
+/// D14, documented: an identical re-PUT of an `index.d/` key keeps its
+/// first mtime in the simulator's store (as on vykar-server), so an object
+/// whose bytes repeat an older unnamed object reads as old as that object.
+/// With random nonces no client writes such a segment. Part 9 owns this
+/// (forward note 3).
 #[test]
-fn a_plaintext_segment_that_repeats_an_old_object_reads_old() {
+fn a_segment_that_repeats_an_old_object_reads_old() {
     use crate::index::head::ObjectName;
     use crate::repo::ages::{SegmentAges, T_PACK};
     use vykar_storage::StorageBackend;
@@ -2237,37 +2238,27 @@ fn a_store_clock_step_ages_every_object() {
     let _ = sim.join(sa);
 }
 
-/// A young malformed marker gives compact no horizon: compact runs but
-/// deletes no orphan pack, not even one older than T_pack (a crashed
-/// backup's); once 45 min old by its mtime it is reaped and the next
-/// compact deletes the orphans. Invariant 9 no longer skips it. Compact
-/// under the lock without the marker handshake, which refuses beside a
-/// malformed marker (fail closed): a plaintext repository.
-// Plaintext only to reach lock mode here: 10-single-protocol step 3 moves
-// this to an encrypted repository on a store without put-if-absent, or
-// deletes it with a reason.
+/// A young malformed marker makes compact under the lock yield: the lock
+/// holder's half of the marker handshake counts it as flagged (fail
+/// closed), so compact is refused `Locked` and deletes no orphan pack, not
+/// even one older than T_pack (a crashed backup's). Once 45 min old by its
+/// mtime it is reaped and the next compact deletes the orphans. Invariant 9
+/// no longer skips it. Lock mode: the default store offers no
+/// put-if-absent.
 #[test]
 fn malformed_marker_ages_out() {
-    let mut sim = Sim::with_config(crate::sim::SimConfig {
-        encrypted: false,
-        ..crate::sim::SimConfig::default()
-    });
+    let mut sim = Sim::new();
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     let (_marker, packs) = crash_backup_after_upload(&mut sim, a, &tree("x1"));
     sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
     sim.tamper_put("sessions/x.json", b"{");
     let r = sim.compact(c);
-    r.expect_ok();
-    assert!(
-        compact_stat(r.detail(), "live") >= packs.len() as u64,
-        "{}",
-        r.detail()
-    );
+    assert!(allowed_as(&r, AllowedError::Locked), "{}", r.detail());
     for k in &packs {
         assert!(
             sim.store().object(k).is_some(),
-            "{k} deleted without a horizon"
+            "{k} deleted beside a young malformed marker"
         );
     }
     sim.advance(Duration::from_secs(46 * 60));

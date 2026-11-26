@@ -48,7 +48,7 @@ struct Fixture {
 impl Fixture {
     /// Back up `files` (name, seed) from a fresh source dir. `extra` runs on
     /// the source dir before the backup (e.g. to add hard links).
-    fn new(encrypted: bool, files: &[(&str, u64)], extra: impl FnOnce(&Path)) -> Self {
+    fn new(files: &[(&str, u64)], extra: impl FnOnce(&Path)) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         let src_dir = tmp.path().join("src");
@@ -59,13 +59,9 @@ impl Fixture {
         }
         extra(&src_dir);
 
-        let (config, passphrase) = if encrypted {
-            let mut config = make_test_config(&repo_dir);
-            config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
-            (config, Some(PASS))
-        } else {
-            (crate::common::make_plaintext_config(&repo_dir), None)
-        };
+        let mut config = make_test_config(&repo_dir);
+        config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
+        let passphrase = Some(PASS);
         vykar_core::testing::with_cheap_kdf(|| commands::init::run(&config, passphrase)).unwrap();
         backup_source(&config, &src_dir, "src", "snap", passphrase, false);
         let dest = tmp.path().join("restore");
@@ -176,8 +172,9 @@ fn damaged_paths(stats: &RestoreStats) -> Vec<PathBuf> {
 
 const FILES: &[(&str, u64)] = &[("a.bin", 1), ("b.bin", 2), ("c.bin", 3)];
 
-fn corrupt_chunk_restores_the_rest(encrypted: bool) {
-    let fx = Fixture::new(encrypted, FILES, |_| {});
+#[test]
+fn corrupt_chunk_restores_the_rest() {
+    let fx = Fixture::new(FILES, |_| {});
     let (b_rel, b_chunk) = fx.file_chunk("b.bin");
     fx.flip_byte_in_chunk(&b_chunk);
 
@@ -193,22 +190,11 @@ fn corrupt_chunk_restores_the_rest(encrypted: bool) {
     fx.assert_no_staging();
 }
 
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_corrupt_chunk_restores_the_rest() {
-    corrupt_chunk_restores_the_rest(false);
-}
-
-#[test]
-fn encrypted_corrupt_chunk_restores_the_rest() {
-    corrupt_chunk_restores_the_rest(true);
-}
-
 /// Progress never counts the damaged file, but its bytes written before the
 /// damage was found stay in `Written.bytes`, which never decreases.
 #[test]
 fn progress_skips_the_damaged_file() {
-    let fx = Fixture::new(true, FILES, |_| {});
+    let fx = Fixture::new(FILES, |_| {});
     let (_, b_chunk) = fx.file_chunk("b.bin");
     fx.flip_byte_in_chunk(&b_chunk);
 
@@ -249,7 +235,7 @@ fn progress_skips_the_damaged_file() {
 
 #[test]
 fn deleted_pack_damages_every_file_in_it() {
-    let fx = Fixture::new(true, FILES, |_| {});
+    let fx = Fixture::new(FILES, |_| {});
     let (a_rel, a_chunk) = fx.file_chunk("a.bin");
     let pack = {
         let repo = open_local_repo(&fx.repo_dir, fx.passphrase);
@@ -269,7 +255,7 @@ fn deleted_pack_damages_every_file_in_it() {
 
 #[test]
 fn chunk_missing_from_index_is_damage() {
-    let fx = Fixture::new(true, FILES, |_| {});
+    let fx = Fixture::new(FILES, |_| {});
     let (b_rel, b_chunk) = fx.file_chunk("b.bin");
     {
         let mut repo = open_local_repo(&fx.repo_dir, fx.passphrase);
@@ -300,7 +286,7 @@ fn chunk_missing_from_index_is_damage() {
 #[cfg(unix)]
 #[test]
 fn damaged_hardlink_representative_drops_the_whole_group() {
-    let fx = Fixture::new(true, &[("h1.bin", 7), ("ok.bin", 8)], |src| {
+    let fx = Fixture::new(&[("h1.bin", 7), ("ok.bin", 8)], |src| {
         std::fs::hard_link(src.join("h1.bin"), src.join("h2.bin")).unwrap();
         std::fs::hard_link(src.join("h1.bin"), src.join("h3.bin")).unwrap();
     });
@@ -339,7 +325,7 @@ fn damaged_hardlink_representative_drops_the_whole_group() {
 
 #[test]
 fn strict_mode_wraps_source_failure_and_publishes_nothing() {
-    let fx = Fixture::new(true, FILES, |_| {});
+    let fx = Fixture::new(FILES, |_| {});
     let (_, b_chunk) = fx.file_chunk("b.bin");
     fx.flip_byte_in_chunk(&b_chunk);
 
@@ -369,7 +355,7 @@ fn strict_mode_wraps_source_failure_and_publishes_nothing() {
 /// before any read stays its own error; the worker-phase mapping is unit-tested
 /// as `restore_error_wraps_only_source_failures`.
 fn strict_mode_does_not_wrap_destination_preflight_errors() {
-    let fx = Fixture::new(true, FILES, |_| {});
+    let fx = Fixture::new(FILES, |_| {});
     std::fs::create_dir_all(&fx.dest).unwrap();
     std::fs::write(fx.dest.join("occupied"), b"x").unwrap();
     let err = fx.restore(false).unwrap_err();

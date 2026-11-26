@@ -2396,9 +2396,8 @@ pub fn acquire_lock_with_deadline(
 }
 
 /// [`acquire_lock_with_deadline`] for a backup's commit in lock mode (04
-/// step 9): each attempt, once its lock is confirmed and on an encrypted
-/// repository (`yield_to_flagged`; no flagged marker exists on a
-/// plaintext one), runs the lock holder's half of the marker handshake
+/// step 9): each attempt, once its lock is confirmed and when
+/// `yield_to_flagged` is set, runs the lock holder's half of the marker handshake
 /// ([`yield_to_lock_free_writers`], `own` excluded) and releases the lock
 /// again when a session that may write heads without it is live: that
 /// counts as contention. A failed session listing releases the lock and

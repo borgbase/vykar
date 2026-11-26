@@ -567,7 +567,7 @@ fn check_pass(
 fn skipped_result() -> CheckResult {
     CheckResult {
         snapshots_checked: 0,
-        key_files_checked: None,
+        key_files_checked: 0,
         items_checked: 0,
         chunks_existence_checked: 0,
         packs_existence_checked: 0,

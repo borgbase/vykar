@@ -240,9 +240,8 @@ struct FoldFinish {
 
 impl PublishMachine {
     /// Publish `seg` as the successor of `prev`: as a segment, or with a
-    /// fold. A full fold when there is no `prev`, a full fold was requested
-    /// or the packed segment's name is already named by `prev` (plaintext
-    /// repeat); a fold of the foldable prefix when a fold was requested or
+    /// fold. A full fold when there is no `prev` or a full fold was
+    /// requested; a fold of the foldable prefix when a fold was requested or
     /// the foldable prefix (with the write's own segment, when foldable)
     /// reaches the hard limit, and there is something to fold. Takes
     /// `repo.fold_requested`. See `Repo::publish_index_state` for
@@ -407,26 +406,6 @@ impl PublishMachine {
             return full(None, seg);
         };
         if request == FoldRequest::Full {
-            return full(Some(prev), seg);
-        }
-        // On a plaintext repository the same change from the same state
-        // packs to the same bytes, so its name may already be in the head
-        // (a state the chain returned to); an object is named only once, so
-        // the write folds every segment, young ones too (04 step 7 D7).
-        if let Some(obj) = packed.as_ref()
-            && prev.named_objects().any(|n| n == obj.name)
-        {
-            let backups = prev
-                .segments
-                .iter()
-                .filter(|s| s.kind == SegmentKind::Backup)
-                .count();
-            if backups > 0 && !repo.segment_grace().is_zero() {
-                tracing::info!(
-                    backup_segments = backups,
-                    "an index write repeats an object the head names; folding every segment"
-                );
-            }
             return full(Some(prev), seg);
         }
         let own = match (seg, packed) {
@@ -1083,7 +1062,7 @@ fn fold_head(repo: &mut super::Repo, base: FoldBase, generation: u64) -> Result<
             entries,
         }),
         segments,
-        // The same state written again (plaintext) has the same name; the
+        // A name the previous head holds is not retired (defensive); the
         // kept segments stay live.
         retired: prev
             .as_ref()

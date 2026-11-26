@@ -7,8 +7,7 @@
 //! `dedup_cache::chunk_id_to_u64` already does for the xor filter.
 //!
 //! This is safe here precisely because the digest is keyed: the chunk-ID key is
-//! repository-private (derived from the repository ID even for unencrypted
-//! repositories), so an attacker cannot grind inputs into a single bucket. Do
+//! repository-private (part of the encrypted repository key), so an attacker cannot grind inputs into a single bucket. Do
 //! not reuse this for unkeyed digests such as `PathHash`.
 
 use std::collections::HashMap;

@@ -29,6 +29,33 @@ fn init_creates_required_keys() {
     assert_eq!(repo.index_head().unwrap().generation, 1);
 }
 
+/// Library callers bypass the YAML: `Repo::init` refuses mode none itself,
+/// before any call on the storage.
+#[test]
+fn init_refuses_encryption_none_before_any_io() {
+    let (storage, calls) = crate::testutil::CallLog::new(Box::new(MemoryBackend::new()));
+    let err = Repo::init(
+        Box::new(storage),
+        EncryptionMode::None,
+        ChunkerParams::default(),
+        Some(crate::testing::TEST_PASSPHRASE),
+        None,
+        None,
+    )
+    .err()
+    .expect("mode none is refused");
+    assert!(
+        matches!(&err, vykar_types::error::VykarError::Config(m)
+            if m == crate::config::PLAINTEXT_MODE_REFUSAL),
+        "{err}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "{:?}",
+        calls.lock().unwrap()
+    );
+}
+
 #[test]
 fn init_twice_fails() {
     let storage = Box::new(MemoryBackend::new());
@@ -919,7 +946,7 @@ fn open_rejects_oversized_max_pack_size() {
 // Dynamic pack target scaling tests
 // ---------------------------------------------------------------------------
 
-/// Helper: create a plaintext repo with tiny pack sizes for testing pack flushes.
+/// Helper: create a repo with tiny pack sizes for testing pack flushes.
 fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> (Repo, WriteSession) {
     use crate::repo::InitOptions;
 

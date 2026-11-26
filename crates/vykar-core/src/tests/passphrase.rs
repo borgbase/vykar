@@ -42,30 +42,6 @@ fn print_script(text: &str) -> String {
     format!("Write-Output \"{text}\"")
 }
 
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn resolve_passphrase_returns_none_when_encryption_mode_is_none() {
-    let _lock = CWD_LOCK.lock().unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = config_without_passphrase(&repo_dir);
-    config.encryption.mode = EncryptionModeConfig::None;
-    config.encryption.passcommand = Some(print_script("cmd-pass"));
-    set_vykar_passphrase(Some("env-pass"));
-
-    let mut prompted = false;
-    let pass = resolve_passphrase(&config, Some("repo-a"), |_prompt| {
-        prompted = true;
-        Ok(Some(Zeroizing::new("prompt-pass".into())))
-    })
-    .unwrap();
-
-    assert!(pass.is_none());
-    assert!(!prompted);
-    set_vykar_passphrase(None);
-}
-
 #[test]
 fn resolve_passphrase_uses_expected_precedence() {
     let _lock = CWD_LOCK.lock().unwrap();
@@ -381,24 +357,4 @@ fn init_cancellation_of_either_prompt_is_not_an_error() {
     })
     .unwrap();
     assert!(matches!(second, InitPassphrase::Cancelled));
-}
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn init_needs_no_passphrase_for_an_unencrypted_repo() {
-    let _lock = CWD_LOCK.lock().unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = config_without_passphrase(&repo_dir);
-    config.encryption.mode = EncryptionModeConfig::None;
-    config.encryption.passphrase = Some("ignored".into());
-    set_vykar_passphrase(Some("env-pass"));
-
-    let outcome = resolve_init_passphrase(&config, None, None, |_, _| {
-        unreachable!("unencrypted repo must not prompt")
-    })
-    .unwrap();
-    assert!(matches!(outcome, InitPassphrase::NotRequired));
-    set_vykar_passphrase(None);
 }

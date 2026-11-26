@@ -1473,3 +1473,46 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
     drop(repo);
     fx.check_clean();
 }
+
+/// The frozen unencrypted v2/v3 fixtures, opened as `vykar upgrade` opens
+/// them (`open_repo_on` with `legacy_format`): refused by their config
+/// with the storage op log holding no PUT and no DELETE.
+#[test]
+fn legacy_none_fixtures_are_refused_without_a_write() {
+    for (prefix, version) in [("v2", 2u64), ("v3", 3)] {
+        crate::testutil::init_test_environment();
+        let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("{prefix}-none.tar.gz"));
+        let tmp = tempfile::tempdir().unwrap();
+        tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(&archive).unwrap(),
+        ))
+        .unpack(tmp.path())
+        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["format_version"].as_u64(), Some(version));
+        let repo_dir = tmp.path().join("repo");
+        let config = make_test_config(&repo_dir);
+        let local =
+            vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
+        let (storage, calls) = crate::testutil::CallLog::new(Box::new(local));
+        let err = crate::commands::util::open_repo_on(
+            Box::new(storage),
+            &crate::commands::util::open_request(&config),
+            pass(&config),
+            OpenOptions::new().legacy_format(),
+        )
+        .err()
+        .expect("an unencrypted repository is refused")
+        .to_string();
+        assert!(
+            err.contains("no longer supports unencrypted repositories")
+                && err.contains("new repository"),
+            "{prefix}: {err}"
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls, ["get config"], "{prefix}");
+    }
+}

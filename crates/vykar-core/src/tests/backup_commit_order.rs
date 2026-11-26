@@ -297,27 +297,6 @@ fn setup() -> (
     (dir, config, src_dir)
 }
 
-/// [`setup`] on a plaintext repository.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-fn setup_plaintext() -> (
-    tempfile::TempDir,
-    crate::config::VykarConfig,
-    std::path::PathBuf,
-) {
-    crate::testutil::init_test_environment();
-    let dir = tempfile::tempdir().unwrap();
-    let repo_dir = dir.path().join("repo");
-    let src_dir = dir.path().join("src");
-    fs::create_dir_all(&src_dir).unwrap();
-    fs::write(src_dir.join("a.bin"), vec![0x5au8; 64 * 1024]).unwrap();
-    fs::write(src_dir.join("b.txt"), b"hello").unwrap();
-    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
-    config.encryption.mode = crate::config::EncryptionModeConfig::None;
-    config.encryption.passphrase = None;
-    crate::commands::init::run(&config, None).unwrap();
-    (dir, config, src_dir)
-}
-
 fn run_backup(
     config: &crate::config::VykarConfig,
     src: &Path,
@@ -1126,15 +1105,13 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 /// found them in an applied segment (reuse by key) or, after a fold, in the
 /// table (reuse by position).
 ///
-/// The aged session is reaped by maintenance under the lock, which on a
-/// put-if-absent store only a plaintext repository takes.
-// Plaintext only to reach lock mode here: 10-single-protocol step 3 moves
-// this to an encrypted repository on a store without put-if-absent, or
-// deletes it with a reason.
+/// The backup's handle offers no put-if-absent, so it commits under the
+/// lock; the other client runs delete and compact lock-free, and the
+/// lock-free compact reaps the aged marker (a lock-free delete reaps none).
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     for (new_chunk, fold_first) in [(true, false), (false, false), (true, true), (false, true)] {
-        let (dir, config, src) = setup_plaintext();
+        let (dir, config, src) = setup();
         // A snapshot that stays, so the sweep is not one to empty.
         let src0 = dir.path().join("src0");
         fs::create_dir_all(&src0).unwrap();
@@ -1204,10 +1181,6 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                     &CancelToken::new(),
                 )
                 .unwrap();
-                assert!(
-                    !storage.exists(key).unwrap(),
-                    "maintenance reaped the marker"
-                );
                 // s1's segment is old, so the sweep takes its chunks (04
                 // step 7 keeps those of segments younger than T_pack).
                 crate::tests::helpers::age_repo_objects(
@@ -1225,6 +1198,10 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 )
                 .unwrap();
                 assert!(swept.chunks_unreferenced > 0, "{swept:?}");
+                assert!(
+                    !storage.exists(key).unwrap(),
+                    "maintenance reaped the marker"
+                );
 
                 let head = latest_head(&*storage);
                 *seen.lock().unwrap() = Some((head, repo_keys(&config, "index.d/")));

@@ -4,7 +4,7 @@ use tracing::info;
 
 use std::sync::Arc;
 
-use crate::config::{EncryptionModeConfig, VykarConfig};
+use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::control::CancelToken;
 use crate::repo::lock;
@@ -32,7 +32,6 @@ pub fn open_request(config: &VykarConfig) -> OpenRequest {
         url: config.repository.url.clone(),
         cache_dir: cache_dir_from_config(config),
         trust_repo: config.trust_repo,
-        require_encryption: config.encryption.mode != EncryptionModeConfig::None,
     }
 }
 
@@ -50,15 +49,12 @@ pub(crate) fn verify_repo_identity(req: &OpenRequest, repo: &Repo) -> Result<()>
 /// Attach the identity context `Repo::open` cannot derive on its own.
 ///
 /// The URL is what lets the key loader consult the local identity pin, and
-/// `trust_repo` is the deliberate waiver of it. The configured encryption mode
-/// decides whether a plaintext repository is acceptable: the repository's own
-/// config is unauthenticated and must not be able to downgrade the client.
-/// Applied in one place so every core open path gets all three; caller-set
-/// flags such as `skip_key_backfill` are preserved.
+/// `trust_repo` is the deliberate waiver of it. Applied in one place so
+/// every core open path gets both; caller-set flags such as
+/// `skip_key_backfill` are preserved.
 pub(crate) fn with_identity_context(opts: OpenOptions, req: &OpenRequest) -> OpenOptions {
     opts.with_repo_url(req.url.clone())
         .trust_repo(req.trust_repo)
-        .require_encryption(req.require_encryption)
 }
 
 /// Open a repository from config using the standard backend resolver.
@@ -262,28 +258,17 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repo) -> Result<()> {
     // beside maintenance (04 step 7): compact keeps their uploads by age and
     // by their marker's horizon.
     //
-    // On an encrypted repository the same listing is the lock holder's half
-    // of the marker handshake (04 step 9): a live session that may write
-    // heads without the lock (a lock-free backup committing, or a lock-free
-    // compact, whose marker carries `writes_heads` for its whole run) makes
-    // this holder yield with `Locked` naming it, before any write; the user
-    // retries. A plaintext repository has no lock-free writers.
-    let stale_threshold = lock::default_stale_session_duration();
-    let listed = if repo.config().encryption == crate::repo::EncryptionMode::None {
-        lock::cleanup_stale_sessions_keeping(
-            repo.storage().as_ref(),
-            stale_threshold,
-            repo.host_env(),
-            repo.lock_store_time(),
-        )
-    } else {
-        lock::yield_to_lock_free_writers(
-            repo.storage().as_ref(),
-            repo.host_env(),
-            repo.lock_store_time(),
-            None,
-        )
-    };
+    // The same listing is the lock holder's half of the marker handshake
+    // (04 step 9): a live session that may write heads without the lock (a
+    // lock-free backup committing, or a lock-free compact, whose marker
+    // carries `writes_heads` for its whole run) makes this holder yield with
+    // `Locked` naming it, before any write; the user retries.
+    let listed = lock::yield_to_lock_free_writers(
+        repo.storage().as_ref(),
+        repo.host_env(),
+        repo.lock_store_time(),
+        None,
+    );
     let live = match listed {
         Err(e @ VykarError::Locked(_)) => return Err(e),
         Ok((cleaned, live)) => {

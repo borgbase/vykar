@@ -631,8 +631,7 @@ pub(crate) fn resolve_from_index(
 ///
 /// Holds its own storage and crypto handles so the caller can keep using the
 /// repository mutably while the stream is being consumed. Every chunk is
-/// authenticated (AEAD) or, for unencrypted repositories, checked against its
-/// chunk ID, exactly like [`Repo::read_chunks_coalesced_into`].
+/// authenticated (AEAD), exactly like [`Repo::read_chunks_coalesced_into`].
 ///
 /// A pack that answers 404 (a concurrent compact repacked or removed it
 /// after the index was loaded) is re-resolved against the latest head

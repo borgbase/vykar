@@ -20,7 +20,7 @@ budget_for() {
   fi
   case "$1" in
     # Still growing (+9% features or more).
-    fuzz_plaintext_read | fuzz_restore_paths | fuzz_file_cache_decode | \
+    fuzz_restore_paths | fuzz_file_cache_decode | \
       fuzz_item_stream | fuzz_msgpack_snapshot_meta | fuzz_msgpack_index_blob | \
       fuzz_metadata_msgpack)
       echo $((per * 4)) ;;

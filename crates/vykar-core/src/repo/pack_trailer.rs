@@ -14,8 +14,8 @@
 //!
 //! The trailer is an ordinary length-framed blob, so every reader that scans
 //! frames or reads indexed ranges ignores it; the pack ID covers it. Its
-//! length is a function of the entry count and of whether the repository
-//! encrypts ([`trailer_blob_len`]), so writers can size it before building it.
+//! length is a function of the entry count ([`trailer_blob_len`]), so writers
+//! can size it before building it.
 
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::{PACK_HEADER_SIZE, validate_pack_header};
@@ -50,7 +50,7 @@ pub const TRAILER_TAIL_READ: u64 = 64 * 1024;
 
 /// Smallest `L` a footer may claim: the footer plus the object's tag.
 const MIN_TRAILER_BLOB_LEN: u32 = 13;
-/// AEAD overhead of an encrypting engine: 12-byte nonce + 16-byte tag.
+/// AEAD overhead: 12-byte nonce + 16-byte tag.
 const AEAD_OVERHEAD: usize = 28;
 /// Envelope tag byte plus codec tag byte.
 const TAG_BYTES: usize = 2;
@@ -131,22 +131,20 @@ pub fn framed_offsets(lengths: impl IntoIterator<Item = u32>) -> impl Iterator<I
 }
 
 /// Exact length `L` of a sealed trailer blob with this many entries.
-pub const fn trailer_blob_len(entries: usize, encrypting: bool) -> usize {
-    let aead = if encrypting { AEAD_OVERHEAD } else { 0 };
-    TAG_BYTES + aead + BODY_HEADER_LEN + TRAILER_ENTRY_LEN * entries + TRAILER_FOOTER_LEN
+pub const fn trailer_blob_len(entries: usize) -> usize {
+    TAG_BYTES + AEAD_OVERHEAD + BODY_HEADER_LEN + TRAILER_ENTRY_LEN * entries + TRAILER_FOOTER_LEN
 }
 
 /// Bytes of the trailer frame `PackWriter::seal` appends to a pack of
-/// `blobs` blobs (`4 + trailer_blob_len(blobs, encrypting)`): the
-/// `trailer_len` an index records for the pack.
-pub(crate) fn trailer_frame_len(blobs: usize, encrypting: bool) -> u32 {
-    (4 + trailer_blob_len(blobs, encrypting)) as u32
+/// `blobs` blobs: the `trailer_len` an index records for the pack.
+pub(crate) const fn trailer_frame_len(blobs: usize) -> u32 {
+    (4 + trailer_blob_len(blobs)) as u32
 }
 
-/// `4 + trailer_blob_len(entries, true)`: the frame a heap pack buffer
-/// reserves before the engine is known.
-pub const fn trailer_frame_len_upper(entries: usize) -> usize {
-    4 + trailer_blob_len(entries, true)
+/// `trailer_frame_len`, the frame `PackWriter::seal` appends for `entries`
+/// blobs, as a heap size.
+pub const fn trailer_frame_size(entries: usize) -> usize {
+    4 + trailer_blob_len(entries)
 }
 
 fn invalid(msg: impl Into<String>) -> VykarError {
@@ -290,10 +288,7 @@ impl PackTrailer {
             .map_err(|_| invalid("trailer does not fit u32"))?;
         blob.extend_from_slice(&len.to_le_bytes());
         blob.extend_from_slice(TRAILER_MAGIC);
-        debug_assert_eq!(
-            blob.len(),
-            trailer_blob_len(self.entries.len(), crypto.is_encrypting())
-        );
+        debug_assert_eq!(blob.len(), trailer_blob_len(self.entries.len()));
         Ok(blob)
     }
 
@@ -427,14 +422,9 @@ pub enum TrailerRead {
     /// A footer is present, but the frame, the AEAD, the body or the layout
     /// is wrong. A body of an unknown version or codec is
     /// `Damaged(VykarError::UnsupportedVersion(_))`: written by a newer
-    /// binary, not broken; callers must refuse rather than repair it. (In a
-    /// plaintext repository rot can produce it too: the index rebuild tells
-    /// the two apart by hashing the pack against its ID.)
+    /// binary, not broken; callers must refuse rather than repair it.
     ///
-    /// Only the last 12 bytes decide between this and `Absent`. In a
-    /// plaintext repository a pack from before trailers whose last blob ends
-    /// in bytes shaped like a footer reads as `Damaged`, so this variant
-    /// alone is not grounds for repairing or distrusting a pack.
+    /// Only the last 12 bytes decide between this and `Absent`.
     Damaged(VykarError),
 }
 
@@ -589,14 +579,13 @@ mod tests {
             for n in [1, 2, 10_000] {
                 let t = trailer(n, TrailerPackType::Tree);
                 let blob = t.seal_blob(engine).unwrap();
-                assert_eq!(blob.len(), trailer_blob_len(n, engine.is_encrypting()));
+                assert_eq!(blob.len(), trailer_blob_len(n));
                 assert_eq!(PackTrailer::open_blob(&blob, engine).unwrap(), t);
             }
         }
-        // The fixed overhead per pack: 52 bytes encrypted, 24 plaintext.
-        assert_eq!(4 + trailer_blob_len(0, true), 52);
-        assert_eq!(4 + trailer_blob_len(0, false), 24);
-        assert_eq!(trailer_frame_len_upper(3), 52 + 3 * 41);
+        // The fixed overhead per pack: 52 bytes.
+        assert_eq!(4 + trailer_blob_len(0), 52);
+        assert_eq!(trailer_frame_size(3), 52 + 3 * 41);
     }
 
     #[test]

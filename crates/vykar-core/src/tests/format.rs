@@ -11,17 +11,6 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
 use vykar_types::pack_id::PackId;
 
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn roundtrip_plaintext() {
-    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
-    let data = b"manifest data here";
-    let packed = pack_object(ObjectType::Manifest, data, &engine).unwrap();
-    let (obj_type, unpacked) = unpack_object(&packed, &engine).unwrap();
-    assert_eq!(obj_type, ObjectType::Manifest);
-    assert_eq!(unpacked, data);
-}
-
 #[test]
 fn roundtrip_encrypted() {
     let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
@@ -108,20 +97,6 @@ fn unpack_expect_rejects_wrong_object_type() {
     let err = unpack_object_expect(&packed, ObjectType::ChunkData, &engine).unwrap_err();
     assert!(matches!(err, VykarError::InvalidFormat(_)));
     assert!(err.to_string().contains("unexpected object type"));
-}
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn pack_object_streaming_roundtrip_plaintext() {
-    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
-    let data = b"streaming plaintext data";
-    let packed = pack_object_streaming(ObjectType::Manifest, data.len(), &engine, |buf| {
-        buf.extend_from_slice(data);
-        Ok(())
-    })
-    .unwrap();
-    let unpacked = unpack_object_expect(&packed, ObjectType::Manifest, &engine).unwrap();
-    assert_eq!(unpacked, data);
 }
 
 #[test]
@@ -324,24 +299,6 @@ fn decode_chunk_size_mismatch_only_with_hint() {
         "{e:?}"
     );
     assert_eq!(decode(&raw, at, &engine, None, false).unwrap(), data);
-}
-
-/// Without an AEAD the chunk ID is always checked.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn decode_chunk_id_check_plaintext() {
-    let data = b"payload stored under the wrong id";
-    let wrong = ChunkId::from_bytes([0x55; 32]);
-    let payload = compress::compress(Compression::None, data).unwrap();
-
-    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
-    let raw = chunk_blob(&wrong, &payload, &engine);
-    let e = decode(&raw, location(wrong, &raw), &engine, None, false).unwrap_err();
-    let actual_id = ChunkId::compute(engine.chunk_hasher(), data);
-    assert!(
-        matches!(e.stage, ChunkDecodeStage::IdMismatch { actual } if actual == actual_id),
-        "{e:?}"
-    );
 }
 
 /// Under an AEAD a blob sealed under the wrong ID authenticates: only the

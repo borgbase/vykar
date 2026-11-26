@@ -144,7 +144,7 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: interleavings::h4_compact_deletes_after_lost_lock,
         // Lock-free clients take no lock (10-single-protocol step 2); the
         // regression H4-conditional, of a lock-mode compact losing its lock
-        // on that store, went with the plaintext template.
+        // on that store, went with the unencrypted template.
         conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {

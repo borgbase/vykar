@@ -22,7 +22,7 @@ use vykar_protocol::PACK_HEADER_SIZE;
 use vykar_types::error::{Result, VykarError};
 
 use super::pack::{MAX_BLOBS_PER_PACK, PackType};
-use super::pack_trailer::trailer_frame_len_upper;
+use super::pack_trailer::trailer_frame_size;
 use super::upload_queue::UPLOAD_QUEUE_HEADROOM;
 
 /// Who may borrow pipeline capacity against sealed packs.
@@ -131,7 +131,7 @@ impl State {
             .saturating_add(target)
             .saturating_add(4)
             .saturating_add(self.max_blob)
-            .saturating_add(trailer_frame_len_upper(MAX_BLOBS_PER_PACK))
+            .saturating_add(trailer_frame_size(MAX_BLOBS_PER_PACK))
     }
 
     /// Upper bound of pipeline + open + sealed under the policy, assuming
@@ -658,7 +658,7 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         let (p, t, tt, b) = (256 * MIB, 32 * MIB, 4 * MIB, 8 * MIB + 64 * 1024);
         let pack = |target: usize| {
-            PACK_HEADER_SIZE + target + 4 + b + trailer_frame_len_upper(MAX_BLOBS_PER_PACK)
+            PACK_HEADER_SIZE + target + 4 + b + trailer_frame_size(MAX_BLOBS_PER_PACK)
         };
         let budget = MemoryBudget::new(2, t, tt);
         budget.begin_pipeline(p, b);

@@ -43,8 +43,7 @@ pub fn init_repo(repo_dir: &Path) -> VykarConfig {
     config
 }
 
-/// The passphrase the config's repository opens with (None only for the
-/// plaintext-only tests that set mode none).
+/// The passphrase the config's repository opens with.
 pub fn pass(config: &VykarConfig) -> Option<&str> {
     config.encryption.passphrase.as_deref()
 }

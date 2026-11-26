@@ -561,63 +561,6 @@ fn flip_byte_in_stored_blob(repo: &Repo, id: &vykar_types::chunk_id::ChunkId) {
     repo.storage().put(&key, &pack).unwrap();
 }
 
-/// Flip one byte of `data` inside its stored blob in a plaintext repo. With no
-/// compression and no AEAD the blob stays decodable at the same length, so only
-/// the chunk ID check can notice.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-fn flip_byte_in_stored_chunk(repo: &Repo, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
-    let entry = repo.chunk_index().get(id).unwrap();
-    let key = entry.pack_id.storage_key();
-    let mut pack = repo.storage().get(&key).unwrap().unwrap();
-    let start = entry.pack_offset as usize;
-    let blob = &pack[start..start + entry.stored_size as usize];
-    let pos = blob
-        .windows(data.len())
-        .position(|w| w == data)
-        .expect("plaintext chunk is stored verbatim");
-    pack[start + pos + data.len() / 2] ^= 0x01;
-    repo.storage().put(&key, &pack).unwrap();
-}
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_read_chunk_rejects_corrupt_blob() {
-    let (mut repo, mut ws) = crate::testutil::plaintext_repo_with_session();
-    let data = b"plaintext-chunk-that-will-be-corrupted-on-disk";
-    let (id, _, _) = ws
-        .store_chunk(&repo, data, Compression::None, PackType::Tree)
-        .unwrap();
-    crate::testutil::save_and_resume(&mut repo, &mut ws);
-    flip_byte_in_stored_chunk(&repo, &id, data);
-
-    for attempt in 0..2 {
-        let err = repo.read_chunk(&id).unwrap_err();
-        assert!(
-            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
-            "attempt {attempt}: expected hash mismatch, got: {err}"
-        );
-    }
-}
-
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn plaintext_coalesced_read_rejects_corrupt_blob() {
-    let (mut repo, mut ws) = crate::testutil::plaintext_repo_with_session();
-    let ids = store_chunks(&mut repo, &mut ws, 3);
-    let corrupt = "chunk-data-0001-padding-to-make-it-unique";
-    flip_byte_in_stored_chunk(&repo, &ids[1], corrupt.as_bytes());
-
-    let chunks = resolve_chunks(&repo, &ids);
-    let mut out = Vec::new();
-    let err = repo
-        .read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
-        .unwrap_err();
-    assert!(
-        matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
-        "expected hash mismatch, got: {err}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Parallel reads
 // ---------------------------------------------------------------------------

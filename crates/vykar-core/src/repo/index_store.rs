@@ -216,8 +216,7 @@ pub(crate) enum HeadFallback {
 ///
 /// - `Ok(Yes)` → `Created`.
 /// - `Ok(AlreadyExists)` → GET the key: the same bytes → `Created` (the
-///   backend's own retry after a lost reply, or a plaintext head of the same
-///   state); other bytes or none (collected since, or a soft-deleted key on
+///   backend's own retry after a lost reply); other bytes or none (collected since, or a soft-deleted key on
 ///   S3) → `Taken`.
 /// - `Err(UnsupportedBackend)` (a check concluded the storage refuses or
 ///   ignores the condition; normally seen at the fence first) → noted in
@@ -1094,11 +1093,7 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// heads listing includes `latest`, so "now" is its mtime) — unless the
 /// writer's head lands more than `grace.objects` after its first object
 /// PUT started, which the lock excludes and the writer itself refuses
-/// ([`INDEX_OBJECT_GRACE`]). On a plaintext repository an index object's name is a
-/// function of its content, so a writer can re-create an old unreferenced
-/// name the listing saw as old; harmless while the lock keeps collectors away
-/// from writers (recorded for the owner with 04 step 9: plaintext
-/// repositories may keep the lock for index writes).
+/// ([`INDEX_OBJECT_GRACE`]).
 pub(crate) fn collect_index_garbage(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,

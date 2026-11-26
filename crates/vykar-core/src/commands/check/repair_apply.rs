@@ -306,12 +306,7 @@ fn restore_key_copies(
         let RepairAction::RestoreKeyCopy { to, .. } = action else {
             continue;
         };
-        let Some(bytes) = repo.key_blob() else {
-            repair_errors.push(format!(
-                "cannot restore {to}: this repository has no key to restore it from"
-            ));
-            continue;
-        };
+        let bytes = repo.key_blob();
         match repo.storage().put(to, bytes) {
             Ok(()) => {
                 tracing::info!("restored repository key copy {to}");
@@ -627,7 +622,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let opened_with = repo.key_blob().unwrap().to_vec();
+        let opened_with = repo.key_blob().to_vec();
         repo.storage().put(KEY_SECONDARY, b"garbage").unwrap();
 
         let config = crate::tests::helpers::make_test_config(std::path::Path::new("/mem"));

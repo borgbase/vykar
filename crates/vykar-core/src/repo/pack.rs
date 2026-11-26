@@ -10,7 +10,7 @@ use vykar_types::pack_id::PackId;
 
 use vykar_protocol::{PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, validate_pack_header};
 
-use super::pack_trailer::{PackTrailer, TrailerPackType, trailer_frame_len_upper};
+use super::pack_trailer::{PackTrailer, TrailerPackType, trailer_frame_size};
 
 /// Distinguishes data packs (file content) from tree packs (item-stream metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,10 +396,9 @@ impl PackWriter {
                 // The blob crossing the target seals this pack. Reserve only
                 // its actual bytes and the trailer's frame rather than
                 // letting Vec double a large buffer that will immediately
-                // move to the upload queue. The engine is not known here, so
-                // the frame is sized for an encrypting one.
+                // move to the upload queue.
                 if self.current_size + additional >= self.target_size {
-                    v.reserve_exact(additional + trailer_frame_len_upper(self.blob_meta.len() + 1));
+                    v.reserve_exact(additional + trailer_frame_size(self.blob_meta.len() + 1));
                 }
                 v.extend_from_slice(&len_prefix);
                 v.extend_from_slice(&encrypted_blob);
@@ -478,14 +477,14 @@ impl PackWriter {
     }
 
     /// Heap bytes the in-progress pack occupies, counting the trailer frame
-    /// it would get if closed now (sized for an encrypting engine): 0 before
+    /// it would get if closed now: 0 before
     /// the first blob, and for a staged pack, whose bytes are in the
     /// backend's temp file.
     pub fn heap_len(&self) -> usize {
         match &self.buffer {
             Some(PackBuffer::Memory(_)) => PACK_HEADER_SIZE
                 .saturating_add(self.current_size)
-                .saturating_add(trailer_frame_len_upper(self.blob_meta.len())),
+                .saturating_add(trailer_frame_size(self.blob_meta.len())),
             Some(PackBuffer::Staged { .. } | PackBuffer::Failed) | None => 0,
         }
     }
@@ -542,10 +541,8 @@ impl PackWriter {
         &mut self,
         entries: Vec<PackedChunkEntry>,
         trailer: PackTrailer,
-        encrypting: bool,
     ) -> Result<ClosedPack> {
-        let trailer_len =
-            crate::repo::pack_trailer::trailer_frame_len(self.blob_meta.len(), encrypting);
+        let trailer_len = crate::repo::pack_trailer::trailer_frame_len(self.blob_meta.len());
         let len = (PACK_HEADER_SIZE + self.current_size) as u64 + u64::from(trailer_len);
         let buffer = match self.buffer.take().expect("buffer was initialized") {
             PackBuffer::Memory(v) => ClosedBuffer::Memory(v),
@@ -577,17 +574,16 @@ impl PackWriter {
         })
     }
 
-    /// Close the pack for an engine that encrypts iff `encrypting`: compute
-    /// the entries, the exact length and the trailer (`PackTrailer::for_blobs`),
+    /// Close the pack: compute the entries, the exact length and the trailer (`PackTrailer::for_blobs`),
     /// take the buffer and reset the writer for the next pack. Encrypting
     /// the trailer and hashing the pack are left to `PackTail::finish`.
     ///
     /// Fails as `seal` does before it touches the buffer (a poisoned
     /// writer, an empty writer, a trailer that cannot be built); the writer
     /// is then unchanged.
-    pub fn close(&mut self, encrypting: bool) -> Result<ClosedPack> {
+    pub fn close(&mut self) -> Result<ClosedPack> {
         let (entries, trailer) = self.closing_parts()?;
-        self.take_closed(entries, trailer, encrypting)
+        self.take_closed(entries, trailer)
     }
 
     /// Seal the pack: append the trailer, encrypted with `crypto`, compute
@@ -602,15 +598,12 @@ impl PackWriter {
         let frame = trailer_frame(&trailer, crypto)?;
         debug_assert_eq!(
             frame.len(),
-            crate::repo::pack_trailer::trailer_frame_len(
-                self.blob_meta.len(),
-                crypto.is_encrypting()
-            ) as usize,
+            crate::repo::pack_trailer::trailer_frame_len(self.blob_meta.len()) as usize,
             "the trailer frame has the length the index records"
         );
         let ClosedPack {
             entries, len, tail, ..
-        } = self.take_closed(entries, trailer, crypto.is_encrypting())?;
+        } = self.take_closed(entries, trailer)?;
         match tail.finish_with_frame(frame) {
             Ok((pack_id, data)) => Ok(SealedPack {
                 pack_id,
@@ -1050,11 +1043,11 @@ mod tests {
                     let stage = staged.then_some(&local as &dyn StorageBackend);
 
                     let (mut closing, mut sealing) = twin_writers(algo, target, &blobs, stage);
-                    let closed = closing.close(true).unwrap();
+                    let closed = closing.close().unwrap();
                     assert!(!closing.has_pending());
                     assert!(closing.buffer.is_none());
                     assert_eq!(closing.current_size, 0);
-                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), true));
+                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len()));
                     let (pack_id, data) = closed.tail.finish(&engine()).unwrap();
                     let sealed = sealing.seal(&engine()).unwrap();
                     assert_eq!(pack_id, sealed.pack_id, "{algo:?} staged={staged}");
@@ -1072,8 +1065,8 @@ mod tests {
                     let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
                     let stage = staged.then_some(&local as &dyn StorageBackend);
                     let (mut w, _) = twin_writers(algo, target, &blobs, stage);
-                    let closed = w.close(true).unwrap();
-                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), true));
+                    let closed = w.close().unwrap();
+                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len()));
                     let (pack_id, data) = closed.tail.finish(&aes_engine()).unwrap();
                     let bytes = finished_bytes(pack_id, data, stage);
                     assert_eq!(closed.len, bytes.len() as u64);
@@ -1085,37 +1078,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// A pack closed for a plaintext engine cannot be finished with an
-    /// encrypting one: the frame would not have the length the index
-    /// records. A staged pack's temp file is discarded.
-    #[test]
-    fn finish_refuses_another_engines_trailer() {
-        use vykar_storage::local_backend::LocalBackend;
-
-        let dir = tempfile::tempdir().unwrap();
-        let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
-        for stage in [None, Some(&local as &dyn StorageBackend)] {
-            let mut w = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake3);
-            w.add_blob_to(stage, dummy_chunk_id(1), vec![1; 10])
-                .unwrap();
-            let closed = w.close(false).unwrap();
-            let err = closed
-                .tail
-                .finish(&engine())
-                .err()
-                .expect("length mismatch");
-            assert!(err.to_string().contains("BUG"), "{err}");
-        }
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("packs"))
-            .map(|rd| {
-                rd.map(|e| e.unwrap().path())
-                    .filter(|p| p.is_file())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// The trailer append moved to `finish`: `close` succeeds and resets the
@@ -1130,7 +1092,7 @@ mod tests {
         let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake3);
         w.add_blob_to(Some(&backend), dummy_chunk_id(1), vec![1; 10])
             .unwrap();
-        let closed = w.close(true).unwrap();
+        let closed = w.close().unwrap();
         assert!(!w.has_pending());
         assert!(w.buffer.is_none());
         assert!(
@@ -1206,7 +1168,7 @@ mod tests {
                 };
                 assert_eq!(
                     data.len(),
-                    PACK_HEADER_SIZE + target + last_size + 4 + trailer_blob_len(2, true)
+                    PACK_HEADER_SIZE + target + last_size + 4 + trailer_blob_len(2)
                 );
                 assert_eq!(sealed.len, data.len() as u64);
                 assert_eq!(data.capacity(), data.len());
@@ -1218,8 +1180,7 @@ mod tests {
         }
     }
 
-    /// The open pack's heap figure is header + blobs + the encrypting
-    /// trailer frame; a closed heap pack is charged its final length, not
+    /// The open pack's heap figure is header + blobs + the trailer frame; a closed heap pack is charged its final length, not
     /// its capacity (here 32 MiB reserved for a pack of a few hundred bytes).
     #[test]
     fn heap_len_and_heap_bytes_count_bytes_not_capacity() {
@@ -1229,33 +1190,16 @@ mod tests {
         w.add_blob(dummy_chunk_id(2), vec![2; 50]).unwrap();
         assert_eq!(
             w.heap_len(),
-            PACK_HEADER_SIZE + 104 + 54 + trailer_frame_len_upper(2)
+            PACK_HEADER_SIZE + 104 + 54 + trailer_frame_size(2)
         );
         assert!(w.buffer_capacity() > w.heap_len());
         let mut w2 = PackWriter::new(PackType::Data, 32 * 1024 * 1024, HashAlgorithm::Blake3);
         w2.add_blob(dummy_chunk_id(1), vec![1; 100]).unwrap();
         let open = w2.heap_len();
-        let closed = w2.close(true).unwrap();
+        let closed = w2.close().unwrap();
         assert_eq!(closed.tail.heap_bytes() as u64, closed.len);
         assert!(closed.tail.heap_bytes() <= open);
         assert_eq!(w2.heap_len(), 0);
-    }
-
-    /// A plaintext trailer is smaller than the encrypting one the crossing
-    /// blob reserves room for: the AEAD's 28 bytes stay spare.
-    // Plaintext-only: 10-single-protocol step 3 removes this.
-    #[test]
-    fn crossing_target_plaintext_leaves_aead_room_spare() {
-        let target = 1024 * 1024;
-        let mut w = PackWriter::new(PackType::Data, target, HashAlgorithm::Blake3);
-        w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
-        w.add_blob(dummy_chunk_id(2), vec![2; 128]).unwrap();
-        let plaintext =
-            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
-        let SealedData::Memory(data) = w.seal(&plaintext).unwrap().data else {
-            panic!("no stage given, so the pack is heap-buffered");
-        };
-        assert_eq!(data.capacity() - data.len(), 28);
     }
 
     #[test]
@@ -1298,7 +1242,7 @@ mod tests {
         //   [22..156]  trailer frame: 4B len LE (130) + trailer object
         //              (tag 12, 12B nonce, 89B ciphertext, 16B GCM tag)
         //              + footer (4B len LE (130) + "VYKTRLR1")
-        // The plaintext trailer frame was 102 bytes; the AEAD adds 28.
+        // Without the AEAD's 28 bytes the trailer frame would be 102 bytes.
         #[rustfmt::skip]
         const PREFIX: &[u8] = &[
             // Pack header: VGERPACK + version 1

@@ -305,22 +305,151 @@ pub fn test_repo_with_session() -> (Repo, WriteSession) {
     (repo, ws)
 }
 
-/// A plaintext repository backed by MemoryBackend, with a write session
-/// begun over it, for the tests whose subject is plaintext.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-pub fn plaintext_repo_with_session() -> (Repo, WriteSession) {
-    init_test_environment();
-    let repo = Repo::init(
-        Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
-        ChunkerParams::default(),
-        None,
-        None,
-        None,
-    )
-    .expect("failed to init test repo");
-    let ws = repo.begin_write_session(&WriteSessionOptions::default());
-    (repo, ws)
+/// Records every call a repository makes on its storage, as "op key", and
+/// forwards it. Offers no put-if-absent, batch delete, staged put or server.
+pub struct CallLog {
+    inner: Box<dyn StorageBackend>,
+    calls: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+impl CallLog {
+    /// `inner` wrapped, and the shared log of its calls.
+    pub fn new(inner: Box<dyn StorageBackend>) -> (Self, std::sync::Arc<Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::<Mutex<Vec<String>>>::default();
+        (
+            Self {
+                inner,
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+
+    fn note(&self, op: &str, key: &str) {
+        self.calls.lock().unwrap().push(format!("{op} {key}"));
+    }
+}
+
+impl InnerBackend for CallLog {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for CallLog;
+    except [
+        get, put, delete, exists, list, get_range, get_range_into, open_range, create_dir,
+        put_owned, put_pack, begin_staged_put, size, list_sized, list_meta, conditional,
+        batch_delete, server_ops, profile
+    ];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.note("get", key);
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.note("put", key);
+        self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.note("delete", key);
+        self.inner.delete(key)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        self.note("exists", key);
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.note("list", prefix);
+        self.inner.list(prefix)
+    }
+
+    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        self.note("get_range", key);
+        self.inner.get_range(key, offset, length)
+    }
+
+    fn get_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        self.note("get_range", key);
+        self.inner.get_range_into(key, offset, length, buf)
+    }
+
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+        vykar_storage::buffered_range(self, key, offset, length, buf)
+    }
+
+    fn create_dir(&self, key: &str) -> Result<()> {
+        self.note("create_dir", key);
+        self.inner.create_dir(key)
+    }
+
+    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        self.note("put", key);
+        self.inner.put_owned(key, data)
+    }
+
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        self.note("put", key);
+        self.inner.put_pack(key, data)
+    }
+
+    fn begin_staged_put(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
+
+    fn size(&self, key: &str) -> Result<Option<u64>> {
+        self.note("size", key);
+        self.inner.size(key)
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.note("list", prefix);
+        self.inner.list_sized(prefix)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.note("list", prefix);
+        self.inner.list_meta(prefix)
+    }
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
+    }
 }
 
 /// Fixed chunk hasher for deterministic tests.

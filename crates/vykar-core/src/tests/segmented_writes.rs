@@ -58,37 +58,6 @@ fn fixture(format: RepoFormat) -> Fixture {
     }
 }
 
-/// [`fixture`] on a plaintext repository.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-fn plaintext_fixture(format: RepoFormat) -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
-    let source = tmp.path().join("src");
-    std::fs::create_dir_all(&repo_dir).unwrap();
-    std::fs::create_dir_all(&source).unwrap();
-    let mut config = make_test_config(&repo_dir);
-    config.encryption.mode = crate::config::EncryptionModeConfig::None;
-    config.encryption.passphrase = None;
-    let cache = tmp.path().join("cache");
-    config.cache_dir = Some(cache.to_string_lossy().into_owned());
-    Repo::init_at_format(
-        Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
-        EncryptionMode::None,
-        config.chunker.params(),
-        None,
-        Some(&config.repository.init_options()),
-        Some(cache),
-        format,
-    )
-    .unwrap();
-    Fixture {
-        tmp,
-        repo_dir,
-        source,
-        config,
-    }
-}
-
 impl Fixture {
     fn cache(&self) -> PathBuf {
         PathBuf::from(self.config.cache_dir.as_ref().unwrap())
@@ -571,28 +540,6 @@ fn maintenance_writes_fold_at_the_hard_limit() {
     // and folds again.
     assert_eq!(counts, vec![2, 0, 1, 2, 0]);
     assert!(fx.named_objects_exist(&last.unwrap()));
-    assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
-}
-
-/// On a plaintext repository a change repeated from a state the chain
-/// returned to packs to an object name the head already holds; the write
-/// folds instead of naming it twice.
-// Plaintext-only: 10-single-protocol step 3 removes this.
-#[test]
-fn repeated_plaintext_segment_folds() {
-    let fx = plaintext_fixture(RepoFormat::CURRENT);
-    fx.write("a", "alpha");
-    fx.backup(&fx.config, "s1");
-    let mut repo = fx.open(&fx.cache(), false).unwrap();
-    repo.load_chunk_index_under_lock().unwrap();
-    // Remove, re-add, remove: the third write's segment is the first's.
-    let mut toggled = None;
-    for _ in 0..3 {
-        toggle_an_entry(&mut repo, &mut toggled);
-        repo.unchecked_writer().save_state().unwrap();
-    }
-    let head = fx.head();
-    assert!(head.segments.is_empty(), "{head:?}");
     assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
 }
 

@@ -41,8 +41,6 @@ pub use host_env::{Clock, HostEnv, HostIdentity, StopSignal, SystemClock};
 pub use index_rebuild::{RebuildCounts, UncoveredPack};
 pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
-#[cfg(any(test, feature = "fuzzing"))]
-pub(crate) use open::derive_plaintext_chunk_id_key;
 #[cfg(any(test, feature = "sim", feature = "testing"))]
 pub use open::with_cheap_kdf;
 mod read;
@@ -194,6 +192,22 @@ pub struct RepoConfig {
 /// refused as written by a newer vykar.
 pub const KNOWN_CONFIG_FEATURES: &[&str] = &[];
 
+/// Why `encryption.mode: none` is refused while the config is parsed. The
+/// whole file fails to load, so the text says the line must change before
+/// any repository in it can be used.
+pub const PLAINTEXT_MODE_REFUSAL: &str = "encryption.mode none is no longer supported: every repository is encrypted. Remove \
+     the line or change it to auto (the default), aes256gcm or chacha20poly1305 before any \
+     repository in this config file can be used; the passphrase comes from \
+     encryption.passphrase, encryption.passcommand or VYKAR_PASSPHRASE. An existing \
+     unencrypted repository is not opened by this vykar: create a new repository and back \
+     up into it; vykar 0.24 can still restore from the old one";
+
+/// Why an unencrypted repository is refused ([`DecodedConfig::validate`]).
+pub const UNENCRYPTED_REPOSITORY_REFUSAL: &str = "this repository is unencrypted (encryption mode none); this vykar no longer \
+     supports unencrypted repositories and does not open it. Create a new repository \
+     (every new repository is encrypted) and back up into it; vykar 0.24 can still \
+     restore from this one";
+
 pub(crate) fn default_min_pack_size() -> u32 {
     32 * 1024 * 1024 // 32 MiB
 }
@@ -283,7 +297,8 @@ impl DecodedConfig {
     /// `InvalidFormat`; an unknown `chunk_hash` or feature is refused as
     /// written by a newer vykar. Positional: 2 and 3 are accepted, 6 and 7
     /// (development builds) are refused with a "create a new repository"
-    /// message, every other version is `UnsupportedVersion`. Both: a
+    /// message, every other version is `UnsupportedVersion`. Both:
+    /// encryption mode none ([`UNENCRYPTED_REPOSITORY_REFUSAL`]), a
     /// `max_pack_size` above the hard limit.
     pub fn validate(&self) -> Result<RepoFormat> {
         use vykar_types::error::VykarError;
@@ -339,6 +354,13 @@ impl DecodedConfig {
                 (format, c.max_pack_size)
             }
         };
+        let encryption = match self {
+            Self::Map(c) => &c.encryption,
+            Self::Positional(c) => &c.encryption,
+        };
+        if *encryption == EncryptionMode::None {
+            return Err(VykarError::Other(UNENCRYPTED_REPOSITORY_REFUSAL.into()));
+        }
         if max_pack_size > MAX_PACK_SIZE_LIMIT {
             return Err(VykarError::Config(format!(
                 "max_pack_size ({max_pack_size}) exceeds hard limit of 512 MiB"
@@ -393,8 +415,6 @@ pub const KEY_SECONDARY: &str = "keys/repokey.2";
 /// What the two key copies looked like when the repository was opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCopyState {
-    /// Unencrypted repository — there is no key file.
-    NotApplicable,
     /// Both copies present and byte-identical.
     Matched,
     /// Exactly one copy was usable. `missing` names the other — either absent,
@@ -457,8 +477,6 @@ pub struct OpenRequest {
     pub cache_dir: Option<PathBuf>,
     /// Accept a key that contradicts the local identity pin (`--trust-repo`).
     pub trust_repo: bool,
-    /// Refuse a repository whose config says it is unencrypted.
-    pub require_encryption: bool,
 }
 
 /// Options controlling which expensive subsystems are loaded when opening a
@@ -477,10 +495,6 @@ pub struct OpenOptions {
     /// `check --repair --dry-run`, which prints "no changes applied" and must
     /// not have written one underneath that statement.
     pub skip_key_backfill: bool,
-    /// Refuse a repository whose config says it is unencrypted. The repo
-    /// config is unauthenticated, so only the client's own config may opt
-    /// into plaintext.
-    pub require_encryption: bool,
     /// Open a segmented repository whose index head cannot be read (an
     /// older binary overwrote it). Set by `check --repair`, which rebuilds
     /// the index; every other command refuses such a repository.
@@ -516,10 +530,6 @@ impl OpenOptions {
     }
     pub fn skip_key_backfill(mut self) -> Self {
         self.skip_key_backfill = true;
-        self
-    }
-    pub fn require_encryption(mut self, require: bool) -> Self {
-        self.require_encryption = require;
         self
     }
     pub fn tolerate_broken_index(mut self) -> Self {
@@ -575,8 +585,8 @@ pub struct Repo {
     /// The key-copy bytes that actually unwrapped at open. `check` compares
     /// the stored objects against these instead of unwrapping again, which
     /// would cost another Argon2id derivation and need the passphrase threaded
-    /// into the scan. `None` for unencrypted repositories.
-    key_blob: Option<Vec<u8>>,
+    /// into the scan.
+    key_blob: Vec<u8>,
     /// The head the in-memory state was loaded from (or written as). `None`
     /// on a handle opened for the upgrade, and while `check --repair`
     /// rebuilds the index.
@@ -651,9 +661,9 @@ impl Repo {
         self.host_env = env;
     }
 
-    /// The key blob that unwrapped at open, if this repository is encrypted.
-    pub fn key_blob(&self) -> Option<&[u8]> {
-        self.key_blob.as_deref()
+    /// The key blob that unwrapped at open.
+    pub fn key_blob(&self) -> &[u8] {
+        &self.key_blob
     }
 
     /// Mark the file cache as needing persistence on the next `save_state()`.
@@ -1030,36 +1040,31 @@ impl Repo {
 
     /// How this handle commits, decided once per handle (the put-if-absent
     /// check once per backend instance, `vykar_storage::Verifier`):
-    /// `Lock` on a plaintext repository (they never commit lock-free: their
-    /// index objects are named by their contents), or when the storage
-    /// offers no put-if-absent or its check concluded `Unsupported`;
+    /// `Lock` when the storage offers no put-if-absent or its check
+    /// concluded `Unsupported`;
     /// `LockFree` when the check passed. An undecided check (no write
     /// permission, a transport failure) is an error: no guess either way.
     pub(crate) fn commit_mode(&mut self) -> Result<CommitMode> {
         if let Some(mode) = self.commit_mode {
             return Ok(mode);
         }
-        let mode = if self.config.encryption == EncryptionMode::None {
-            CommitMode::Lock
-        } else {
-            let reason = match self.storage.conditional() {
-                None => Some(None),
-                Some(cond) => match cond.verify()? {
-                    vykar_storage::ConditionalSupport::Verified => None,
-                    vykar_storage::ConditionalSupport::Unsupported { reason } => Some(Some(reason)),
-                },
-            };
-            match reason {
-                None => CommitMode::LockFree,
-                Some(reason) => {
-                    if index_store::note_fallback(&mut self.head_fallback, reason.as_deref()) {
-                        tracing::info!(
-                            "this client commits under the repository lock; lock-free writers on \
-                             this repository wait for it"
-                        );
-                    }
-                    CommitMode::Lock
+        let reason = match self.storage.conditional() {
+            None => Some(None),
+            Some(cond) => match cond.verify()? {
+                vykar_storage::ConditionalSupport::Verified => None,
+                vykar_storage::ConditionalSupport::Unsupported { reason } => Some(Some(reason)),
+            },
+        };
+        let mode = match reason {
+            None => CommitMode::LockFree,
+            Some(reason) => {
+                if index_store::note_fallback(&mut self.head_fallback, reason.as_deref()) {
+                    tracing::info!(
+                        "this client commits under the repository lock; lock-free writers on \
+                         this repository wait for it"
+                    );
                 }
+                CommitMode::Lock
             }
         };
         match mode {
@@ -1107,14 +1112,12 @@ mod format_tests {
     use super::*;
     use vykar_types::error::VykarError;
 
-    // Plaintext-only: 10-single-protocol step 3 removes this (mode none as a
-    // config value).
     fn legacy(version: u32) -> LegacyRepoConfig {
         LegacyRepoConfig {
             version,
             id: vec![0u8; 32],
             chunker_params: ChunkerParams::default(),
-            encryption: EncryptionMode::None,
+            encryption: EncryptionMode::Aes256Gcm,
             created: chrono::Utc::now(),
             min_pack_size: default_min_pack_size(),
             max_pack_size: default_max_pack_size(),
@@ -1273,6 +1276,46 @@ mod format_tests {
         let mut c = v6(HashAlgorithm::Blake3);
         c.max_pack_size = MAX_PACK_SIZE_LIMIT + 1;
         assert!(matches!(decode(&c), Err(VykarError::Config(_))));
+    }
+
+    /// An otherwise valid config that says mode none is refused with the
+    /// unencrypted-repository text; the version gates keep precedence.
+    #[test]
+    fn validate_refuses_encryption_none() {
+        for version in [2u32, 3] {
+            let mut c = legacy(version);
+            c.encryption = EncryptionMode::None;
+            let bytes = rmp_serde::to_vec(&c).unwrap();
+            match RepoConfig::decode(&bytes).unwrap().validate() {
+                Err(VykarError::Other(m)) => assert_eq!(m, UNENCRYPTED_REPOSITORY_REFUSAL),
+                other => panic!("v{version} none should be refused, got {other:?}"),
+            }
+        }
+        let mut c = v6(HashAlgorithm::Blake3);
+        c.encryption = EncryptionMode::None;
+        match RepoConfig::decode(&c.encode().unwrap()).unwrap().validate() {
+            Err(VykarError::Other(m)) => assert_eq!(m, UNENCRYPTED_REPOSITORY_REFUSAL),
+            other => panic!("v6 none should be refused, got {other:?}"),
+        }
+        for version in [6u32, 7] {
+            let mut c = legacy(version);
+            c.encryption = EncryptionMode::None;
+            let err = RepoConfig::decode(&rmp_serde::to_vec(&c).unwrap())
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("development build"), "{err}");
+        }
+        let mut c = v6(HashAlgorithm::Blake3);
+        c.encryption = EncryptionMode::None;
+        c.version = 7;
+        assert!(matches!(
+            RepoConfig::decode(&rmp_serde::to_vec_named(&c).unwrap())
+                .unwrap()
+                .validate(),
+            Err(VykarError::UnsupportedVersion(7))
+        ));
     }
 
     /// CFG-4: positional development formats are refused.

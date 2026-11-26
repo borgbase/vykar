@@ -631,13 +631,13 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
         )
         .filter(|_, k| k.ends_with(".1.json")),
     );
-    let shutdown = CancelToken::new();
+    let cancel = CancelToken::new();
     let rf = sim.spawn(
         f,
         Call::BackupCancellable {
             snapshot: "f1".into(),
             tree: tree("f1"),
-            shutdown: shutdown.clone(),
+            cancel: cancel.clone(),
         },
     );
     sim.expect_paused(f_mark, "f's commit mark");
@@ -682,7 +682,7 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
             .count()
     };
     let before = probes(&sim);
-    shutdown.cancel();
+    cancel.cancel();
     // One slice of the backoff (at least 750 ms after the second probe).
     sim.time().advance(std::time::Duration::from_millis(500));
     sim.time().set_mode(TimeMode::Auto);

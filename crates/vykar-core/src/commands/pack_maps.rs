@@ -17,11 +17,11 @@ pub use crate::repo::pack_map::PackMapStats;
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<PackMapStats> {
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
     with_maintenance_lock(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
-        repo.write_pack_maps(None, shutdown)
+        repo.write_pack_maps(None, cancel)
     })
 }

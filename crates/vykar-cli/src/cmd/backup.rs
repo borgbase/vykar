@@ -18,7 +18,7 @@ pub(crate) struct BackupRunOpts<'a> {
     pub threads: Option<usize>,
     pub paths: Vec<String>,
     pub source_filter: &'a [String],
-    pub shutdown: &'a CancelToken,
+    pub cancel: &'a CancelToken,
     pub verbose: u8,
 }
 
@@ -32,7 +32,7 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
         threads,
         paths,
         source_filter,
-        shutdown,
+        cancel,
         verbose,
     } = opts;
 
@@ -131,7 +131,7 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
             &repo,
             &sources,
             passphrase,
-            shutdown,
+            cancel,
             verbose >= 1,
             Some(&mut callback),
         );

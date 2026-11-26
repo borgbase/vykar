@@ -2354,12 +2354,12 @@ fn retry_while_locked<T>(
 /// are reaped at once; a 6 h stale lock by the waiter's own attempts).
 pub const COMMIT_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
 
-/// Longest single sleep between `shutdown` checks.
+/// Longest single sleep between `cancel` checks.
 const LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Acquire a repo lock, retrying with backoff until `max_wait` has elapsed.
 ///
-/// `shutdown` is checked before every attempt (including the first) and
+/// `cancel` is checked before every attempt (including the first) and
 /// during sleeps; when set, returns `Interrupted`. After the deadline one
 /// final attempt is always made, so this never gives up early.
 ///
@@ -2382,14 +2382,14 @@ pub fn acquire_lock_with_deadline(
     env: &HostEnv,
     max_wait: std::time::Duration,
     base_delay_ms: u64,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     on_contended: impl FnMut(&LockHolder),
 ) -> Result<LockGuard> {
     wait_while_locked(
         env,
         max_wait,
         base_delay_ms,
-        shutdown,
+        cancel,
         on_contended,
         |clock| acquire_lock_reading(storage, env, clock),
     )
@@ -2409,7 +2409,7 @@ pub(crate) fn acquire_commit_lock(
     env: &HostEnv,
     max_wait: std::time::Duration,
     base_delay_ms: u64,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     own: &str,
     yield_to_flagged: bool,
     on_contended: impl FnMut(&LockHolder),
@@ -2418,7 +2418,7 @@ pub(crate) fn acquire_commit_lock(
         env,
         max_wait,
         base_delay_ms,
-        shutdown,
+        cancel,
         on_contended,
         |clock| {
             let guard = acquire_lock_reading(storage, env, clock)?;
@@ -2460,7 +2460,7 @@ pub(crate) fn commit_lock_yield(
 
 /// The wait loop of [`acquire_lock_with_deadline`] around `attempt`: until
 /// it returns something other than `Locked`, or `max_wait` has elapsed
-/// (one final attempt after the deadline). `shutdown` is checked before
+/// (one final attempt after the deadline). `cancel` is checked before
 /// every attempt and every 500 ms of a sleep (`Interrupted`);
 /// `on_contended` is called once, on the first `Locked`. The attempts
 /// share one reading of the store's clock.
@@ -2468,7 +2468,7 @@ pub(crate) fn wait_while_locked<T>(
     env: &HostEnv,
     max_wait: std::time::Duration,
     base_delay_ms: u64,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     mut on_contended: impl FnMut(&LockHolder),
     mut attempt_once: impl FnMut(&mut StoreClock) -> Result<T>,
 ) -> Result<T> {
@@ -2477,7 +2477,7 @@ pub(crate) fn wait_while_locked<T>(
     let mut attempt: usize = 0;
     let mut store_clock = StoreClock::default();
     loop {
-        if shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
         let holder = match attempt_once(&mut store_clock) {
@@ -2513,7 +2513,7 @@ pub(crate) fn wait_while_locked<T>(
             if now >= wake {
                 break;
             }
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
             env.clock.sleep((wake - now).min(LOCK_WAIT_SLICE));

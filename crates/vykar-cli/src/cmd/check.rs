@@ -19,7 +19,7 @@ pub(crate) fn run_check(
     repair: bool,
     dry_run: bool,
     yes: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
@@ -27,13 +27,13 @@ pub(crate) fn run_check(
                 "--distrust-server requires --verify-data (flag is meaningless without data verification)",
             ));
         }
-        return run_check_readonly(config, label, verify_data, distrust_server, shutdown);
+        return run_check_readonly(config, label, verify_data, distrust_server, cancel);
     }
 
     // --repair mode
     if dry_run {
         // Plan only: show plan and exit.
-        let result = run_repair(config, label, verify_data, RepairMode::PlanOnly, shutdown)?;
+        let result = run_repair(config, label, verify_data, RepairMode::PlanOnly, cancel)?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         eprintln!("Dry run: no changes applied.");
@@ -48,7 +48,7 @@ pub(crate) fn run_check(
 
     if yes {
         // --yes: apply directly without confirmation.
-        let result = run_repair(config, label, verify_data, RepairMode::Apply, shutdown)?;
+        let result = run_repair(config, label, verify_data, RepairMode::Apply, cancel)?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         print_repair_result(&result);
@@ -56,7 +56,7 @@ pub(crate) fn run_check(
     }
 
     // Interactive: plan first, then confirm, then apply.
-    let plan_result = run_repair(config, label, verify_data, RepairMode::PlanOnly, shutdown)?;
+    let plan_result = run_repair(config, label, verify_data, RepairMode::PlanOnly, cancel)?;
 
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
@@ -65,7 +65,7 @@ pub(crate) fn run_check(
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let mode = apply_mode_after(&plan_result.plan);
-        let result = run_repair(config, label, verify_data, mode, shutdown)?;
+        let result = run_repair(config, label, verify_data, mode, cancel)?;
         print_repair_result(&result);
         return Ok(());
     }
@@ -83,7 +83,7 @@ pub(crate) fn run_check(
 
     // Re-scan and apply under maintenance lock.
     let mode = apply_mode_after(&plan_result.plan);
-    let result = run_repair(config, label, verify_data, mode, shutdown)?;
+    let result = run_repair(config, label, verify_data, mode, cancel)?;
     print_repair_result(&result);
 
     Ok(())
@@ -105,7 +105,7 @@ fn run_repair(
     label: Option<&str>,
     verify_data: bool,
     mode: RepairMode,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<RepairResult> {
     with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_repair(
@@ -114,7 +114,7 @@ fn run_repair(
             verify_data,
             mode,
             Some(&mut make_progress_callback()),
-            shutdown,
+            cancel,
         )?)
     })
 }
@@ -124,7 +124,7 @@ fn run_check_readonly(
     label: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     let result = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_progress(
@@ -135,7 +135,7 @@ fn run_check_readonly(
             Some(&mut make_progress_callback()),
             100,   // standalone always 100%
             false, // don't update daemon's full_every timer
-            shutdown,
+            cancel,
         )?)
     })?;
 

@@ -89,7 +89,7 @@ pub(super) fn phase1_upload(
     prepared: &Prepared<'_>,
     num_workers: usize,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     dataless: &mut DatalessTally,
     marker: Option<Arc<lock::SessionMarker>>,
 ) -> Result<Phase1Output> {
@@ -138,7 +138,7 @@ pub(super) fn phase1_upload(
     }
 
     // Recover chunk→pack mappings from a previous interrupted session.
-    match ws.recover_pending_index(repo, shutdown) {
+    match ws.recover_pending_index(repo, cancel) {
         Ok(recovery) => {
             if recovery.recovered_chunks > 0 {
                 info!(
@@ -220,7 +220,7 @@ pub(super) fn phase1_upload(
                 let stream_result = crate::commands::list::for_each_snapshot_item(
                     repo,
                     &parent_name,
-                    shutdown,
+                    cancel,
                     |item| {
                         builder.push(item);
                         Ok(())
@@ -316,7 +316,7 @@ pub(super) fn phase1_upload(
             segment_size,
             pipeline_buffer_bytes,
             prefilter: prefilter.as_ref(),
-            shutdown,
+            cancel,
             verbose,
             parent_reuse_index: parent_reuse_index.as_ref(),
         };
@@ -354,7 +354,7 @@ pub(super) fn phase1_upload(
     }
 
     // Bail before committing if shutdown was requested during the walk.
-    shutdown.check()?;
+    cancel.check()?;
 
     let listing = listing.finish(repo, ws)?;
 
@@ -382,7 +382,7 @@ pub(super) fn phase1_upload(
         memory: ws.memory.snapshot(),
     };
     instrumentation.emit(&stats);
-    shutdown.check()?;
+    cancel.check()?;
 
     let time_end = clock.now_utc();
 
@@ -549,7 +549,7 @@ impl PendingCommit {
     pub(crate) fn wait_for_lock(
         &self,
         progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<lock::LockGuard> {
         let env = self.repo.host_env().clone();
         lock::acquire_commit_lock(
@@ -557,7 +557,7 @@ impl PendingCommit {
             &env,
             lock::COMMIT_LOCK_MAX_WAIT,
             500,
-            shutdown,
+            cancel,
             &self.session.id,
             self.yields_to_flagged(),
             |_| {
@@ -594,16 +594,16 @@ impl PendingCommit {
     /// Production, lock-free (04 step 9): mark the session marker
     /// `committing` ([`Self::mark_committing`]), then wait until `locks/`
     /// holds no live lock ([`Self::try_probe`]; `COMMIT_LOCK_MAX_WAIT`, with
-    /// backoff and `shutdown` checked as [`Self::wait_for_lock`] does),
+    /// backoff and `cancel` checked as [`Self::wait_for_lock`] does),
     /// reporting "waiting for commit lock" once contended. The flag stays
     /// set while waiting, so lock holders yield meanwhile, and until
     /// deregistration.
     pub(crate) fn wait_until_unlocked(
         &mut self,
         progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<()> {
-        if shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
         self.mark_committing()?;
@@ -612,7 +612,7 @@ impl PendingCommit {
             &env,
             lock::COMMIT_LOCK_MAX_WAIT,
             500,
-            shutdown,
+            cancel,
             |_| {
                 emit_progress(
                     progress,
@@ -777,13 +777,13 @@ impl CommitInProgress {
     /// End Phase 2 once the machine ended with `result`: the post-commit
     /// work, deregistration and the lock release (lock mode) on success; on
     /// failure, deregistration, the lock release, then `flush_on_abort`.
-    /// `shutdown` only shortens the post-commit wait for the local
+    /// `cancel` only shortens the post-commit wait for the local
     /// file-cache lock.
     pub(crate) fn finish(
         self,
         result: Result<Committed>,
         progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<BackupOutcome> {
         let Self {
             mut session,
@@ -819,7 +819,7 @@ impl CommitInProgress {
                 write,
                 &mut report.new_file_cache,
                 &events,
-                shutdown,
+                cancel,
                 || {
                     let guard = session.guard.take();
                     let storage = Arc::clone(&repo_storage);

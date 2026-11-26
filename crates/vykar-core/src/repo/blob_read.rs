@@ -252,7 +252,7 @@ impl<'a> BlobReader<'a> {
 
 /// Run `fetch` over `groups` on up to `width` threads and pass each result
 /// to `accept` on the calling thread, in completion order. Threads claim
-/// groups in slice order and poll `shutdown` before each fetch. With
+/// groups in slice order and poll `cancel` before each fetch. With
 /// `width <= 1` or a single group everything runs on the calling thread, in
 /// order, and the first error is returned at once.
 ///
@@ -265,14 +265,14 @@ impl<'a> BlobReader<'a> {
 pub(crate) fn fetch_groups_bounded<G: Sync, T: Send>(
     width: usize,
     groups: &[G],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     fetch: impl Fn(&G) -> Result<T> + Sync,
     mut accept: impl FnMut(T) -> Result<()>,
 ) -> Result<()> {
     let threads = width.min(groups.len());
     if threads <= 1 {
         for group in groups {
-            shutdown.check()?;
+            cancel.check()?;
             accept(fetch(group)?)?;
         }
         return Ok(());
@@ -293,7 +293,7 @@ pub(crate) fn fetch_groups_bounded<G: Sync, T: Send>(
                 if stop.load(Ordering::Relaxed) {
                     return Err(());
                 }
-                let result = shutdown.check().and_then(|()| fetch(group));
+                let result = cancel.check().and_then(|()| fetch(group));
                 let failed = result.is_err();
                 // The receiver lives until this thread drops `tx`.
                 let _ = tx.send((idx, result));

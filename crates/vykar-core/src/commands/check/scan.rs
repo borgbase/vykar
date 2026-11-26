@@ -327,7 +327,7 @@ fn check_tree_chunk(
     plain: &[u8],
     index: &LiveIndex,
     collect_refs: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CheckedChunk {
     let mut chunk = CheckedChunk {
         items: 0,
@@ -339,7 +339,7 @@ fn check_tree_chunk(
     let result = for_each_decoded_item(plain, |item| {
         // Per-item poll: a single multi-million-item snapshot must stay
         // responsive, not just the per-snapshot boundary.
-        shutdown.check()?;
+        cancel.check()?;
         let idx = chunk.items;
         chunk.items += 1;
         chunk.paths.observe(item.path_bytes());
@@ -455,7 +455,7 @@ pub(super) fn integrity_scan(
     config: &VykarConfig,
     opts: &ScanOptions,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<ScanResult> {
     let mut counters = ScanCounters::default();
     let mut issues: Vec<IntegrityIssue> = Vec::new();
@@ -484,7 +484,7 @@ pub(super) fn integrity_scan(
             .collect();
         let remote_keys = repo.storage().list("snapshots/")?;
         for key in &remote_keys {
-            shutdown.check()?;
+            cancel.check()?;
             let Some(id_hex) = key.strip_prefix("snapshots/") else {
                 continue;
             };
@@ -571,7 +571,7 @@ pub(super) fn integrity_scan(
     // snapshot so the final order stays per snapshot.
     let mut passes: Vec<SnapshotPass> = Vec::with_capacity(snapshot_count);
     for (i, entry) in snapshot_entries.into_iter().enumerate() {
-        shutdown.check()?;
+        cancel.check()?;
         emit_progress(
             progress,
             CheckProgressEvent::SnapshotStarted {
@@ -693,8 +693,8 @@ pub(super) fn integrity_scan(
             TreeChunkSource::Storage,
             OnChunkError::Record,
             default_decode_threads(),
-            shutdown,
-            |_, plain| check_tree_chunk(plain, index, collect_refs, shutdown),
+            cancel,
+            |_, plain| check_tree_chunk(plain, index, collect_refs, cancel),
             |k, outcome| {
                 if let Some(slot) = outcomes.get_mut(k) {
                     *slot = Some(outcome);
@@ -925,10 +925,10 @@ pub(super) fn integrity_scan(
         );
 
         let (existence_checked, missing_count, pack_issues) =
-            parallel_pack_existence(repo.storage(), &packs_for_existence, concurrency, shutdown);
+            parallel_pack_existence(repo.storage(), &packs_for_existence, concurrency, cancel);
         // Workers `break` out of the work queue on cancellation, so a short
         // count must never be folded into the result as coverage.
-        shutdown.check()?;
+        cancel.check()?;
         counters.packs_existence_checked = existence_checked;
 
         // Count chunks only in packs whose existence was definitively resolved
@@ -966,7 +966,7 @@ pub(super) fn integrity_scan(
 
     // Phase 2b: Locate snapshot items affected by missing packs (issue #122).
     // Cheap on healthy repos — short-circuits when no packs are missing.
-    let item_impacts = locate_items_in_missing_packs(repo, &missing_packs, shutdown)?;
+    let item_impacts = locate_items_in_missing_packs(repo, &missing_packs, cancel)?;
 
     // Phase 3: Verify data (client-side crypto verification)
     if opts.verify_data {
@@ -988,16 +988,16 @@ pub(super) fn integrity_scan(
             &packs_vec,
             config.limits.verify_data_concurrency(),
             BATCH_THRESHOLD,
-            shutdown,
+            cancel,
         );
-        shutdown.check()?;
+        cancel.check()?;
         counters.chunks_data_verified = data_count;
         let data_issues = drop_trailer_issues_covered_by_maps(
             repo,
             &packs_vec,
             data_issues,
             config.limits.verify_data_concurrency(),
-            shutdown,
+            cancel,
         )?;
         issues.extend(data_issues);
 
@@ -1013,7 +1013,7 @@ pub(super) fn integrity_scan(
     // Final guard: closes the window where the flag is raised after the last
     // loop-level check — e.g. a callback setting it on `PacksExistenceProgress`
     // with `verify_data = false`, where nothing downstream polls again.
-    shutdown.check()?;
+    cancel.check()?;
 
     Ok(ScanResult {
         counters,
@@ -1040,7 +1040,7 @@ pub(super) fn integrity_scan(
 fn locate_items_in_missing_packs(
     repo: &mut Repo,
     missing_packs: &HashSet<PackId>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<ItemImpact>> {
     if missing_packs.is_empty() {
         return Ok(Vec::new());
@@ -1062,9 +1062,8 @@ fn locate_items_in_missing_packs(
     let mut impacts: Vec<ItemImpact> = Vec::new();
 
     for entry in &entries {
-        shutdown.check()?;
-        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, shutdown)
-        {
+        cancel.check()?;
+        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, cancel) {
             Ok(s) => s,
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(_) => continue,
@@ -1073,7 +1072,7 @@ fn locate_items_in_missing_packs(
         let mut item_index: usize = 0;
         let mut local: Vec<ItemImpact> = Vec::new();
         let walk = for_each_decoded_item(&items_stream, |item| {
-            shutdown.check()?;
+            cancel.check()?;
             let idx = item_index;
             item_index += 1;
             if item.entry_type == ItemType::RegularFile {
@@ -1119,7 +1118,7 @@ fn parallel_pack_existence(
     storage: &Arc<dyn StorageBackend>,
     packs: &[(PackId, usize)],
     concurrency: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> (usize, usize, Vec<IntegrityIssue>) {
     if packs.is_empty() {
         return (0, 0, Vec::new());
@@ -1132,7 +1131,7 @@ fn parallel_pack_existence(
     crate::repo::bounded::for_each_bounded(
         concurrency,
         packs,
-        shutdown,
+        cancel,
         |(pack_id, _chunk_count)| {
             let pack_key = pack_id.storage_key();
             match storage.exists(&pack_key) {
@@ -1177,7 +1176,7 @@ fn parallel_verify_data(
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     concurrency: usize,
     batch_threshold: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> (usize, Vec<IntegrityIssue>) {
     if packs.is_empty() {
         return (0, Vec::new());
@@ -1186,7 +1185,7 @@ fn parallel_verify_data(
     let verified = AtomicUsize::new(0);
     let issues = Mutex::new(Vec::new());
 
-    crate::repo::bounded::for_each_bounded(concurrency, packs, shutdown, |(pack_id, chunks)| {
+    crate::repo::bounded::for_each_bounded(concurrency, packs, cancel, |(pack_id, chunks)| {
         let mut local_issues = Vec::new();
         let count = if chunks.len() >= batch_threshold {
             verify_pack_full(
@@ -1203,7 +1202,7 @@ fn parallel_verify_data(
                 pack_id,
                 chunks,
                 &mut local_issues,
-                shutdown,
+                cancel,
             )
         };
 
@@ -1347,9 +1346,9 @@ fn verify_pack_individual(
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> usize {
-    if !shutdown.is_cancelled() {
+    if !cancel.is_cancelled() {
         verify_trailer_by_range(storage, crypto, pack_id, chunks, issues);
     }
     let mut count = 0;
@@ -1357,7 +1356,7 @@ fn verify_pack_individual(
     // issuing storage requests for the rest of the pack. `break` rather than
     // `Err` — the caller's post-scope guard raises the error.
     for (chunk_id, entry) in chunks {
-        if shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             break;
         }
         let mut raw =
@@ -1467,7 +1466,7 @@ fn drop_trailer_issues_covered_by_maps(
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     issues: Vec<IntegrityIssue>,
     width: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<IntegrityIssue>> {
     if !issues
         .iter()
@@ -1480,7 +1479,7 @@ fn drop_trailer_issues_covered_by_maps(
         repo.crypto().as_ref(),
         width,
         true,
-        shutdown,
+        cancel,
     ) {
         Ok(maps) => maps,
         Err(VykarError::Interrupted) => return Err(VykarError::Interrupted),

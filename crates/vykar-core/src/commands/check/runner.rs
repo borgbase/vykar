@@ -156,12 +156,12 @@ pub fn run_with_progress(
     progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CheckResult> {
     // Entry guard: on an empty repository every loop below runs zero
     // iterations, so without this a pre-set flag would return a clean `Ok` and
     // record success for work that never ran.
-    shutdown.check()?;
+    cancel.check()?;
 
     // Pre-open early exit: if max_percent=0 and no full_every configured,
     // skip without opening the repo at all.
@@ -171,7 +171,7 @@ pub fn run_with_progress(
 
     // Open repo (needed for fingerprint check and actual scan).
     let mut repo =
-        crate::commands::util::open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
+        crate::commands::util::open_repo(config, passphrase, OpenOptions::new(), cancel)?;
 
     run_on_repo(
         &mut repo,
@@ -181,7 +181,7 @@ pub fn run_with_progress(
         progress,
         max_percent,
         record_state,
-        shutdown,
+        cancel,
     )
 }
 
@@ -196,7 +196,7 @@ pub(crate) fn run_on_repo(
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CheckResult> {
     let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
     let full_every_dur = config.check.full_every_duration();
@@ -242,7 +242,7 @@ pub(crate) fn run_on_repo(
         &mut progress,
         effective,
         &mut sample,
-        shutdown,
+        cancel,
     )?;
     while !result.errors.is_empty() {
         let latest = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())?;
@@ -273,7 +273,7 @@ pub(crate) fn run_on_repo(
             latest,
             "check found problems and the index changed during the check; checking again on the latest head"
         );
-        shutdown.check()?;
+        cancel.check()?;
         repo.refresh_snapshot_list()?;
         passes += 1;
         result = check_pass(
@@ -284,7 +284,7 @@ pub(crate) fn run_on_repo(
             &mut progress,
             effective,
             &mut sample,
-            shutdown,
+            cancel,
         )?;
     }
 
@@ -293,7 +293,7 @@ pub(crate) fn run_on_repo(
     // vec, so an extra `&&` term here would still return `Ok(partial_result)` —
     // which the cycle orchestrator maps to `StepOutcome::Ok` and the CLI prints
     // as a completed summary. Cancellation must be an error, not a short `Ok`.
-    shutdown.check()?;
+    cancel.check()?;
 
     // Record full check timestamp if this was a 100% run and succeeded.
     if record_state && effective == 100 && result.errors.is_empty() {
@@ -393,7 +393,7 @@ fn check_pass(
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
     effective: u8,
     sample: &mut Option<CheckSample>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CheckResult> {
     repo.load_chunk_index_uncached()?;
 
@@ -430,14 +430,14 @@ fn check_pass(
             verify_data,
             repo.content_hash(),
             progress,
-            shutdown,
+            cancel,
         )
     } else {
         ServerVerifyOutcome::Fallback
     };
     // `try_server_verify` returns an outcome rather than a `Result`, so a
     // cancellation mid-batch needs raising explicitly here.
-    shutdown.check()?;
+    cancel.check()?;
 
     let (verified_packs, srv_packs_responded, srv_chunks_verified, srv_errors) =
         match server_outcome {
@@ -481,7 +481,7 @@ fn check_pass(
             snapshot_sample: sample.map(|s| &s.snapshots),
         },
         progress,
-        shutdown,
+        cancel,
     )?;
 
     // Fold the server-verify contribution into the scan's projection.
@@ -562,21 +562,21 @@ pub fn run_with_repair(
     verify_data: bool,
     mode: RepairMode,
     progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RepairResult> {
-    shutdown.check()?;
+    cancel.check()?;
 
     let opts = repair_open_options(mode);
     if mode == RepairMode::PlanOnly {
-        let mut repo = crate::commands::util::open_repo(config, passphrase, opts, shutdown)?;
-        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
+        let mut repo = crate::commands::util::open_repo(config, passphrase, opts, cancel)?;
+        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, cancel)
     } else {
         // A token nothing cancels: past its mutation boundary a repair must
         // not be cut short, and the read path beneath `execute_repair` does
-        // not poll `shutdown` either. The scan stays cancellable by polling.
+        // not poll `cancel` either. The scan stays cancellable by polling.
         let mut repo =
             crate::commands::util::open_repo(config, passphrase, opts, &CancelToken::new())?;
-        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
+        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, cancel)
     }
 }
 
@@ -604,7 +604,7 @@ pub(crate) fn run_with_repair_on_repo(
     verify_data: bool,
     mode: RepairMode,
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RepairResult> {
     let scan_opts = ScanOptions {
         collect_chunk_refs: true,
@@ -615,10 +615,10 @@ pub(crate) fn run_with_repair_on_repo(
     };
 
     if mode == RepairMode::PlanOnly {
-        let load = repo.load_chunk_index_for_repair(shutdown)?;
+        let load = repo.load_chunk_index_for_repair(cancel)?;
         repo.refresh_snapshot_list()?;
 
-        let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
+        let scan = integrity_scan(repo, config, &scan_opts, &mut progress, cancel)?;
 
         // Refuse before building the plan so a dry-run never presents a
         // misleading executable RemoveUnreferencedEntries plan for a too-new repo.
@@ -629,7 +629,7 @@ pub(crate) fn run_with_repair_on_repo(
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
         // from a cancelled run as though it were complete.
-        shutdown.check()?;
+        cancel.check()?;
 
         Ok(RepairResult {
             check_result: scan.into(),
@@ -643,10 +643,10 @@ pub(crate) fn run_with_repair_on_repo(
             // Repair rebuilds or rewrites the index and deletes snapshots:
             // it does not run beside a backup.
             repo.refuse_live_sessions()?;
-            let load = repo.load_chunk_index_for_repair(shutdown)?;
+            let load = repo.load_chunk_index_for_repair(cancel)?;
             repo.refresh_snapshot_list()?;
 
-            let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
+            let scan = integrity_scan(repo, config, &scan_opts, &mut progress, cancel)?;
 
             // Refuse right after the under-lock scan — before the delete
             // probe and execute_repair — so not even the probe object is
@@ -682,7 +682,7 @@ pub(crate) fn run_with_repair_on_repo(
             // no resumable mid-state, so it and the read path beneath it
             // (`repair_apply`) deliberately do not poll the flag. This is the
             // last point at which aborting is free.
-            shutdown.check()?;
+            cancel.check()?;
 
             // Execute the repair
             let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;

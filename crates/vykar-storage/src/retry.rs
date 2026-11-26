@@ -323,18 +323,18 @@ mod tests {
         retry_max_delay_ms: 60_000,
     };
 
-    /// Cancel `token` from another thread after `after`; the receiver gets
+    /// Cancel `cancel` from another thread after `after`; the receiver gets
     /// the instant just before `cancel()`.
     fn cancel_later(
-        token: &CancelToken,
+        cancel: &CancelToken,
         after: Duration,
     ) -> std::sync::mpsc::Receiver<std::time::Instant> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let token = token.clone();
+        let cancel = cancel.clone();
         std::thread::spawn(move || {
             std::thread::sleep(after);
             let _ = tx.send(std::time::Instant::now());
-            token.cancel();
+            cancel.cancel();
         });
         rx
     }

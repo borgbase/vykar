@@ -125,10 +125,10 @@ impl<'m> ListingView<'m> {
         &self,
         repo: &Repo,
         dir: &[u8],
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
-        self.read(repo, Query::DirEntries(trim_dir(dir)), shutdown, &mut visit)
+        self.read(repo, Query::DirEntries(trim_dir(dir)), cancel, &mut visit)
     }
 
     /// `dir` itself (every entry whose path equals it) and every entry
@@ -141,17 +141,17 @@ impl<'m> ListingView<'m> {
         &self,
         repo: &Repo,
         dir: &[u8],
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
-        self.read(repo, Query::Subtree(trim_dir(dir)), shutdown, &mut visit)
+        self.read(repo, Query::Subtree(trim_dir(dir)), cancel, &mut visit)
     }
 
     fn read(
         &self,
         repo: &Repo,
         q: Query<'_>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         visit: &mut dyn FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
         let ptrs = &self.meta.item_ptrs;
@@ -165,17 +165,13 @@ impl<'m> ListingView<'m> {
                 (true, _) => stats.fallback = Some("key index ignored".into()),
                 (false, Err(no)) => stats.fallback = Some(no.to_string()),
                 (false, Ok(index)) => {
-                    let mut spans = RepoSpans {
-                        repo,
-                        ptrs,
-                        shutdown,
-                    };
+                    let mut spans = RepoSpans { repo, ptrs, cancel };
                     let outcome = query_index(
                         index,
                         ptrs.len(),
                         q,
                         &mut spans,
-                        shutdown,
+                        cancel,
                         &mut |item| {
                             delivered.note(item.path_bytes());
                             visit(item)
@@ -199,7 +195,7 @@ impl<'m> ListingView<'m> {
                 }
             }
         }
-        let mut stream = LazyItemStream::open(repo, ptrs, shutdown)?;
+        let mut stream = LazyItemStream::open(repo, ptrs, cancel)?;
         stats.chunks_read += ptrs.len();
         stats.stored_bytes += ptrs
             .iter()
@@ -247,7 +243,7 @@ pub(crate) trait SpanReader {
 struct RepoSpans<'a> {
     repo: &'a Repo,
     ptrs: &'a [ChunkId],
-    shutdown: &'a CancelToken,
+    cancel: &'a CancelToken,
 }
 
 impl SpanReader for RepoSpans<'_> {
@@ -268,7 +264,7 @@ impl SpanReader for RepoSpans<'_> {
             &locs,
             out,
             ends,
-            self.shutdown,
+            self.cancel,
             TreeChunkSource::CacheFirst,
         )?;
         Ok(locs.iter().map(|l| u64::from(l.3)).sum())
@@ -400,7 +396,7 @@ struct RangeReader<'x> {
     stride: usize,
     q: Query<'x>,
     spans: &'x mut dyn SpanReader,
-    shutdown: &'x CancelToken,
+    cancel: &'x CancelToken,
     emit: &'x mut dyn FnMut(Item) -> Result<()>,
     stats: &'x mut ListingRead,
     buf: Vec<u8>,
@@ -473,7 +469,7 @@ impl RangeReader<'_> {
         let mut cur = first;
         while cur < seg_end {
             let end = planned_end.min(cur + MAX_WINDOW).min(seg_end);
-            self.shutdown.check()?;
+            self.cancel.check()?;
             let stored = match self
                 .spans
                 .read_span(cur, end, &mut self.buf, &mut self.ends)
@@ -570,7 +566,7 @@ pub(crate) fn query_index(
     n_ptrs: usize,
     q: Query<'_>,
     spans: &mut dyn SpanReader,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     emit: &mut dyn FnMut(Item) -> Result<()>,
     stats: &mut ListingRead,
 ) -> Result<Outcome> {
@@ -579,7 +575,7 @@ pub(crate) fn query_index(
         stride: (index.stride as usize).max(1),
         q,
         spans,
-        shutdown,
+        cancel,
         emit,
         stats,
         buf: Vec::new(),
@@ -675,7 +671,7 @@ pub(crate) fn run_query(
     n_ptrs: usize,
     q: Query<'_>,
     spans: &mut dyn SpanReader,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     for_each: &mut ForEachItem<'_>,
     visit: &mut dyn FnMut(Item) -> Result<()>,
 ) -> Result<ListingRead> {
@@ -692,7 +688,7 @@ pub(crate) fn run_query(
                 n_ptrs,
                 q,
                 spans,
-                shutdown,
+                cancel,
                 &mut |item| {
                     delivered.note(item.path_bytes());
                     visit(item)

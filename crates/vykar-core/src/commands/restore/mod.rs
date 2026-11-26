@@ -230,7 +230,7 @@ pub fn run(
     pattern: Option<&str>,
     xattrs_enabled: bool,
     verify_chunks: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RestoreStats> {
     let opts = RestoreOptions {
         xattrs_enabled,
@@ -245,7 +245,7 @@ pub fn run(
         pattern,
         opts,
         None,
-        shutdown,
+        cancel,
     )
 }
 
@@ -262,7 +262,7 @@ pub fn run_with_options(
     pattern: Option<&str>,
     opts: RestoreOptions,
     events: Option<&dyn EventSink<RestoreEvent>>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RestoreStats> {
     let filter = compile_pattern(pattern)?;
 
@@ -275,7 +275,7 @@ pub fn run_with_options(
         pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
         events,
-        shutdown,
+        cancel,
     )
 }
 
@@ -300,7 +300,7 @@ pub(crate) fn run_on_repo(
     dest: &str,
     pattern: Option<&str>,
     opts: RestoreOptions,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RestoreStats> {
     let filter = compile_pattern(pattern)?;
     restore_on_repo_with_filter(
@@ -311,7 +311,7 @@ pub(crate) fn run_on_repo(
         pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
         None,
-        shutdown,
+        cancel,
     )
     .map(|(stats, _)| stats)
 }
@@ -334,7 +334,7 @@ pub(crate) fn restore_on_repo_for_test(
     dest: &str,
     selection: TestSelection<'_>,
     whole: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)> {
     let opts = RestoreOptions::default();
     match selection {
@@ -352,7 +352,7 @@ pub(crate) fn restore_on_repo_for_test(
                 scope,
                 |path| path_matches_selection(path, selected),
                 None,
-                shutdown,
+                cancel,
             )
         }
         TestSelection::Pattern(pattern) => {
@@ -370,7 +370,7 @@ pub(crate) fn restore_on_repo_for_test(
                 scope,
                 move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
                 None,
-                shutdown,
+                cancel,
             )
         }
     }
@@ -389,7 +389,7 @@ pub fn run_selected(
     selected_paths: &HashSet<String>,
     xattrs_enabled: bool,
     verify_chunks: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RestoreStats> {
     restore_with_filter(
         config,
@@ -404,7 +404,7 @@ pub fn run_selected(
         selection_scope(selected_paths),
         |path| path_matches_selection(path, selected_paths),
         None,
-        shutdown,
+        cancel,
     )
 }
 
@@ -514,7 +514,7 @@ enum RestoreSource<'a> {
         meta: &'a SnapshotMeta,
         repo: &'a Repo,
         dirs: Vec<String>,
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
         read: ListingRead,
     },
 }
@@ -528,19 +528,19 @@ impl ItemSource for &mut RestoreSource<'_> {
                 meta,
                 repo,
                 dirs,
-                shutdown,
+                cancel,
                 read,
             } => {
                 let mut rest = dirs.as_slice();
                 while let Some((dir, tail)) = rest.split_first() {
-                    let r = view.subtree(repo, dir.as_bytes(), shutdown, &mut visit)?;
+                    let r = view.subtree(repo, dir.as_bytes(), cancel, &mut visit)?;
                     let fell_back = !r.via_index;
                     read.absorb(r);
                     rest = tail;
                     if fell_back && !rest.is_empty() {
                         // The index failed once: one scan for every remaining
                         // directory instead of one per directory.
-                        let scan = scan_subtrees(repo, meta, rest, shutdown, &mut visit)?;
+                        let scan = scan_subtrees(repo, meta, rest, cancel, &mut visit)?;
                         read.absorb(scan);
                         break;
                     }
@@ -557,7 +557,7 @@ fn scan_subtrees(
     repo: &Repo,
     meta: &SnapshotMeta,
     dirs: &[String],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     visit: &mut dyn FnMut(Item) -> Result<()>,
 ) -> Result<ListingRead> {
     let wanted: HashSet<&[u8]> = dirs.iter().map(|d| d.as_bytes()).collect();
@@ -573,7 +573,7 @@ fn scan_subtrees(
         queries: dirs.len(),
         ..ListingRead::default()
     };
-    let mut stream = LazyItemStream::open(repo, &meta.item_ptrs, shutdown)?;
+    let mut stream = LazyItemStream::open(repo, &meta.item_ptrs, cancel)?;
     stream.for_each_item(|item| {
         let p = item.path_bytes();
         let under = wanted.contains(p)
@@ -604,18 +604,14 @@ fn restore_with_filter<F>(
     scope: ReadScope,
     include_path: F,
     events: Option<&dyn EventSink<RestoreEvent>>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<RestoreStats>
 where
     F: FnMut(&str) -> bool,
 {
-    shutdown.check()?;
-    let mut repo = super::util::open_repo(
-        config,
-        passphrase,
-        crate::repo::OpenOptions::new(),
-        shutdown,
-    )?;
+    cancel.check()?;
+    let mut repo =
+        super::util::open_repo(config, passphrase, crate::repo::OpenOptions::new(), cancel)?;
     restore_on_repo_with_filter(
         &mut repo,
         snapshot_name,
@@ -624,7 +620,7 @@ where
         scope,
         include_path,
         events,
-        shutdown,
+        cancel,
     )
     .map(|(stats, _)| stats)
 }
@@ -644,7 +640,7 @@ fn restore_on_repo_with_filter<F>(
     scope: ReadScope,
     include_path: F,
     events: Option<&dyn EventSink<RestoreEvent>>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)>
 where
     F: FnMut(&str) -> bool,
@@ -663,7 +659,7 @@ where
         scope,
         include_path,
         events,
-        shutdown,
+        cancel,
     )
     .map_err(|e| origin.explain(repo, e))
 }
@@ -678,7 +674,7 @@ fn restore_planned<F>(
     scope: ReadScope,
     mut include_path: F,
     events: Option<&dyn EventSink<RestoreEvent>>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)>
 where
     F: FnMut(&str) -> bool,
@@ -738,7 +734,7 @@ where
     // entry is non-UTF8, even one a filter would exclude — acceptable for this
     // extreme edge.
     if !fs::raw_names_supported() {
-        let mut preflight = items.open_lazy(repo, &resolved_name, shutdown)?;
+        let mut preflight = items.open_lazy(repo, &resolved_name, cancel)?;
         if let Some((raw_count, example)) = detect_raw_entries(&mut preflight)? {
             return Err(VykarError::Other(format!(
                 "snapshot contains {raw_count} entr{} with non-UTF8 name(s) \
@@ -749,7 +745,7 @@ where
             )));
         }
     }
-    shutdown.check()?;
+    cancel.check()?;
     let meta = super::list::load_snapshot_meta(repo, &resolved_name)?;
     items.ensure_index(repo)?;
     // Shared until the source is dropped.
@@ -764,11 +760,7 @@ where
         _ => None,
     };
     let mut source = match dirs {
-        None => RestoreSource::Lazy(Box::new(LazyItemStream::open(
-            ro,
-            &meta.item_ptrs,
-            shutdown,
-        )?)),
+        None => RestoreSource::Lazy(Box::new(LazyItemStream::open(ro, &meta.item_ptrs, cancel)?)),
         Some(dirs) => {
             // A pointer the chunk index lacks is refused before anything is
             // written, as the lazy read refuses it, even where the subtree
@@ -779,7 +771,7 @@ where
                 meta: &meta,
                 repo: ro,
                 dirs,
-                shutdown,
+                cancel,
                 read: ListingRead::default(),
             }
         }
@@ -847,9 +839,9 @@ where
         batch_size,
         &mut group_reps,
         &mut pending_links,
-        shutdown,
+        cancel,
         |mut batch_files, mut batch_chunks, verified_dirs, stats| -> Result<()> {
-            shutdown.check()?;
+            cancel.check()?;
             if batch_files.is_empty() {
                 return Ok(());
             }
@@ -890,7 +882,7 @@ where
             }
 
             // Phase 3: create every file of the batch exclusively.
-            plan::stage_batch_files(&batch_files, &temp_root, verified_dirs, shutdown)?;
+            plan::stage_batch_files(&batch_files, &temp_root, verified_dirs, cancel)?;
 
             // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
             // A pack a concurrent compact removed is re-resolved (04 step 7).
@@ -908,7 +900,7 @@ where
                 &temp_root,
                 readers,
                 verify_chunks,
-                shutdown,
+                cancel,
                 Some(&relocator),
                 failures.as_ref(),
                 progress.as_ref(),
@@ -951,7 +943,7 @@ where
                 xattrs_enabled,
                 restore_as_root,
                 stats,
-                shutdown,
+                cancel,
             )?;
 
             total_bytes += bytes;
@@ -988,7 +980,7 @@ where
     // links still live in `temp_root` — the no-reopen property holds for the
     // security-sensitive lchown, and a `rename` never disturbs a symlink's own
     // metadata.
-    finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats, shutdown)
+    finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats, cancel)
         .map_err(cleanup)?;
 
     // Relink hard-link group members now that every representative is written
@@ -1008,7 +1000,7 @@ where
         restore_as_root,
         &mut tombstones,
         &mut stats,
-        shutdown,
+        cancel,
     )
     .map_err(cleanup)?;
 
@@ -1016,7 +1008,7 @@ where
     // at their paths. A failure must abort: publishing would put an empty file
     // at a path reported as damaged. Directory mtimes are unaffected, as
     // `apply_dir_metadata` runs after the move.
-    sweep_tombstones(&temp_root, &tombstones, shutdown).map_err(cleanup)?;
+    sweep_tombstones(&temp_root, &tombstones, cancel).map_err(cleanup)?;
 
     // Phase 5a: rename temp subtrees into the final destination.  All file
     // metadata is already on the inodes, so the rename has no observable TOCTOU
@@ -1029,15 +1021,15 @@ where
     // "remove before retrying" error if even rollback fails.
     //
     // Last cancellable point. The metadata/hard-link passes above poll
-    // `shutdown` per item, but a flag raised during the *final* batch's passes
+    // `cancel` per item, but a flag raised during the *final* batch's passes
     // would otherwise go unobserved and publish the staging tree anyway; this
     // guard turns that into a clean abort with `dest` left empty. Once
     // `move_temp_to_dest` is entered there is no resumable mid-state, so it
     // (and the post-publication `apply_dir_metadata` pass) deliberately do not
     // poll the flag.
     #[cfg(test)]
-    fault_pre_publish_shutdown(&temp_root, shutdown);
-    shutdown.check().map_err(cleanup)?;
+    fault_pre_publish_shutdown(&temp_root, cancel);
+    cancel.check().map_err(cleanup)?;
     finalize::move_temp_to_dest(&temp_root, &dest_root)?;
 
     // Directory metadata (F1/F2: chown → xattrs → mode → mtime, deepest-first)
@@ -1174,14 +1166,14 @@ fn discard_damaged(
     Ok(())
 }
 
-/// Remove every tombstone left by continue mode. Polls `shutdown`.
+/// Remove every tombstone left by continue mode. Polls `cancel`.
 fn sweep_tombstones(
     temp_root: &Path,
     tombstones: &HashSet<PathBuf>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<()> {
     for rel in tombstones {
-        shutdown.check()?;
+        cancel.check()?;
         let path = temp_root.join(rel);
         std::fs::remove_file(&path).map_err(|e| {
             VykarError::Other(format!(
@@ -1304,7 +1296,7 @@ pub(super) fn apply_item_xattrs(
 // filter-driven cancel on the last item is always caught by the per-item guard
 // and can never reach the window between "staging complete" and "rename into
 // dest". This hook opens that window deliberately: it fires once, records how
-// much was staged, and raises the shutdown flag. Thread-local for the same
+// much was staged, and cancels the token. Thread-local for the same
 // reason as `finalize`'s fault state — the restore orchestration is a serial
 // pass on the test's own thread.
 // ---------------------------------------------------------------------------
@@ -1317,7 +1309,7 @@ thread_local! {
     /// Regular files present under `temp_root` when the fault last fired.
     static PRE_PUBLISH_STAGED_FILES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    /// `Some(n)` raises the shutdown flag on the n-th staging-loop iteration.
+    /// `Some(n)` cancels the token on the n-th staging-loop iteration.
     static FAULT_CANCEL_AT_STAGED_FILE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     /// Staging-loop iterations run since the fault was armed.
@@ -1337,7 +1329,7 @@ impl PrePublishFaultGuard {
         PrePublishFaultGuard
     }
 
-    /// Raise the shutdown flag on the `n`-th (0-based) staging-loop iteration,
+    /// Cancel the token on the `n`-th (0-based) staging-loop iteration,
     /// simulating a signal that arrives while Phase 3 is creating files.
     fn arm_staging_cancel(n: usize) -> Self {
         FAULT_CANCEL_AT_STAGED_FILE.with(|c| c.set(Some(n)));
@@ -1367,26 +1359,26 @@ impl Drop for PrePublishFaultGuard {
 }
 
 #[cfg(test)]
-fn fault_pre_publish_shutdown(temp_root: &Path, shutdown: &CancelToken) {
+fn fault_pre_publish_shutdown(temp_root: &Path, cancel: &CancelToken) {
     if !FAULT_PRE_PUBLISH_CANCEL.with(std::cell::Cell::get) {
         return;
     }
     PRE_PUBLISH_STAGED_FILES.with(|c| c.set(count_staged_files(temp_root)));
-    shutdown.cancel();
+    cancel.cancel();
 }
 
-/// Counts staging-loop iterations and, when armed, raises the shutdown flag on
+/// Counts staging-loop iterations and, when armed, cancels the token on
 /// the chosen one. Called *after* that iteration's guard, so the armed
 /// iteration still completes and the following one is the first to abort.
 #[cfg(test)]
-pub(super) fn fault_staging_loop(shutdown: &CancelToken) {
+pub(super) fn fault_staging_loop(cancel: &CancelToken) {
     let idx = STAGING_LOOP_ITERATIONS.with(|c| {
         let v = c.get();
         c.set(v + 1);
         v
     });
     if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx) {
-        shutdown.cancel();
+        cancel.cancel();
     }
 }
 

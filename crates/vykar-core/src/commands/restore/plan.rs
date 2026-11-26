@@ -210,7 +210,7 @@ pub(super) fn stream_and_plan<F, B>(
     batch_size: usize,
     group_reps: &mut HashMap<HardlinkId, RepInfo>,
     pending_links: &mut Vec<PendingLink>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     mut flush_batch: B,
 ) -> Result<StreamPlan>
 where
@@ -236,7 +236,7 @@ where
         // Per-item poll: this is what makes "stop between files" real, since
         // `RESTORE_BATCH_FILES` batch boundaries are far too coarse. A relaxed
         // load is negligible against per-item decode + filesystem work.
-        shutdown.check()?;
+        cancel.check()?;
         if !include_path(&item.path) {
             return Ok(());
         }
@@ -546,18 +546,18 @@ pub(super) fn conflicting_entries(rel_path: &Path) -> VykarError {
 ///
 /// Parents verified during directory creation are trusted (single-process
 /// restore, no concurrent tampering); unverified parents get the full
-/// canonicalize check. Polls `shutdown` per file: a snapshot of empty files is
+/// canonicalize check. Polls `cancel` per file: a snapshot of empty files is
 /// restored entirely here, with no Phase 4 work to poll on its behalf.
 pub(super) fn stage_batch_files(
     files: &[PlannedFile],
     temp_root: &Path,
     verified_dirs: &VerifiedDirs,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<()> {
     for pf in files {
-        shutdown.check()?;
+        cancel.check()?;
         #[cfg(test)]
-        super::fault_staging_loop(shutdown);
+        super::fault_staging_loop(cancel);
         let full_path = temp_root.join(&pf.rel_path);
         if full_path
             .parent()

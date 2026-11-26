@@ -353,8 +353,8 @@ fn mark_counts(
     source: TreeChunkSource,
     decode_threads: usize,
 ) -> HashMap<ChunkId, (bool, u32)> {
-    let shutdown = CancelToken::new();
-    let snaps = load_snapshots_strict(repo, &shutdown).unwrap();
+    let cancel = CancelToken::new();
+    let snaps = load_snapshots_strict(repo, &cancel).unwrap();
     let names: Vec<String> = snaps.iter().map(|s| s.meta.name.clone()).collect();
     let ptrs: Vec<&[ChunkId]> = snaps.iter().map(|s| s.meta.item_ptrs.as_slice()).collect();
     let set = TreeChunkSet::build(&ptrs);
@@ -370,7 +370,7 @@ fn mark_counts(
             missing_refs: MissingRefs::Abort,
             decode_threads,
         },
-        &shutdown,
+        &cancel,
     )
     .unwrap();
     assert_eq!(mark.walk.chunks, set.len());

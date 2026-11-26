@@ -371,12 +371,12 @@ pub(super) fn execute_parallel_restore(
     root: &Path,
     readers: usize,
     verify_chunks: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     relocator: Option<&Relocator<'_>>,
     failures: Option<&BatchFailures>,
     progress: Option<&BatchProgress<'_>>,
 ) -> std::result::Result<u64, ReadError> {
-    shutdown.check()?;
+    cancel.check()?;
     if groups.is_empty() {
         return Ok(0);
     }
@@ -430,7 +430,7 @@ pub(super) fn execute_parallel_restore(
                         &mut pw,
                         root,
                         verify_chunks,
-                        shutdown,
+                        cancel,
                         relocator,
                         failures,
                     ) {
@@ -463,7 +463,7 @@ pub(super) fn execute_parallel_restore(
         // Workers return `Ok(())` when they stop early, so a cancellation would
         // otherwise surface as a short but successful byte count — and the
         // caller would go on to publish a partial tree.
-        shutdown.check()?;
+        cancel.check()?;
         Ok(counters.bytes())
     })
 }
@@ -475,14 +475,14 @@ struct BlobCtx<'a> {
     counters: &'a WriteCounters,
     cancelled: &'a AtomicBool,
     root: &'a Path,
-    shutdown: &'a CancelToken,
+    cancel: &'a CancelToken,
     relocator: Option<&'a Relocator<'a>>,
     failures: Option<&'a BatchFailures>,
 }
 
 impl BlobCtx<'_> {
     fn stopping(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || self.shutdown.is_cancelled()
+        self.cancelled.load(Ordering::Acquire) || self.cancel.is_cancelled()
     }
 
     /// Record a source-side failure of `blob` in the failure sink, or turn it
@@ -532,7 +532,7 @@ fn process_read_group(
     pw: &mut PendingWrite,
     root: &Path,
     verify_chunks: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     relocator: Option<&Relocator<'_>>,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<(), ReadError> {
@@ -542,7 +542,7 @@ fn process_read_group(
         counters,
         cancelled,
         root,
-        shutdown,
+        cancel,
         relocator,
         failures,
     };
@@ -1639,12 +1639,12 @@ mod tests {
         let crypto = PlaintextEngine::new(test_chunk_hasher());
         let (pack_id, packed) = one_chunk_pack(&crypto, payload);
 
-        let shutdown = CancelToken::new();
+        let cancel = CancelToken::new();
         let inner = MemoryBackend::new();
         inner.put(&pack_id.storage_key(), &packed).unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(CancelOnReadBackend {
             inner,
-            flag: shutdown.clone(),
+            flag: cancel.clone(),
         });
 
         let files = one_file_plan(payload.len() as u64);
@@ -1659,7 +1659,7 @@ mod tests {
             }],
         )];
 
-        assert!(!shutdown.is_cancelled(), "flag must start clear");
+        assert!(!cancel.is_cancelled(), "flag must start clear");
         let err = execute_parallel_restore(
             &files,
             groups,
@@ -1668,7 +1668,7 @@ mod tests {
             temp.path(),
             2,
             false,
-            &shutdown,
+            &cancel,
             None,
             None,
             None,
@@ -1681,13 +1681,13 @@ mod tests {
             "expected Interrupted, got: {err}"
         );
         assert!(
-            shutdown.is_cancelled(),
+            cancel.is_cancelled(),
             "the backend should have raised the flag mid-pool"
         );
         assert!(!out.exists(), "no data may have been written");
     }
 
-    /// A pre-set shutdown flag must abort the pool with `Interrupted` before any
+    /// A pre-cancelled token must abort the pool with `Interrupted` before any
     /// worker starts. Kept separate from the mid-pool test above: this one exits
     /// at the entry guard and so cannot exercise the post-join guard.
     #[test]
@@ -1731,8 +1731,8 @@ mod tests {
             }],
         )];
 
-        let shutdown = CancelToken::new();
-        shutdown.cancel();
+        let cancel = CancelToken::new();
+        cancel.cancel();
         let err = execute_parallel_restore(
             &files,
             groups,
@@ -1741,7 +1741,7 @@ mod tests {
             temp.path(),
             2,
             false,
-            &shutdown,
+            &cancel,
             None,
             None,
             None,
@@ -2384,12 +2384,12 @@ mod tests {
             .collect();
         let (data, group) = multi_blob_group(pack_id, entries);
         let files = vec![file("f0.bin", file_offset)];
-        let shutdown = CancelToken::new();
+        let cancel = CancelToken::new();
         let inner = MemoryBackend::new();
         inner.put(&pack_id.storage_key(), &data).unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(CancelOnPieceBackend {
             inner,
-            flag: shutdown.clone(),
+            flag: cancel.clone(),
         });
         let temp = tempdir().unwrap();
         stage_files(temp.path(), &files);
@@ -2406,12 +2406,12 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &shutdown,
+            &cancel,
             None,
             None,
         )
         .unwrap();
-        assert!(shutdown.is_cancelled(), "the first piece raises the flag");
+        assert!(cancel.is_cancelled(), "the first piece raises the flag");
         assert_eq!(counters.bytes(), 0);
         assert_eq!(
             std::fs::read(temp.path().join("f0.bin")).unwrap(),

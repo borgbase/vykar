@@ -75,7 +75,7 @@ struct Shared {
     /// Fail every `locks/` PUT, so the commit lock is never acquired.
     fail_lock_put: bool,
     /// Set by the first successful pack PUT and passed to the backup as its
-    /// shutdown flag, so the run is interrupted once packs are durable.
+    /// cancel token, so the run is interrupted once packs are durable.
     interrupt_after_pack: Option<CancelToken>,
     /// Fail every `snapshots/` PUT, after the index write it follows.
     fail_snapshot_put: bool,
@@ -311,7 +311,7 @@ fn run_backup_with_passphrase(
     passphrase: Option<&str>,
 ) -> Result<backup::BackupOutcome> {
     let source_paths = vec![src.to_string_lossy().to_string()];
-    let shutdown = shared.interrupt_after_pack.clone().unwrap_or_default();
+    let cancel = shared.interrupt_after_pack.clone().unwrap_or_default();
     let shared = shared.clone();
     let wrap = move |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
         Box::new(ObservingBackend {
@@ -336,7 +336,7 @@ fn run_backup_with_passphrase(
             verbose: false,
         },
         None,
-        &shutdown,
+        &cancel,
         Some(&wrap),
         crate::repo::HostEnv::system(),
     )

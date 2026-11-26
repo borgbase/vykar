@@ -187,14 +187,14 @@ fn lazy_stream_polls_shutdown_between_range_reads() {
     let (mut repo, mut ws, log) = repo_on_counting_backend();
     let (_stream, locs) = stored_stream(&mut repo, &mut ws, 300, 64);
     let cap = u64::from(locs[0].3) * 2;
-    let shutdown = CancelToken::new();
-    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, &shutdown);
+    let cancel = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, &cancel);
     log.reset_get_range_count();
     let mut seen = 0usize;
     let err = lazy
         .for_each_item(|_| {
             seen += 1;
-            shutdown.cancel();
+            cancel.cancel();
             Ok(())
         })
         .unwrap_err();

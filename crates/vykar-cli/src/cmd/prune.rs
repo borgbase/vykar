@@ -12,7 +12,7 @@ pub(crate) fn run_prune(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     let (stats, list_entries) = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::prune::run(
@@ -22,7 +22,7 @@ pub(crate) fn run_prune(
             list,
             sources,
             source_filter,
-            shutdown,
+            cancel,
         )?)
     })?;
 

@@ -20,7 +20,7 @@ pub(crate) fn run_restore(
     pattern: Option<String>,
     verify: bool,
     continue_on_error: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<bool> {
     let opts = RestoreOptions {
         xattrs_enabled: config.xattrs.enabled,
@@ -44,7 +44,7 @@ pub(crate) fn run_restore(
                 pattern.as_deref(),
                 opts,
                 sink.as_ref().map(|s| s as &dyn EventSink<RestoreEvent>),
-                shutdown,
+                cancel,
             )
         };
         // On errors too, so a message never lands on a half-drawn line.

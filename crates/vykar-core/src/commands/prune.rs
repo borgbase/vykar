@@ -34,13 +34,13 @@ pub fn run(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
-    // The backend observes `shutdown` in its retry waits. The phases past
+    // The backend observes `cancel` in its retry waits. The phases past
     // the commit point do not poll it, so after a cancel their requests get
     // one attempt each and no retries, and on SFTP a read in flight is
     // abandoned; they are crash-safe by design.
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
     run_on_repo(
         &mut repo,
         config,
@@ -48,7 +48,7 @@ pub fn run(
         list,
         sources,
         source_filter,
-        shutdown,
+        cancel,
     )
 }
 
@@ -61,7 +61,7 @@ pub(crate) fn run_on_repo(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
     with_snapshot_removal_exclusion(repo, |repo| {
         let now = repo.host_env().now_utc();
@@ -151,7 +151,7 @@ pub(crate) fn run_on_repo(
         to_prune.reverse();
 
         let targets = prepare_removal_targets(repo, &to_prune)?;
-        let removed = remove_snapshots(repo, targets, shutdown)?;
+        let removed = remove_snapshots(repo, targets, cancel)?;
 
         Ok((
             PruneStats {

@@ -242,7 +242,7 @@ pub(crate) fn list_under_on_repo(
     repo: &Repo,
     meta: &SnapshotMeta,
     dir: &str,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     mut visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<ListUnderRead> {
     resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
@@ -255,7 +255,7 @@ pub(crate) fn list_under_on_repo(
     };
     let view = ListingView::new(meta);
     let read = if narrowable_display_path(dir) && view.index().is_ok() {
-        let stats = view.subtree(repo, dir.as_bytes(), shutdown, &mut keep)?;
+        let stats = view.subtree(repo, dir.as_bytes(), cancel, &mut keep)?;
         tracing::debug!(
             "list under: index (via_index {}, fallback {:?}, {} tree chunks, {} B stored, {} matches)",
             stats.via_index,
@@ -272,7 +272,7 @@ pub(crate) fn list_under_on_repo(
             TreeChunkSource::CacheFirst,
             LISTING_BATCH_CHUNKS,
             LISTING_BATCH_STORED_BYTES,
-            shutdown,
+            cancel,
             keep,
         )?;
         tracing::debug!("list under: whole listing ({} tree chunks)", stats.chunks);
@@ -317,10 +317,10 @@ pub(crate) fn for_each_item_by_chunk(
     source: TreeChunkSource,
     max_chunks: usize,
     max_stored: u64,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     mut visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<ChunkedListingStats> {
-    shutdown.check()?;
+    cancel.check()?;
     let located: Vec<Located> = resolve_from_index(repo.chunk_index(), item_ptrs)?
         .into_iter()
         .enumerate()
@@ -332,11 +332,11 @@ pub(crate) fn for_each_item_by_chunk(
     let mut spans: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
     let mut items: Vec<Item> = Vec::new();
     for batch in cut_batches_with(&located, max_chunks, max_stored) {
-        shutdown.check()?;
+        cancel.check()?;
         buf.clear();
         spans.clear();
         let locs: Vec<ChunkLoc> = batch.iter().map(|(_, loc)| *loc).collect();
-        repo.read_tree_chunks_split(&locs, &mut buf, &mut ends, shutdown, source)?;
+        repo.read_tree_chunks_split(&locs, &mut buf, &mut ends, cancel, source)?;
         push_spans(&mut spans, 0, 0, &ends, batch.len(), buf.len())?;
         stats.batches += 1;
         stats.chunks += batch.len();
@@ -475,9 +475,9 @@ pub(crate) fn decode_snapshot_meta(
 pub fn load_snapshot_items(
     repo: &mut Repo,
     snapshot_name: &str,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<Item>> {
-    let items_stream = load_snapshot_item_stream(repo, snapshot_name, shutdown)?;
+    let items_stream = load_snapshot_item_stream(repo, snapshot_name, cancel)?;
     decode_items_stream(&items_stream)
 }
 
@@ -486,10 +486,10 @@ pub fn load_snapshot_items(
 pub fn load_snapshot_item_stream(
     repo: &mut Repo,
     snapshot_name: &str,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
-    load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, shutdown)
+    load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, cancel)
 }
 
 /// [`load_snapshot_item_stream`], reading every tree chunk from storage (never
@@ -498,14 +498,14 @@ pub fn load_snapshot_item_stream(
 pub fn load_snapshot_item_stream_from_storage(
     repo: &mut Repo,
     snapshot_name: &str,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
     resolve_and_read(
         repo,
         &snapshot_meta.item_ptrs,
         resolve_through_index,
-        shutdown,
+        cancel,
         TreeChunkSource::Storage,
     )
 }
@@ -530,11 +530,11 @@ impl ItemStreamReader {
         &mut self,
         repo: &mut Repo,
         snapshot_name: &str,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<Vec<u8>> {
-        shutdown.check()?;
+        cancel.check()?;
         self.ensure_index(repo)?;
-        load_snapshot_item_stream(repo, snapshot_name, shutdown)
+        load_snapshot_item_stream(repo, snapshot_name, cancel)
     }
 
     /// Open the item stream of `snapshot_name` for lazy, chunk-at-a-time
@@ -551,11 +551,11 @@ impl ItemStreamReader {
         &mut self,
         repo: &mut Repo,
         snapshot_name: &str,
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
-        shutdown.check()?;
+        cancel.check()?;
         let meta = load_snapshot_meta(repo, snapshot_name)?;
-        self.open_lazy_ptrs(repo, &meta.item_ptrs, shutdown)
+        self.open_lazy_ptrs(repo, &meta.item_ptrs, cancel)
     }
 
     /// [`Self::open_lazy`] over explicit item pointers (a meta the caller
@@ -564,11 +564,11 @@ impl ItemStreamReader {
         &mut self,
         repo: &mut Repo,
         item_ptrs: &[ChunkId],
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
-        shutdown.check()?;
+        cancel.check()?;
         self.ensure_index(repo)?;
-        LazyItemStream::open(repo, item_ptrs, shutdown)
+        LazyItemStream::open(repo, item_ptrs, cancel)
     }
 
     /// Load the full chunk index unless this reader already did.
@@ -646,7 +646,7 @@ pub(crate) fn resolve_from_index(
 pub struct LazyItemStream<'a> {
     storage: Arc<dyn StorageBackend>,
     crypto: Arc<dyn CryptoEngine>,
-    shutdown: &'a CancelToken,
+    cancel: &'a CancelToken,
     chunks: Vec<ChunkLoc>,
     /// Re-resolves the chunks of a pack that answered 404.
     relocation: RelocationSource,
@@ -687,15 +687,15 @@ impl<'a> LazyItemStream<'a> {
     pub(crate) fn open(
         repo: &Repo,
         item_ptrs: &[ChunkId],
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> Result<LazyItemStream<'a>> {
-        shutdown.check()?;
+        cancel.check()?;
         let chunks = resolve_from_index(repo.chunk_index(), item_ptrs)?;
 
         let mut stream = LazyItemStream {
             storage: Arc::clone(repo.storage()),
             crypto: Arc::clone(repo.crypto()),
-            shutdown,
+            cancel,
             chunks,
             relocation: repo.relocation_source(),
             pack_missing: false,
@@ -728,12 +728,12 @@ impl<'a> LazyItemStream<'a> {
         chunks: Vec<ChunkLoc>,
         retry: bool,
         window_max: u64,
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> Self {
         Self {
             storage: Arc::clone(repo.storage()),
             crypto: Arc::clone(repo.crypto()),
-            shutdown,
+            cancel,
             chunks,
             relocation: repo.relocation_source(),
             pack_missing: false,
@@ -760,11 +760,11 @@ impl<'a> LazyItemStream<'a> {
         chunks: Vec<ChunkLoc>,
         retry: bool,
         window_max: u64,
-        shutdown: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> Self {
         Self {
             cache: repo.tree_cache().cloned(),
-            ..Self::for_test(repo, chunks, retry, window_max, shutdown)
+            ..Self::for_test(repo, chunks, retry, window_max, cancel)
         }
     }
 
@@ -824,7 +824,7 @@ impl<'a> LazyItemStream<'a> {
         if idx >= self.window_end {
             // Free the consumed window before fetching the next one.
             self.window = Vec::new();
-            self.shutdown.check()?;
+            self.cancel.check()?;
             if self.load_cached(idx) {
                 return Ok(());
             }
@@ -1087,7 +1087,7 @@ pub fn load_snapshot_item_stream_via_lookup<L>(
     repo: &mut Repo,
     snapshot_name: &str,
     lookup: L,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<u8>>
 where
     L: Fn(&ChunkId) -> Option<(PackId, u64, u32)>,
@@ -1097,7 +1097,7 @@ where
         repo,
         &snapshot_meta.item_ptrs,
         |chunk_id, _repo| lookup(chunk_id).ok_or(VykarError::ChunkNotInIndex(*chunk_id)),
-        shutdown,
+        cancel,
         TreeChunkSource::CacheFirst,
     )
 }
@@ -1108,13 +1108,13 @@ where
 pub fn load_item_stream_from_ptrs(
     repo: &mut Repo,
     item_ptrs: &[ChunkId],
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<u8>> {
     resolve_and_read(
         repo,
         item_ptrs,
         resolve_through_index,
-        shutdown,
+        cancel,
         TreeChunkSource::CacheFirst,
     )
 }
@@ -1135,13 +1135,13 @@ fn resolve_and_read<R>(
     repo: &mut Repo,
     item_ptrs: &[ChunkId],
     resolve: R,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     source: TreeChunkSource,
 ) -> Result<Vec<u8>>
 where
     R: Fn(&ChunkId, &Repo) -> Result<(PackId, u64, u32)>,
 {
-    shutdown.check()?;
+    cancel.check()?;
     let chunks: Vec<(ChunkId, PackId, u64, u32)> = item_ptrs
         .iter()
         .map(|chunk_id| {
@@ -1151,7 +1151,7 @@ where
         .collect::<Result<_>>()?;
 
     let mut items_stream = Vec::new();
-    repo.read_tree_chunks_into(&chunks, &mut items_stream, shutdown, source)?;
+    repo.read_tree_chunks_into(&chunks, &mut items_stream, cancel, source)?;
     Ok(items_stream)
 }
 
@@ -1160,12 +1160,12 @@ pub fn load_snapshot_items_via_lookup<L>(
     repo: &mut Repo,
     snapshot_name: &str,
     lookup: L,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<Item>>
 where
     L: Fn(&ChunkId) -> Option<(PackId, u64, u32)>,
 {
-    let items_stream = load_snapshot_item_stream_via_lookup(repo, snapshot_name, lookup, shutdown)?;
+    let items_stream = load_snapshot_item_stream_via_lookup(repo, snapshot_name, lookup, cancel)?;
     decode_items_stream(&items_stream)
 }
 
@@ -1194,10 +1194,10 @@ pub fn for_each_decoded_item(
 pub fn for_each_snapshot_item(
     repo: &mut Repo,
     snapshot_name: &str,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<()> {
-    let items_stream = load_snapshot_item_stream(repo, snapshot_name, shutdown)?;
+    let items_stream = load_snapshot_item_stream(repo, snapshot_name, cancel)?;
     for_each_decoded_item(&items_stream, visit)
 }
 

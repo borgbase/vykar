@@ -12,13 +12,13 @@ pub(crate) fn run_compact(
     threshold: f64,
     max_repack_size: Option<String>,
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
     let stats = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::compact::run(
-            config, passphrase, threshold, max_bytes, dry_run, shutdown,
+            config, passphrase, threshold, max_bytes, dry_run, cancel,
         )?)
     })?;
 
@@ -53,11 +53,11 @@ pub(crate) fn run_compact(
 pub(crate) fn run_report_unreferenced(
     config: &VykarConfig,
     label: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     let report = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::compact::report_unreferenced(
-            config, passphrase, shutdown,
+            config, passphrase, cancel,
         )?)
     })?;
     println!(

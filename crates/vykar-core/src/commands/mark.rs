@@ -110,9 +110,9 @@ impl LiveSnapshot {
 /// request width.
 pub(crate) fn load_snapshots_strict(
     repo: &Repo,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<LiveSnapshot>> {
-    shutdown.check()?;
+    cancel.check()?;
     let started = Instant::now();
     let keys = repo.storage().list("snapshots/")?;
     let mut listed: Vec<(String, SnapshotId)> = Vec::with_capacity(keys.len());
@@ -135,7 +135,7 @@ pub(crate) fn load_snapshots_strict(
     let gone: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let width = repo.storage().profile().request_width;
     try_for_each_bounded(width, &listed, |(key, id)| {
-        shutdown.check()?;
+        cancel.check()?;
         let frame = |e: VykarError| {
             if passes_through(&e) {
                 e
@@ -165,7 +165,7 @@ pub(crate) fn load_snapshots_strict(
     })?;
     let gone = gone.into_inner().unwrap_or_else(PoisonError::into_inner);
     if !gone.is_empty() {
-        shutdown.check()?;
+        cancel.check()?;
         let again: std::collections::HashSet<String> =
             repo.storage().list("snapshots/")?.into_iter().collect();
         for key in &gone {
@@ -419,7 +419,7 @@ fn reread_failed_batch(
     batch: &[Located],
     batch_error: &VykarError,
     source: TreeChunkSource,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     buf: &mut Vec<u8>,
     spans: &mut Vec<(usize, Range<usize>)>,
     failed: &mut Vec<(usize, Arc<VykarError>)>,
@@ -436,7 +436,7 @@ fn reread_failed_batch(
         let run = &batch[start..end];
         let locs: Vec<_> = run.iter().map(|(_, loc)| *loc).collect();
         let from = buf.len();
-        match repo.read_tree_chunks_split(&locs, buf, &mut ends, shutdown, source) {
+        match repo.read_tree_chunks_split(&locs, buf, &mut ends, cancel, source) {
             Ok(()) => push_spans(spans, start, from, &ends, run.len(), buf.len())?,
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(pack_error) => {
@@ -444,15 +444,10 @@ fn reread_failed_batch(
                 let failed_before = failed.len();
                 let mut j = 0;
                 while j < run.len() {
-                    shutdown.check()?;
+                    cancel.check()?;
                     let from = buf.len();
-                    match repo.read_tree_chunks_split(
-                        &locs[j..=j],
-                        buf,
-                        &mut ends,
-                        shutdown,
-                        source,
-                    ) {
+                    match repo.read_tree_chunks_split(&locs[j..=j], buf, &mut ends, cancel, source)
+                    {
                         Ok(()) => push_spans(spans, start + j, from, &ends, 1, buf.len())?,
                         Err(e @ VykarError::Interrupted) => return Err(e),
                         Err(e) => {
@@ -494,13 +489,13 @@ fn reread_failed_batch(
 
 /// Run `decode` over `spans` of `buf` on up to `threads` scoped threads.
 /// Results come back sorted by batch position. Workers stop claiming chunks
-/// once `shutdown` is cancelled.
+/// once `cancel` is cancelled.
 fn decode_spans<T, D>(
     batch: &[Located],
     buf: &[u8],
     spans: &[(usize, Range<usize>)],
     threads: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     decode: &D,
 ) -> Vec<(usize, T)>
 where
@@ -515,7 +510,7 @@ where
     let mut results: Vec<(usize, T)> = if threads <= 1 {
         let mut out = Vec::with_capacity(spans.len());
         for span in spans {
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 break;
             }
             out.push(run(span));
@@ -529,7 +524,7 @@ where
                     s.spawn(|| {
                         let mut local = Vec::new();
                         loop {
-                            if shutdown.is_cancelled() {
+                            if cancel.is_cancelled() {
                                 break;
                             }
                             let Some(span) = spans.get(next.fetch_add(1, Ordering::Relaxed)) else {
@@ -568,7 +563,7 @@ pub(crate) fn walk_tree_chunks<T, D, C>(
     source: TreeChunkSource,
     on_error: OnChunkError,
     decode_threads: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     decode: D,
     mut collect: C,
 ) -> Result<WalkStats>
@@ -577,7 +572,7 @@ where
     D: Fn(usize, &[u8]) -> T + Sync,
     C: FnMut(usize, ChunkOutcome<T>) -> Result<()>,
 {
-    shutdown.check()?;
+    cancel.check()?;
     let decode_threads = decode_threads.max(1);
     let mut stats = WalkStats {
         decode_threads,
@@ -611,13 +606,13 @@ where
     let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
     let mut failed: Vec<(usize, Arc<VykarError>)> = Vec::new();
     for batch in cut_batches(&located) {
-        shutdown.check()?;
+        cancel.check()?;
         buf.clear();
         spans.clear();
         failed.clear();
         let locs: Vec<_> = batch.iter().map(|(_, loc)| *loc).collect();
         let read_started = Instant::now();
-        match repo.read_tree_chunks_split(&locs, &mut buf, &mut ends, shutdown, source) {
+        match repo.read_tree_chunks_split(&locs, &mut buf, &mut ends, cancel, source) {
             Ok(()) => push_spans(&mut spans, 0, 0, &ends, batch.len(), buf.len())?,
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(e) if on_error == OnChunkError::Abort => return Err(e),
@@ -628,7 +623,7 @@ where
                     batch,
                     &e,
                     source,
-                    shutdown,
+                    cancel,
                     &mut buf,
                     &mut spans,
                     &mut failed,
@@ -642,9 +637,9 @@ where
         stats.plaintext_bytes += buf.len() as u64;
 
         let decode_started = Instant::now();
-        let decoded = decode_spans(batch, &buf, &spans, decode_threads, shutdown, &decode);
+        let decoded = decode_spans(batch, &buf, &spans, decode_threads, cancel, &decode);
         stats.decode_time += decode_started.elapsed();
-        shutdown.check()?;
+        cancel.check()?;
 
         // Hand every outcome to `collect` in batch order.
         let outcomes = batch_outcomes(batch.len(), decoded, failed.drain(..))?;
@@ -736,7 +731,7 @@ pub(crate) fn mark_live(
     positions: &IndexPositions<'_>,
     source: TreeChunkSource,
     opts: MarkOptions,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Mark> {
     let started = Instant::now();
     let name = |k: usize| {
@@ -775,7 +770,7 @@ pub(crate) fn mark_live(
         };
         let mut missing = None;
         let result = for_each_decoded_item(plain, |item| {
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
             tally.items += 1;
@@ -818,7 +813,7 @@ pub(crate) fn mark_live(
         source,
         OnChunkError::Abort,
         opts.decode_threads,
-        shutdown,
+        cancel,
         decode,
         |k, outcome| {
             let ChunkOutcome::Decoded(tally) = outcome else {

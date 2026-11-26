@@ -811,10 +811,10 @@ fn wrong_passphrase_on_first_source_stays_typed() {
 fn shutdown_before_first_source_is_interrupted() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = local_repo(&tmp, &["one", "two"]);
-    let shutdown = CancelToken::new();
-    shutdown.cancel();
+    let cancel = CancelToken::new();
+    cancel.cancel();
 
-    let err = run_backup_selection(&repo, &repo.sources, None, &shutdown, false, None)
+    let err = run_backup_selection(&repo, &repo.sources, None, &cancel, false, None)
         .err()
         .unwrap();
     assert!(

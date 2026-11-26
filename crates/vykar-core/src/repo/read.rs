@@ -400,7 +400,7 @@ impl Repo {
     /// an earlier read wait in memory, bounded by the stream size. A chunk
     /// listed more than once at the same location is read and decoded once.
     ///
-    /// `shutdown` is polled before every range read, so a cancellation is
+    /// `cancel` is polled before every range read, so a cancellation is
     /// observed within one storage round-trip per read in flight rather than
     /// after the whole stream.
     ///
@@ -411,14 +411,14 @@ impl Repo {
         &self,
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
         let mut asm = Assembler::new(chunks.len(), out, None);
         let all: Vec<usize> = (0..chunks.len()).collect();
-        self.read_coalesced_slots(chunks, &all, &mut asm, None, shutdown)?;
+        self.read_coalesced_slots(chunks, &all, &mut asm, None, cancel)?;
         asm.finish();
         Ok(())
     }
@@ -439,10 +439,10 @@ impl Repo {
         &self,
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         source: TreeChunkSource,
     ) -> Result<()> {
-        self.read_tree_chunks_impl(chunks, out, None, shutdown, source)
+        self.read_tree_chunks_impl(chunks, out, None, cancel, source)
     }
 
     /// [`Self::read_tree_chunks_into`], also recording where each chunk ends:
@@ -455,12 +455,12 @@ impl Repo {
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
         ends: &mut Vec<usize>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         source: TreeChunkSource,
     ) -> Result<()> {
         ends.clear();
         ends.reserve(chunks.len());
-        self.read_tree_chunks_impl(chunks, out, Some(ends), shutdown, source)
+        self.read_tree_chunks_impl(chunks, out, Some(ends), cancel, source)
     }
 
     /// The body of [`Self::read_tree_chunks_into`] and
@@ -470,7 +470,7 @@ impl Repo {
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
         ends: Option<&mut Vec<usize>>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
         source: TreeChunkSource,
     ) -> Result<()> {
         if chunks.is_empty() {
@@ -481,12 +481,12 @@ impl Repo {
             _ => {
                 let mut asm = Assembler::new(chunks.len(), out, ends);
                 let all: Vec<usize> = (0..chunks.len()).collect();
-                self.read_coalesced_slots(chunks, &all, &mut asm, None, shutdown)?;
+                self.read_coalesced_slots(chunks, &all, &mut asm, None, cancel)?;
                 asm.finish();
                 return Ok(());
             }
         };
-        shutdown.check()?;
+        cancel.check()?;
         let started = Instant::now();
         let mut asm = Assembler::new(chunks.len(), out, ends);
 
@@ -501,7 +501,7 @@ impl Repo {
         fetch_groups_bounded(
             width,
             &batches,
-            shutdown,
+            cancel,
             |batch| Ok(probe_cache(cache, crypto, chunks, batch)),
             |(decoded, missed)| {
                 misses.extend(missed);
@@ -516,7 +516,7 @@ impl Repo {
             (0, 0)
         } else {
             let sink: RawSink<'_> = &|id: &ChunkId, raw: &[u8]| cache.insert(id, raw);
-            self.read_coalesced_slots(chunks, &misses, &mut asm, Some(sink), shutdown)?
+            self.read_coalesced_slots(chunks, &misses, &mut asm, Some(sink), cancel)?
         };
         asm.finish();
         tracing::debug!(
@@ -540,7 +540,7 @@ impl Repo {
         todo: &[usize],
         asm: &mut Assembler<'_>,
         sink: Option<RawSink<'_>>,
-        shutdown: &CancelToken,
+        cancel: &CancelToken,
     ) -> Result<(usize, u64)> {
         // --- Phase 1: group by pack, one blob per distinct location ---
         // A repeated entry (the same chunk twice in a stream) is read and
@@ -607,7 +607,7 @@ impl Repo {
         fetch_groups_bounded(
             width,
             &groups,
-            shutdown,
+            cancel,
             |g| fetch_group(&reader, g, &relocator, 0),
             |blobs| asm.accept(blobs),
         )?;

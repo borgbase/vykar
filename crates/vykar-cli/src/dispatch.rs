@@ -50,7 +50,7 @@ pub(crate) struct CycleOutcome {
 
 pub(crate) fn run_default_actions(
     repo: &ResolvedRepo,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: u8,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -87,7 +87,7 @@ pub(crate) fn run_default_actions(
     let result = operations::run_full_cycle_with_passphrase_source(
         repo,
         &mut resolve,
-        shutdown,
+        cancel,
         verbose >= 1,
         source_filter,
         unavailable,
@@ -227,7 +227,7 @@ fn print_summary(steps: &[(CycleStep, StepOutcome)], start: std::time::Instant) 
 pub(crate) fn dispatch_command(
     command: &Commands,
     repo: &ResolvedRepo,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: u8,
 ) -> CliResult<bool> {
     let cfg = &repo.config;
@@ -253,7 +253,7 @@ pub(crate) fn dispatch_command(
                 threads: threads.map(usize::from),
                 paths: paths.clone(),
                 source_filter: source,
-                shutdown,
+                cancel,
                 verbose,
             },
         ),
@@ -261,7 +261,7 @@ pub(crate) fn dispatch_command(
             cmd::list::run_list(cfg, label, source, *last).map(|()| false)
         }
         Commands::Snapshot { command, .. } => {
-            cmd::snapshot::run_snapshot_command(command, cfg, label, shutdown).map(|()| false)
+            cmd::snapshot::run_snapshot_command(command, cfg, label, cancel).map(|()| false)
         }
         Commands::Restore {
             snapshot,
@@ -278,7 +278,7 @@ pub(crate) fn dispatch_command(
             pattern.clone(),
             *verify,
             *continue_on_error,
-            shutdown,
+            cancel,
         ),
         Commands::Delete {
             yes_delete_this_repo,
@@ -289,7 +289,7 @@ pub(crate) fn dispatch_command(
             list,
             source,
             ..
-        } => cmd::prune::run_prune(cfg, label, *dry_run, *list, sources, source, shutdown)
+        } => cmd::prune::run_prune(cfg, label, *dry_run, *list, sources, source, cancel)
             .map(|()| false),
         Commands::Check {
             verify_data,
@@ -306,7 +306,7 @@ pub(crate) fn dispatch_command(
             *repair,
             *dry_run,
             *yes,
-            shutdown,
+            cancel,
         )
         .map(|()| false),
         Commands::Info { .. } => cmd::info::run_info(cfg, label).map(|()| false),
@@ -339,7 +339,7 @@ pub(crate) fn dispatch_command(
         Commands::Compact {
             report_unreferenced: true,
             ..
-        } => cmd::compact::run_report_unreferenced(cfg, label, shutdown).map(|()| false),
+        } => cmd::compact::run_report_unreferenced(cfg, label, cancel).map(|()| false),
         Commands::Compact {
             threshold,
             max_repack_size,
@@ -347,7 +347,7 @@ pub(crate) fn dispatch_command(
             ..
         } => {
             let t = threshold.unwrap_or(cfg.compact.threshold);
-            cmd::compact::run_compact(cfg, label, t, max_repack_size.clone(), *dry_run, shutdown)
+            cmd::compact::run_compact(cfg, label, t, max_repack_size.clone(), *dry_run, cancel)
                 .map(|()| false)
         }
         Commands::Upgrade { yes, .. } => {

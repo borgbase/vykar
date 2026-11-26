@@ -265,7 +265,7 @@ pub(super) fn with_hooked_repo_op<T>(
 
 pub(super) fn run_selection_with_progress(
     ui_tx: &Sender<UiEvent>,
-    cancel_requested: &CancelToken,
+    cancel: &CancelToken,
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
@@ -277,7 +277,7 @@ pub(super) fn run_selection_with_progress(
         repo,
         sources,
         passphrase,
-        cancel_requested,
+        cancel,
         false,
         Some(&mut |evt| match evt {
             operations::BackupRunEvent::Backup(BackupProgressEvent::Warning { message }) => {

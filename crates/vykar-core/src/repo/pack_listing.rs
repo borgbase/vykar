@@ -99,7 +99,7 @@ fn parallel_list_packs(
     let errors: Mutex<Vec<VykarError>> = Mutex::new(Vec::new());
     let shards: Vec<u16> = (0..256).collect();
 
-    // Not cancellable: `shutdown` is honoured by the analysis that follows.
+    // Not cancellable: `cancel` is honoured by the analysis that follows.
     crate::repo::bounded::for_each_bounded(concurrency, &shards, &CancelToken::new(), |&shard| {
         let prefix = format!("packs/{:02x}/", shard);
         let objects = match storage.list_meta(&prefix) {

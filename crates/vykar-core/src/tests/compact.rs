@@ -1627,7 +1627,7 @@ vykar_storage::delegate_storage_backend! {
     }
 }
 
-/// A shutdown raised before analysis stops it before the first pack is
+/// A cancellation requested before analysis stops it before the first pack is
 /// claimed.
 #[test]
 fn compact_honours_shutdown_during_analysis() {
@@ -1641,11 +1641,10 @@ fn compact_honours_shutdown_during_analysis() {
     let packs_before = count_all_packs(&repo);
     assert!(packs_before > 0);
 
-    let shutdown = CancelToken::new();
-    shutdown.cancel();
-    let err =
-        compact_repo_without_mark(&mut repo.unchecked_writer(), 1.0, None, false, 4, &shutdown)
-            .unwrap_err();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = compact_repo_without_mark(&mut repo.unchecked_writer(), 1.0, None, false, 4, &cancel)
+        .unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::Interrupted),
         "{err:?}"

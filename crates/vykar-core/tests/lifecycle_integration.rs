@@ -858,9 +858,9 @@ fn item_stream_reader_propagates_interrupt_without_fallback() {
 
     let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
     let mut reader = commands::list::ItemStreamReader::new(&repo);
-    let shutdown = CancelToken::new();
-    shutdown.cancel();
-    let err = reader.load(&mut repo, "snap1", &shutdown).unwrap_err();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = reader.load(&mut repo, "snap1", &cancel).unwrap_err();
 
     assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);

@@ -24,7 +24,7 @@ pub(crate) fn run_snapshot_command(
     command: &SnapshotCommand,
     config: &VykarConfig,
     label: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     match command {
         SnapshotCommand::List {
@@ -98,7 +98,7 @@ pub(crate) fn run_snapshot_command(
         }
         SnapshotCommand::Delete {
             snapshots, dry_run, ..
-        } => super::delete::run_delete(config, label, snapshots, *dry_run, shutdown),
+        } => super::delete::run_delete(config, label, snapshots, *dry_run, cancel),
         SnapshotCommand::Diff {
             snapshot_a,
             snapshot_b,

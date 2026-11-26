@@ -26,14 +26,14 @@ pub fn run(
     passphrase: Option<&str>,
     snapshot_names: &[&str],
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<DeleteResult> {
-    // The backend observes `shutdown` in its retry waits. The phases past
+    // The backend observes `cancel` in its retry waits. The phases past
     // the commit point do not poll it, so after a cancel their requests get
     // one attempt each and no retries, and on SFTP a read in flight is
     // abandoned; they are crash-safe by design.
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
-    run_on_repo(&mut repo, snapshot_names, dry_run, shutdown)
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
+    run_on_repo(&mut repo, snapshot_names, dry_run, cancel)
 }
 
 /// [`run`] on an already opened repository, under the maintenance lock or,
@@ -43,7 +43,7 @@ pub(crate) fn run_on_repo(
     repo: &mut Repo,
     snapshot_names: &[&str],
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<DeleteResult> {
     // Phase 0: Deduplicate while preserving order.
     let mut seen = HashSet::new();
@@ -61,7 +61,7 @@ pub(crate) fn run_on_repo(
             if !targets.is_empty() {
                 refuse_on_append_only_server(repo.storage().as_ref(), "vykar snapshot delete")?;
             }
-            remove_snapshots(repo, targets, shutdown)?
+            remove_snapshots(repo, targets, cancel)?
         };
         Ok(DeleteResult {
             stats: names

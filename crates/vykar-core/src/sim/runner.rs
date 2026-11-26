@@ -152,12 +152,12 @@ pub enum Call {
         snapshot: String,
         tree: SourceTree,
     },
-    /// [`Call::Backup`] that stops (`Interrupted`) once `shutdown` is
+    /// [`Call::Backup`] that stops (`Interrupted`) once `cancel` is
     /// cancelled, as a signal stops the CLI's.
     BackupCancellable {
         snapshot: String,
         tree: SourceTree,
-        shutdown: CancelToken,
+        cancel: CancelToken,
     },
     /// [`Call::Backup`] of the source directory snapshot `of` was taken
     /// from, untouched since: equal items (path, mtime, ctime), hence equal
@@ -909,8 +909,8 @@ impl Sim {
             Call::BackupCancellable {
                 snapshot,
                 tree,
-                shutdown,
-            } => self.prepare_backup(c, snapshot, tree, shutdown),
+                cancel,
+            } => self.prepare_backup(c, snapshot, tree, cancel),
             Call::BackupSameSource { snapshot, of } => {
                 let tree = self
                     .history
@@ -1137,16 +1137,16 @@ impl Sim {
     }
 
     /// The op and the body of a backup of `tree` as `snapshot`, stopped by
-    /// `shutdown`.
+    /// `cancel`.
     fn prepare_backup(
         &mut self,
         c: ClientId,
         snapshot: String,
         tree: SourceTree,
-        shutdown: CancelToken,
+        cancel: CancelToken,
     ) -> (ClientOp, Body) {
         let src = self.prepare_backup_source(&snapshot, tree);
-        self.backup_body(c, snapshot, src, shutdown)
+        self.backup_body(c, snapshot, src, cancel)
     }
 
     /// The op and the body of a backup of `src` as `snapshot`.
@@ -1155,7 +1155,7 @@ impl Sim {
         c: ClientId,
         snapshot: String,
         src: PathBuf,
-        shutdown: CancelToken,
+        cancel: CancelToken,
     ) -> (ClientOp, Body) {
         let op = ClientOp::Backup {
             snapshot: snapshot.clone(),
@@ -1184,7 +1184,7 @@ impl Sim {
                         verbose: false,
                     },
                     None,
-                    &shutdown,
+                    &cancel,
                     Some(&wrap),
                     env,
                 )?;

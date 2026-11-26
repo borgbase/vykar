@@ -50,13 +50,13 @@ pub(super) fn apply_file_metadata(
     xattrs_enabled: bool,
     restore_as_root: bool,
     stats: &mut RestoreStats,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<()> {
     // Per-file poll: the pass is short per file but runs up to
     // `RESTORE_BATCH_FILES` times, each opening an fd and applying
     // chown -> xattrs -> chmod -> mtime.
     for pf in planned_files {
-        shutdown.check()?;
+        cancel.check()?;
         finalize_one_file(pf, temp_root, xattrs_enabled, restore_as_root, stats)?;
     }
     Ok(())
@@ -183,10 +183,10 @@ pub(super) fn apply_symlink_metadata(
     symlinks: &[PlannedNode],
     restore_as_root: bool,
     stats: &mut RestoreStats,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<()> {
     for s in symlinks {
-        shutdown.check()?;
+        cancel.check()?;
         if restore_as_root {
             warn_metadata_err(
                 stats,
@@ -276,13 +276,13 @@ pub(super) fn create_hardlinks(
     restore_as_root: bool,
     tombstones: &mut HashSet<PathBuf>,
     stats: &mut RestoreStats,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<u64> {
     let mut copied_bytes: u64 = 0;
     // Per-link poll: not a cheap metadata pass — the EMLINK fallback copies the
     // representative's whole content for each link it cannot make.
     for link in pending_links {
-        shutdown.check()?;
+        cancel.check()?;
         let Some(rep) = group_reps.get(&link.id) else {
             // A link is only ever queued after its representative is recorded,
             // and representatives are never evicted — so this is unreachable.
@@ -393,7 +393,7 @@ pub(super) fn create_hardlinks(
                             xattrs_enabled,
                             restore_as_root,
                             stats,
-                            shutdown,
+                            cancel,
                         )?;
                         // Separate inode → a file, not a hard link. Its bytes
                         // were physically written, so they count toward

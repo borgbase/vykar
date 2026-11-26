@@ -363,9 +363,9 @@ pub fn run_with_progress(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<BackupOutcome> {
-    run_impl(config, req, progress, shutdown, None, HostEnv::system())
+    run_impl(config, req, progress, cancel, None, HostEnv::system())
 }
 
 /// Wraps the storage backend before the backup uses it (tests only).
@@ -389,11 +389,11 @@ pub(crate) fn run_impl(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> Result<BackupOutcome> {
-    run_scoped(config, req, progress, shutdown, wrap_backend, host_env).map_err(|(_, e)| e)
+    run_scoped(config, req, progress, cancel, wrap_backend, host_env).map_err(|(_, e)| e)
 }
 
 /// [`run_impl`] that also reports whether a failure was source-local.
@@ -401,27 +401,20 @@ pub(crate) fn run_scoped(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
-    let pending = upload(
-        config,
-        &req,
-        &mut progress,
-        shutdown,
-        wrap_backend,
-        host_env,
-    )?;
+    let pending = upload(config, &req, &mut progress, cancel, wrap_backend, host_env)?;
 
     // ── Phase 2: Commit (lock-free, or under the commit lock) ───────────
     let mut pending = pending;
     let protection = pending.commit_mode().and_then(|mode| match mode {
         CommitMode::LockFree => pending
-            .wait_until_unlocked(&mut progress, shutdown)
+            .wait_until_unlocked(&mut progress, cancel)
             .map(|()| CommitLock::Free),
         CommitMode::Lock => pending
-            .wait_for_lock(&mut progress, shutdown)
+            .wait_for_lock(&mut progress, cancel)
             .map(CommitLock::Held),
     });
     let lock = match protection {
@@ -437,7 +430,7 @@ pub(crate) fn run_scoped(
         commit.drive(&events)
     };
     commit
-        .finish(result, &mut progress, shutdown)
+        .finish(result, &mut progress, cancel)
         .map_err(|e| (FailureScope::Repository, e))
 }
 
@@ -449,7 +442,7 @@ pub(crate) fn upload(
     config: &VykarConfig,
     req: &BackupRequest<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> std::result::Result<PendingCommit, (FailureScope, VykarError)> {
@@ -459,7 +452,7 @@ pub(crate) fn upload(
         req,
         &prepared,
         progress,
-        shutdown,
+        cancel,
         wrap_backend,
         host_env,
     )
@@ -530,7 +523,7 @@ fn upload_prepared(
     req: &BackupRequest<'_>,
     prepared: &Prepared<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> Result<PendingCommit> {
@@ -538,7 +531,7 @@ fn upload_prepared(
     let passphrase = req.passphrase;
     let source_paths = req.source_paths;
 
-    // The backend observes `shutdown` in its retry waits. Phase 2 (past the
+    // The backend observes `cancel` in its retry waits. Phase 2 (past the
     // commit point) does not poll it, so after a cancel its requests get one
     // attempt each and no retries, and on SFTP a read in flight is abandoned;
     // it is crash-safe by design.
@@ -546,7 +539,7 @@ fn upload_prepared(
         &config
             .repository
             .storage_config(config.limits.connections)
-            .with_cancel(shutdown.clone()),
+            .with_cancel(cancel.clone()),
     )?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let backend = match wrap_backend {
@@ -637,7 +630,7 @@ fn upload_prepared(
         prepared,
         num_workers,
         progress,
-        shutdown,
+        cancel,
         &mut dataless,
         session.marker(),
     );

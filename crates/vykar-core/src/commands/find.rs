@@ -193,7 +193,7 @@ pub(crate) fn find_on_repo(
     repo: &mut Repo,
     entries: &[SnapshotEntry],
     filter: &FindFilter,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(Vec<PathTimeline>, FindStats)> {
     let mut stats = FindStats {
         snapshots: entries.len(),
@@ -229,7 +229,7 @@ pub(crate) fn find_on_repo(
     let decode = |_k: usize, plain: &[u8]| -> std::result::Result<Vec<SlotHit>, VykarError> {
         let mut hits = Vec::new();
         list::for_each_decoded_item(plain, |item| {
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
             if matches_filter(&item, filter) {
@@ -252,7 +252,7 @@ pub(crate) fn find_on_repo(
         TreeChunkSource::CacheFirst,
         OnChunkError::Abort,
         default_decode_threads(),
-        shutdown,
+        cancel,
         decode,
         |k, outcome| {
             let id = *set.id(k);

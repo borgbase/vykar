@@ -39,12 +39,12 @@ pub fn prepare_removal_targets<S: AsRef<str>>(
 pub fn remove_snapshots(
     repo: &mut RepoWriter<'_>,
     targets: Vec<RemovalTarget>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Vec<String>> {
     let mut removed = Vec::with_capacity(targets.len());
     let result = (|| {
         for target in targets {
-            shutdown.check()?;
+            cancel.check()?;
             repo.check_fence()?;
             repo.storage().delete(&target.snapshot_key).map_err(|e| {
                 VykarError::Other(format!(

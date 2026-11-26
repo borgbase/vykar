@@ -158,7 +158,7 @@ pub(crate) fn diff_on_repo(
     repo: &mut Repo,
     base: &SnapshotEntry,
     target: &SnapshotEntry,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<(Vec<DiffEntry>, DiffStats)> {
     let base_meta = load_snapshot_meta(repo, &base.name)?;
     let target_meta = load_snapshot_meta(repo, &target.name)?;
@@ -207,7 +207,7 @@ pub(crate) fn diff_on_repo(
             &[&base_only, &target_only],
             &mut files,
             &mut stats,
-            shutdown,
+            cancel,
         )?;
         let (base_map, base_dup) = side_map(&base_only, &files)?;
         let (target_map, target_dup) = side_map(&target_only, &files)?;
@@ -227,7 +227,7 @@ pub(crate) fn diff_on_repo(
                 .filter(|id| !files.contains_key(*id))
                 .copied()
                 .collect();
-            decode_into(repo, &[&missing], &mut files, &mut stats, shutdown)?;
+            decode_into(repo, &[&missing], &mut files, &mut stats, cancel)?;
             let (base_map, _) = side_map(base_ptrs, &files)?;
             let (target_map, _) = side_map(target_ptrs, &files)?;
             diff_maps(&base_map, &target_map)
@@ -290,13 +290,13 @@ fn decode_into(
     ids: &[&[ChunkId]],
     files: &mut DecodedChunks,
     stats: &mut DiffStats,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<()> {
     let set = TreeChunkSet::build(ids);
     let decode = |_k: usize, plain: &[u8]| -> std::result::Result<Vec<DecodedFile>, VykarError> {
         let mut out = Vec::new();
         for_each_decoded_item(plain, |item| {
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
             if item.entry_type == ItemType::RegularFile {
@@ -312,7 +312,7 @@ fn decode_into(
         TreeChunkSource::CacheFirst,
         OnChunkError::Abort,
         default_decode_threads(),
-        shutdown,
+        cancel,
         decode,
         |k, outcome| {
             let id = *set.id(k);

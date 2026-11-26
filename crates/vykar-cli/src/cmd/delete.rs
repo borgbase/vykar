@@ -12,12 +12,12 @@ pub(crate) fn run_delete(
     label: Option<&str>,
     snapshot_names: &[String],
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> CliResult<()> {
     let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
     let result = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::delete::run(
-            config, passphrase, &name_refs, dry_run, shutdown,
+            config, passphrase, &name_refs, dry_run, cancel,
         )?)
     })?;
 

@@ -257,7 +257,7 @@ pub(crate) struct PipelineCtx<'a> {
     pub segment_size: u64,
     pub pipeline_buffer_bytes: usize,
     pub prefilter: Option<&'a DedupPrefilter>,
-    pub shutdown: &'a CancelToken,
+    pub cancel: &'a CancelToken,
     pub verbose: bool,
     pub parent_reuse_index: Option<&'a ParentReuseIndex>,
 }
@@ -305,7 +305,7 @@ pub(crate) fn run_parallel_pipeline(
         segment_size,
         pipeline_buffer_bytes,
         prefilter,
-        shutdown,
+        cancel,
         verbose,
         parent_reuse_index,
     } = *ctx;
@@ -386,7 +386,7 @@ pub(crate) fn run_parallel_pipeline(
 
             let mut seq_idx: usize = 0;
             for entry_result in walk_iter {
-                if shutdown.is_cancelled() {
+                if cancel.is_cancelled() {
                     break;
                 }
                 match entry_result {
@@ -509,7 +509,7 @@ pub(crate) fn run_parallel_pipeline(
             let wait = Instant::now();
             let Ok(msg) = result_rx.recv() else { break };
             consumer_recv_wait += wait.elapsed();
-            if shutdown.is_cancelled() {
+            if cancel.is_cancelled() {
                 memory.poison();
                 consume_err = Some(VykarError::Interrupted);
                 break;
@@ -725,7 +725,7 @@ pub(crate) fn run_parallel_pipeline(
 
         // The walk thread may have exited cleanly on shutdown without
         // the consumer ever seeing a message.  Catch that here.
-        if shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
 

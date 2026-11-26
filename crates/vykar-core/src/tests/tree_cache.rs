@@ -373,9 +373,9 @@ fn read_tree_chunks_split_bounds_match_per_chunk_reads() {
 // ---------------------------------------------------------------------------
 
 fn read_lazy(repo: &Repo, locs: &[Loc], log: &PutLog) -> (Vec<u8>, u64) {
-    let shutdown = CancelToken::new();
+    let cancel = CancelToken::new();
     let mut stream =
-        LazyItemStream::for_test_with_cache(repo, locs.to_vec(), false, 1 << 20, &shutdown);
+        LazyItemStream::for_test_with_cache(repo, locs.to_vec(), false, 1 << 20, &cancel);
     log.reset_get_range_count();
     let mut out = Vec::new();
     stream.read_to_end(&mut out).unwrap();

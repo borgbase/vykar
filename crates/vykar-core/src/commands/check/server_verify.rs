@@ -45,7 +45,7 @@ pub(crate) fn try_server_verify(
     verify_data: bool,
     hash: HashAlgorithm,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> ServerVerifyOutcome {
     let total_packs = pack_chunks.len();
     if total_packs == 0 {
@@ -75,7 +75,7 @@ pub(crate) fn try_server_verify(
     while offset < pack_list.len() {
         // Break between round-trips. The partial result is kept; the caller
         // re-raises the cancellation via `CancelToken::check` before using it.
-        if shutdown.is_cancelled() {
+        if cancel.is_cancelled() {
             break;
         }
         // Compute batch end respecting both pack count and byte volume.

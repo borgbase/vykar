@@ -269,7 +269,7 @@ fn run_backup_sources(
     sources: &[SourceEntry],
     passphrase: Option<&str>,
     repo_label: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: bool,
     on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> OpsResult<BackupRunReport> {
@@ -311,17 +311,17 @@ fn run_backup_sources(
                     config,
                     req,
                     Some(&mut backup_cb),
-                    shutdown,
+                    cancel,
                     None,
                     HostEnv::system(),
                 )
             } else {
-                commands::backup::run_scoped(config, req, None, shutdown, None, HostEnv::system())
+                commands::backup::run_scoped(config, req, None, cancel, None, HostEnv::system())
             };
             r.map_err(|(scope, e)| (scope, OpsError::from(e)))
         };
 
-        let result = if shutdown.is_cancelled() {
+        let result = if cancel.is_cancelled() {
             Err((
                 FailureScope::Repository,
                 OpsError::from(VykarError::Interrupted),
@@ -475,7 +475,7 @@ pub fn run_backup_selection(
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: bool,
     on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> OpsResult<BackupRunReport> {
@@ -504,7 +504,7 @@ pub fn run_backup_selection(
                 sources,
                 passphrase,
                 repo.label.as_deref(),
-                shutdown,
+                cancel,
                 verbose,
                 &mut on_event,
             )
@@ -569,7 +569,7 @@ where
 pub fn run_full_cycle_for_repo(
     repo: &ResolvedRepo,
     passphrase: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -578,7 +578,7 @@ pub fn run_full_cycle_for_repo(
     run_full_cycle_with_passphrase_source(
         repo,
         &mut || Ok(passphrase.map(|p| Zeroizing::new(p.to_string()))),
-        shutdown,
+        cancel,
         verbose,
         source_filter,
         unavailable,
@@ -597,7 +597,7 @@ pub fn run_full_cycle_for_repo(
 pub fn run_full_cycle_with_passphrase_source(
     repo: &ResolvedRepo,
     resolve: &mut dyn FnMut() -> OpsResult<Option<Zeroizing<String>>>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -615,7 +615,7 @@ pub fn run_full_cycle_with_passphrase_source(
     let mut repo_unavailable = false;
 
     // 1. Backup
-    if !shutdown.is_cancelled() {
+    if !cancel.is_cancelled() {
         match resolve_cycle_sources(sources, source_filter) {
             Err(e) => emit_terminal(
                 CycleStep::Backup,
@@ -644,7 +644,7 @@ pub fn run_full_cycle_with_passphrase_source(
                             &effective_sources,
                             passphrase.get()?,
                             repo.label.as_deref(),
-                            shutdown,
+                            cancel,
                             verbose,
                             &mut Some(&mut |bpe: BackupRunEvent| match bpe {
                                 BackupRunEvent::Backup(e) => evt(CycleEvent::Backup(e)),
@@ -692,7 +692,7 @@ pub fn run_full_cycle_with_passphrase_source(
     let backup_skip_outcome = || StepOutcome::Skipped("backup skipped".into());
 
     // 2. Prune
-    if !shutdown.is_cancelled() {
+    if !cancel.is_cancelled() {
         let has_retention = config.retention.has_any_rule()
             || sources
                 .iter()
@@ -733,7 +733,7 @@ pub fn run_full_cycle_with_passphrase_source(
                         false,
                         sources,
                         source_filter,
-                        shutdown,
+                        cancel,
                     )
                     .map(|(stats, _)| stats)?;
                     // Surface post-commit warnings as cycle events so GUI/CLI
@@ -753,7 +753,7 @@ pub fn run_full_cycle_with_passphrase_source(
     }
 
     // 3. Compact
-    if !shutdown.is_cancelled() {
+    if !cancel.is_cancelled() {
         if backup_skipped {
             emit_terminal(
                 CycleStep::Compact,
@@ -780,7 +780,7 @@ pub fn run_full_cycle_with_passphrase_source(
                     config.compact.threshold,
                     None,
                     false,
-                    shutdown,
+                    cancel,
                 ) {
                     // Compact runs in every cycle; on an append-only server it
                     // belongs to the maintenance window, so the cycle skips it.
@@ -795,7 +795,7 @@ pub fn run_full_cycle_with_passphrase_source(
     }
 
     // 4. Check (metadata-only, with sampling support)
-    if !shutdown.is_cancelled() {
+    if !cancel.is_cancelled() {
         let check_max_percent = config.check.max_percent;
         if backup_skipped {
             emit_terminal(
@@ -827,7 +827,7 @@ pub fn run_full_cycle_with_passphrase_source(
                         Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
                         check_max_percent,
                         true, // record_state: daemon/GUI updates the full_every timer
-                        shutdown,
+                        cancel,
                     )
                     .map_err(OpsError::from)
                 },

@@ -1535,7 +1535,7 @@ fn walk_find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathB
 // Cancellation
 //
 // The progress callback is the lever here: it is `FnMut`, so a test closure can
-// raise the shutdown flag on a chosen event and drive a precise cancellation
+// cancel the token on a chosen event and drive a precise cancellation
 // point through the real code path with no mock backend.
 //
 // Scope note, so a later reader does not over-read these tests: cancellation is

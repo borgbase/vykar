@@ -182,7 +182,7 @@ pub fn run(
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     let threshold = if !threshold.is_finite() || !(0.0..=100.0).contains(&threshold) {
         let default = config.compact.threshold;
@@ -195,12 +195,12 @@ pub fn run(
         threshold
     };
 
-    // The backend observes `shutdown` in its retry waits. `persist_and_delete`
+    // The backend observes `cancel` in its retry waits. `persist_and_delete`
     // does not poll it, so after a cancel its requests get one attempt each
     // and no retries, and on SFTP a read in flight is abandoned; it is
     // crash-safe by design.
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
-    run_on_repo(&mut repo, threshold, max_repack_size, dry_run, shutdown)
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
+    run_on_repo(&mut repo, threshold, max_repack_size, dry_run, cancel)
 }
 
 /// What a mark found in the index (`vykar compact --report-unreferenced`).
@@ -232,10 +232,10 @@ pub struct UnreferencedReport {
 pub fn report_unreferenced(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<UnreferencedReport> {
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
-    report_unreferenced_on_repo(&mut repo, shutdown)
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
+    report_unreferenced_on_repo(&mut repo, cancel)
 }
 
 /// Load the index, list snapshots strictly, mark from the tree-chunk cache
@@ -252,7 +252,7 @@ pub fn report_unreferenced(
 /// is retried on the latest head, at most [`COMPACT_MARK_ATTEMPTS`] times.
 pub(crate) fn report_unreferenced_on_repo(
     repo: &mut Repo,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<UnreferencedReport> {
     let frame = |e: VykarError| {
         if mark::passes_through(&e) {
@@ -267,13 +267,13 @@ pub(crate) fn report_unreferenced_on_repo(
     match repo.commit_mode()? {
         CommitMode::Lock => with_maintenance_lock(repo, |repo| {
             repo.load_chunk_index_under_lock()?;
-            report_under_lock(repo, shutdown).map_err(frame)
+            report_under_lock(repo, cancel).map_err(frame)
         }),
         CommitMode::LockFree => {
             repo.load_chunk_index_under_lock()?;
             let mut attempt = 1;
             loop {
-                match report_under_lock(repo, shutdown) {
+                match report_under_lock(repo, cancel) {
                     Ok(report) => return Ok(report),
                     Err(e) if mark::passes_through(&e) => return Err(e),
                     Err(e) if attempt < COMPACT_MARK_ATTEMPTS && head_moved(repo)? => {
@@ -298,8 +298,8 @@ fn head_moved(repo: &Repo) -> Result<bool> {
 }
 
 /// The report of [`report_unreferenced_on_repo`] over the loaded index.
-fn report_under_lock(repo: &mut Repo, shutdown: &CancelToken) -> Result<UnreferencedReport> {
-    let snaps = mark::load_snapshots_strict(repo, shutdown)?;
+fn report_under_lock(repo: &mut Repo, cancel: &CancelToken) -> Result<UnreferencedReport> {
+    let snaps = mark::load_snapshots_strict(repo, cancel)?;
     let names: Vec<String> = snaps.iter().map(mark::LiveSnapshot::label).collect();
     let ptrs: Vec<&[ChunkId]> = snaps.iter().map(|s| s.meta.item_ptrs.as_slice()).collect();
     let set = mark::TreeChunkSet::build(&ptrs);
@@ -316,7 +316,7 @@ fn report_under_lock(repo: &mut Repo, shutdown: &CancelToken) -> Result<Unrefere
             missing_refs: mark::MissingRefs::Abort,
             decode_threads: mark::default_decode_threads(),
         },
-        shutdown,
+        cancel,
     )?;
 
     let mut report = UnreferencedReport {
@@ -413,7 +413,7 @@ pub(crate) fn run_on_repo(
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     if !dry_run {
         refuse_on_append_only_server(repo.storage().as_ref(), "vykar compact")?;
@@ -431,7 +431,7 @@ pub(crate) fn run_on_repo(
             let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
             list_live_sessions_under_lock(repo)?; // 2. sessions
             repo.load_chunk_index_under_lock()?; // 3. head
-            compact_repo_listed(repo, None, listing, opts, shutdown)
+            compact_repo_listed(repo, None, listing, opts, cancel)
         }),
         CommitMode::LockFree => {
             // A dry run writes no head: it does not make lock holders yield.
@@ -443,7 +443,7 @@ pub(crate) fn run_on_repo(
                 let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
                 list_live_sessions_registered(repo, own)?; // 2. sessions #1, "now"
                 repo.load_chunk_index_under_lock()?; // 3. head
-                compact_repo_listed(repo, Some(own), listing, opts, shutdown)
+                compact_repo_listed(repo, Some(own), listing, opts, cancel)
             })
         }
     }
@@ -512,7 +512,7 @@ pub fn compact_repo(
     max_repack_size: Option<u64>,
     dry_run: bool,
     concurrency: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     let listing = take_pack_listing(repo, dry_run, concurrency)?;
     let opts = CompactOpts {
@@ -521,7 +521,7 @@ pub fn compact_repo(
         dry_run,
         concurrency,
     };
-    compact_repo_listed(repo, None, listing, opts, shutdown)
+    compact_repo_listed(repo, None, listing, opts, cancel)
 }
 
 /// [`compact_repo`] over a pack listing its caller took; `free`: the
@@ -531,18 +531,18 @@ fn compact_repo_listed(
     free: Option<&MaintenanceSession>,
     listing: PackListing,
     opts: CompactOpts,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     let swept = match free {
-        None => mark_and_sweep(repo, opts.dry_run, shutdown)?,
-        Some(own) => mark_and_sweep_lock_free(repo, own, opts.dry_run, shutdown)?,
+        None => mark_and_sweep(repo, opts.dry_run, cancel)?,
+        Some(own) => mark_and_sweep_lock_free(repo, own, opts.dry_run, cancel)?,
     };
     let mut stats = compact_after_mark(
         repo,
         free.map(MaintenanceSession::id),
         listing,
         opts,
-        shutdown,
+        cancel,
     )?;
     stats.snapshots_marked = swept.snapshots;
     stats.chunks_unreferenced = swept.entries_removed;
@@ -563,7 +563,7 @@ pub(crate) fn compact_repo_without_mark(
     max_repack_size: Option<u64>,
     dry_run: bool,
     concurrency: usize,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     let listing = take_pack_listing(repo, dry_run, concurrency)?;
     let opts = CompactOpts {
@@ -572,7 +572,7 @@ pub(crate) fn compact_repo_without_mark(
         dry_run,
         concurrency,
     };
-    compact_after_mark(repo, None, listing, opts, shutdown)
+    compact_after_mark(repo, None, listing, opts, cancel)
 }
 
 /// Everything [`compact_repo`] does after the mark-and-sweep; `free`: the
@@ -582,14 +582,14 @@ fn compact_after_mark(
     free: Option<&str>,
     listing: PackListing,
     opts: CompactOpts,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<CompactStats> {
     let CompactOpts {
         dry_run,
         concurrency,
         ..
     } = opts;
-    let run = compact_packs(repo, free, listing, opts, shutdown);
+    let run = compact_packs(repo, free, listing, opts, cancel);
     if dry_run {
         repo.discard_index_edits();
     }
@@ -628,7 +628,7 @@ fn compact_after_mark(
             repo.crypto().as_ref(),
             concurrency,
             &alive,
-            shutdown,
+            cancel,
         ) {
             Ok(n) => debug!("deleted {n} pack maps"),
             Err(e) => warn!("compact: pack maps were not cleaned up: {e}"),
@@ -675,8 +675,8 @@ struct Swept {
 /// is framed as [`VykarError::MarkRefused`], unless [`mark::passes_through`] (cancel,
 /// newer vykar). "Nothing was changed" means no object: the stale temp-file
 /// sweep of `take_pack_listing` ran before.
-fn plan_sweep(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
-    plan_sweep_inner(repo, shutdown).map_err(mark_refused)
+fn plan_sweep(repo: &Repo, cancel: &CancelToken) -> Result<SweepPlan> {
+    plan_sweep_inner(repo, cancel).map_err(mark_refused)
 }
 
 /// `e` framed as [`VykarError::MarkRefused`], unless [`mark::passes_through`].
@@ -703,8 +703,8 @@ fn check_sweep_listing(repo: &Repo, snaps: &[mark::LiveSnapshot]) -> Result<()> 
     check_listing_against_last_sweep(repo, snaps)
 }
 
-fn plan_sweep_inner(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
-    let snaps = mark::load_snapshots_strict(repo, shutdown)?;
+fn plan_sweep_inner(repo: &Repo, cancel: &CancelToken) -> Result<SweepPlan> {
+    let snaps = mark::load_snapshots_strict(repo, cancel)?;
     check_sweep_listing(repo, &snaps)?;
 
     let names: Vec<String> = snaps.iter().map(mark::LiveSnapshot::label).collect();
@@ -722,7 +722,7 @@ fn plan_sweep_inner(repo: &Repo, shutdown: &CancelToken) -> Result<SweepPlan> {
             missing_refs: mark::MissingRefs::Abort,
             decode_threads: mark::default_decode_threads(),
         },
-        shutdown,
+        cancel,
     )?;
     let mut plan = SweepPlan {
         snapshots: snaps.iter().map(|s| s.id).collect(),
@@ -917,11 +917,7 @@ fn trim_tree_cache(repo: &Repo, plan: &SweepPlan) {
 /// dry run removes the unreferenced entries from the in-memory index only,
 /// so that the analysis after it shows what a real run would free; the
 /// caller discards those edits.
-fn mark_and_sweep(
-    repo: &mut RepoWriter<'_>,
-    dry_run: bool,
-    shutdown: &CancelToken,
-) -> Result<Swept> {
+fn mark_and_sweep(repo: &mut RepoWriter<'_>, dry_run: bool, cancel: &CancelToken) -> Result<Swept> {
     // The ages of the head's backup segments (04 step 7), one listing per
     // lock hold; a failed listing returns before anything changed.
     if let Some(head) = repo.index_head()
@@ -929,7 +925,7 @@ fn mark_and_sweep(
     {
         repo.load_segment_ages()?;
     }
-    let plan = plan_sweep(repo, shutdown)?;
+    let plan = plan_sweep(repo, cancel)?;
     let swept = Swept {
         snapshots: plan.snapshots.len() as u64,
         entries_removed: plan.unreferenced.len() as u64,
@@ -1024,7 +1020,7 @@ fn mark_and_sweep_lock_free(
     repo: &mut RepoWriter<'_>,
     own: &MaintenanceSession,
     dry_run: bool,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<Swept> {
     // The ages of the loaded head's backup segments, listed once; segments
     // of heads read later are unknown, hence young (kept).
@@ -1035,7 +1031,7 @@ fn mark_and_sweep_lock_free(
     }
     let mut so_far: Option<MarkSoFar> = None;
     for attempt in 1..=COMPACT_MARK_ATTEMPTS {
-        shutdown.check()?;
+        cancel.check()?;
         // 4. Sessions #2.
         let committing =
             lock::committing_sessions(repo.storage().as_ref(), own.id()).map_err(mark_refused)?;
@@ -1051,7 +1047,7 @@ fn mark_and_sweep_lock_free(
             });
         }
         // 5. The snapshots, then the head again.
-        let snaps = mark::load_snapshots_strict(repo, shutdown).map_err(mark_refused)?;
+        let snaps = mark::load_snapshots_strict(repo, cancel).map_err(mark_refused)?;
         if head_moved(repo).map_err(mark_refused)? {
             debug!(
                 attempt,
@@ -1084,7 +1080,7 @@ fn mark_and_sweep_lock_free(
                 missing_refs: mark::MissingRefs::Abort,
                 decode_threads: mark::default_decode_threads(),
             },
-            shutdown,
+            cancel,
         ) {
             Ok(found) => found,
             Err(e) if mark::passes_through(&e) => return Err(e),
@@ -1229,7 +1225,7 @@ fn compact_packs(
     free: Option<&str>,
     listing: PackListing,
     opts: CompactOpts,
-    shutdown: &CancelToken,
+    cancel: &CancelToken,
 ) -> Result<PackRun> {
     let CompactOpts {
         threshold,
@@ -1319,7 +1315,7 @@ fn compact_packs(
     }
 
     let storage = repo.storage().as_ref();
-    crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |p: &ListedPack| {
+    crate::repo::bounded::for_each_bounded(concurrency, &discovered, cancel, |p: &ListedPack| {
         packs_total.fetch_add(1, Ordering::Relaxed);
         let (key, pack_id) = (&p.key, &p.pack_id);
 
@@ -1494,7 +1490,7 @@ fn compact_packs(
     }
 
     // Bail before Phase 2 if shutdown was requested during analysis.
-    shutdown.check()?;
+    cancel.check()?;
 
     let mut analyses = analyses_mu
         .into_inner()
@@ -1577,7 +1573,7 @@ fn compact_packs(
     let mut batch: Vec<&PackAnalysis> = Vec::new();
     let mut batch_bytes: u64 = 0;
     for analysis in &selected {
-        shutdown.check()?;
+        cancel.check()?;
         if let Some(cap) = max_repack_size
             && total_repacked_bytes >= cap
         {

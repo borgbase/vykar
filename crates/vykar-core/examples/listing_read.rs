@@ -101,7 +101,7 @@ fn run(
     dir: &[u8],
     subtree: bool,
 ) -> Result<(Vec<Vec<u8>>, ListingRead, f64), Error> {
-    let shutdown = CancelToken::new();
+    let cancel = CancelToken::new();
     let mut paths = Vec::new();
     let visit = |i: vykar_core::snapshot::item::Item| {
         paths.push(i.path_bytes().to_vec());
@@ -109,9 +109,9 @@ fn run(
     };
     let t = Instant::now();
     let stats = if subtree {
-        view.subtree(repo, dir, &shutdown, visit)?
+        view.subtree(repo, dir, &cancel, visit)?
     } else {
-        view.dir_entries(repo, dir, &shutdown, visit)?
+        view.dir_entries(repo, dir, &cancel, visit)?
     };
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     Ok((paths, stats, ms))

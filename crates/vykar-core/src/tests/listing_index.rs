@@ -142,11 +142,11 @@ fn read(
         got.push(i.path_bytes().to_vec());
         Ok(())
     };
-    let shutdown = CancelToken::new();
+    let cancel = CancelToken::new();
     let stats = if subtree {
-        view.subtree(repo, dir, &shutdown, visit)
+        view.subtree(repo, dir, &cancel, visit)
     } else {
-        view.dir_entries(repo, dir, &shutdown, visit)
+        view.dir_entries(repo, dir, &cancel, visit)
     }
     .unwrap();
     (got, stats)

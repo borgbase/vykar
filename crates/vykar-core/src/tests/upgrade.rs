@@ -8,6 +8,7 @@ use super::helpers::{
     FaultyPut, backup_single_source, downgrade_to_legacy, is_base_put, is_head_put,
     make_test_config, pass, try_backup_single_source,
 };
+use super::vendored_v0_24_lock as v024;
 use crate::commands;
 use crate::commands::check::RepairMode;
 use crate::config::VykarConfig;
@@ -16,9 +17,10 @@ use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
-    DecodedConfig, EncryptionMode, OpenOptions, Repo, RepoConfig, RepoFormat, UpgradeOutcome,
-    WriterMode,
+    DecodedConfig, EncryptionMode, HostEnv, OpenOptions, Repo, RepoConfig, RepoFormat,
+    UpgradeOutcome, WriterMode,
 };
+use crate::sim::env::{SimTime, TimeMode};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
@@ -230,8 +232,8 @@ fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
 }
 
 /// B7 (04 step 7): upgrade rewrites the index and does not run beside a
-/// backup. Through the production path the refusal runs under the lock
-/// (inside `run_under_fence`), after the stale-session cleanup; nothing
+/// backup. Through the production path the refusal runs under the legacy
+/// lock key, after the stale-session cleanup; nothing
 /// is upgraded and the session's marker is kept.
 #[test]
 fn upgrade_refuses_with_a_live_session() {
@@ -598,8 +600,7 @@ fn upgrade_through(
         OpenOptions::new().legacy_format(),
     )
     .unwrap();
-    let result =
-        commands::util::with_maintenance_lock(&mut repo, |repo| repo.upgrade_index_layout());
+    let result = commands::upgrade::upgrade_repo(&mut repo, None);
     drop(repo);
     let ops = ops.lock().unwrap().clone();
     (result, ops)
@@ -924,7 +925,7 @@ fn upgrade_probes_the_server_before_writing() {
             OpenOptions::new().legacy_format(),
         )
         .unwrap();
-        let result = commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout());
+        let result = commands::upgrade::upgrade_repo(&mut repo, None);
         drop(repo);
         let ops = ops.lock().unwrap().clone();
         (result, ops)
@@ -1793,4 +1794,533 @@ fn the_switch_refuses_beside_a_live_session() {
     assert!(matches!(err, VykarError::ActiveSessions(_)), "{err:?}");
     assert!(marker.exists());
     assert_eq!(fx.config_bytes(), config);
+}
+
+// ── The legacy lock key (10-single-protocol step 6) ─────────────────────
+
+/// What a [`Hooked`] hook is called with.
+#[derive(Clone, Copy, Debug)]
+enum Call<'a> {
+    /// A read (`get`, `exists`) of the key.
+    Read(&'a str),
+    /// A write (`put k`, `delete k`, `create_dir k`), before it is
+    /// forwarded; an `Err` fails it unforwarded.
+    Before(&'a str),
+    /// The same write after it was forwarded and succeeded.
+    After(&'a str),
+}
+
+type Hook = Box<dyn Fn(Call<'_>, &dyn StorageBackend) -> Result<()> + Send + Sync>;
+
+/// Logs every write (`put`, `delete`, `create_dir`, packs and staged
+/// writes included) and calls `hook` around each write and before each
+/// `get`/`exists`, with the raw backend.
+struct Hooked {
+    inner: Arc<dyn StorageBackend>,
+    hook: Hook,
+    ops: Mutex<Vec<String>>,
+}
+
+impl Hooked {
+    fn write(&self, op: String, f: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.ops.lock().unwrap().push(op.clone());
+        (self.hook)(Call::Before(&op), &*self.inner)?;
+        f()?;
+        (self.hook)(Call::After(&op), &*self.inner)
+    }
+
+    fn ops(&self) -> Vec<String> {
+        self.ops.lock().unwrap().clone()
+    }
+}
+
+impl InnerBackend for Hooked {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for Hooked;
+    except [get, put, delete, exists, create_dir, put_pack, begin_staged_put, conditional,
+            batch_delete, profile];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        (self.hook)(Call::Read(key), &*self.inner)?;
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.write(format!("put {key}"), || self.inner.put(key, data))
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.write(format!("delete {key}"), || self.inner.delete(key))
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        (self.hook)(Call::Read(key), &*self.inner)?;
+        self.inner.exists(key)
+    }
+
+    fn create_dir(&self, key: &str) -> Result<()> {
+        self.write(format!("create_dir {key}"), || self.inner.create_dir(key))
+    }
+
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        self.write(format!("put {key}"), || self.inner.put(key, data.as_slice()))
+    }
+
+    // Keeps every write on the hooked `put`.
+    fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
+    }
+}
+
+/// The 0.24 lock keys (`locks/*.json`) on `raw`.
+fn legacy_lock_keys(raw: &dyn StorageBackend) -> Vec<String> {
+    let mut keys = v024::list_lock_keys(raw).unwrap();
+    keys.sort();
+    keys
+}
+
+/// The one lock key on `raw`: the upgrade's.
+fn the_lock_key(raw: &dyn StorageBackend) -> String {
+    let keys = legacy_lock_keys(raw);
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    keys.into_iter().next().unwrap()
+}
+
+/// Whether `op` is a write of a lock key.
+fn is_lock_op(op: &str) -> bool {
+    op.split_once(' ')
+        .is_some_and(|(_, k)| k.starts_with("locks/"))
+}
+
+/// `fx` opened as `vykar upgrade` opens it, on `env` when given, then
+/// switched to a [`Hooked`] over its storage (so the open's reads are not
+/// hooked).
+fn hooked_repo(fx: &Fixture, env: Option<HostEnv>, hook: Hook) -> (Repo, Arc<Hooked>) {
+    let mut repo = fx.open_legacy(&fx.cache()).unwrap();
+    if let Some(env) = env {
+        repo.set_host_env(env);
+    }
+    let hooked = Arc::new(Hooked {
+        inner: Arc::from(fx.storage()),
+        hook,
+        ops: Mutex::new(Vec::new()),
+    });
+    repo.set_storage_for_test(Arc::clone(&hooked) as Arc<dyn StorageBackend>);
+    (repo, hooked)
+}
+
+/// A v3 fixture with one backup.
+fn legacy_fixture() -> Fixture {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    fx
+}
+
+/// A sim clock starting now and this machine's identity on it.
+fn sim_env(host: Option<crate::repo::HostIdentity>) -> (Arc<SimTime>, HostEnv) {
+    let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
+    let mut env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
+    if let Some(host) = host {
+        env = env.with_host(host);
+    }
+    (time, env)
+}
+
+/// Done-when 1: while the upgrade runs, a 0.24 backup's (or read's)
+/// session registration and a 0.24 maintenance lock both refuse, naming the
+/// upgrade's key.
+///
+/// The vendored 0.24 code reads this machine's real hostname, PID liveness
+/// and boot ID. The upgrade runs on the real host environment
+/// (`HostEnv::system()`: this hostname, this live PID, this boot), so 0.24's
+/// same-host rule finds the PID alive and the boot unchanged and leaves the
+/// key to the age rule, under which it is young.
+#[test]
+fn a_0_24_backup_and_compact_refuse_during_an_upgrade() {
+    let fx = legacy_fixture();
+    let probed = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&probed);
+    let hook: Hook = Box::new(move |call, raw| {
+        let Call::Before(op) = call else {
+            return Ok(());
+        };
+        if !op.starts_with("put packmaps/") || seen.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        let key = the_lock_key(raw);
+        match v024::register_session_inner(raw, "v024", 1, 100) {
+            Err(VykarError::Locked(holder)) => assert_eq!(holder.key, key),
+            other => panic!("0.24 registration: {other:?}"),
+        }
+        assert!(!raw.exists("sessions/v024.json").unwrap());
+        match v024::acquire_lock(raw) {
+            Err(VykarError::Locked(holder)) => assert_eq!(holder.key, key),
+            other => panic!("0.24 lock: {other:?}"),
+        }
+        assert_eq!(legacy_lock_keys(raw), vec![key]);
+        Ok(())
+    });
+    let (mut repo, _hooked) = hooked_repo(&fx, None, hook);
+    let outcome = commands::upgrade::upgrade_repo(&mut repo, None).unwrap();
+    drop(repo);
+    assert!(
+        matches!(outcome, UpgradeOutcome::Upgraded { from: 3, to: 6, .. }),
+        "{outcome:?}"
+    );
+    assert!(probed.load(Ordering::SeqCst) > 0, "no pack map was written");
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+    fx.check_clean();
+}
+
+/// Done-when 2: beside a live 0.24 lock the upgrade refuses, writing
+/// nothing but its own key (and deleting it again).
+#[test]
+fn the_upgrade_refuses_beside_a_0_24_lock() {
+    let fx = legacy_fixture();
+    let raw = fx.storage();
+    let guard = v024::acquire_lock(&*raw).unwrap();
+    let foreign = guard.key().to_string();
+    let config = std::fs::read(fx.repo_dir.join("config")).unwrap();
+    let index = fx.legacy_bytes();
+
+    let (mut repo, hooked) = hooked_repo(&fx, None, Box::new(|_, _| Ok(())));
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    match &err {
+        VykarError::Locked(holder) => assert_eq!(holder.key, foreign),
+        other => panic!("{other:?}"),
+    }
+    let ops = hooked.ops();
+    assert_eq!(ops.len(), 2, "{ops:?}");
+    assert!(ops[0].starts_with("put locks/"), "{ops:?}");
+    assert_eq!(ops[1], ops[0].replacen("put", "delete", 1), "{ops:?}");
+    assert_eq!(std::fs::read(fx.repo_dir.join("config")).unwrap(), config);
+    assert_eq!(fx.legacy_bytes(), index);
+    assert!(!fx.repo_dir.join("packmaps").exists());
+    assert!(fx.heads().is_empty());
+    assert_eq!(legacy_lock_keys(&*raw), vec![foreign]);
+
+    v024::release_lock(&*raw, guard).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert_eq!(fx.version(), 6);
+}
+
+/// Done-when 3: an upgrade that takes 7 h keeps its key's `time` under an
+/// hour old at every write, so 0.24 never takes it for stale.
+///
+/// Each call not under `locks/` advances the clock 10 min, each such write
+/// another 40 min, in the order assert (before forwarding), forward,
+/// advance. So between two writes 50 min or more pass: an implementation
+/// that rewrites only at the lock fence (the head and the `config` switch)
+/// or only every 3 h would show a key older than an hour at the second or
+/// third write, and fail the assertion.
+#[test]
+fn the_legacy_key_stays_young_across_a_7h_upgrade() {
+    let fx = legacy_fixture();
+    let (time, env) = sim_env(None);
+    let checked = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let time = Arc::clone(&time);
+        let checked = Arc::clone(&checked);
+        Box::new(move |call, raw| {
+            let step = |minutes: u64| time.advance(std::time::Duration::from_secs(minutes * 60));
+            match call {
+                Call::Read(key) if !key.starts_with("locks/") => step(10),
+                Call::Before(op) if !is_lock_op(op) => {
+                    let key = the_lock_key(raw);
+                    let entry: v024::LockEntry =
+                        serde_json::from_slice(&raw.get(&key).unwrap().unwrap()).unwrap();
+                    let written = chrono::DateTime::parse_from_rfc3339(&entry.time)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc);
+                    let now = time.now_utc();
+                    assert!(
+                        now - written < chrono::Duration::minutes(60),
+                        "{op}: the key is {} old",
+                        now - written
+                    );
+                    assert!(!v024::should_cleanup_lock(
+                        &key,
+                        Some(&entry),
+                        now,
+                        chrono::Duration::hours(6),
+                        "other-host",
+                        None,
+                        &|_| true,
+                    ));
+                    checked.fetch_add(1, Ordering::SeqCst);
+                }
+                Call::After(op) if !is_lock_op(op) => step(50),
+                _ => {}
+            }
+            Ok(())
+        })
+    };
+    let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
+    let outcome = commands::upgrade::upgrade_repo(&mut repo, None).unwrap();
+    drop(repo);
+    assert!(
+        matches!(outcome, UpgradeOutcome::Upgraded { from: 3, to: 6, .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        time.elapsed() >= std::time::Duration::from_secs(7 * 3600),
+        "{:?}",
+        time.elapsed()
+    );
+    let ops = hooked.ops();
+    let own = ops
+        .iter()
+        .find(|o| o.starts_with("put locks/") && o.ends_with(".json"))
+        .unwrap()
+        .clone();
+    let rewrites = ops.iter().filter(|o| **o == own).count() - 1;
+    assert!(rewrites >= 6, "{rewrites} rewrites: {ops:?}");
+    assert!(checked.load(Ordering::SeqCst) >= 7);
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+    fx.check_clean();
+}
+
+/// Done-when 4a: a key removed during the upgrade (`break-lock`, as 0.24
+/// runs it) stops the upgrade at its next write; nothing more is written,
+/// not even the release. At the pre-flight `config` re-PUT the error is the
+/// lost key's, not the append-only text.
+#[test]
+fn an_upgrade_whose_key_was_removed_writes_nothing_more() {
+    // (what triggers the removal, where the upgrade stops)
+    for (trigger, at_config) in [("get config", true), ("put packmaps/", false)] {
+        let fx = legacy_fixture();
+        let index = fx.legacy_bytes();
+        let removed = Arc::new(Mutex::new(None::<usize>));
+        let (mut repo, hooked) = {
+            let removed = Arc::clone(&removed);
+            let ops_seen = Arc::new(AtomicUsize::new(0));
+            hooked_repo(
+                &fx,
+                None,
+                Box::new(move |call, raw| {
+                    let hit = match call {
+                        Call::Read(key) => trigger == format!("get {key}") && at_config,
+                        Call::Before(op) => {
+                            ops_seen.fetch_add(1, Ordering::SeqCst);
+                            !at_config && op.starts_with(trigger)
+                        }
+                        Call::After(_) => false,
+                    };
+                    let mut removed = removed.lock().unwrap();
+                    if hit && removed.is_none() {
+                        assert_eq!(v024::break_lock(raw).unwrap(), 1);
+                        // Ops logged so far; the write being hooked is in flight.
+                        *removed = Some(ops_seen.load(Ordering::SeqCst));
+                    }
+                    Ok(())
+                }),
+            )
+        };
+        let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+        drop(repo);
+        let msg = err.to_string();
+        assert!(
+            matches!(err, VykarError::LockExpired(_)),
+            "{trigger}: {err:?}"
+        );
+        assert!(msg.contains("removed"), "{msg}");
+        let ops = hooked.ops();
+        let at = removed.lock().unwrap().expect("the key was removed");
+        // The in-flight write (packmaps) completes; nothing after it.
+        assert_eq!(ops.len(), at, "{trigger}: {ops:?}");
+        if at_config {
+            assert!(!ops.iter().any(|o| o == "put config"), "{ops:?}");
+        }
+        assert_eq!(fx.version(), 3, "{trigger}");
+        assert_eq!(fx.legacy_bytes(), index, "{trigger}");
+        assert!(fx.heads().is_empty(), "{trigger}");
+
+        commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+        assert_eq!(fx.version(), 6, "{trigger}");
+        fx.check_clean();
+    }
+}
+
+/// Done-when 4b: an upgrade that cannot rewrite its key for 5.5 h stops
+/// before switching, deleting its key and writing nothing else. The clock
+/// moves in steps, so the lapse is reached only through failed rewrites.
+#[test]
+fn an_upgrade_that_cannot_rewrite_its_key_stops() {
+    let fx = legacy_fixture();
+    let (time, env) = sim_env(None);
+    let hook: Hook = {
+        let time = Arc::clone(&time);
+        // The key the acquisition wrote; every later PUT of it fails.
+        let own = Mutex::new(None::<String>);
+        Box::new(move |call, _raw| {
+            match call {
+                Call::Before(op) if op.starts_with("put locks/") && op.ends_with(".json") => {
+                    let mut own = own.lock().unwrap();
+                    match own.as_deref() {
+                        None => *own = Some(op.to_string()),
+                        Some(first) if first == op => {
+                            return Err(VykarError::Other(format!("injected failure: {op}")));
+                        }
+                        Some(_) => {}
+                    }
+                }
+                // 3 h per write: the second write's check finds the rewrite
+                // due and fails it, the third finds 6 h since the last
+                // successful one. Only a failed rewrite counted as a
+                // success would get past 5.5 h.
+                Call::After(op) if !is_lock_op(op) => {
+                    time.advance(std::time::Duration::from_secs(3 * 3600));
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+    };
+    let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(matches!(err, VykarError::LockExpired(_)), "{err:?}");
+    assert!(err.to_string().contains("last rewritten"), "{err}");
+    let ops = hooked.ops();
+    let own_put = ops[0].clone();
+    assert!(own_put.starts_with("put locks/"), "{ops:?}");
+    let own_key = own_put.strip_prefix("put ").unwrap();
+    // Hooked logs a write before the hook fails it.
+    let failed = |o: &String| *o == own_put;
+    assert!(ops[1..].iter().any(failed), "no failed rewrite: {ops:?}");
+    let last_write = ops.iter().rposition(|o| !is_lock_op(o)).unwrap();
+    let after: Vec<_> = ops[last_write + 1..]
+        .iter()
+        .filter(|o| !failed(o))
+        .collect();
+    assert_eq!(after, [&format!("delete {own_key}")], "{ops:?}");
+    assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
+    assert!(fx.heads().is_empty());
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert_eq!(fx.version(), 6);
+}
+
+/// A key removed between acquisition and the stale-session reap's delete
+/// fails the reap with `LockExpired`, the variant kept; nothing is written.
+#[test]
+fn a_key_removed_before_the_session_reap_is_lock_expired() {
+    let fx = legacy_fixture();
+    let host = crate::repo::HostIdentity {
+        hostname: "upgrader-host".into(),
+        pid: 4242,
+        boot_id: Some("boot-x".into()),
+        installation_id: Some("inst-x".into()),
+        pid_ns: Some(1),
+    };
+    // A session this machine left behind: its PID is dead, so it is reaped.
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = crate::repo::lock::SessionEntry {
+        hostname: host.hostname.clone(),
+        pid: 7,
+        registered_at: now.clone(),
+        last_refresh: now,
+        boot_id: host.boot_id.clone(),
+        installation_id: host.installation_id.clone(),
+        pid_ns: host.pid_ns,
+        elapsed_secs: None,
+        committing: false,
+        writes_heads: false,
+    };
+    let marker = "sessions/deadbeef-1234-5678-9abc-def012345678.json";
+    fx.storage()
+        .put(marker, &serde_json::to_vec(&entry).unwrap())
+        .unwrap();
+    let env = HostEnv::system()
+        .with_host(host)
+        .with_pid_alive(Arc::new(|_, pid| pid == 4242));
+    let hook: Hook = Box::new(move |call, raw| {
+        // The reap's GET of the marker, before its delete: break-lock.
+        if let Call::Read(key) = call
+            && key == marker
+        {
+            raw.delete(&the_lock_key(raw))?;
+        }
+        Ok(())
+    });
+    let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(matches!(err, VykarError::LockExpired(_)), "{err:?}");
+    let ops = hooked.ops();
+    assert!(ops.iter().all(|o| is_lock_op(o)), "{ops:?}");
+    assert!(fx.storage().exists(marker).unwrap());
+    assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+}
+
+/// The documented residual: a 0.24 client on a machine with the
+/// upgrader's hostname whose PID check fails there (another machine with
+/// that name, this one after a reboot, another PID namespace) reaps the
+/// key at once; the upgrade then stops at its next write, before the switch.
+#[test]
+fn a_0_24_client_with_this_hostname_reaps_the_key() {
+    let fx = legacy_fixture();
+    let host = crate::repo::HostIdentity {
+        hostname: "upgrader-host".into(),
+        pid: 999_999,
+        boot_id: Some("boot-x".into()),
+        installation_id: None,
+        pid_ns: None,
+    };
+    let env = HostEnv::system().with_host(host);
+    let reaped = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let reaped = Arc::clone(&reaped);
+        Box::new(move |call, raw| {
+            if let Call::Before(op) = call
+                && op.starts_with("put packmaps/")
+                && reaped.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                // 0.24's reaper as it runs on a machine named upgrader-host,
+                // where the upgrader's PID is not alive.
+                let surviving = v024::cleanup_stale_locks_inner(
+                    raw,
+                    chrono::Duration::hours(6),
+                    "upgrader-host",
+                    Some("boot-x"),
+                    |_| false,
+                )
+                .unwrap();
+                assert!(surviving.is_empty(), "{surviving:?}");
+            }
+            Ok(())
+        })
+    };
+    let (mut repo, _hooked) = hooked_repo(&fx, Some(env), hook);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(matches!(err, VykarError::LockExpired(_)), "{err:?}");
+    assert!(reaped.load(Ordering::SeqCst) > 0);
+    assert_eq!(fx.version(), 3);
+    assert!(fx.heads().is_empty());
 }

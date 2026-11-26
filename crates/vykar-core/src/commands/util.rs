@@ -168,26 +168,6 @@ fn run_under_fence<T>(
     result
 }
 
-/// Open a repository and execute a maintenance operation while holding the lock.
-///
-/// Unlike `with_repo_lock`, this first cleans up stale sessions, and the
-/// action refuses (`ActiveSessions`, under the lock) while backup sessions
-/// are live: upgrade, its one caller, rewrites the index and must not run
-/// beside a backup.
-pub fn with_open_repo_maintenance_lock<T>(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    opts: OpenOptions,
-    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
-) -> Result<T> {
-    // Upgrade, the only caller, has no token.
-    let mut repo = open_repo(config, passphrase, opts, &CancelToken::new())?;
-    with_maintenance_lock(&mut repo, |repo| {
-        repo.refuse_live_sessions()?;
-        action(repo)
-    })
-}
-
 /// `Err(AppendOnlyServer { command })` when the repository's server
 /// advertises append-only mode ([`vykar_storage::ServerOps::append_only`]).
 /// Call before a command's first delete; it sends at most one `GET /health`.
@@ -270,7 +250,9 @@ pub(crate) fn list_live_sessions_under_lock(repo: &mut Repo) -> Result<()> {
         None,
     );
     let live = match listed {
-        Err(e @ VykarError::Locked(_)) => return Err(e),
+        // `LockExpired`: the deletes of a v2/v3 upgrade's reap run its
+        // lock key's check first.
+        Err(e @ (VykarError::Locked(_) | VykarError::LockExpired(_))) => return Err(e),
         Ok((cleaned, live)) => {
             if !cleaned.is_empty() {
                 info!(

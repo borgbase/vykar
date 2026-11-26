@@ -50,7 +50,9 @@ mod session;
 pub use memory_budget::PackPolicy;
 pub use session::WriteSessionOptions;
 mod upgrade;
+pub(crate) use upgrade::LegacyUpgradeLock;
 pub use upgrade::{UpgradeOutcome, WriterModeReport};
+pub(crate) mod write_check;
 mod writer;
 pub(crate) mod writer_mode;
 pub(crate) use chunks::{
@@ -892,6 +894,16 @@ impl Repo {
     #[cfg(test)]
     pub(crate) fn set_storage_for_test(&mut self, storage: Arc<dyn StorageBackend>) {
         self.storage = storage;
+    }
+
+    /// Replace the backend this handle uses; returns the previous one. The
+    /// v2/v3 upgrade wraps the backend in a write check for its run
+    /// (`commands::upgrade`). Callers restore the previous backend after.
+    pub(crate) fn swap_storage(
+        &mut self,
+        storage: Arc<dyn StorageBackend>,
+    ) -> Arc<dyn StorageBackend> {
+        std::mem::replace(&mut self.storage, storage)
     }
 
     /// Tests: replace the crypto engine.

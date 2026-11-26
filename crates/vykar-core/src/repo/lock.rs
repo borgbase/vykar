@@ -448,9 +448,11 @@ impl NowSource<'_> {
     }
 }
 
-/// An entry's age as a reaper judges it.
+/// An entry's age as a reaper judges it. Also judges foreign locks for
+/// the v2/v3 upgrade's legacy lock key (`upgrade::LegacyUpgradeLock`);
+/// moves with the session half in 10-single-protocol step 9.
 #[derive(Clone, Copy, Debug)]
-enum EntryAge {
+pub(crate) enum EntryAge {
     /// On the store's clock: (store now − the entry's mtime).
     Store(std::time::Duration),
     /// The listing reported no mtime (test doubles; a vykar-server older
@@ -467,7 +469,7 @@ impl EntryAge {
     /// The age of an entry listed with `mtime`, judged at `now`;
     /// `timestamp` gives the fallback when there is no mtime (warned once
     /// per run of `env`).
-    fn of(
+    pub(crate) fn of(
         mtime: Option<std::time::SystemTime>,
         now: Option<StoreNow>,
         env: &HostEnv,
@@ -483,7 +485,7 @@ impl EntryAge {
         }
     }
 
-    fn exceeds(self, max_age: Duration) -> bool {
+    pub(crate) fn exceeds(self, max_age: Duration) -> bool {
         match self {
             Self::Store(age) => max_age.to_std().is_ok_and(|max| age > max),
             Self::Timestamp(age) => age.is_some_and(|age| age > max_age),
@@ -492,7 +494,7 @@ impl EntryAge {
     }
 
     /// The age as the same-host rule compares it with local uptime.
-    fn as_std(self) -> Option<std::time::Duration> {
+    pub(crate) fn as_std(self) -> Option<std::time::Duration> {
         match self {
             Self::Store(age) => Some(age),
             Self::Timestamp(age) => age.and_then(|a| a.to_std().ok()),

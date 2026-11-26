@@ -1,6 +1,9 @@
 //! In-place upgrade from the monolithic index (formats v2/v3) to format v6
-//! (v2 keeps BLAKE2b IDs, v3 BLAKE3; the config names the hash). Runs under
-//! the maintenance lock, on a repository opened without its index.
+//! (v2 keeps BLAKE2b IDs, v3 BLAKE3; the config names the hash), on a
+//! repository opened without its index. A v2/v3 repository is upgraded
+//! under the legacy lock key ([`LegacyUpgradeLock`]: 0.24's lock format,
+//! rewritten every few minutes, checked before every write); a v6 one
+//! (the resume after the switch, a mode switch) under the maintenance lock.
 //!
 //! 1. Probe the server capabilities and PUT the stored `config` bytes back
 //!    unchanged: a server that refuses overwrites (append-only) fails here,
@@ -38,12 +41,20 @@
 //! the switch finds a current format and only retries the deletions of
 //! step 7.
 
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::ages::{CLOCK_PROBE_DEBRIS_AGE, is_probe_key};
 use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
+use super::host_env::HostEnv;
 use super::index_store;
 use super::index_write::PendingSweep;
+use super::lock::{EntryAge, EntryHost, SameHost, format_age_since, same_host};
+use super::write_check::WriteChecked;
+use super::writer::FenceFn;
 use super::writer_mode::{ModeCheck, init_time_check};
 use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat, WriterMode};
 use crate::compress;
@@ -53,7 +64,8 @@ use crate::index::dedup_cache;
 use crate::index::table::{self, ChunkTable};
 use crate::index::{IndexBlob, LegacyChunkIndex, LiveIndex};
 use vykar_crypto::CryptoEngine;
-use vykar_types::error::{Result, VykarError};
+use vykar_storage::{StorageBackend, StoreNow};
+use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
 
 /// The writer mode a [`UpgradeOutcome`] leaves the repository in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +160,8 @@ pub(crate) fn is_index_head(data: &[u8]) -> bool {
 
 impl Repo {
     /// Upgrade a v2/v3 repository to v6 in place; see the module docs.
-    /// The caller holds the maintenance lock, whose fence is `fence`
+    /// The caller holds the legacy lock key (v2/v3) or the maintenance
+    /// lock (v6), whose check is `fence`
     /// (`RepoWriter::upgrade_index_layout`). One-way: older binaries cannot
     /// read the repository afterwards.
     ///
@@ -200,17 +213,21 @@ impl Repo {
                 "the repository config changed after it was opened; retry the upgrade".into(),
             ));
         }
-        self.storage.put("config", &config_bytes).map_err(|e| {
-            VykarError::Other(format!(
-                "the repository config cannot be rewritten ({e}). The upgrade rewrites \
+        // A lost legacy lock key (the write check) is reported as itself.
+        self.storage
+            .put("config", &config_bytes)
+            .map_err(|e| match e {
+                e @ VykarError::LockExpired(_) => e,
+                e => VykarError::Other(format!(
+                    "the repository config cannot be rewritten ({e}). The upgrade rewrites \
                  `config` and deletes `index`; on an append-only server, disable \
                  append-only for the upgrade. Nothing was changed."
-            ))
-        })?;
+                )),
+            })?;
         // The writer mode `switch_version` records (10-single-protocol step
         // 5), decided before anything else is written. The upgrade's own
         // head below is a plain PUT: the positional config makes the handle
-        // single-writer, and the maintenance lock is held.
+        // single-writer, and the legacy lock key is held.
         let (mode, single_reason) = match requested {
             Some(WriterMode::Single) => (WriterMode::Single, None),
             Some(WriterMode::Multi) => match init_time_check(self.storage.as_ref()) {
@@ -475,5 +492,353 @@ impl Repo {
         {
             let _ = std::fs::remove_file(blob);
         }
+    }
+}
+
+// ── The legacy lock key (10-single-protocol step 6) ─────────────────────
+
+/// 0.24's lock directory; a lock is a key under it ending in `.json`.
+const LEGACY_LOCKS_PREFIX: &str = "locks/";
+/// 0.24 reaps a lock whose `time` is older than this on its own clock
+/// (v0.24.0 `DEFAULT_STALE_LOCK_SECS`); also the age after which the
+/// acquisition reaps a foreign lock (on the store's clock).
+const LEGACY_LOCK_STALE: chrono::Duration = chrono::Duration::hours(6);
+/// A check rewrites the key with a fresh `time` once this long has passed
+/// since its last rewrite, so at every write the key's `time` is at most
+/// this old (well under an hour), and a lapse counted from the last rewrite
+/// is counted from at most this long before the last check. Its cost: a
+/// write after a gap of this long or more costs an EXISTS and a PUT of the
+/// key before it (at most 12 rewrites an hour).
+const LEGACY_LOCK_REWRITE_SECS: i64 = 5 * 60;
+/// A check fails once the last successful rewrite is older than this
+/// (0.24's `LOCK_MAX_UNREFRESHED_SECS`: 6 h − 30 min).
+const LEGACY_LOCK_MAX_UNREWRITTEN_SECS: i64 = 6 * 60 * 60 - 30 * 60;
+
+/// The body of a lock key: exactly the JSON 0.24 parses (`hostname`,
+/// `pid`, `time` as RFC 3339, `boot_id`) plus this binary's identity
+/// fields, which 0.24 ignores. The same field names and order as
+/// `lock::LockEntry`.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyLockEntry {
+    hostname: String,
+    pid: u32,
+    time: String,
+    #[serde(default)]
+    boot_id: Option<String>,
+    #[serde(default)]
+    installation_id: Option<String>,
+    #[serde(default)]
+    pid_ns: Option<u64>,
+}
+
+impl LegacyLockEntry {
+    fn new(env: &HostEnv, time: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            hostname: env.host.hostname.clone(),
+            pid: env.host.pid,
+            time: time.to_rfc3339(),
+            boot_id: env.host.boot_id.clone(),
+            installation_id: env.host.installation_id.clone(),
+            pid_ns: env.host.pid_ns,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| VykarError::Other(format!("lock serialize: {e}")))
+    }
+}
+
+/// The lock key a v2/v3 upgrade holds: a 0.24 advisory lock, so 0.24
+/// backups, reads and maintenance refuse while the upgrade runs, and a
+/// lock of any version makes the upgrade refuse. Its [check](Self::check)
+/// runs before every write of the upgrade (the writer's fence and a
+/// [`WriteChecked`] storage wrapper), rewrites the key every few minutes
+/// and fails once the key is gone or its last rewrite is 5.5 h old.
+///
+/// Self-contained, apart from the age and same-host judgements it shares
+/// with `lock`: it outlives the lock (10-single-protocol step 9).
+pub(crate) struct LegacyUpgradeLock {
+    shared: Arc<LegacyKey>,
+}
+
+struct LegacyKey {
+    /// The unwrapped backend: the lock's own requests are never checked.
+    storage: Arc<dyn StorageBackend>,
+    env: HostEnv,
+    key: String,
+    /// The key's mtime in the confirming listing.
+    store_acquired: Option<StoreNow>,
+    state: Mutex<LegacyKeyState>,
+}
+
+struct LegacyKeyState {
+    /// Unix seconds, on `env`'s clock, of the last successful write of the key.
+    last_rewrite: i64,
+    /// A check found the key gone: every later check fails, release sends nothing.
+    lost: bool,
+    /// A rewrite has failed (warned once).
+    rewrite_failed: bool,
+}
+
+impl LegacyUpgradeLock {
+    /// Write the key, list `locks/`, reap stale foreign locks and refuse
+    /// (`Locked`, naming the first live one) beside a live one; the key is
+    /// deleted again on every failure.
+    ///
+    /// The key is written before the listing, not after a listing that
+    /// found no holder: judging a foreign lock's age needs "now" on the
+    /// store's clock, which the key's own mtime gives. One listing is
+    /// enough: a contender whose write completed before it is in it, one
+    /// whose write came later lists after it and sees this key.
+    pub(crate) fn acquire(storage: Arc<dyn StorageBackend>, env: &HostEnv) -> Result<Self> {
+        let now = env.now_utc();
+        let body = LegacyLockEntry::new(env, now).encode()?;
+        // 0.24's and this binary's key shape; the prefix is kept across rewrites.
+        let key = format!(
+            "{LEGACY_LOCKS_PREFIX}{:020}-{:032x}.json",
+            now.timestamp_micros(),
+            rand::random::<u128>()
+        );
+        let undo = |e: VykarError| {
+            // A PUT can land and still fail; the key is uniquely named.
+            if let Err(del) = storage.delete(&key) {
+                debug!(key, error = %del, "could not delete the upgrade's lock key");
+            }
+            e
+        };
+        storage.put(&key, &body).map_err(undo)?;
+        let listing = storage.list_meta(LEGACY_LOCKS_PREFIX).map_err(undo)?;
+        if !listing.iter().any(|o| o.key == key) {
+            return Err(undo(VykarError::Other(
+                "lock acquisition failed: written lock key not returned by LIST".into(),
+            )));
+        }
+        let store_now = StoreNow::of_written(&listing, &key);
+        let local_now = env.now_utc();
+        let mut live = Vec::new();
+        for object in listing.iter().filter(|o| o.key != key) {
+            let other = object.key.as_str();
+            if !(other.starts_with(LEGACY_LOCKS_PREFIX) && other.ends_with(".json")) {
+                if let Some(now) = store_now
+                    && is_probe_key(other)
+                    && object
+                        .mtime
+                        .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
+                    && let Err(e) = storage.delete(other)
+                {
+                    debug!(key = other, error = %e, "could not delete an old clock probe");
+                }
+                continue;
+            }
+            let Some(data) = storage.get(other).map_err(undo)? else {
+                continue;
+            };
+            let entry = serde_json::from_slice::<LegacyLockEntry>(&data).ok();
+            let age = EntryAge::of(object.mtime, store_now, env, || {
+                legacy_lock_timestamp(entry.as_ref(), other)
+                    .map(|ts| local_now.signed_duration_since(ts))
+            });
+            let dead_here = entry.as_ref().is_some_and(|e| {
+                matches!(
+                    same_host(
+                        &EntryHost {
+                            hostname: &e.hostname,
+                            pid: e.pid,
+                            boot_id: e.boot_id.as_deref(),
+                            installation_id: e.installation_id.as_deref(),
+                            pid_ns: e.pid_ns,
+                            age: age.as_std(),
+                        },
+                        env,
+                    ),
+                    SameHost::DeadProcess | SameHost::EarlierBoot
+                )
+            });
+            if dead_here || age.exceeds(LEGACY_LOCK_STALE) {
+                debug!(lock_key = other, "reaping a stale lock");
+                storage.delete(other).map_err(undo)?;
+            } else {
+                live.push(other.to_string());
+            }
+        }
+        live.sort();
+        if let Some(holder) = live.first() {
+            let holder = legacy_lock_holder(storage.as_ref(), holder, env);
+            return Err(undo(VykarError::Locked(holder)));
+        }
+        Ok(Self {
+            shared: Arc::new(LegacyKey {
+                storage: Arc::clone(&storage),
+                env: env.clone(),
+                key,
+                store_acquired: store_now,
+                state: Mutex::new(LegacyKeyState {
+                    last_rewrite: now.timestamp(),
+                    lost: false,
+                    rewrite_failed: false,
+                }),
+            }),
+        })
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.shared.key
+    }
+
+    /// The key's mtime in the confirming listing: "now" on the store's
+    /// clock at acquisition. `None` when the storage reports no mtime.
+    pub(crate) fn store_time(&self) -> Option<StoreNow> {
+        self.shared.store_acquired
+    }
+
+    /// Tests: one check ([`Self::check_fn`]).
+    #[cfg(test)]
+    pub(crate) fn check(&self) -> Result<()> {
+        self.shared.check()
+    }
+
+    /// The check before every write, as a fence function: `LockExpired`
+    /// once the key is gone (sticky, no further request), on a clock
+    /// anomaly, or once the last successful rewrite is more than 5.5 h old
+    /// (wall clock, so a suspended machine fails its next check); otherwise
+    /// it rewrites the key when [`LEGACY_LOCK_REWRITE_SECS`] have passed
+    /// since the last rewrite. A failed rewrite is warned once and retried
+    /// at the next check. Every function returned shares the state.
+    pub(crate) fn check_fn(&self) -> FenceFn {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || shared.check())
+    }
+
+    /// `storage` wrapped so that every write runs [`Self::check`] first.
+    pub(crate) fn checked_storage(
+        &self,
+        storage: Arc<dyn StorageBackend>,
+    ) -> Arc<dyn StorageBackend> {
+        Arc::new(WriteChecked::new(storage, self.check_fn()))
+    }
+
+    /// Delete the key; sends nothing when a check found it gone. The error
+    /// is the DELETE's.
+    pub(crate) fn release(self) -> Result<()> {
+        let lost = self.shared.lock_state().lost;
+        if lost {
+            return Ok(());
+        }
+        self.shared.storage.delete(&self.shared.key)
+    }
+}
+
+impl LegacyKey {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, LegacyKeyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lost_error(&self) -> VykarError {
+        VykarError::LockExpired(format!(
+            "the upgrade's lock key {} was removed (`vykar break-lock`, or a vykar 0.24 \
+             client on a machine with this hostname took it for stale); nothing more is \
+             written. Run `vykar upgrade` again",
+            self.key
+        ))
+    }
+
+    fn check(&self) -> Result<()> {
+        // Held throughout: concurrent writes wait for one check.
+        let mut state = self.lock_state();
+        if state.lost {
+            return Err(self.lost_error());
+        }
+        if !self.storage.exists(&self.key)? {
+            state.lost = true;
+            return Err(self.lost_error());
+        }
+        let now_secs = self.env.now_utc().timestamp();
+        let elapsed = now_secs - state.last_rewrite;
+        if elapsed < 0 || now_secs < 0 {
+            return Err(VykarError::LockExpired(
+                "clock anomaly detected; refusing to write with a lock key vykar 0.24 may \
+                 judge stale"
+                    .into(),
+            ));
+        }
+        if elapsed > LEGACY_LOCK_MAX_UNREWRITTEN_SECS {
+            // The key is still ours: release deletes it.
+            return Err(VykarError::LockExpired(format!(
+                "the upgrade's lock key was last rewritten {elapsed}s ago (limit \
+                 {LEGACY_LOCK_MAX_UNREWRITTEN_SECS}s); a vykar 0.24 client may take it for \
+                 stale. Nothing more is written; run `vykar upgrade` again"
+            )));
+        }
+        if elapsed >= LEGACY_LOCK_REWRITE_SECS {
+            let written = LegacyLockEntry::new(&self.env, self.env.now_utc())
+                .encode()
+                .and_then(|body| self.storage.put(&self.key, &body));
+            match written {
+                Ok(()) => {
+                    state.last_rewrite = now_secs;
+                    debug!(lock_key = %self.key, "upgrade lock key rewritten");
+                }
+                Err(e) => {
+                    if !state.rewrite_failed {
+                        state.rewrite_failed = true;
+                        warn!(
+                            lock_key = %self.key,
+                            "could not rewrite the upgrade's lock key ({e}); retrying at the \
+                             next write"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// When a 0.24-shaped lock was written: its `time`, else the key's
+/// 20-digit microsecond prefix (as `lock::lock_timestamp`, which step 9
+/// deletes with the lock).
+fn legacy_lock_timestamp(
+    entry: Option<&LegacyLockEntry>,
+    key: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    entry
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.time).ok())
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            let raw = key
+                .strip_prefix(LEGACY_LOCKS_PREFIX)?
+                .strip_suffix(".json")?;
+            let (micros, _) = raw.split_once('-')?;
+            if micros.len() != 20 || !micros.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            chrono::DateTime::from_timestamp_micros(micros.parse().ok()?)
+        })
+}
+
+/// The holder of `key` for the `Locked` error (as `lock::build_lock_holder`):
+/// no details when it cannot be read; its age since its `time` on `env`'s clock.
+fn legacy_lock_holder(storage: &dyn StorageBackend, key: &str, env: &HostEnv) -> LockHolder {
+    let entry = storage
+        .get(key)
+        .ok()
+        .flatten()
+        .and_then(|data| serde_json::from_slice::<LegacyLockEntry>(&data).ok());
+    let details = entry.map(|entry| {
+        let age = legacy_lock_timestamp(Some(&entry), key).map_or_else(
+            || "unknown".to_string(),
+            |ts| format_age_since(&env.now_utc(), &ts),
+        );
+        LockHolderDetails {
+            hostname: entry.hostname,
+            pid: entry.pid,
+            age,
+        }
+    });
+    LockHolder {
+        key: key.to_string(),
+        details,
     }
 }

@@ -111,8 +111,7 @@ fn upgrade_through(fx: &Fixture, fail_at: usize, applied: bool) -> (Result<()>, 
         OpenOptions::new().legacy_format(),
     )
     .unwrap();
-    let result =
-        commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).map(|_| ());
+    let result = commands::upgrade::upgrade_repo(&mut repo, None).map(|_| ());
     drop(repo);
     let log = storage.log.lock().unwrap().clone();
     (result, log)

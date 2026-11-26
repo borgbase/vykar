@@ -46,20 +46,7 @@ use vykar_types::error::{Result, VykarError};
 
 pub(crate) use listing::ListingWriter;
 
-/// Normalize a relative path to always use `/` as the separator.
-///
-/// On Windows, `Path::to_string_lossy()` produces backslash-separated paths,
-/// but the repository format uses `/` exclusively. This function is a no-op
-/// on Unix (the compiler elides it), but always compiled so it can be tested
-/// on any platform.
-#[inline]
-pub(crate) fn normalize_rel_path(path: String) -> String {
-    if cfg!(windows) {
-        path.replace('\\', "/")
-    } else {
-        path
-    }
-}
+pub(crate) use crate::platform::fs::normalize_rel_path;
 
 /// Outcome of looking up a file in the local file cache and parent reuse index.
 ///
@@ -501,7 +488,7 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
             "no source paths or command dumps specified".into(),
         ));
     }
-    if req.one_file_system && !cfg!(unix) {
+    if req.one_file_system && !fs::device_ids_supported() {
         warn!("one_file_system filtering has limited support on this platform");
     }
 

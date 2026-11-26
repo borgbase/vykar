@@ -3,16 +3,13 @@
 //! syscall-coalesced batching and an LRU file-handle cache.
 
 use std::collections::HashMap;
-#[cfg(not(unix))]
-use std::io::{Seek, Write as IoWrite};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::platform::fs;
 use crate::repo::blob_read::{BlobReader, GroupEnd, ReadBuffers, coalesce_groups};
 use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::relocate::{Located, MAX_RELOCATE_ROUNDS, Relocator, pack_not_found};
@@ -863,11 +860,7 @@ fn write_buf(
         // truncate here, and never follow a symlink at the leaf.
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
+        fs::set_nofollow(&mut opts);
         let handle = opts.open(&full_path).map_err(|e| {
             VykarError::Other(format!(
                 "failed to open {} for writing: {e}",
@@ -879,13 +872,7 @@ fn write_buf(
     let fh = file_handles
         .get(file_idx)
         .ok_or_else(|| VykarError::Other("missing file handle in restore worker".into()))?;
-    #[cfg(unix)]
-    fh.write_all_at(buf, offset)?;
-    #[cfg(not(unix))]
-    {
-        fh.seek(std::io::SeekFrom::Start(offset))?;
-        fh.write_all(buf)?;
-    }
+    fs::write_all_at(fh, buf, offset)?;
     counters.wrote(file_idx, buf.len() as u64);
     Ok(())
 }

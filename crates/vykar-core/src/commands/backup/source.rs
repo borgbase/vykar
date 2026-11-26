@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+use crate::platform::fs;
 use crate::repo::file_cache::{ParentReusePolicy, ParentReuseRoot};
 use vykar_types::error::{Result, VykarError};
 
@@ -255,32 +256,22 @@ fn finalize_raw_prefix(display: &mut String, raw: Vec<u8>) -> Option<Vec<u8>> {
     Some(raw)
 }
 
-#[cfg(unix)]
 fn is_safe_basename_bytes(b: &[u8]) -> bool {
     !b.is_empty() && b != b"." && b != b".."
 }
 
-/// Byte-faithful counterpart to [`derive_basename`].
-#[cfg(unix)]
+/// Byte-faithful counterpart to [`derive_basename`]. Empty off Unix.
 fn derive_basename_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    if let Some(name) = configured.file_name() {
-        let b = name.as_bytes();
-        if is_safe_basename_bytes(b) {
-            return b.to_vec();
-        }
+    if let Some(b) = configured.file_name().and_then(fs::os_str_bytes)
+        && is_safe_basename_bytes(b)
+    {
+        return b.to_vec();
     }
-    if let Some(name) = abs_source.file_name() {
-        let b = name.as_bytes();
-        if is_safe_basename_bytes(b) {
-            return b.to_vec();
-        }
+    if let Some(b) = abs_source.file_name().and_then(fs::os_str_bytes)
+        && is_safe_basename_bytes(b)
+    {
+        return b.to_vec();
     }
-    Vec::new()
-}
-
-#[cfg(not(unix))]
-fn derive_basename_raw(_configured: &Path, _abs_source: &Path) -> Vec<u8> {
     Vec::new()
 }
 
@@ -288,15 +279,20 @@ fn derive_basename_raw(_configured: &Path, _abs_source: &Path) -> Vec<u8> {
 /// display derivation exactly so `from_utf8_lossy` of the result equals it:
 /// lexically clean the absolutized path, then strip the leading `/` and any
 /// trailing `/` at the byte level (both ASCII, so byte- and char-stripping
-/// agree).
-#[cfg(unix)]
+/// agree). Empty off Unix.
 fn derive_snapshot_prefix_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
+    // Raw names exist only where paths are bytes; returning before
+    // `absolutize_and_clean` keeps its `current_dir` call Unix-only, as before.
+    if !fs::raw_names_supported() {
+        return Vec::new();
+    }
     let abs_clean = match absolutize_and_clean(configured) {
         Some(p) => p,
         None => return derive_basename_raw(configured, abs_source),
     };
-    let bytes = abs_clean.as_os_str().as_bytes();
+    let Some(bytes) = fs::os_str_bytes(abs_clean.as_os_str()) else {
+        return Vec::new();
+    };
     let bytes = bytes.trim_prefix(b"/");
     let trimmed_len = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
     let trimmed = bytes.get(..trimmed_len).unwrap_or(bytes);
@@ -305,11 +301,6 @@ fn derive_snapshot_prefix_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
     } else {
         trimmed.to_vec()
     }
-}
-
-#[cfg(not(unix))]
-fn derive_snapshot_prefix_raw(_configured: &Path, _abs_source: &Path) -> Vec<u8> {
-    Vec::new()
 }
 
 /// Make a configured path absolute (no canonicalize / no symlink follow) and
@@ -363,38 +354,16 @@ fn pop_normal(out: &mut PathBuf) -> bool {
     }
 }
 
-#[cfg(unix)]
 fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
     let abs_clean = match absolutize_and_clean(configured) {
         Some(p) => p,
         None => return derive_basename(configured, abs_source),
     };
-    let s = abs_clean.to_string_lossy();
-    let trimmed = s.trim_prefix('/').trim_end_matches('/');
+    let trimmed = fs::rootless_slash_path(&abs_clean);
     if trimmed.is_empty() {
         derive_basename(configured, abs_source)
     } else {
-        trimmed.to_string()
-    }
-}
-
-#[cfg(windows)]
-fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
-    let abs_clean = match absolutize_and_clean(configured) {
-        Some(p) => p,
-        None => return derive_basename(configured, abs_source),
-    };
-    // dunce::simplified strips the \\?\ verbatim prefix if present.
-    let simplified = dunce::simplified(&abs_clean);
-    let s = simplified.to_string_lossy().replace('\\', "/");
-    // Drive letter: "C:/Users/..." → "C/Users/..."
-    // UNC root:    "//server/share/..." → "server/share/..."
-    let s = s.replacen(':', "", 1);
-    let trimmed = s.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        derive_basename(configured, abs_source)
-    } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 
@@ -801,5 +770,50 @@ mod tests {
     fn derive_snapshot_prefix_windows_verbatim() {
         let prefix = derive_snapshot_prefix(Path::new(r"\\?\C:\foo"), Path::new(r"\\?\C:\foo"));
         assert_eq!(prefix, "C/foo");
+    }
+
+    #[cfg(unix)]
+    fn byte_path(b: &[u8]) -> &Path {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(b))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_basename_raw_prefers_configured_bytes() {
+        assert_eq!(
+            derive_basename_raw(byte_path(b"/x/\x80f"), Path::new("/x/y")),
+            b"\x80f"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_basename_raw_falls_back_to_canonical() {
+        assert_eq!(
+            derive_basename_raw(Path::new(".."), byte_path(b"/x/\x80d")),
+            b"\x80d"
+        );
+        assert!(derive_basename_raw(Path::new(".."), Path::new("/")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_snapshot_prefix_raw_strips_root_and_trailing() {
+        let p = byte_path(b"/x/\x80d/");
+        assert_eq!(derive_snapshot_prefix_raw(p, p), b"x/\x80d");
+        // `/..` escapes the root: fall back to the canonical basename.
+        assert_eq!(
+            derive_snapshot_prefix_raw(Path::new("/.."), byte_path(b"/\x80")),
+            b"\x80"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn raw_prefix_helpers_are_empty_off_unix() {
+        let p = Path::new(r"C:\a\b");
+        assert!(derive_basename_raw(p, p).is_empty());
+        assert!(derive_snapshot_prefix_raw(p, p).is_empty());
     }
 }

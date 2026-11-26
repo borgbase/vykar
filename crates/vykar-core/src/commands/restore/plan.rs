@@ -95,18 +95,16 @@ pub(crate) fn classify_symlink_target_path(path: &Path) -> SymlinkSafety {
 }
 
 /// Build the symlink target path, byte-faithfully when the item carries a raw
-/// (non-UTF8) target shadow (Unix), else from the lossy display string.
+/// (non-UTF8) target shadow (Unix; see `platform::fs::path_from_bytes`), else
+/// from the lossy display string.
 pub(crate) fn symlink_target_path(item: &Item) -> PathBuf {
-    #[cfg(unix)]
+    if let Some(raw) = item
+        .raw_names
+        .as_ref()
+        .and_then(|r| r.link_target.as_deref())
+        .and_then(fs::path_from_bytes)
     {
-        use std::os::unix::ffi::OsStrExt;
-        if let Some(raw) = item
-            .raw_names
-            .as_ref()
-            .and_then(|r| r.link_target.as_deref())
-        {
-            return PathBuf::from(std::ffi::OsStr::from_bytes(raw));
-        }
+        return raw.to_path_buf();
     }
     PathBuf::from(item.link_target.as_deref().unwrap_or_default())
 }
@@ -587,11 +585,7 @@ pub(super) fn stage_batch_files(
 pub(super) fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    fs::set_nofollow(&mut opts);
     opts.open(path)
 }
 
@@ -635,16 +629,13 @@ fn ensure_path_within_root(path: &Path, root: &Path) -> Result<()> {
 /// otherwise. The same traversal checks (reject absolute / `..` / root /
 /// prefix) run on both branches — this is security-sensitive.
 pub(crate) fn sanitize_item_into(item: &Item, out: &mut PathBuf) -> Result<()> {
-    #[cfg(unix)]
+    if let Some(raw) = item
+        .raw_names
+        .as_ref()
+        .and_then(|r| r.path.as_deref())
+        .and_then(fs::path_from_bytes)
     {
-        use std::os::unix::ffi::OsStrExt;
-        if let Some(raw) = item.raw_names.as_ref().and_then(|r| r.path.as_deref()) {
-            return sanitize_path_into(
-                Path::new(std::ffi::OsStr::from_bytes(raw)),
-                &item.path,
-                out,
-            );
-        }
+        return sanitize_path_into(raw, &item.path, out);
     }
     sanitize_path_into(Path::new(&item.path), &item.path, out)
 }

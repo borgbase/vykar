@@ -2,7 +2,9 @@
 // SAFETY documented per block.
 #![allow(unsafe_code)]
 
-use std::fs::{FileType, Metadata};
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, FileType, Metadata, OpenOptions};
+use std::io;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -454,6 +456,334 @@ pub fn xattrs_supported() -> bool {
     cfg!(unix)
 }
 
+// ---- Byte paths and separators -------------------------------------------
+
+/// The bytes of an OS string where paths are byte strings (Unix); `None`
+/// elsewhere, where vykar records no raw (byte-faithful) names.
+#[inline]
+pub(crate) fn os_str_bytes(s: &OsStr) -> Option<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(s.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = s;
+        None
+    }
+}
+
+/// A path from raw name bytes (Unix); `None` elsewhere.
+#[inline]
+pub(crate) fn path_from_bytes(b: &[u8]) -> Option<&Path> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(Path::new(OsStr::from_bytes(b)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = b;
+        None
+    }
+}
+
+/// Whether snapshots can carry, and restore can write, byte-faithful
+/// non-UTF-8 names (`ItemRawNames`). Unix only.
+pub(crate) fn raw_names_supported() -> bool {
+    cfg!(unix)
+}
+
+/// Whether `\` is an ordinary byte in a path component (Unix). Elsewhere it
+/// is a separator, and globset normalizes it in candidate paths.
+pub(crate) fn backslash_is_literal() -> bool {
+    cfg!(unix)
+}
+
+/// Normalize a relative path to always use `/` as the separator.
+///
+/// On Windows, `Path::to_string_lossy()` produces backslash-separated paths,
+/// but the repository format uses `/` exclusively. This function is a no-op
+/// on Unix (the compiler elides it), but always compiled so it can be tested
+/// on any platform.
+#[inline]
+pub(crate) fn normalize_rel_path(path: String) -> String {
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
+}
+
+/// An absolute, lexically clean path as a rootless `/`-separated string with
+/// no leading or trailing `/`: Unix drops the root `/`; Windows strips a
+/// verbatim `\\?\` prefix (dunce), turns `\` into `/`, drops the drive
+/// colon and a UNC `//`. May be empty (the caller falls back to a basename).
+pub(crate) fn rootless_slash_path(abs_clean: &Path) -> String {
+    #[cfg(unix)]
+    {
+        let s = abs_clean.to_string_lossy();
+        s.trim_prefix('/').trim_end_matches('/').to_string()
+    }
+    #[cfg(windows)]
+    {
+        // dunce::simplified strips the \\?\ verbatim prefix if present.
+        let simplified = dunce::simplified(abs_clean);
+        let s = simplified.to_string_lossy().replace('\\', "/");
+        // Drive letter: "C:/Users/..." → "C/Users/..."
+        // UNC root:    "//server/share/..." → "server/share/..."
+        let s = s.replacen(':', "", 1);
+        s.trim_start_matches('/').trim_end_matches('/').to_string()
+    }
+}
+
+// ---- Walk ---------------------------------------------------------------
+
+/// Inode number of a directory entry from `readdir` (Unix); 0 elsewhere.
+#[cfg(unix)]
+#[inline]
+pub(crate) fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
+    use std::os::unix::fs::DirEntryExt;
+    entry.ino()
+}
+
+#[cfg(not(unix))]
+#[inline]
+pub(crate) fn dir_entry_inode(_entry: &std::fs::DirEntry) -> u64 {
+    0
+}
+
+/// Returns true if inode-sorted stat reduces disk seeks on this filesystem.
+/// Only beneficial on Linux ext4/xfs/reiserfs; returns false on all other platforms.
+#[cfg(target_os = "linux")]
+pub(crate) fn inode_sort_beneficial(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Filesystem magic numbers from linux/magic.h where inode order
+    /// correlates with on-disk position.
+    ///
+    /// The type of `statfs.f_type` differs between glibc (`__fsword_t`, i64) and
+    /// musl (`c_ulong`, u64). We compare via `as u64` to work on both.
+    const EXT_SUPER_MAGIC: u64 = 0xEF53; // ext2/3/4
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342; // "XFSB"
+    const REISERFS_SUPER_MAGIC: u64 = 0x5265_4973;
+
+    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::debug!(path = %path.display(), "statfs skipped: path contains null byte");
+            return false;
+        }
+    };
+    // SAFETY: `libc::statfs` is a C plain-old-data struct of integer fields;
+    // an all-zero bit pattern is a valid (if uninitialized) instance and
+    // statfs(2) overwrites every field on success.
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this scope;
+    // `&mut buf` is a unique exclusive reference to a properly-aligned statfs
+    // for the kernel to populate.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
+    if rc != 0 {
+        tracing::debug!(path = %path.display(), "statfs failed, disabling inode sort");
+        return false;
+    }
+    matches!(
+        buf.f_type as u64,
+        EXT_SUPER_MAGIC | XFS_SUPER_MAGIC | REISERFS_SUPER_MAGIC
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn inode_sort_beneficial(_path: &Path) -> bool {
+    false
+}
+
+/// Map a non-directory/file/symlink file type to a human-readable label for
+/// the warn-only skip message. On unix, distinguishes socket / FIFO / block
+/// device / character device via `FileTypeExt`; everything else (and all
+/// non-unix entries, where this branch is effectively unreachable) falls back
+/// to a generic label.
+#[cfg(unix)]
+pub(crate) fn unsupported_file_type_label(file_type: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_fifo() {
+        "FIFO"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else if file_type.is_char_device() {
+        "character device"
+    } else {
+        "unsupported file type"
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn unsupported_file_type_label(_file_type: std::fs::FileType) -> &'static str {
+    "unsupported file type"
+}
+
+/// Whether `MetadataSummary::device` carries real device IDs, which
+/// `one_file_system` compares. Unix only (0 on Windows, see `summarize_metadata`).
+pub(crate) fn device_ids_supported() -> bool {
+    cfg!(unix)
+}
+
+// ---- Extended attributes (the `xattr` crate; none exist off Unix) --------
+
+/// Names of `path`'s extended attributes (`xattr::list`). Off Unix: none.
+pub(crate) fn xattr_list(path: &Path) -> io::Result<impl Iterator<Item = OsString>> {
+    #[cfg(unix)]
+    {
+        ::xattr::list(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(std::iter::empty::<OsString>())
+    }
+}
+
+/// One attribute's value (`xattr::get`). Off Unix: `Ok(None)`.
+pub(crate) fn xattr_get(path: &Path, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        ::xattr::get(path, name)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, name);
+        Ok(None)
+    }
+}
+
+/// Set one attribute (`xattr::set`). Off Unix: a no-op `Ok(())`.
+pub(crate) fn xattr_set(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        ::xattr::set(path, name, value)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, name, value);
+        Ok(())
+    }
+}
+
+// ---- Restore writes -----------------------------------------------------
+
+/// Refuse to follow a symlink at the final component when opening
+/// (`O_NOFOLLOW`; the open fails `ELOOP`). No-op off Unix. Sets, not ORs,
+/// the custom flags, as the callers did.
+#[inline]
+pub(crate) fn set_nofollow(opts: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opts;
+    }
+}
+
+/// Write all of `buf` at `offset`: `pwrite` (`FileExt::write_all_at`) on
+/// Unix; seek then `write_all` elsewhere (moves the file cursor).
+#[inline]
+pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = file;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(buf)
+    }
+}
+
+/// Apply `mode` to an open regular file: via its fd on Unix (no path lookup,
+/// never follows the leaf), via `path` elsewhere (`apply_mode_fd` is a no-op there).
+pub(crate) fn apply_mode_open(file: &File, path: &Path, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        apply_mode_fd(file, mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        apply_mode(path, mode)
+    }
+}
+
+/// Set an open regular file's mtime: via its fd on Unix, via `path` elsewhere.
+pub(crate) fn set_mtime_open(file: &File, path: &Path, secs: i64, nanos: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        set_file_mtime_fd(file, secs, nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        set_file_mtime(path, secs, nanos)
+    }
+}
+
+/// Full `st_mode` (file-type bits included) of `path` without following a
+/// symlink (Unix); `None` if the lstat fails, and always `None` elsewhere
+/// (no syscall).
+pub(crate) fn lstat_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().map(|m| m.mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Grant the owner rwx on a directory about to be cleared (Unix
+/// `chmod 0o700`). No-op elsewhere: a Windows `apply_mode` would clear the
+/// read-only flag, which the old code never did.
+pub(crate) fn grant_owner_rwx(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        apply_mode(dir, 0o700)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// A directory symlink or junction (Windows `FileTypeExt::is_symlink_dir`),
+/// which must be removed with `remove_dir`. Always `false` elsewhere, where a
+/// symlink of any kind is removed with `remove_file`.
+pub(crate) fn is_symlink_dir(file_type: FileType) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        file_type.is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file_type;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +1071,104 @@ mod tests {
         // Unix handles negative timestamps natively. Windows SystemTime can
         // represent pre-epoch times, so this should succeed on both.
         assert!(result.is_ok(), "pre-epoch mtime failed: {result:?}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn os_str_bytes_and_path_from_bytes_roundtrip() {
+        let bytes: &[u8] = b"a\xffb";
+        let path = path_from_bytes(bytes).unwrap();
+        assert_eq!(os_str_bytes(path.as_os_str()), Some(bytes));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn os_str_bytes_and_path_from_bytes_roundtrip() {
+        assert!(path_from_bytes(b"ab").is_none());
+        assert!(os_str_bytes(OsStr::new("ab")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_nofollow_refuses_symlink_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut opts = OpenOptions::new();
+        opts.write(true);
+        set_nofollow(&mut opts);
+        let err = opts.open(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        opts.open(&target).unwrap();
+    }
+
+    #[test]
+    fn write_all_at_writes_at_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        write_all_at(&f, b"ab", 3).unwrap();
+        write_all_at(&f, b"z", 0).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            [b'z', 0, 0, b'a', b'b', 0, 0, 0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lstat_mode_reads_mode_and_not_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+        // POSIX file-type bits; `libc::S_IF*` are `u16` on macOS, `u32` on Linux.
+        const S_IFMT: u32 = 0o170_000;
+        const S_IFREG: u32 = 0o100_000;
+        const S_IFLNK: u32 = 0o120_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let m = lstat_mode(&path).unwrap();
+        assert_eq!(m & 0o7777, 0o640);
+        assert_eq!(m & S_IFMT, S_IFREG);
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let m = lstat_mode(&link).unwrap();
+        assert_eq!(m & S_IFMT, S_IFLNK);
+
+        assert!(lstat_mode(&dir.path().join("missing")).is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn lstat_mode_reads_mode_and_not_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(lstat_mode(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootless_slash_path_unix() {
+        assert_eq!(rootless_slash_path(Path::new("/a/b")), "a/b");
+        assert_eq!(rootless_slash_path(Path::new("/")), "");
+        assert_eq!(rootless_slash_path(Path::new("/a")), "a");
+    }
+
+    #[test]
+    fn is_symlink_dir_false_for_plain_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        let sub = dir.path().join("d");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        for p in [&file, &sub] {
+            let ft = std::fs::symlink_metadata(p).unwrap().file_type();
+            assert!(!is_symlink_dir(ft));
+        }
     }
 }
 

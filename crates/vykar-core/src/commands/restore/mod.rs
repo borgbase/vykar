@@ -41,9 +41,8 @@ mod test_support;
 ///
 /// Pure (no filesystem access), so the non-Unix preflight can call it *before*
 /// any destination mutation — guaranteeing the abort leaves the filesystem
-/// untouched. Compiled on non-Unix (where the preflight uses it) and in all
-/// test builds (where it is unit-tested cross-platform).
-#[cfg(any(not(unix), test))]
+/// untouched. Used by the pre-flight where raw names are unsupported, and
+/// unit-tested everywhere.
 fn detect_raw_entries(items: impl super::list::ItemSource) -> Result<Option<(usize, String)>> {
     let mut count = 0usize;
     let mut example: Option<String> = None;
@@ -456,7 +455,7 @@ fn pattern_scope(pattern: Option<&str>) -> ReadScope {
     let Some(pattern) = pattern else {
         return ReadScope::Whole;
     };
-    if !cfg!(unix) {
+    if !fs::backslash_is_literal() {
         return ReadScope::Whole;
     }
     let literal: Vec<&str> = pattern
@@ -728,7 +727,8 @@ where
     // exist behind, empty.
     let mut items = super::list::ItemStreamReader::new(repo);
 
-    // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
+    // Byte-faithful restore of non-UTF8 names is only possible where
+    // `fs::raw_names_supported()` (Unix). On other platforms
     // run a separate read-only metadata pass over the whole stream *before*
     // any filesystem mutation (dest prep / temp-root creation) and refuse if
     // the snapshot carries any raw (non-UTF8) entry. The stream is not kept, so
@@ -737,8 +737,7 @@ where
     // cannot be safely re-invoked), so a non-Unix restore is refused if *any*
     // entry is non-UTF8, even one a filter would exclude — acceptable for this
     // extreme edge.
-    #[cfg(not(unix))]
-    {
+    if !fs::raw_names_supported() {
         let mut preflight = items.open_lazy(repo, &resolved_name, shutdown)?;
         if let Some((raw_count, example)) = detect_raw_entries(&mut preflight)? {
             return Err(VykarError::Other(format!(
@@ -1153,11 +1152,7 @@ fn discard_damaged(
         let full_path = temp_root.join(&pf.rel_path);
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
+        fs::set_nofollow(&mut opts);
         opts.open(&full_path)
             .and_then(|f| f.set_len(0))
             .map_err(|e| {
@@ -1293,19 +1288,11 @@ pub(super) fn apply_item_xattrs(
             continue;
         };
 
-        #[cfg(unix)]
-        if let Err(e) = xattr::set(target, name, value) {
+        if let Err(e) = fs::xattr_set(target, name, value) {
             push_metadata_warning(
                 stats,
                 format!("failed to apply xattr {name} on {}: {e}", target.display()),
             );
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = target;
-            let _ = name;
-            let _ = value;
-            let _ = &mut *stats;
         }
     }
 }

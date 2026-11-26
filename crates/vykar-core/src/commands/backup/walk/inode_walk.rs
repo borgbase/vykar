@@ -16,9 +16,6 @@
 //! re-sorted before emission. Every directory's entries are emitted before
 //! any of its descendants, so each root's entries come out in dfs-name order.
 
-// libc::statfs to detect filesystems where inode-sorted stat helps; SAFETY per block.
-#![allow(unsafe_code)]
-
 use std::collections::VecDeque;
 use std::fs::FileType;
 use std::path::{Path, PathBuf};
@@ -26,69 +23,13 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tracing::debug;
 
-use crate::platform::fs::{self, MetadataSummary};
+use crate::platform::fs::{self, MetadataSummary, dir_entry_inode, inode_sort_beneficial};
 use vykar_types::error::{Result, VykarError, is_fileprovider_deadlock, is_soft_backup_io_error};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
 use super::{
     DatalessKind, DirSkipKind, build_explicit_excludes, classify_dir_skip, should_skip_for_device,
 };
-
-#[cfg(unix)]
-fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
-    use std::os::unix::fs::DirEntryExt;
-    entry.ino()
-}
-
-#[cfg(not(unix))]
-fn dir_entry_inode(_entry: &std::fs::DirEntry) -> u64 {
-    0
-}
-
-/// Returns true if inode-sorted stat reduces disk seeks on this filesystem.
-/// Only beneficial on Linux ext4/xfs/reiserfs; returns false on all other platforms.
-#[cfg(target_os = "linux")]
-fn inode_sort_beneficial(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    /// Filesystem magic numbers from linux/magic.h where inode order
-    /// correlates with on-disk position.
-    ///
-    /// The type of `statfs.f_type` differs between glibc (`__fsword_t`, i64) and
-    /// musl (`c_ulong`, u64). We compare via `as u64` to work on both.
-    const EXT_SUPER_MAGIC: u64 = 0xEF53; // ext2/3/4
-    const XFS_SUPER_MAGIC: u64 = 0x5846_5342; // "XFSB"
-    const REISERFS_SUPER_MAGIC: u64 = 0x5265_4973;
-
-    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => {
-            tracing::debug!(path = %path.display(), "statfs skipped: path contains null byte");
-            return false;
-        }
-    };
-    // SAFETY: `libc::statfs` is a C plain-old-data struct of integer fields;
-    // an all-zero bit pattern is a valid (if uninitialized) instance and
-    // statfs(2) overwrites every field on success.
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this scope;
-    // `&mut buf` is a unique exclusive reference to a properly-aligned statfs
-    // for the kernel to populate.
-    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
-    if rc != 0 {
-        tracing::debug!(path = %path.display(), "statfs failed, disabling inode sort");
-        return false;
-    }
-    matches!(
-        buf.f_type as u64,
-        EXT_SUPER_MAGIC | XFS_SUPER_MAGIC | REISERFS_SUPER_MAGIC
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn inode_sort_beneficial(_path: &Path) -> bool {
-    false
-}
 
 /// Order in which a directory's entries are emitted (and its subdirectories
 /// descended). Stat order is unaffected: it stays inode-sorted wherever
@@ -169,7 +110,7 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
 /// Byte-faithful counterpart to [`rel_path_from_abs`]: returns the raw relative
 /// path bytes when the relative path is not valid UTF-8 (Unix only), else
 /// `None`. `normalize_rel_path` is a no-op on Unix so no separator rewrite is
-/// needed. Delegates the `cfg(unix)` byte extraction to the shared
+/// needed. Delegates the Unix-only byte extraction to the shared
 /// [`crate::platform::fs::non_utf8_bytes`] helper.
 pub(super) fn rel_raw_from_abs(abs_source: &Path, abs_path: &Path) -> Option<Vec<u8>> {
     let rel = fs::strip_path_prefix(abs_path, abs_source).unwrap_or(abs_path);

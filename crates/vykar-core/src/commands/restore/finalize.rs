@@ -107,42 +107,22 @@ fn finalize_one_file(
     #[cfg(test)]
     record_op("xattr", 0, 0);
 
-    // fd-based fchmod/futimens are Unix-only; other platforms use the
-    // path-based calls (the leaf is a regular file staging created). On Unix
-    // an fd failure is recorded as-is: a path retry would follow the leaf.
-    #[cfg(unix)]
-    {
-        warn_metadata_err(
-            stats,
-            fs::apply_mode_fd(&file, pf.mode),
-            &target_path,
-            "mode",
-        );
-        warn_metadata_err(
-            stats,
-            fs::set_file_mtime_fd(&file, mtime_secs, mtime_nanos),
-            &target_path,
-            "mtime",
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        warn_metadata_err(
-            stats,
-            fs::apply_mode(&target_path, pf.mode),
-            &target_path,
-            "mode",
-        );
-        warn_metadata_err(
-            stats,
-            fs::set_file_mtime(&target_path, mtime_secs, mtime_nanos),
-            &target_path,
-            "mtime",
-        );
-    }
-    // Recorded outside the cfg blocks so the ordering test (which is not
-    // platform-gated) sees `chmod` then `mtime` on every platform; both
-    // branches apply mode before mtime.
+    // Mode before mtime. Unix applies both through the fd; other platforms use
+    // the path (the leaf is a regular file staging created). On Unix an fd
+    // failure is recorded as-is: a path retry would follow the leaf.
+    warn_metadata_err(
+        stats,
+        fs::apply_mode_open(&file, &target_path, pf.mode),
+        &target_path,
+        "mode",
+    );
+    warn_metadata_err(
+        stats,
+        fs::set_mtime_open(&file, &target_path, mtime_secs, mtime_nanos),
+        &target_path,
+        "mtime",
+    );
+    // Recorded after both calls so the ordering test sees `chmod` then `mtime`.
     #[cfg(test)]
     {
         record_op("chmod", 0, 0);
@@ -465,18 +445,7 @@ fn copy_into_new(src: &Path, dst: &Path) -> io::Result<u64> {
 /// copy-fallback sibling. On Unix this includes setuid/setgid/sticky; falls
 /// back to `0o644` if the stat fails. Non-Unix has no comparable bits.
 fn rep_mode_on_disk(rep_abs: &Path) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(rep_abs)
-            .map(|m| m.mode())
-            .unwrap_or(0o644)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = rep_abs;
-        0o644
-    }
+    fs::lstat_mode(rep_abs).unwrap_or(0o644)
 }
 
 /// Read the representative's extended attributes into the map shape
@@ -485,54 +454,46 @@ fn rep_mode_on_disk(rep_abs: &Path) -> u32 {
 /// warnings rather than silently dropping attributes, matching the backup-side
 /// xattr reader. Returns `None` when there are no xattrs or no platform support.
 fn read_xattrs_map(rep_abs: &Path, stats: &mut RestoreStats) -> Option<HashMap<String, Vec<u8>>> {
-    #[cfg(unix)]
-    {
-        let names = match xattr::list(rep_abs) {
-            Ok(names) => names,
-            Err(e) => {
-                push_metadata_warning(
-                    stats,
-                    format!(
-                        "failed to list xattrs of '{}' for hard-link copy: {e}",
-                        rep_abs.display()
-                    ),
-                );
-                return None;
-            }
-        };
-        let mut map = HashMap::new();
-        for name in names {
-            let Some(name_str) = name.to_str() else {
-                push_metadata_warning(
-                    stats,
-                    format!(
-                        "skipping non-UTF8 xattr name on '{}' for hard-link copy",
-                        rep_abs.display()
-                    ),
-                );
-                continue;
-            };
-            match xattr::get(rep_abs, &name) {
-                Ok(Some(value)) => {
-                    map.insert(name_str.to_string(), value);
-                }
-                Ok(None) => {}
-                Err(e) => push_metadata_warning(
-                    stats,
-                    format!(
-                        "failed to read xattr {name_str} of '{}' for hard-link copy: {e}",
-                        rep_abs.display()
-                    ),
+    let names = match fs::xattr_list(rep_abs) {
+        Ok(names) => names,
+        Err(e) => {
+            push_metadata_warning(
+                stats,
+                format!(
+                    "failed to list xattrs of '{}' for hard-link copy: {e}",
+                    rep_abs.display()
                 ),
-            }
+            );
+            return None;
         }
-        (!map.is_empty()).then_some(map)
+    };
+    let mut map = HashMap::new();
+    for name in names {
+        let Some(name_str) = name.to_str() else {
+            push_metadata_warning(
+                stats,
+                format!(
+                    "skipping non-UTF8 xattr name on '{}' for hard-link copy",
+                    rep_abs.display()
+                ),
+            );
+            continue;
+        };
+        match fs::xattr_get(rep_abs, &name) {
+            Ok(Some(value)) => {
+                map.insert(name_str.to_string(), value);
+            }
+            Ok(None) => {}
+            Err(e) => push_metadata_warning(
+                stats,
+                format!(
+                    "failed to read xattr {name_str} of '{}' for hard-link copy: {e}",
+                    rep_abs.display()
+                ),
+            ),
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (rep_abs, stats);
-        None
-    }
+    (!map.is_empty()).then_some(map)
 }
 
 /// Open `path` writable for the finalize metadata pass, self-healing on a
@@ -667,10 +628,7 @@ fn rollback_finalization(
 /// point) and its target is never touched.
 pub(super) fn force_remove_temp_tree(dir: &Path) -> io::Result<()> {
     // Grant owner rwx so our own read_dir/remove_dir can't EACCES on this dir.
-    #[cfg(unix)]
-    {
-        let _ = fs::apply_mode(dir, 0o700);
-    }
+    let _ = fs::grant_owner_rwx(dir);
 
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -683,15 +641,11 @@ pub(super) fn force_remove_temp_tree(dir: &Path) -> io::Result<()> {
             continue;
         }
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileTypeExt;
-            if file_type.is_symlink_dir() {
-                // Directory symlink / junction: remove the reparse point
-                // itself, never the target.
-                std::fs::remove_dir(&path)?;
-                continue;
-            }
+        if fs::is_symlink_dir(file_type) {
+            // Directory symlink / junction: remove the reparse point
+            // itself, never the target.
+            std::fs::remove_dir(&path)?;
+            continue;
         }
 
         // File, or a file/Unix symlink — `remove_file` unlinks the entry
@@ -781,11 +735,7 @@ fn inj_open_writable(path: &Path) -> io::Result<std::fs::File> {
     opts.write(true);
     // Never follow a symlink at the leaf: a symlink fails `ELOOP`, so the
     // `PermissionDenied` self-heal only ever chmods a regular file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
+    fs::set_nofollow(&mut opts);
     opts.open(path)
 }
 

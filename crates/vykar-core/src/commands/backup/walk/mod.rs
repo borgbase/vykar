@@ -73,9 +73,8 @@ pub(crate) fn classify_dir_skip(is_provider_deadlock: bool, dir_is_dataless: boo
     }
 }
 
-#[cfg(unix)]
 pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
-    let names = match xattr::list(path) {
+    let names = match fs::xattr_list(path) {
         Ok(names) => names,
         Err(e) => {
             warn!(
@@ -101,7 +100,7 @@ pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> 
             }
         };
 
-        match xattr::get(path, &name) {
+        match fs::xattr_get(path, &name) {
             Ok(Some(value)) => {
                 attrs.insert(key, value);
             }
@@ -118,11 +117,6 @@ pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> 
     }
 
     if attrs.is_empty() { None } else { Some(attrs) }
-}
-
-#[cfg(not(unix))]
-pub(super) fn read_item_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>> {
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -168,32 +162,6 @@ fn build_raw_names(
     })
 }
 
-/// Map a non-directory/file/symlink file type to a human-readable label for
-/// the warn-only skip message. On unix, distinguishes socket / FIFO / block
-/// device / character device via `FileTypeExt`; everything else (and all
-/// non-unix entries, where this branch is effectively unreachable) falls back
-/// to a generic label.
-#[cfg(unix)]
-fn classify_unsupported(file_type: std::fs::FileType) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    if file_type.is_socket() {
-        "socket"
-    } else if file_type.is_fifo() {
-        "FIFO"
-    } else if file_type.is_block_device() {
-        "block device"
-    } else if file_type.is_char_device() {
-        "character device"
-    } else {
-        "unsupported file type"
-    }
-}
-
-#[cfg(not(unix))]
-fn classify_unsupported(_file_type: std::fs::FileType) -> &'static str {
-    "unsupported file type"
-}
-
 /// Classify a walked filesystem entry and build an `Item` from its metadata.
 ///
 /// Handles file-type classification, symlink target resolution, ctime
@@ -233,7 +201,7 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
     } else {
         return Ok(Materialized::Unsupported {
             path: walked.abs_path,
-            file_type: classify_unsupported(file_type),
+            file_type: fs::unsupported_file_type_label(file_type),
         });
     };
 

@@ -3,7 +3,8 @@
 #   engine modules (repo, index, compress, chunker) must not use commands or app;
 #   commands must not use app;
 #   index may use repo only through repo::format, which itself uses neither;
-#   repo, index, compress, chunker, storage and snapshot must not use config.
+#   repo, index, compress, chunker, storage and snapshot must not use config;
+#   platform must not use any other vykar-core module.
 # A text match, not a compiler check: it sees `crate::`/`super::` paths and
 # `crate::{..}` groups, not `super::{..}` groups, paths broken across lines or macros.
 set -eu
@@ -49,4 +50,6 @@ forbid "repo/index/compress/chunker/storage/snapshot must not use config" \
     "$src/repo" "$src/index" "$src/compress" "$src/chunker" "$src/storage" "$src/snapshot"
 forbid "repo/format.rs must stay a leaf (no crate::repo, crate::index, super::)" \
     "crate::(repo|index)$w|super::" "$src/repo/format.rs"
+forbid "platform must stay a leaf (no crate::, super::super::)" \
+    "(^|[^A-Za-z0-9_$])crate::|super::super::" "$src/platform"
 exit $fail

@@ -99,6 +99,10 @@ the snapshots that need it are removed.
 `check --verify-data` also checks pack trailers; a damaged trailer is repaired
 by writing a pack map for its pack, which removes nothing.
 
+If a pack upload fails while repair rewrites snapshots, repair stops before
+publishing any rewritten snapshot and changes nothing it had not already
+applied; run it again.
+
 If a backup crashes after its index was committed but before its snapshot was
 written, the index keeps orphan chunk entries that no snapshot references; a
 `compact` at least 12 hours later sweeps them and reclaims the space.

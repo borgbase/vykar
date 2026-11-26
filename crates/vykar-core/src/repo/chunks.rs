@@ -79,13 +79,15 @@ pub(crate) struct StoredChunk {
 impl WriteSession {
     /// The one chunk-store entry: record the reuse of an existing chunk,
     /// or pack a new one into `pack_type`'s writer (a new tree chunk also
-    /// goes to the local tree-chunk cache).
+    /// goes to the local tree-chunk cache). Err, without touching the
+    /// session, once an upload of the session failed.
     pub(crate) fn store(
         &mut self,
         repo: &Repo,
         chunk: ChunkInput<'_>,
         pack_type: PackType,
     ) -> Result<StoredChunk> {
+        self.refuse_if_failed()?;
         match chunk {
             ChunkInput::Worker {
                 chunk: WorkerChunk::Prepared(p),
@@ -202,6 +204,7 @@ impl WriteSession {
     /// Errors if the chunk is not found in any state (committed, recovered,
     /// or pending pack writer) — this indicates storage corruption.
     pub fn reuse_cached_chunk_ref(&mut self, repo: &Repo, chunk_id: &ChunkId) -> Result<u32> {
+        self.refuse_if_failed()?;
         self.reuse_if_exists(repo, chunk_id).ok_or_else(|| {
             VykarError::Other(format!(
                 "cache hit references unresolvable chunk {chunk_id}"
@@ -514,6 +517,8 @@ impl WriteSession {
     }
 
     /// Flush all pending pack writes and wait for background uploads.
+    /// Err at once, joining nothing, once an upload failed: the caller ends
+    /// the session with `flush_on_abort`.
     pub fn flush_packs(&mut self, repo: &Repo) -> Result<()> {
         self.flush_packs_inner(repo, false)
     }
@@ -528,6 +533,7 @@ impl WriteSession {
     }
 
     fn flush_packs_inner(&mut self, repo: &Repo, background_journal: bool) -> Result<()> {
+        self.refuse_if_failed()?;
         let flush_data = self.data_pack_writer.has_pending();
         let flush_tree = self.tree_pack_writer.has_pending();
 

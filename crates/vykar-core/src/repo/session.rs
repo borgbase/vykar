@@ -72,7 +72,8 @@ impl Repo {
     /// current chunk index and repo config. The chunk-store and flush
     /// methods are on the session; a save
     /// (`RepoWriter::save_session`) or a backup commit consumes it, and
-    /// [`WriteSession::flush_on_abort`] ends it on failure.
+    /// [`WriteSession::flush_on_abort`] ends it on failure. A failed upload
+    /// fails the session: stores, flushes and saves then return its error.
     ///
     /// Over an unedited index the session resolves existing chunks against
     /// the repository's index view as it is now (the table and the head's
@@ -188,7 +189,8 @@ impl WriteSession {
     ///
     /// Seals any partial pack writers, waits for in-flight uploads to land,
     /// and writes the final `pending_index` journal so a subsequent run can
-    /// recover. All errors are logged but never propagated.
+    /// recover. All errors are logged but never propagated. Also after a
+    /// failed upload, which makes every other entry refuse.
     ///
     /// Returns at once when there is nothing to clean up.
     pub fn flush_on_abort(mut self, repo: &Repo) {
@@ -684,6 +686,81 @@ mod tests {
         assert!(ws.pack_trailers.is_empty());
         assert!(ws.journal.entries.is_empty());
         drop(ws);
+    }
+
+    /// After a failed upload, the session refuses what would dedup against
+    /// or save the lost pack's chunks; flush_on_abort still journals the
+    /// packs that did land.
+    #[test]
+    fn failed_upload_fails_the_session() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let healthy = Arc::clone(&repo.storage);
+        repo.storage = Arc::new(FailPacks(Arc::clone(&healthy)));
+
+        let (a, _, new) = ws
+            .store_chunk(
+                &repo,
+                b"chunk in the lost pack",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+        assert!(new);
+        // The upload captures the failing storage now.
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
+        while !ws.uploads.pending()[0].is_finished() {
+            std::thread::yield_now();
+        }
+        // Later packs land.
+        repo.storage = healthy;
+
+        // B is new: its store joins the failed upload and reports it.
+        let err = ws
+            .store_chunk(&repo, b"next chunk", Compression::None, PackType::Data)
+            .unwrap_err();
+        assert!(err.to_string().contains("injected pack failure"), "{err}");
+        // The caller ignored that. A is no dedup hit now.
+        let err = ws
+            .store_chunk(
+                &repo,
+                b"chunk in the lost pack",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("injected pack failure"), "{err}");
+        assert!(ws.reuse_cached_chunk_ref(&repo, &a).is_err());
+        assert!(ws.flush_packs(&repo).is_err());
+        assert!(repo.unchecked_writer().save_session(ws).is_err());
+
+        assert!(!repo.chunk_index().contains(&a));
+        // save_session's flush_on_abort sealed and uploaded B's partial pack
+        // and journaled it.
+        assert!(repo.storage.exists("sessions/default.index").unwrap());
+    }
+
+    /// save_session refuses a delta naming a chunk with no index entry: one
+    /// the session stored in a pack that was never confirmed, or one it
+    /// reused that the index does not hold.
+    #[test]
+    fn save_session_refuses_chunks_without_an_index_entry() {
+        use vykar_types::chunk_id::ChunkId;
+
+        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let lost = ChunkId::from_bytes([7; 32]);
+        // A closed pack whose upload never confirmed.
+        ws.record_closed(&[(lost, 10, 0)]);
+        let err = repo.unchecked_writer().save_session(ws).unwrap_err();
+        assert!(err.to_string().contains("no index entry"), "{err}");
+
+        let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+        ws.index_delta.as_mut().unwrap().reused.insert_key(&lost);
+        let err = repo.unchecked_writer().save_session(ws).unwrap_err();
+        assert!(err.to_string().contains("no index entry"), "{err}");
+        assert!(!repo.chunk_index().contains(&lost));
     }
 
     /// Many packs reuse the same few upload threads.

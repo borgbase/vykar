@@ -555,6 +555,12 @@ impl VykarError {
     /// unsupported-reparse / cloud-file / locked-file (sharing or lock
     /// violation) failure) **before** any data was committed. These are safe to
     /// skip for partial-backup support.
+    ///
+    /// Only for errors reading a backup's source files. Commit-path errors
+    /// (storing a chunk, a pack upload, the index or snapshot writes) can carry
+    /// the same I/O kinds and must stay fatal: never apply this
+    /// classification to them. A write session whose pack upload failed
+    /// refuses every further store and save regardless.
     pub fn is_soft_file_error(&self) -> bool {
         match self {
             VykarError::Io(e) | VykarError::IoAt { source: e, .. } => is_soft_backup_io_error(e),

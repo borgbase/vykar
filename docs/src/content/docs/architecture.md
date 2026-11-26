@@ -604,6 +604,8 @@ begin_write_session(session_id) → a WriteSession; journal key = sessions/<sess
     upload threads, which encrypt the pack's trailer, compute its ID and
     upload it (a pack staged in a local repository is hashed as it is
     written; only its trailer and the final hash step run there)
+  → a failed upload fails the write session: it then stores and saves
+    nothing more; the abort flush still journals the packs that landed
   → final flush (unconditional): close partial pack writers, wait for all
     queued uploads, write sessions/<id>.index
   → pack SnapshotMeta in memory (do not write snapshots/<id> yet)

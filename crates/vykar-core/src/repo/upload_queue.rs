@@ -70,7 +70,8 @@ type UploadJob = Box<dyn FnOnce() + Send + 'static>;
 /// Pack uploads waiting to be joined, run on a fixed pool of long-lived
 /// threads. Joined in completion order, not in submission order. A
 /// confirmed upload is handed to the caller (`on_confirmed`), which
-/// journals it; a failed one never is.
+/// journals it; a failed one never is. The first failure is remembered
+/// (`failure`).
 pub(crate) struct UploadQueue {
     pending: Vec<PendingUpload>,
     /// Upload jobs send their `seq` here as they finish, so a blocked
@@ -92,6 +93,11 @@ pub(crate) struct UploadQueue {
     /// dropping the queue closes `jobs_tx`; each thread runs the jobs still
     /// queued, then exits (detached, as per-pack threads were).
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// The text of the first upload or submit failure. Once set, the
+    /// session refuses to store or save (`WriteSession::refuse_if_failed`):
+    /// the lost pack's chunks are still dedup hits. The queue itself keeps
+    /// working, so `flush_on_abort` can still join and journal what landed.
+    failure: Option<String>,
 }
 
 impl UploadQueue {
@@ -108,7 +114,20 @@ impl UploadQueue {
             jobs_tx,
             jobs_rx,
             workers: Vec::new(),
+            failure: None,
         }
+    }
+
+    /// Remember `e` as the queue's failure (the first one is kept) and hand
+    /// it back unchanged.
+    pub(super) fn record_failure(&mut self, e: VykarError) -> VykarError {
+        self.failure.get_or_insert_with(|| e.to_string());
+        e
+    }
+
+    /// The first upload or submit failure, if any.
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 
     /// Queue `upload` for an upload thread. `held` charges the pack's heap
@@ -134,14 +153,18 @@ impl UploadQueue {
             .saturating_add(UPLOAD_QUEUE_HEADROOM);
         if self.workers.len() < pool {
             let rx = self.jobs_rx.clone();
-            let worker = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("vykar-upload-{}", self.workers.len()))
                 .spawn(move || {
                     for job in rx {
                         job();
                     }
-                })
-                .map_err(|e| VykarError::Other(format!("starting a pack upload thread: {e}")))?;
+                });
+            let worker = spawned.map_err(|e| {
+                self.record_failure(VykarError::Other(format!(
+                    "starting a pack upload thread: {e}"
+                )))
+            })?;
             self.workers.push(worker);
         }
 
@@ -163,9 +186,9 @@ impl UploadQueue {
             // Marks the upload finished, then sends `seq`.
             drop(done);
         });
-        self.jobs_tx
-            .send(job)
-            .map_err(|_| VykarError::Other("pack upload queue closed".into()))?;
+        if self.jobs_tx.send(job).is_err() {
+            return Err(self.record_failure(VykarError::Other("pack upload queue closed".into())));
+        }
         self.pending.push(PendingUpload {
             seq,
             entries,
@@ -217,17 +240,21 @@ impl UploadQueue {
             }
             if let Some(i) = self.pending.iter().position(PendingUpload::is_finished) {
                 let upload = self.pending.swap_remove(i);
-                return Self::finish(upload).map(Some);
+                return Self::finish(upload)
+                    .map(Some)
+                    .map_err(|e| self.record_failure(e));
             }
             // Every queued upload sends exactly once; messages from uploads
             // already joined elsewhere are skipped.
-            let seq = self
-                .done_rx
-                .recv()
-                .map_err(|_| VykarError::Other("upload completion channel closed".into()))?;
+            let Ok(seq) = self.done_rx.recv() else {
+                return Err(self
+                    .record_failure(VykarError::Other("upload completion channel closed".into())));
+            };
             if let Some(i) = self.pending.iter().position(|u| u.seq == seq) {
                 let upload = self.pending.swap_remove(i);
-                return Self::finish(upload).map(Some);
+                return Self::finish(upload)
+                    .map(Some)
+                    .map_err(|e| self.record_failure(e));
             }
         }
     }
@@ -242,7 +269,7 @@ impl UploadQueue {
         while let Some(slot) = self.pending.get(i) {
             if slot.is_finished() {
                 let upload = self.pending.swap_remove(i);
-                on_confirmed(Self::finish(upload)?);
+                on_confirmed(Self::finish(upload).map_err(|e| self.record_failure(e))?);
             } else {
                 i += 1;
             }
@@ -266,7 +293,7 @@ impl UploadQueue {
         // late one is skipped by `finish_any` like any stale completion.
         while self.done_rx.try_recv().is_ok() {}
         match first_err {
-            Some(e) => Err(e),
+            Some(e) => Err(self.record_failure(e)),
             None => Ok(()),
         }
     }
@@ -539,5 +566,50 @@ mod tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(10));
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// The first upload error is remembered on every join path, and a later
+    /// success does not clear it. The two submit error paths (an upload
+    /// thread that cannot be started, a closed job channel) record through
+    /// the same `record_failure`; neither can be forced here without a
+    /// test hook.
+    #[test]
+    fn a_failed_upload_is_remembered() {
+        fn fail(msg: &'static str) -> impl FnOnce(HeldBytes) -> Result<PackId> + Send + 'static {
+            move |_: HeldBytes| Err(VykarError::Other(msg.into()))
+        }
+
+        let mut queue = UploadQueue::new(2);
+        assert!(queue.failure().is_none());
+        queue
+            .submit(Vec::new(), 0, HeldBytes::none(), fail("first"))
+            .unwrap();
+        queue
+            .submit(Vec::new(), 0, HeldBytes::none(), fail("second"))
+            .unwrap();
+        assert!(queue.join_all(|_| {}).is_err());
+        assert!(queue.failure().unwrap().contains("first"));
+        queue
+            .submit(Vec::new(), 0, HeldBytes::none(), |_| Ok(pack_id_of(1)))
+            .unwrap();
+        queue.join_all(|_| {}).unwrap();
+        assert!(queue.failure().unwrap().contains("first"));
+
+        let mut queue = UploadQueue::new(2);
+        queue
+            .submit(Vec::new(), 0, HeldBytes::none(), fail("drained"))
+            .unwrap();
+        while !queue.any_finished() {
+            std::thread::yield_now();
+        }
+        assert!(queue.drain_finished(|_| {}).is_err());
+        assert!(queue.failure().unwrap().contains("drained"));
+
+        let mut queue = UploadQueue::new(2);
+        queue
+            .submit(Vec::new(), 0, HeldBytes::none(), fail("joined"))
+            .unwrap();
+        assert!(queue.join_one(|_| {}).is_err());
+        assert!(queue.failure().unwrap().contains("joined"));
     }
 }

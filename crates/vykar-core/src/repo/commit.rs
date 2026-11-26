@@ -14,6 +14,7 @@ use super::machine::{StepCx, drive_blocking};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::write_session::{SessionView, WriteSession};
+use crate::index::hasher::ChunkIdHashMap;
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::Location;
 use crate::index::table::IndexState;
@@ -354,14 +355,30 @@ impl WriteSession {
         repo: &Repo,
     ) -> Result<(Option<IndexDelta>, Option<SessionView>)> {
         self.flush_packs(repo)?;
+        Ok(self.take_delta())
+    }
 
+    /// `RepoWriter::save_session`'s flush: [`Self::flush_and_take_delta`],
+    /// refusing first when a chunk the session stored or reused has no
+    /// index entry ([`check_saved_chunks`]). Not on the backup commit's path.
+    pub(super) fn flush_and_take_saved_delta(&mut self, repo: &Repo) -> Result<Option<IndexDelta>> {
+        self.flush_packs(repo)?;
+        if let Some(delta) = self.index_delta.as_ref() {
+            check_saved_chunks(&self.session_new, delta, &repo.chunk_index)?;
+        }
+        Ok(self.take_delta().0)
+    }
+
+    /// Take the delta (with the trailer lengths of the session's packs) and
+    /// the view, and drop the lookup state.
+    fn take_delta(&mut self) -> (Option<IndexDelta>, Option<SessionView>) {
         let mut delta = self.index_delta.take();
         if let Some(delta) = delta.as_mut() {
             delta.pack_trailers = std::mem::take(&mut self.pack_trailers);
         }
         let view = self.view.take();
         self.session_new = Default::default();
-        Ok((delta, view))
+        (delta, view)
     }
 }
 
@@ -422,6 +439,36 @@ pub(super) fn check_reused_chunks(delta: &IndexDelta, index: &LiveIndex) -> Resu
         .any(|id| !index.contains(&id) && !new.contains(&id))
     {
         return Err(VykarError::StaleChunksDuringCommit);
+    }
+    Ok(())
+}
+
+/// Repair's save (`RepoWriter::save_session`): every chunk the session
+/// reused must pass [`check_reused_chunks`], the backup commit's recheck,
+/// and every chunk it stored (`stored`: its `session_new`) must be among
+/// the delta's new entries or in `index`. A stored chunk without an entry
+/// is in a pack whose upload was never confirmed. A backstop: a failed
+/// upload already fails the session (`WriteSession::refuse_if_failed`).
+pub(super) fn check_saved_chunks(
+    stored: &ChunkIdHashMap<u32>,
+    delta: &IndexDelta,
+    index: &LiveIndex,
+) -> Result<()> {
+    let refuse = || {
+        VykarError::Other(
+            "refusing to save the write session: a chunk it stored or reused has no index \
+             entry (a pack upload was lost); nothing was saved"
+                .into(),
+        )
+    };
+    check_reused_chunks(delta, index).map_err(|_| refuse())?;
+    let new: std::collections::HashSet<ChunkId> =
+        delta.new_entries.iter().map(|e| e.chunk_id).collect();
+    if stored
+        .keys()
+        .any(|id| !new.contains(id) && !index.contains(id))
+    {
+        return Err(refuse());
     }
     Ok(())
 }

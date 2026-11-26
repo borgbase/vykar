@@ -46,6 +46,10 @@ struct PreparedRewrite {
 /// Build, flush, and publish the snapshot rewrites requested by every
 /// `DropItemsFromSnapshot` action in the plan.
 ///
+/// A rewrite that fails to prepare is logged and skipped, except after a
+/// failed pack upload: that aborts before anything is published, since the
+/// rewrites prepared so far may name chunks of the lost pack.
+///
 /// The publish loop intentionally never returns `?`: a partial publication
 /// must not bypass the trailing whole-snapshot deletes or index sweep
 /// in [`execute_repair`]. The only fatal case is "old DELETE failed AND
@@ -93,6 +97,18 @@ fn apply_item_level_rewrites(
             action_idx,
         ) {
             Ok(rw) => prepared.push(rw),
+            // A pack of the session is lost, and the rewrites prepared so
+            // far may name its chunks: publish none. No retry: the storage
+            // layer retried the upload already, and nothing is published
+            // before this abort, so running the repair again is safe.
+            Err(e) if ws.upload_failed() => {
+                ws.flush_on_abort(repo);
+                return Err(VykarError::Other(format!(
+                    "aborting repair: a pack upload failed while rewriting snapshot \
+                     '{snapshot_name}': {e}; no rewritten snapshot was published. \
+                     Run `vykar check --repair` again"
+                )));
+            }
             Err(e) => {
                 repair_errors.push(format!(
                     "failed to prepare rewrite for snapshot '{snapshot_name}': {e}"
@@ -414,7 +430,8 @@ pub(super) fn execute_repair(
     // Mirrors the backup commit (`repo::commit_machine::BackupCommit`):
     // begin_write_session → store per surviving item → flush_packs →
     // save_state (persists chunks BEFORE any snapshot blob references them).
-    // Per-action errors are logged and skipped; the trailing sweep
+    // Per-action errors are logged and skipped, except a failed pack
+    // upload, which aborts before anything is published; the trailing sweep
     // garbage-collects any orphan chunks. The publish loop deliberately
     // never short-circuits with `?`: a failed PUT/DELETE must not bypass
     // Step 5 (whole-snapshot deletes) or Step 6 (the index sweep).
@@ -565,6 +582,10 @@ mod tests {
     use crate::repo::ChunkerParams;
     use crate::repo::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY};
     use crate::testutil::MemoryBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use vykar_storage::{InnerBackend, delegate_storage_backend};
 
     /// **Repair writes the verified bytes, not a fresh read of the source.**
     ///
@@ -702,6 +723,348 @@ mod tests {
             heads,
             "no head written"
         );
+    }
+
+    /// Fails the first pack PUT, and only once the second snapshot's rewrite
+    /// starts (the first GET of a second `snapshots/` key). That GET then
+    /// waits until the failed upload has returned. So the first rewrite is
+    /// prepared over a closed pack whose upload has not failed yet, and the
+    /// second rewrite's first store sees the failure, as on a slow backend.
+    struct FailFirstPackLate {
+        inner: Arc<dyn StorageBackend>,
+        /// The first `snapshots/` key read (the first rewrite's snapshot).
+        first_snapshot: Mutex<Option<String>>,
+        /// (second rewrite started, first pack PUT failed)
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+        pack_puts: AtomicUsize,
+    }
+
+    impl FailFirstPackLate {
+        const WAIT: Duration = Duration::from_secs(10);
+
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
+            Self {
+                inner,
+                first_snapshot: Mutex::new(None),
+                state: Mutex::new((false, false)),
+                changed: Condvar::new(),
+                pack_puts: AtomicUsize::new(0),
+            }
+        }
+
+        /// The first pack PUT: wait for the second rewrite, then fail.
+        fn pack_put(&self, key: &str) -> vykar_types::error::Result<()> {
+            if !key.starts_with("packs/") || self.pack_puts.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(());
+            }
+            let state = self.state.lock().unwrap();
+            let (mut state, _) = self
+                .changed
+                .wait_timeout_while(state, Self::WAIT, |s| !s.0)
+                .unwrap();
+            state.1 = true;
+            self.changed.notify_all();
+            Err(VykarError::Other("injected pack upload failure".into()))
+        }
+
+        /// The first GET of a second `snapshots/` key: release the failing
+        /// PUT and wait until it has returned.
+        fn snapshot_get(&self, key: &str) {
+            if !key.starts_with("snapshots/") {
+                return;
+            }
+            {
+                let mut first = self.first_snapshot.lock().unwrap();
+                match first.as_deref() {
+                    None => {
+                        *first = Some(key.to_string());
+                        return;
+                    }
+                    Some(k) if k == key => return,
+                    Some(_) => {}
+                }
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.0 {
+                return;
+            }
+            state.0 = true;
+            self.changed.notify_all();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, Self::WAIT, |s| !s.1)
+                .unwrap();
+            assert!(
+                state.1,
+                "premise: the first rewrite closed no tree pack before the second began; \
+                 lower min_pack_size or grow the listing"
+            );
+            drop(state);
+            // The upload thread marks its job finished just after put_pack
+            // returns (UploadQueue::submit); give it that moment.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    impl InnerBackend for FailFirstPackLate {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for FailFirstPackLate;
+        except [get, put, put_owned, put_pack, begin_staged_put, conditional, profile];
+
+        fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+            self.snapshot_get(key);
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+            self.pack_put(key)?;
+            self.inner.put(key, data)
+        }
+
+        fn put_owned(&self, key: &str, data: Vec<u8>) -> vykar_types::error::Result<()> {
+            self.pack_put(key)?;
+            self.inner.put_owned(key, data)
+        }
+
+        fn put_pack(
+            &self,
+            key: &str,
+            data: vykar_storage::PackData,
+        ) -> vykar_types::error::Result<()> {
+            self.pack_put(key)?;
+            self.inner.put_pack(key, data)
+        }
+
+        // Test wrapper: keeps every write on the intercepted paths.
+        fn begin_staged_put(
+            &self,
+            _prefix: &str,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            Ok(None)
+        }
+
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                staged_put: false,
+                ..self.inner.profile()
+            }
+        }
+    }
+
+    /// Incompressible bytes, the same for the same seed.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A pack upload that fails while repair rewrites snapshots aborts the
+    /// rewrites: none is published, though the first was prepared over a
+    /// pack whose upload failed only later. A second repair then succeeds.
+    #[test]
+    fn repair_publishes_nothing_after_a_failed_upload() {
+        use crate::commands::check::types::RepairMode;
+        use crate::tests::helpers::{backup_single_source, make_test_config, open_local_repo};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let src_a = tmp.path().join("src-a");
+        let src_b = tmp.path().join("src-b");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        // Different listings, so the second rewrite stores new tree chunks.
+        for (dir, prefix, base) in [(&src_a, "a", 1_000u64), (&src_b, "b", 2_000)] {
+            std::fs::create_dir_all(dir).unwrap();
+            for i in 0..100u64 {
+                std::fs::write(
+                    dir.join(format!("{prefix}_{i:03}.bin")),
+                    noise(base + i, 4096),
+                )
+                .unwrap();
+            }
+            // Named to sort first in both listings, so the dropped entry is in
+            // the first tree chunk, which holds at least 8 KiB before any cut
+            // and so always keeps other entries and always changes.
+            std::fs::write(dir.join("0_shared.bin"), noise(7, 4096)).unwrap();
+        }
+        // Every chunk closes a pack as it is stored: the changed tree chunk is
+        // far smaller than the tree-pack target the test config would give.
+        let mut config = make_test_config(&repo_dir);
+        config.repository.min_pack_size = 1;
+        config.repository.max_pack_size = 1;
+        crate::commands::init::run(&config, None).unwrap();
+        backup_single_source(&config, &src_a, "src-a", "snap-a");
+        backup_single_source(&config, &src_b, "src-b", "snap-b");
+
+        // Delete the pack of 0_shared.bin, which both snapshots name.
+        let mut repo = open_local_repo(&repo_dir);
+        let stream = crate::commands::list::load_snapshot_item_stream(
+            &mut repo,
+            "snap-a",
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let mut shared: Vec<ChunkId> = Vec::new();
+        for_each_decoded_item(&stream, |item| {
+            if item.path.ends_with("0_shared.bin") {
+                shared.extend(item.chunks.iter().map(|c| c.id));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(!shared.is_empty());
+        let lost_pack = repo.chunk_index().get(&shared[0]).unwrap().pack_id;
+        assert!(
+            shared
+                .iter()
+                .all(|id| repo.chunk_index().get(id).unwrap().pack_id == lost_pack)
+        );
+        assert_eq!(
+            repo.chunk_index()
+                .iter()
+                .filter(|(_, e)| e.pack_id == lost_pack)
+                .count(),
+            shared.len(),
+            "premise: the lost pack holds only 0_shared.bin"
+        );
+        let original = |repo: &Repo, name: &str| repo.manifest().find_snapshot(name).unwrap().id;
+        let (id_a, id_b) = (original(&repo, "snap-a"), original(&repo, "snap-b"));
+        drop(repo);
+        std::fs::remove_file(repo_dir.join(lost_pack.storage_key())).unwrap();
+
+        let mut repo = open_local_repo(&repo_dir);
+        let opts = ScanOptions {
+            collect_chunk_refs: true,
+            detect_orphans: false,
+            verify_data: false,
+            skip_packs: None,
+            snapshot_sample: None,
+        };
+        let scan =
+            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
+        for (chunk_id, entry) in repo.chunk_index().iter() {
+            pack_chunks
+                .entry(entry.pack_id)
+                .or_default()
+                .push((chunk_id, entry));
+        }
+        let name_to_id: HashMap<String, SnapshotId> = repo
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|e| (e.name.clone(), e.id))
+            .collect();
+        let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
+        let drops = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, RepairAction::DropItemsFromSnapshot { .. }))
+            .count();
+        assert_eq!(drops, 2, "{:?}", plan.actions);
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                RepairAction::RemoveDanglingIndexEntries { pack_id, .. } if *pack_id == lost_pack
+            )),
+            "{:?}",
+            plan.actions
+        );
+
+        let heads =
+            crate::repo::index_store::list_head_generations(repo.storage().as_ref()).unwrap();
+        let snapshot_keys = |storage: &dyn StorageBackend| {
+            let mut keys = storage.list("snapshots/").unwrap();
+            keys.sort();
+            keys
+        };
+        let mut original_keys = vec![id_a.storage_key(), id_b.storage_key()];
+        original_keys.sort();
+        assert_eq!(snapshot_keys(repo.storage().as_ref()), original_keys);
+
+        repo.set_storage_for_test(Arc::new(FailFirstPackLate::new(Arc::clone(repo.storage()))));
+        let result = execute_repair(
+            &mut repo.unchecked_writer(),
+            &plan,
+            &scan.issues,
+            &HashMap::new(),
+        );
+        drop(repo);
+
+        // Nothing was published: the state first, then the error.
+        assert_eq!(
+            snapshot_keys(
+                &vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap())
+                    .unwrap()
+            ),
+            original_keys,
+            "no rewritten snapshot was published"
+        );
+        let repo = open_local_repo(&repo_dir);
+        assert_eq!(original(&repo, "snap-a"), id_a);
+        assert_eq!(original(&repo, "snap-b"), id_b);
+        assert_eq!(
+            crate::repo::index_store::list_head_generations(repo.storage().as_ref()).unwrap(),
+            heads,
+            "no head written"
+        );
+        drop(repo);
+        let err = match result {
+            Ok(r) => panic!("the repair must fail: {r:?}"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("injected pack upload failure"),
+            "{err}"
+        );
+
+        // A second repair, on a healthy backend, succeeds.
+        let repaired = crate::commands::check::run_with_repair(
+            &config,
+            None,
+            false,
+            RepairMode::Apply,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert!(
+            repaired.repair_errors.is_empty(),
+            "{:?}",
+            repaired.repair_errors
+        );
+        assert_eq!(
+            repaired
+                .applied
+                .iter()
+                .filter(|a| matches!(a, RepairAction::DropItemsFromSnapshot { .. }))
+                .count(),
+            2,
+            "{:?}",
+            repaired.applied
+        );
+        let check = crate::commands::check::run(&config, None, true, false).unwrap();
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+        let mut repo = open_local_repo(&repo_dir);
+        for (name, old) in [("snap-a", id_a), ("snap-b", id_b)] {
+            assert_ne!(original(&repo, name), old);
+            load_snapshot_item_stream_from_storage(&mut repo, name, &CancelToken::new()).unwrap();
+        }
     }
 
     struct ForbiddenDeleteBackend;

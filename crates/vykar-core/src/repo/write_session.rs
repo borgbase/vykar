@@ -11,7 +11,7 @@ use crate::index::{
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
@@ -89,7 +89,8 @@ pub struct WriteSession {
     pub(crate) tree_pack_writer: PackWriter,
     /// Pack uploads, run on a fixed pool of upload threads; a pack enters
     /// `journal`, `index_delta` and `pack_trailers` only after its upload
-    /// returns `Ok`.
+    /// returns `Ok`. Its first failure fails the session
+    /// (`refuse_if_failed`).
     pub(crate) uploads: UploadQueue,
     /// The bytes the backup buffers: its pipeline, open packs and sealed
     /// packs waiting for upload. Shared with the pipeline's walk thread and
@@ -195,6 +196,25 @@ impl WriteSession {
             || self.journal.needs_write()
     }
 
+    /// Whether an upload or submit of this session failed: its pack is
+    /// lost while its chunks stay dedup hits (`session_new`), so the
+    /// session stores and saves nothing more.
+    pub(crate) fn upload_failed(&self) -> bool {
+        self.uploads.failure().is_some()
+    }
+
+    /// Err once an upload of this session failed (see
+    /// [`Self::upload_failed`]); the error carries the first failure's text.
+    pub(super) fn refuse_if_failed(&self) -> Result<()> {
+        match self.uploads.failure() {
+            Some(first) => Err(VykarError::Other(format!(
+                "a pack upload of this write session failed, so it stores and saves nothing \
+                 more: {first}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Queue `upload` for an upload thread; it returns the ID of the pack
     /// it stored, whose `entries` and `trailer_len` are recorded once it is
     /// confirmed. `held` is the pack's charge to `memory`, released when
@@ -219,7 +239,7 @@ impl WriteSession {
     /// Join one upload and record its pack if it succeeded. A failed
     /// upload is never journaled.
     pub(crate) fn finish_upload(&mut self, upload: PendingUpload) -> Result<()> {
-        let confirmed = UploadQueue::finish(upload)?;
+        let confirmed = UploadQueue::finish(upload).map_err(|e| self.uploads.record_failure(e))?;
         record_confirmed(
             &mut self.journal.entries,
             &mut self.pack_trailers,

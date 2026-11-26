@@ -166,8 +166,13 @@ impl RepoWriter<'_> {
     /// and its journal written ([`WriteSession::flush_on_abort`]) before
     /// the error returns. The `pending_index` file itself is deleted later
     /// by `clear_pending_index()` from the backup command.
+    ///
+    /// Refuses, before anything is applied, when a chunk the session stored
+    /// or reused has no index entry, or when an upload of the session
+    /// failed. The backup commit does not come here: it takes its delta in
+    /// the commit machine.
     pub fn save_session(&mut self, mut ws: WriteSession) -> Result<()> {
-        let applied = ws.flush_and_take_delta(self.repo).map(|(delta, _view)| {
+        let applied = ws.flush_and_take_saved_delta(self.repo).map(|delta| {
             if let Some(delta) = delta.filter(|d| !d.is_empty()) {
                 delta.apply_to(&mut self.repo.chunk_index);
                 self.repo.index_dirty = true;

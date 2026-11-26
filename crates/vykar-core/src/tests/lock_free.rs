@@ -34,7 +34,6 @@ fn backup_call(name: &str) -> Call {
 fn encrypted(kind: StoreKind) -> Sim {
     Sim::with_config(SimConfig {
         kind,
-        encrypted: true,
         ..SimConfig::default()
     })
 }
@@ -291,10 +290,12 @@ fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
 
 /// A plaintext repository never commits lock-free (O1): on a store that
 /// offers put-if-absent its backups still take the commit lock.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn plaintext_repositories_commit_under_the_lock() {
     let mut sim = Sim::with_config(SimConfig {
         kind: StoreKind::Conditional,
+        encrypted: false,
         ..SimConfig::default()
     });
     let a = sim.client("a");

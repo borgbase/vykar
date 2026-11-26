@@ -1,6 +1,6 @@
 {
   "name": "late-head-before-snapshot",
-  "note": "Second campaign of phase F part 2 (random-1867481859511672080): compact's head PUT is delayed, a backup puts its head, the late head lands over it at the same key, then the backup puts its snapshot and crashes before finish (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step, folds c0's segment and writes its own segment after the base; the released compact head still lands over it. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-before-snapshot-conditional is the same case on a conditional store.",
+  "note": "Second campaign of phase F part 2 (random-1867481859511672080): compact's head PUT is delayed, a backup puts its head, the late head lands over it at the same key, then the backup puts its snapshot and crashes before finish (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step, folds c0's segment and writes its own segment after the base; the released compact head still lands over it. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-before-snapshot-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2.",
   "expect": [
     "LateHeadWrite"
   ],
@@ -229,6 +229,7 @@
       0,
       7
     ],
-    "policy": "First"
+    "policy": "First",
+    "template": "Encrypted"
   }
 }

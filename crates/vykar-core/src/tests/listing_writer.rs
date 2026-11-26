@@ -13,7 +13,7 @@ use crate::compress::Compression;
 use crate::repo::{Repo, WriteSession, WriteSessionOptions};
 use crate::snapshot::CURRENT_FORMAT_VERSION;
 use crate::snapshot::item::{ChunkRef, Item, ItemType, v1_wire};
-use crate::testutil::{test_chunk_hasher, test_repo_plaintext};
+use crate::testutil::{test_chunk_hasher, test_repo};
 use vykar_types::chunk_id::ChunkId;
 
 /// `item_ptrs` of [`fixed_items`] on [`fixed_key_repo`], format 1.
@@ -32,11 +32,22 @@ const KNOWN_V1: &[&str] = &[
     "0ad17ccd527ab48d884f488290ac2c7fb7f9e0fb4e08dc39ed4e3094db38ff8b",
 ];
 
-/// A plaintext in-memory repository whose chunk-ID key (and so the cut
-/// key) is fixed: `test_repo_plaintext` draws a fresh key per init.
+/// An in-memory repository whose chunk-ID key (and so the cut key) is
+/// fixed: `test_repo` draws a fresh key per init. The engine keeps the
+/// repository's own encryption key, so its index and head still open.
 fn fixed_key_repo() -> (Repo, WriteSession) {
-    let mut repo = test_repo_plaintext();
-    repo.set_crypto_for_test(Arc::new(vykar_crypto::PlaintextEngine::new(
+    let mut repo = test_repo();
+    let blob = repo
+        .storage()
+        .get(crate::repo::KEY_PRIMARY)
+        .unwrap()
+        .unwrap();
+    let encrypted = vykar_crypto::key::inspect_key_blob(&blob).unwrap();
+    let key =
+        vykar_crypto::key::MasterKey::from_encrypted(&encrypted, crate::testing::TEST_PASSPHRASE)
+            .unwrap();
+    repo.set_crypto_for_test(Arc::new(vykar_crypto::aes_gcm::Aes256GcmEngine::new(
+        &key.encryption_key,
         test_chunk_hasher(),
     )));
     let ws = repo.begin_write_session(&WriteSessionOptions::default());

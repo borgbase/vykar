@@ -1639,13 +1639,13 @@ mod tests {
     #[test]
     fn verify_single_chunk_rejects_frame_restore_rejects() {
         use crate::repo::format::pack_object_with_context;
-        use vykar_crypto::PlaintextEngine;
+        use vykar_crypto::testing::DeterministicEngine;
         use vykar_types::chunk_id::ChunkHasher;
         use vykar_types::hash::HashAlgorithm;
 
         let frame = crate::compress::tests::ZSTD_EMPTY_COMPRESSED_BLOCK;
         let hasher = ChunkHasher::new(HashAlgorithm::Blake3, [0x5A; 32]);
-        let engine = PlaintextEngine::new(hasher.clone());
+        let engine = DeterministicEngine::new(hasher.clone());
         let chunk_id = ChunkId::compute(&hasher, &frame[frame.len() - 6..]);
         let pack_id = PackId::from_bytes([0x01; 32]);
         let mut raw =

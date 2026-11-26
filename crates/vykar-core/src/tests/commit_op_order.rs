@@ -3,6 +3,9 @@
 //! Each scenario projects one run's op log to (op, key class, outcome);
 //! between two mutations, reads form a multiset (sorted), since some of them
 //! run concurrently. `VYKAR_PRINT_OP_ORDER=1` prints the projections.
+//! Since 10-single-protocol step 2 the scenarios run on an encrypted
+//! repository on the fallback store: lock mode with the marker handshake,
+//! whose reads under the lock are commented where they appear.
 
 // Printing is the point of the env-driven helpers here (projections,
 // replays, the measurement); every other path asserts.
@@ -123,9 +126,13 @@ fn first_backup_writes_a_segment() {
             "Put locks/ ok",
             "Exists sessions/ ok",
             "Get index.h/ ok",
+            // The session's own marker, read for the handshake (encrypted repository).
+            "Get sessions/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
             "ListMeta locks/ ok",
+            // The marker handshake's listing under the lock (encrypted repository).
+            "ListMeta sessions/ ok",
             "reads packs/",
             "Put index.d/ ok",
             "Exists locks/ ok",
@@ -153,9 +160,13 @@ fn second_backup_of_the_same_tree_writes_a_segment() {
             "Put locks/ ok",
             "Exists sessions/ ok",
             "Get index.h/ ok",
+            // The session's own marker, read for the handshake (encrypted repository).
+            "Get sessions/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
             "ListMeta locks/ ok",
+            // The marker handshake's listing under the lock (encrypted repository).
+            "ListMeta sessions/ ok",
             "reads packs/",
             "Put index.d/ ok",
             "Exists locks/ ok",
@@ -188,7 +199,7 @@ fn commit_with_no_new_additions_writes_no_index() {
         ws.store_chunk(repo, data, Compression::None, PackType::Data)?;
         let mut first = Repo::open(
             Box::new(other),
-            None,
+            store.passphrase(),
             Some(cache.path().to_path_buf()),
             OpenOptions::new().with_index(),
         )?;
@@ -270,6 +281,8 @@ fn compact_after_delete_writes_a_record_and_a_segment() {
         &[
             "Get config ok",
             "Get index.h/ ok",
+            // The key copies, read at open (encrypted since 10-single-protocol step 2).
+            "Get keys/ ok x2",
             "List index.h/ ok",
             "List snapshots/ ok",
             "ListMeta locks/ ok",
@@ -316,6 +329,8 @@ fn compact_with_nothing_to_remove_writes_a_head_only() {
         &[
             "Get config ok",
             "Get index.h/ ok",
+            // The key copies, read at open (encrypted since 10-single-protocol step 2).
+            "Get keys/ ok x2",
             "List index.h/ ok",
             "List snapshots/ ok",
             "ListMeta locks/ ok",
@@ -362,6 +377,8 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
         &[
             "Get config ok",
             "Get index.h/ ok",
+            // The key copies, read at open (encrypted since 10-single-protocol step 2).
+            "Get keys/ ok x2",
             "List index.h/ ok",
             "List snapshots/ ok",
             "ListMeta locks/ ok",

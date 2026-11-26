@@ -43,8 +43,8 @@ pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;
-#[cfg(any(test, feature = "sim"))]
-pub(crate) use open::with_cheap_kdf;
+#[cfg(any(test, feature = "sim", feature = "testing"))]
+pub use open::with_cheap_kdf;
 mod read;
 pub(crate) use read::TreeChunkSource;
 pub(crate) mod relocate;
@@ -1107,6 +1107,8 @@ mod format_tests {
     use super::*;
     use vykar_types::error::VykarError;
 
+    // Plaintext-only: 10-single-protocol step 3 removes this (mode none as a
+    // config value).
     fn legacy(version: u32) -> LegacyRepoConfig {
         LegacyRepoConfig {
             version,

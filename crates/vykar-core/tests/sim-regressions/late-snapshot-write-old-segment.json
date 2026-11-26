@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-write-old-segment",
-  "note": "LateSnapshotWrite with the late snapshot's segment older than T_pack (phase F part 8c, built from late-snapshot-write for 04 step 7): advances on and two 6 h 1 min jumps before client 2's delete of c0, so at the compact a's backup segment is about 12 h 2 min old: the sweep takes a's own new chunks (a1 is not visible yet) and deletes the packs it emptied (old too); the release then lands a1 naming absent chunks. Since 04 step 7 the late snapshot's own chunks survive while its segment is younger than T_pack. Fixed by 04 step 8 (the commit point is the head). Since 04 step 8 (phase F part 9) late-snapshot-write-old-segment-conditional is the same case on a conditional store, which keeps it too.",
+  "note": "LateSnapshotWrite with the late snapshot's segment older than T_pack (phase F part 8c, built from late-snapshot-write for 04 step 7): advances on and two 6 h 1 min jumps before client 2's delete of c0, so at the compact a's backup segment is about 12 h 2 min old: the sweep takes a's own new chunks (a1 is not visible yet) and deletes the packs it emptied (old too); the release then lands a1 naming absent chunks. Since 04 step 7 the late snapshot's own chunks survive while its segment is younger than T_pack. Fixed by 04 step 8 (the commit point is the head). Since 04 step 8 (phase F part 9) late-snapshot-write-old-segment-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2.",
   "expect": [
     "LateSnapshotWrite"
   ],
@@ -369,6 +369,7 @@
       0,
       1
     ],
-    "policy": "Continue"
+    "policy": "Continue",
+    "template": "Encrypted"
   }
 }

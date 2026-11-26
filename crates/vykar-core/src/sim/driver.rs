@@ -215,7 +215,9 @@ pub struct Case {
     #[serde(default, skip_serializing_if = "StoreKind::is_plain")]
     pub storage: StoreKind,
     /// The template a case forks (phase F part 10): Plain (every seed before
-    /// part 10b) or Encrypted, where the lock-free path exists (O1).
+    /// part 10b) or Encrypted, where the lock-free path exists (O1). Since
+    /// 10-single-protocol step 2 both build the same encrypted repository;
+    /// Plain is only the label of cases recorded before then.
     #[serde(default, skip_serializing_if = "TemplateKind::is_plain")]
     pub template: TemplateKind,
     /// Clients (indices into clients) whose storage handle offers no
@@ -227,7 +229,9 @@ pub struct Case {
 /// The repository a [`Template`] holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TemplateKind {
-    /// Plaintext (every seed recorded before phase F part 10b).
+    /// Recorded before 10-single-protocol step 2, when it was plaintext
+    /// (every seed recorded before phase F part 10b). It now runs encrypted,
+    /// the same repository as `Encrypted`. Step 10 removes it.
     #[default]
     Plain,
     /// AES-256-GCM with a cheap KDF: object names are random per run
@@ -447,10 +451,7 @@ impl Template {
     fn build(aged: bool, kind: TemplateKind) -> Self {
         let mut sim = match kind {
             TemplateKind::Plain => Sim::new(),
-            TemplateKind::Encrypted => Sim::with_config(super::store::SimConfig {
-                encrypted: true,
-                ..super::store::SimConfig::default()
-            }),
+            TemplateKind::Encrypted => Sim::with_config(super::store::SimConfig::default()),
         };
         let ctl = sim.client("ctl");
         sim.backup(ctl, "c0", &backup_tree("c0", true)).expect_ok();

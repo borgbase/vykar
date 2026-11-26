@@ -35,14 +35,14 @@ fn backup_symlink_to_directory_descends_target() {
     unix_fs::symlink(&real_dir, &link).unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     let source_paths = vec![link.to_string_lossy().to_string()];
     commands::backup::run(
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "docs",
             exclude_patterns: &[],
@@ -60,7 +60,7 @@ fn backup_symlink_to_directory_descends_target() {
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap",
         restore_dir.to_str().unwrap(),
         None,

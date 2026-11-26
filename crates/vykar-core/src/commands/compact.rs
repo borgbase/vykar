@@ -2513,7 +2513,8 @@ mod repack_chunk_tests {
         let op = PlannedOp::new(&empty, true);
         assert_eq!(op.trailer_len, 0);
         assert_eq!(op.output_size(), 0);
-        let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
+        let engine =
+            vykar_crypto::testing::DeterministicEngine::new(crate::testutil::test_chunk_hasher());
         assert!(op.into_request(&engine).unwrap().trailer.is_none());
     }
 
@@ -2522,10 +2523,11 @@ mod repack_chunk_tests {
     #[test]
     fn attached_trailer_matches_its_estimate() {
         let a = analysis(3, 50);
-        let plain = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
-        let request = PlannedOp::new(&a, false).into_request(&plain).unwrap();
-        assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3, false));
-        let err = PlannedOp::new(&a, true).into_request(&plain).unwrap_err();
+        let engine =
+            vykar_crypto::testing::DeterministicEngine::new(crate::testutil::test_chunk_hasher());
+        let request = PlannedOp::new(&a, true).into_request(&engine).unwrap();
+        assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3, true));
+        let err = PlannedOp::new(&a, false).into_request(&engine).unwrap_err();
         assert!(err.to_string().contains("estimate"), "{err}");
     }
 }

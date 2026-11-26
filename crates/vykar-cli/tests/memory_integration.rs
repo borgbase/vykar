@@ -75,6 +75,30 @@ impl CliFixture {
         ]
     }
 
+    /// Create the repository `cfg` names, as `vykar init` would, through
+    /// the library with the cheap test KDF: a `vykar init` would store the
+    /// product KDF parameters, and every measured backup and restore would
+    /// then run a 64 MiB Argon2id. Its identity pin and caches go where this
+    /// fixture's vykar children look for them.
+    fn init_repo(&self, cfg: &str) {
+        isolate_process_env();
+        for repo in vykar_core::config::load_and_resolve(Path::new(cfg)).unwrap() {
+            let mut config = repo.config;
+            if config.cache_dir.is_none() {
+                let root = if cfg!(target_os = "macos") {
+                    self.home_dir.join("Library").join("Caches").join("vykar")
+                } else {
+                    self.cache_dir.join("vykar")
+                };
+                config.cache_dir = Some(root.to_string_lossy().into_owned());
+            }
+            vykar_core::testing::with_cheap_kdf(|| {
+                vykar_core::commands::init::run(&config, Some(TEST_PASS))
+            })
+            .unwrap();
+        }
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
@@ -183,12 +207,39 @@ fn yaml_quote_path(path: &Path) -> String {
     format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn write_plain_config(config_path: &Path, repo_dir: &Path) {
+/// The passphrase of the repositories these tests create.
+const TEST_PASS: &str = vykar_core::testing::TEST_PASSPHRASE;
+
+fn write_test_config(config_path: &Path, repo_dir: &Path) {
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\ncompression:\n  algorithm: none\nsources: []\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"{TEST_PASS}\"\ncompression:\n  algorithm: none\nsources: []\n",
         yaml_quote_path(repo_dir)
     );
     std::fs::write(config_path, config).unwrap();
+}
+
+/// Point this test process's own per-user directories at a per-process temp
+/// directory before it opens a repository in-process (see `cli_integration`).
+#[allow(unsafe_code)]
+fn isolate_process_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let base = std::env::temp_dir().join(format!("vykar-mem-tests-{}", std::process::id()));
+        let (home, config, cache) = (base.join("home"), base.join("config"), base.join("cache"));
+        for dir in [&home, &config, &cache] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once, before this process opens a repository.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("APPDATA", &config);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+            std::env::set_var("LOCALAPPDATA", &cache);
+        }
+    });
 }
 
 fn parse_snapshot_name(output: &str) -> String {
@@ -275,6 +326,10 @@ fn assert_peak_under_cap(test_name: &str, peak_rss_bytes: u64, saw_rss_sample: b
     );
 
     let cap_bytes = mib_to_bytes(cap_mib);
+    eprintln!(
+        "{test_name}: peak RSS {:.1} MiB, cap {cap_mib} MiB",
+        bytes_to_mib(peak_rss_bytes)
+    );
     assert!(
         peak_rss_bytes <= cap_bytes,
         "{test_name}: peak RSS {:.1} MiB exceeded cap {} MiB",
@@ -290,7 +345,7 @@ fn memory_backup_large_file_peak_rss_under_cap() {
     }
 
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let file_path = fx.source_dir.join("large.bin");
     write_deterministic_file(&file_path, (256 * MIB) as usize, 17);
@@ -298,7 +353,7 @@ fn memory_backup_large_file_peak_rss_under_cap() {
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_dir.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repo(&cfg);
     let (_backup_out, peak_rss_bytes, saw_rss_sample) =
         fx.run_monitored_ok(&["--config", &cfg, "backup", &source]);
 
@@ -317,7 +372,7 @@ fn memory_backup_many_files_peak_rss_under_cap() {
     }
 
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     for i in 0..64u8 {
         let file_path = fx.source_dir.join(format!("file-{i:02}.bin"));
@@ -327,7 +382,7 @@ fn memory_backup_many_files_peak_rss_under_cap() {
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_dir.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repo(&cfg);
     let (_backup_out, peak_rss_bytes, saw_rss_sample) =
         fx.run_monitored_ok(&["--config", &cfg, "backup", &source]);
 
@@ -346,7 +401,7 @@ fn memory_restore_peak_rss_under_cap() {
     }
 
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     for i in 0..64u8 {
         let file_path = fx.source_dir.join(format!("file-{i:02}.bin"));
@@ -356,7 +411,7 @@ fn memory_restore_peak_rss_under_cap() {
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_dir.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repo(&cfg);
     let backup_out = fx.run_ok(&["--config", &cfg, "backup", &source]);
     let snapshot = parse_snapshot_name(&backup_out);
 

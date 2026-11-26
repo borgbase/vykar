@@ -89,6 +89,10 @@ fuzzing = []
 # Simulation harness for protocol tests (src/sim). Test support, not API;
 # never enable in a product build.
 sim = []
+# Test support for crates/vykar-core/tests/, vykar-cli and vykar-gui tests
+# (src/testing.rs: the cheap KDF, the test passphrase) and the deterministic
+# engine of vykar-crypto. Not API; never enable in a product build.
+testing = ["vykar-crypto/testing"]
 # Measurement entry points for examples/walk_order.rs and examples/listing_stats.rs (06 step 0;
 # walk_order keeps the pre-step-3 emission order for A/B), and the feature gate of
 # examples/listing_read.rs (06 step 4). Not API.
@@ -107,6 +111,9 @@ name = "listing_read"
 required-features = ["measure"]
 
 [dev-dependencies]
+# Turns on the testing feature for this crate's own integration tests
+# (tests/*.rs) and unit tests; never in a normal build (resolver 3).
+vykar-core = { path = ".", features = ["testing"] }
 proptest = { workspace = true }
 test-case = { workspace = true }
 # Extracts the frozen repository-format-v2 fixtures (tests/fixtures/*.tar.gz).

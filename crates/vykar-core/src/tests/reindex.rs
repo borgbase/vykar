@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::helpers::{backup_single_source, latest_head_key, make_test_config};
+use super::helpers::{backup_single_source, latest_head_key, make_test_config, pass};
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode, RepairResult};
 use crate::commands::compact::CompactStats;
@@ -39,7 +39,7 @@ fn fixture(small_packs: bool) -> Fixture {
         config.repository.max_pack_size = 4 * 1024;
     }
     config.cache_dir = Some(tmp.path().join("cache").to_string_lossy().into_owned());
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
     Fixture {
         tmp,
         repo_dir,
@@ -62,7 +62,13 @@ impl Fixture {
 
     fn open(&self, config: &VykarConfig) -> Repo {
         let cache = PathBuf::from(config.cache_dir.as_ref().unwrap());
-        Repo::open(self.storage(), None, Some(cache), OpenOptions::new()).unwrap()
+        Repo::open(
+            self.storage(),
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(cache),
+            OpenOptions::new(),
+        )
+        .unwrap()
     }
 
     /// The packs the index of `config`'s client names.
@@ -107,7 +113,7 @@ impl Fixture {
     fn compact(&self, config: &VykarConfig) -> Result<CompactStats> {
         commands::compact::run(
             config,
-            None,
+            pass(config),
             config.compact.threshold,
             None,
             false,
@@ -116,11 +122,18 @@ impl Fixture {
     }
 
     fn repair(&self, config: &VykarConfig, mode: RepairMode) -> Result<RepairResult> {
-        commands::check::run_with_repair(config, None, false, mode, None, &CancelToken::new())
+        commands::check::run_with_repair(
+            config,
+            pass(config),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
     }
 
     fn check_clean(&self, config: &VykarConfig) {
-        let result = commands::check::run(config, None, true, false).unwrap();
+        let result = commands::check::run(config, pass(config), true, false).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
@@ -132,7 +145,7 @@ impl Fixture {
             .join(format!("restore-{snapshot}-{}", rand::random::<u32>()));
         commands::restore::run(
             config,
-            None,
+            pass(config),
             snapshot,
             dest.to_str().unwrap(),
             None,
@@ -162,7 +175,7 @@ impl Fixture {
     }
 
     fn info(&self, config: &VykarConfig) -> commands::info::InfoStats {
-        commands::info::run(config, None).unwrap()
+        commands::info::run(config, pass(config)).unwrap()
     }
 }
 
@@ -294,7 +307,8 @@ fn a_lost_update_is_reindexed_from_pack_maps() {
     fx.backup("s1");
     fx.write("b", &noise(2, 5000));
     let s2_packs = fx.backup("s2");
-    let stats = commands::pack_maps::run(&fx.config, None, &CancelToken::new()).unwrap();
+    let stats =
+        commands::pack_maps::run(&fx.config, pass(&fx.config), &CancelToken::new()).unwrap();
     assert!(stats.packs_mapped >= s2_packs.len(), "{stats:?}");
     fx.lose_latest_head();
     let cold = fx.client("cold");
@@ -504,7 +518,7 @@ fn a_failed_lookup_changes_nothing() {
         let cache = PathBuf::from(cold.cache_dir.as_ref().unwrap());
         let mut repo = Repo::open(
             Box::new(storage),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(cache),
             commands::check::repair_open_options(mode),
         )
@@ -593,7 +607,7 @@ fn a_failed_read_of_a_reindexed_tree_changes_nothing() {
     fx.backup("s1");
     fx.write("b", &noise(9, 5000));
     let s2_packs = fx.backup("s2");
-    commands::pack_maps::run(&fx.config, None, &CancelToken::new()).unwrap();
+    commands::pack_maps::run(&fx.config, pass(&fx.config), &CancelToken::new()).unwrap();
     fx.lose_latest_head();
     let before = fx.repo_files();
     for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
@@ -605,7 +619,7 @@ fn a_failed_read_of_a_reindexed_tree_changes_nothing() {
         let cache = PathBuf::from(cold.cache_dir.as_ref().unwrap());
         let mut repo = Repo::open(
             Box::new(storage),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(cache),
             commands::check::repair_open_options(mode),
         )

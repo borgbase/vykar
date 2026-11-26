@@ -16,7 +16,7 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
 use super::helpers::{
-    backup_single_source, init_repo, init_test_environment, make_test_config, open_local_repo,
+    backup_single_source, init_repo, init_test_environment, make_test_config, open_local_repo, pass,
 };
 
 /// Mock storage backend whose server returns a transient error from verify-packs.
@@ -87,13 +87,13 @@ fn check_verify_data_flag_controls_data_verification_counters() {
     let config = init_repo(&repo_dir);
     backup_single_source(&config, &source_dir, "src-a", "snap-check-verify");
 
-    let without_verify = commands::check::run(&config, None, false, false).unwrap();
+    let without_verify = commands::check::run(&config, pass(&config), false, false).unwrap();
     assert!(without_verify.errors.is_empty());
     assert_eq!(without_verify.chunks_data_verified, 0);
     assert!(without_verify.chunks_existence_checked > 0);
     assert!(without_verify.packs_existence_checked > 0);
 
-    let with_verify = commands::check::run(&config, None, true, false).unwrap();
+    let with_verify = commands::check::run(&config, pass(&config), true, false).unwrap();
     assert!(with_verify.errors.is_empty());
     assert!(with_verify.chunks_data_verified > 0);
     assert!(with_verify.chunks_existence_checked > 0);
@@ -126,7 +126,7 @@ fn sampled_check_preserves_local_fallback_counters() {
         for verify_data in [false, true] {
             let result = commands::check::run_with_progress(
                 &config,
-                None,
+                pass(&config),
                 verify_data,
                 distrust_server,
                 None,
@@ -170,7 +170,7 @@ fn check_reports_missing_pack_file_in_storage() {
     assert!(pack_path.exists());
     std::fs::remove_file(pack_path).unwrap();
 
-    let result = commands::check::run(&config, None, false, false).unwrap();
+    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
     assert!(result.chunks_existence_checked > 0);
     assert!(result.packs_existence_checked > 0);
     assert!(
@@ -206,7 +206,7 @@ fn check_reports_snapshot_metadata_load_failures() {
     // Corrupt the snapshot blob so it's still listed but fails to decrypt/deserialize.
     std::fs::write(&snapshot_path, b"corrupted-snapshot-data").unwrap();
 
-    let result = commands::check::run(&config, None, false, false).unwrap();
+    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
     assert_eq!(result.snapshots_checked, 0);
     assert!(
         result
@@ -239,7 +239,7 @@ fn check_with_progress_emits_phase_events() {
 
     let result = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         Some(&mut on_progress),
@@ -280,7 +280,7 @@ fn check_deduplicates_pack_existence_checks() {
     let config = init_repo(&repo_dir);
     backup_single_source(&config, &source_dir, "src-dedup", "snap-dedup");
 
-    let result = commands::check::run(&config, None, false, false).unwrap();
+    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
     assert!(result.errors.is_empty());
     assert!(result.chunks_existence_checked > 0);
     assert!(result.packs_existence_checked > 0);
@@ -452,7 +452,9 @@ fn test_verify_pack_full_overflow_offset() {
     init_test_environment();
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
+    let crypto = vykar_crypto::testing::DeterministicEngine::new(
+        crate::testutil::chunk_hasher_for([0u8; 32]),
+    );
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file so we get past the header check.
@@ -490,7 +492,9 @@ fn test_verify_pack_full_overflow_add() {
     init_test_environment();
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
+    let crypto = vykar_crypto::testing::DeterministicEngine::new(
+        crate::testutil::chunk_hasher_for([0u8; 32]),
+    );
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file
@@ -536,7 +540,7 @@ fn init_repo_small_packs(repo_dir: &std::path::Path) -> crate::config::VykarConf
     let mut config = make_test_config(repo_dir);
     config.repository.min_pack_size = 1;
     config.repository.max_pack_size = 4 * 1024;
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
     config
 }
 
@@ -634,7 +638,7 @@ fn check_reports_items_affected_by_missing_pack() {
         "test setup picked a pack with no referencing items"
     );
 
-    let result = commands::check::run(&config, None, false, false).unwrap();
+    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
 
     // Pack-level error from Phase 2 must still be present (existing behavior).
     assert!(
@@ -729,7 +733,7 @@ fn check_repair_dry_run_includes_item_impact() {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -801,7 +805,7 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -846,7 +850,7 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
     std::fs::create_dir_all(&dest).unwrap();
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-drop",
         dest.to_str().unwrap(),
         None,
@@ -894,7 +898,7 @@ fn repair_falls_back_to_whole_snapshot_when_all_items_affected() {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -946,7 +950,7 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -1030,7 +1034,7 @@ fn repair_drops_items_and_sweeps_the_index() {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -1066,7 +1070,7 @@ fn repair_drops_items_and_sweeps_the_index() {
     std::fs::create_dir_all(&dest).unwrap();
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-b",
         dest.to_str().unwrap(),
         None,
@@ -1124,7 +1128,7 @@ fn check_flags_unsupported_version_and_repair_refuses() {
     bump_snapshot_version_on_disk(&repo_dir, "snap-future", 999);
 
     // Plain check: reports it as unsupported, never as corrupt.
-    let res = commands::check::run(&config, None, false, false).unwrap();
+    let res = commands::check::run(&config, pass(&config), false, false).unwrap();
     assert!(
         res.errors
             .iter()
@@ -1143,7 +1147,7 @@ fn check_flags_unsupported_version_and_repair_refuses() {
     // Both repair modes refuse before producing a plan / mutating anything.
     let plan_err = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -1155,7 +1159,7 @@ fn check_flags_unsupported_version_and_repair_refuses() {
 
     let apply_err = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -1242,10 +1246,16 @@ fn check_repair_refuses_on_incompatible_envelope() {
     let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
 
     for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err =
-            commands::check::run_with_repair(&config, None, false, mode, None, &CancelToken::new())
-                .unwrap_err()
-                .to_string();
+        let err = commands::check::run_with_repair(
+            &config,
+            pass(&config),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("aborting repair") && err.contains("newer vykar"),
             "{mode:?}: repair must refuse and name the cause, got: {err}"
@@ -1269,7 +1279,7 @@ fn check_repair_apply_writes_nothing_for_incompatible_envelope() {
 
     let apply_err = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -1293,7 +1303,7 @@ fn listing_reports_incompatible_envelope_as_hidden() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
 
-    let listing = commands::list::list_snapshots_with_stats(&config, None).unwrap();
+    let listing = commands::list::list_snapshots_with_stats(&config, pass(&config)).unwrap();
     assert!(
         listing.snapshots.is_empty(),
         "the unreadable snapshot must not be listed"
@@ -1359,7 +1369,7 @@ fn check_repair_apply_writes_nothing_for_unsupported_version() {
 
     let apply_err = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -1407,7 +1417,7 @@ fn small_file_non_utf8_name_round_trips_at_one_thread() {
     std::fs::create_dir_all(&dest).unwrap();
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-small",
         dest.to_str().unwrap(),
         None,
@@ -1481,7 +1491,7 @@ fn non_utf8_names_round_trip_via_pipeline() {
     std::fs::create_dir_all(&dest).unwrap();
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-pipe",
         dest.to_str().unwrap(),
         None,
@@ -1604,7 +1614,7 @@ fn check_cancelled_mid_scan_returns_interrupted() {
 
     let result = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         Some(&mut cb),
@@ -1636,7 +1646,7 @@ fn check_cancelled_on_late_callback_returns_interrupted() {
 
     let result = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         Some(&mut cb),
@@ -1661,7 +1671,7 @@ fn interrupted_check_does_not_record_full_check() {
     config.cache_dir = Some(control_cache.to_string_lossy().into_owned());
     let control = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         None,
@@ -1693,7 +1703,7 @@ fn interrupted_check_does_not_record_full_check() {
     };
     let result = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         Some(&mut cb),
@@ -1737,8 +1747,16 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
 
     let flag = CancelToken::new();
     flag.cancel();
-    let result =
-        commands::check::run_with_progress(&config, None, false, false, None, 100, true, &flag);
+    let result = commands::check::run_with_progress(
+        &config,
+        pass(&config),
+        false,
+        false,
+        None,
+        100,
+        true,
+        &flag,
+    );
     assert_interrupted(result);
     assert!(
         check_state_files(&cache).is_empty(),
@@ -1747,8 +1765,16 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
 
     // Pre-open early exit: without the entry guard this returns Ok(skipped).
     config.check.full_every = None;
-    let result =
-        commands::check::run_with_progress(&config, None, false, false, None, 0, true, &flag);
+    let result = commands::check::run_with_progress(
+        &config,
+        pass(&config),
+        false,
+        false,
+        None,
+        0,
+        true,
+        &flag,
+    );
     assert_interrupted(result);
 }
 
@@ -1786,7 +1812,7 @@ fn missing_pack_rescan_is_cancellable() {
     };
     let result = commands::check::run_with_progress(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         Some(&mut cb),
@@ -1811,7 +1837,7 @@ fn repair_aborts_before_mutating() {
     flag.cancel();
     assert_interrupted(commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -1825,7 +1851,7 @@ fn repair_aborts_before_mutating() {
 
     assert_interrupted(commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,

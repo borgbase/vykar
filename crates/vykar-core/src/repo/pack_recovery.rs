@@ -416,17 +416,16 @@ mod tests {
         (entry, sealed.data.as_bytes().unwrap().to_vec())
     }
 
-    /// A pack ending in the trailer frame for its chunk count is adopted,
-    /// under both engine kinds; one byte more or less is not, and neither is
-    /// the length of the other engine kind's trailer.
+    /// A pack ending in the trailer frame for its chunk count is adopted;
+    /// one byte more or less is not, and neither is the length of a
+    /// plaintext trailer.
     #[test]
     fn trailer_pack_is_adopted_by_exact_length() {
-        let plain = crate::repo::write_session::tests::test_crypto();
         let aes = vykar_crypto::aes_gcm::Aes256GcmEngine::new(
             &[0x11; 32],
             crate::testutil::chunk_hasher_for([0x22; 32]),
         );
-        let engines: [(&dyn vykar_crypto::CryptoEngine, bool); 2] = [(&plain, false), (&aes, true)];
+        let engines: [(&dyn vykar_crypto::CryptoEngine, bool); 1] = [(&aes, true)];
         for (crypto, encrypting) in engines {
             let (entry, data) = sealed_pack(crypto);
             let full = data.len();

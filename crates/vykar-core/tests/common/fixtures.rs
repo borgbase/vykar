@@ -50,7 +50,10 @@ impl Fixture {
     pub fn config(&self) -> VykarConfig {
         let mut config = make_test_config(&self.repo_dir());
         config.cache_dir = Some(self.cache_dir().to_string_lossy().into_owned());
+        // The fixture's own passphrase is passed explicitly (`passphrase()`).
+        config.encryption.passphrase = None;
         config.encryption.mode = match self.mode.as_str() {
+            // Plaintext-only: 10-single-protocol step 3 moves the "none" fixtures.
             "none" => EncryptionModeConfig::None,
             "aes256gcm" => EncryptionModeConfig::Aes256Gcm,
             "chacha20poly1305" => EncryptionModeConfig::Chacha20Poly1305,
@@ -61,6 +64,7 @@ impl Fixture {
 
     pub fn expected_encryption(&self) -> EncryptionMode {
         match self.mode.as_str() {
+            // Plaintext-only: 10-single-protocol step 3 moves the "none" fixtures.
             "none" => EncryptionMode::None,
             "aes256gcm" => EncryptionMode::Aes256Gcm,
             "chacha20poly1305" => EncryptionMode::Chacha20Poly1305,

@@ -69,19 +69,21 @@ fn storage_label(init_opts: Option<&InitOptions>) -> String {
         .unwrap_or_else(|| "the configured server".to_string())
 }
 
-#[cfg(any(test, feature = "sim"))]
+#[cfg(any(test, feature = "sim", feature = "testing"))]
 thread_local! {
     /// Set by [`with_cheap_kdf`]: init on this thread wraps the master key
-    /// with Argon2id parameters cheap enough for the simulator.
-    static CHEAP_KDF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// with Argon2id parameters cheap enough for the simulator. On by
+    /// default in this crate's own unit-test binary, off everywhere else.
+    static CHEAP_KDF: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
 }
 
 /// Run `f` with every `Repo::init` on this thread wrapping the
 /// master key with Argon2id t = 1, m = 8 KiB, p = 1 (the simulator's
 /// encrypted template; tests). Opens derive with the parameters the blob
 /// stores, so later opens of such a repository are cheap without it.
-#[cfg(any(test, feature = "sim"))]
-pub(crate) fn with_cheap_kdf<T>(f: impl FnOnce() -> T) -> T {
+/// Not API: test support (features sim, testing).
+#[cfg(any(test, feature = "sim", feature = "testing"))]
+pub fn with_cheap_kdf<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -95,7 +97,7 @@ pub(crate) fn with_cheap_kdf<T>(f: impl FnOnce() -> T) -> T {
 /// Wrap a new repository's master key with the passphrase: the product's
 /// Argon2id parameters, or [`with_cheap_kdf`]'s inside it.
 fn wrap_master_key(master_key: &MasterKey, pass: &str) -> Result<EncryptedKey> {
-    #[cfg(any(test, feature = "sim"))]
+    #[cfg(any(test, feature = "sim", feature = "testing"))]
     if CHEAP_KDF.with(std::cell::Cell::get) {
         return master_key.to_encrypted_with_kdf(pass, 1, 8, 1);
     }
@@ -588,16 +590,16 @@ mod tests {
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 
-    /// A plaintext repository whose index was persisted as a base, with its
-    /// table file in `cache`.
+    /// A repository whose index was persisted as a base, with its table
+    /// file in `cache`.
     fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repo) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let mut repo = Repo::init(
             Box::new(Arc::clone(&inner)),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             Some(cache.to_path_buf()),
         )
@@ -653,7 +655,7 @@ mod tests {
         let open = || {
             Repo::open(
                 Box::new(Arc::clone(&inner)),
-                None,
+                Some(crate::testing::TEST_PASSPHRASE),
                 Some(cache.path().to_path_buf()),
                 OpenOptions::new(),
             )
@@ -685,6 +687,7 @@ mod tests {
     /// the production helper. This value *is* the dedup identity of every
     /// unencrypted repository, so changing either digest silently invalidates
     /// their indexes. Do not regenerate.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_key_derivation_known_answers() {
         let repo_id = [0x11u8; 32];

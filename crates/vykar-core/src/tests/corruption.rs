@@ -7,7 +7,7 @@ use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 use vykar_protocol::PACK_HEADER_SIZE;
 
-use super::helpers::{backup_single_source, init_repo, open_local_repo};
+use super::helpers::{backup_single_source, init_repo, open_local_repo, pass};
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -200,7 +200,7 @@ fn check_detects_corruption_ok_path(corruption: Corruption) {
     let (repo_dir, config) = setup_repo(tmp.path());
 
     // Healthy check should pass
-    let healthy = commands::check::run(&config, None, true, false).unwrap();
+    let healthy = commands::check::run(&config, pass(&config), true, false).unwrap();
     assert!(
         healthy.errors.is_empty(),
         "repo should be healthy before corruption, got errors: {:?}",
@@ -209,7 +209,7 @@ fn check_detects_corruption_ok_path(corruption: Corruption) {
 
     apply_corruption(corruption, &repo_dir);
 
-    let result = commands::check::run(&config, None, true, false).unwrap();
+    let result = commands::check::run(&config, pass(&config), true, false).unwrap();
     assert!(
         !result.errors.is_empty(),
         "{corruption:?}: check should detect corruption but returned no errors"
@@ -228,7 +228,7 @@ fn check_detects_corruption_err_path(corruption: Corruption) {
 
     apply_corruption(corruption, &repo_dir);
 
-    let result = commands::check::run(&config, None, true, false);
+    let result = commands::check::run(&config, pass(&config), true, false);
     assert!(
         result.is_err(),
         "{corruption:?}: check should return Err, got Ok({:?})",
@@ -248,7 +248,7 @@ fn check_with_deleted_index_head_fails() {
     apply_delete_index(&repo_dir);
 
     // A segmented repository always has a head; without one the open fails.
-    let err = commands::check::run(&config, None, true, false)
+    let err = commands::check::run(&config, pass(&config), true, false)
         .expect_err("deleted index head: check must fail");
     assert!(err.to_string().contains("index head missing"), "{err}");
 }
@@ -311,7 +311,7 @@ fn repair_fixes_corruption(corruption: Corruption) {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         true, // verify_data
         commands::check::RepairMode::Apply,
         None,
@@ -330,7 +330,7 @@ fn repair_fixes_corruption(corruption: Corruption) {
     );
 
     // Verify repo is actually clean with a read-only check
-    let check = commands::check::run(&config, None, true, false).unwrap();
+    let check = commands::check::run(&config, pass(&config), true, false).unwrap();
     assert!(
         check.errors.is_empty(),
         "{corruption:?}: post-repair check should report 0 errors, got: {:?}",
@@ -347,7 +347,7 @@ fn repair_not_possible_err_path(corruption: Corruption) {
 
     let result = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         true,
         commands::check::RepairMode::Apply,
         None,

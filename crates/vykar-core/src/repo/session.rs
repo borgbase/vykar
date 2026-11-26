@@ -317,7 +317,7 @@ impl WriteSession {
 mod tests {
     use super::WriteSessionOptions;
     use crate::repo::memory_budget::PackPolicy;
-    use crate::testutil::test_repo_plaintext_with_session;
+    use crate::testutil::test_repo_with_session;
     use std::sync::Arc;
     use vykar_storage::{BackendProfile, InnerBackend, StorageBackend, delegate_storage_backend};
 
@@ -355,7 +355,7 @@ mod tests {
     /// dumps already run under them.
     #[test]
     fn begin_write_session_applies_every_option() {
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         drop(ws);
         let mut opts = WriteSessionOptions {
             session_id: "abc".into(),
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn request_width_follows_the_backend() {
-        let (mut repo, ws) = test_repo_plaintext_with_session();
+        let (mut repo, ws) = test_repo_with_session();
         assert_eq!(repo.request_width(), 2);
         drop(ws);
         assert_eq!(repo.request_width(), 2);
@@ -417,7 +417,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         assert!(!ws.holds_unflushed_work());
         ws.store_chunk(
             &repo,
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn file_reuse_stage_round_trips() {
-        let (_repo, mut ws) = test_repo_plaintext_with_session();
+        let (_repo, mut ws) = test_repo_with_session();
         assert!(!ws.file_reuse_staged());
         ws.stage_file_reuse();
         assert!(ws.file_reuse_staged());
@@ -449,7 +449,7 @@ mod tests {
         expected = "ReusedChunks::checkpoint() called while another checkpoint is armed"
     )]
     fn cannot_stage_two_files() {
-        let (_repo, mut ws) = test_repo_plaintext_with_session();
+        let (_repo, mut ws) = test_repo_with_session();
         ws.stage_file_reuse();
         // A second stage must panic via the overlap assertion.
         ws.stage_file_reuse();
@@ -462,7 +462,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         ws.store_chunk(
             &repo,
             b"first pack chunk",
@@ -491,7 +491,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         ws.store_chunk(&repo, b"first", Compression::None, PackType::Data)
             .unwrap();
         ws.store_chunk(&repo, b"second", Compression::None, PackType::Data)
@@ -530,83 +530,57 @@ mod tests {
             .collect()
     }
 
-    /// A fresh repository on a memory backend, plaintext or encrypting, with
-    /// a write session begun over it.
-    fn repo_with_session(
-        mode: crate::repo::EncryptionMode,
-    ) -> (crate::repo::Repo, crate::repo::WriteSession) {
-        crate::testutil::init_test_environment();
-        let passphrase = match mode {
-            crate::repo::EncryptionMode::None => None,
-            _ => Some("test-pass"),
-        };
-        let repo = crate::repo::Repo::init(
-            Box::new(crate::testutil::MemoryBackend::new()),
-            mode,
-            crate::repo::ChunkerParams::default(),
-            passphrase,
-            None,
-            None,
-        )
-        .expect("init");
-        let ws = repo.begin_write_session(&WriteSessionOptions::default());
-        (repo, ws)
-    }
-
     /// A closed pack's chunks are dedup hits at once, but its index entries
     /// and trailer length wait for the upload: then they name the pack the
     /// upload thread stored, under the ID of its bytes.
     #[test]
     fn sealed_pack_enters_the_delta_when_confirmed() {
         use crate::compress::Compression;
-        use crate::repo::EncryptionMode;
         use crate::repo::pack::PackType;
         use vykar_types::pack_id::PackId;
 
-        for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
-            let (mut repo, mut ws) = repo_with_session(mode);
-            let (gated, tx) = crate::testutil::PackUploadBackend::gated(Arc::clone(&repo.storage));
-            repo.storage = Arc::new(gated);
+        let (mut repo, mut ws) = test_repo_with_session();
+        let (gated, tx) = crate::testutil::PackUploadBackend::gated(Arc::clone(&repo.storage));
+        repo.storage = Arc::new(gated);
 
-            let (chunk_id, _, is_new) = ws
-                .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
-                .unwrap();
-            assert!(is_new);
-            ws.flush_writer_async(&repo, PackType::Data).unwrap();
-            assert!(!ws.uploads.pending()[0].is_finished(), "upload is gated");
+        let (chunk_id, _, is_new) = ws
+            .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
+            .unwrap();
+        assert!(is_new);
+        ws.flush_writer_async(&repo, PackType::Data).unwrap();
+        assert!(!ws.uploads.pending()[0].is_finished(), "upload is gated");
 
-            let (_, _, is_new) = ws
-                .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
-                .unwrap();
-            assert!(!is_new, "a closed pack's chunk is a dedup hit");
-            let delta = ws.index_delta.as_ref().unwrap();
-            assert!(!delta.new_entries.iter().any(|e| e.chunk_id == chunk_id));
-            assert!(ws.pack_trailers.is_empty());
+        let (_, _, is_new) = ws
+            .store_chunk(&repo, b"gated chunk", Compression::None, PackType::Data)
+            .unwrap();
+        assert!(!is_new, "a closed pack's chunk is a dedup hit");
+        let delta = ws.index_delta.as_ref().unwrap();
+        assert!(!delta.new_entries.iter().any(|e| e.chunk_id == chunk_id));
+        assert!(ws.pack_trailers.is_empty());
 
-            tx.send(()).unwrap();
-            ws.flush_packs(&repo).unwrap();
-            let journaled = journal_pack_ids(&ws);
-            assert_eq!(journaled.len(), 1);
-            let pack_id = journaled[0];
-            let delta = ws.index_delta.as_ref().unwrap();
-            let entries: Vec<_> = delta
-                .new_entries
-                .iter()
-                .filter(|e| e.chunk_id == chunk_id)
-                .collect();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].pack_id, pack_id);
-            assert_eq!(
-                ws.pack_trailers.get(&pack_id).copied(),
-                Some(crate::repo::pack_trailer::trailer_frame_len(
-                    1,
-                    repo.crypto.is_encrypting()
-                ))
-            );
-            let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
-            assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
-            drop(ws);
-        }
+        tx.send(()).unwrap();
+        ws.flush_packs(&repo).unwrap();
+        let journaled = journal_pack_ids(&ws);
+        assert_eq!(journaled.len(), 1);
+        let pack_id = journaled[0];
+        let delta = ws.index_delta.as_ref().unwrap();
+        let entries: Vec<_> = delta
+            .new_entries
+            .iter()
+            .filter(|e| e.chunk_id == chunk_id)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pack_id, pack_id);
+        assert_eq!(
+            ws.pack_trailers.get(&pack_id).copied(),
+            Some(crate::repo::pack_trailer::trailer_frame_len(
+                1,
+                repo.crypto.is_encrypting()
+            ))
+        );
+        let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
+        assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
+        drop(ws);
     }
 
     /// Fails every pack upload.
@@ -674,7 +648,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         repo.storage = Arc::new(FailPacks(Arc::clone(&repo.storage)));
         let (chunk_id, _, _) = ws
             .store_chunk(&repo, b"lost chunk", Compression::None, PackType::Data)
@@ -696,7 +670,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         let healthy = Arc::clone(&repo.storage);
         repo.storage = Arc::new(FailPacks(Arc::clone(&healthy)));
 
@@ -749,7 +723,7 @@ mod tests {
     fn save_session_refuses_chunks_without_an_index_entry() {
         use vykar_types::chunk_id::ChunkId;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         let lost = ChunkId::from_bytes([7; 32]);
         // A closed pack whose upload never confirmed.
         ws.record_closed(&[(lost, 10, 0)]);
@@ -770,7 +744,7 @@ mod tests {
         use crate::repo::pack::PackType;
         use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
 
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         for i in 0..200u32 {
             ws.store_chunk(
                 &repo,
@@ -811,7 +785,7 @@ mod tests {
         use vykar_types::pack_id::PackId;
 
         let dir = tempfile::tempdir().unwrap();
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
@@ -910,7 +884,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
         let (gate_tx, gate_rx) = std::sync::mpsc::channel();
         repo.storage = Arc::new(ReleaseThenBlock {
@@ -952,7 +926,7 @@ mod tests {
         use crate::repo::pack::PackType;
 
         let dir = tempfile::tempdir().unwrap();
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         repo.storage = std::sync::Arc::new(
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
@@ -975,7 +949,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         // A store with mtimes: recovery adopts journal packs by their age.
         let (gated, tx) = crate::testutil::PackUploadBackend::gated(Arc::new(
             crate::testutil::MemoryBackend::with_mtimes(),
@@ -1043,7 +1017,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         let (id, size, _) = ws
             .store_chunk(
                 &repo,
@@ -1095,7 +1069,7 @@ mod tests {
         use crate::compress::Compression;
         use crate::repo::pack::PackType;
 
-        let (mut repo, mut ws) = test_repo_plaintext_with_session();
+        let (mut repo, mut ws) = test_repo_with_session();
         let (kept, _, _) = ws
             .store_chunk(&repo, b"kept chunk", Compression::None, PackType::Data)
             .unwrap();

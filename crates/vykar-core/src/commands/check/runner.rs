@@ -817,9 +817,9 @@ mod tests {
     fn plan_against(caps: Option<ServerCapabilities>) -> Result<RepairPlan> {
         let mut repo = Repo::init(
             Box::new(MemoryBackend::new()),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
         )

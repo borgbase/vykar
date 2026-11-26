@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, set_store_now,
+    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, pass, set_store_now,
     try_backup_single_source,
 };
 use crate::commands;
@@ -106,7 +106,13 @@ fn client(server: &Server, tmp: &Path, cache: &str) -> VykarConfig {
 }
 
 fn open(config: &VykarConfig) -> Repo {
-    commands::util::open_repo(config, None, OpenOptions::new(), &CancelToken::new()).unwrap()
+    commands::util::open_repo(
+        config,
+        pass(config),
+        OpenOptions::new(),
+        &CancelToken::new(),
+    )
+    .unwrap()
 }
 
 fn head(config: &VykarConfig) -> IndexHead {
@@ -127,7 +133,7 @@ fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
 fn entries(config: &VykarConfig) -> Vec<String> {
     let repo = commands::util::open_repo(
         config,
-        None,
+        pass(config),
         OpenOptions::new().with_index(),
         &CancelToken::new(),
     )
@@ -137,7 +143,7 @@ fn entries(config: &VykarConfig) -> Vec<String> {
 
 fn check_clean(config: &VykarConfig) {
     for distrust_server in [false, true] {
-        let result = commands::check::run(config, None, true, distrust_server).unwrap();
+        let result = commands::check::run(config, pass(config), true, distrust_server).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 }
@@ -154,8 +160,25 @@ impl Client {
         let source = tmp.path().join("src");
         std::fs::create_dir_all(&source).unwrap();
         let config = client(server, tmp.path(), "cache");
-        let repo = commands::init::run(&config, None).unwrap();
+        let repo = commands::init::run(&config, pass(&config)).unwrap();
         assert_eq!(repo.format(), RepoFormat::CURRENT);
+        Self {
+            tmp,
+            source,
+            config,
+        }
+    }
+
+    /// [`Client::init`] on a plaintext repository.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
+    fn init_plaintext(server: &Server) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut config = client(server, tmp.path(), "cache");
+        config.encryption.mode = crate::config::EncryptionModeConfig::None;
+        config.encryption.passphrase = None;
+        commands::init::run(&config, None).unwrap();
         Self {
             tmp,
             source,
@@ -192,7 +215,14 @@ fn v6_backup_sweep_fold_and_compact_through_the_server() {
     assert_eq!(head(&c.config).segments.len(), 3);
     assert_eq!(server.index_objects(), 3);
 
-    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &c.config,
+        pass(&c.config),
+        &["s1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let after_delete = head(&c.config);
     assert_eq!(after_delete.segments.len(), 3, "delete writes no index");
 
@@ -247,7 +277,7 @@ fn v6_backup_sweep_fold_and_compact_through_the_server() {
     let dest = c.tmp.path().join("restore");
     commands::restore::run(
         &c.config,
-        None,
+        pass(&c.config),
         "s3",
         dest.to_str().unwrap(),
         None,
@@ -295,10 +325,10 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
         counts.push(head.segments.len());
         last = Some(head);
     }
-    // Round 2 repeats round 0's removal after the fold retired it: on a
-    // plaintext repository the segment's name is already named (retired),
-    // so that write folds too.
-    assert_eq!(counts, vec![2, 0, 0, 1, 2]);
+    // Every segment of an encrypted repository has a fresh name, so round 2
+    // appends after the fold, and round 4 reaches the hard limit of three
+    // and folds again.
+    assert_eq!(counts, vec![2, 0, 1, 2, 0]);
     let last = last.unwrap();
     assert!(last.named_objects().all(|n| {
         server
@@ -327,7 +357,7 @@ fn backup_with_fold(c: &Client, name: &str) {
     let source_paths = vec![c.source.to_string_lossy().into_owned()];
     let req = commands::backup::BackupRequest {
         snapshot_name: name,
-        passphrase: None,
+        passphrase: Some(crate::testing::TEST_PASSPHRASE),
         source_paths: &source_paths,
         source_label: "src",
         exclude_patterns: &[],
@@ -557,7 +587,8 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
 
     // compact: refused before the lock, so nothing is written at all.
     server.take_requests();
-    let err = commands::compact::run(&c.config, None, 0.0, None, false, &cancel).unwrap_err();
+    let err =
+        commands::compact::run(&c.config, pass(&c.config), 0.0, None, false, &cancel).unwrap_err();
     assert!(is_append_only_refusal(&err, "vykar compact"), "{err:?}");
     let reqs = assert_refused_cleanly(&server, &c.config, &before, "compact");
     let puts: Vec<_> = reqs
@@ -565,26 +596,28 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
         .filter(|r| r.0 == axum::http::Method::PUT)
         .collect();
     assert!(puts.is_empty(), "{puts:?}");
-    commands::compact::run(&c.config, None, 0.0, None, true, &cancel).unwrap();
+    commands::compact::run(&c.config, pass(&c.config), 0.0, None, true, &cancel).unwrap();
     server.take_requests();
 
     // prune: refused only when it would remove a snapshot.
     let mut pruning = c.config.clone();
     pruning.retention.keep_last = Some(1);
-    let err = commands::prune::run(&pruning, None, false, false, &[], &[], &cancel)
+    let err = commands::prune::run(&pruning, pass(&pruning), false, false, &[], &[], &cancel)
         .err()
         .unwrap();
     assert!(is_append_only_refusal(&err, "vykar prune"), "{err:?}");
     assert_refused_cleanly(&server, &c.config, &before, "prune");
-    let (stats, _) = commands::prune::run(&pruning, None, true, false, &[], &[], &cancel).unwrap();
+    let (stats, _) =
+        commands::prune::run(&pruning, pass(&pruning), true, false, &[], &[], &cancel).unwrap();
     assert_eq!(stats.pruned, 1);
     pruning.retention.keep_last = Some(5);
-    let (stats, _) = commands::prune::run(&pruning, None, false, false, &[], &[], &cancel).unwrap();
+    let (stats, _) =
+        commands::prune::run(&pruning, pass(&pruning), false, false, &[], &[], &cancel).unwrap();
     assert_eq!(stats.pruned, 0);
     server.take_requests();
 
     // snapshot delete: unknown names still fail first.
-    let err = commands::delete::run(&c.config, None, &["s1"], false, &cancel)
+    let err = commands::delete::run(&c.config, pass(&c.config), &["s1"], false, &cancel)
         .err()
         .unwrap();
     assert!(
@@ -592,14 +625,14 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
         "{err:?}"
     );
     assert_refused_cleanly(&server, &c.config, &before, "delete");
-    let err = commands::delete::run(&c.config, None, &["nope"], false, &cancel)
+    let err = commands::delete::run(&c.config, pass(&c.config), &["nope"], false, &cancel)
         .err()
         .unwrap();
     assert!(
         matches!(err, vykar_types::error::VykarError::SnapshotNotFound(_)),
         "{err:?}"
     );
-    commands::delete::run(&c.config, None, &["s1"], true, &cancel).unwrap();
+    commands::delete::run(&c.config, pass(&c.config), &["s1"], true, &cancel).unwrap();
     server.take_requests();
 
     // check --repair with data loss: refused by capability, no delete probe.
@@ -607,7 +640,7 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
     std::fs::remove_file(server.data.path().join(&pack)).unwrap();
     let plan = commands::check::run_with_repair(
         &c.config,
-        None,
+        pass(&c.config),
         false,
         commands::check::RepairMode::PlanOnly,
         None,
@@ -619,7 +652,7 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
     server.take_requests();
     let err = commands::check::run_with_repair(
         &c.config,
-        None,
+        pass(&c.config),
         false,
         commands::check::RepairMode::Apply,
         None,
@@ -653,7 +686,7 @@ fn the_cycle_skips_compact_on_an_append_only_server() {
         );
         let result = run_full_cycle_for_repo(
             &repo,
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             &CancelToken::new(),
             false,
             &[],
@@ -883,7 +916,7 @@ fn assert_trailers_match_index(
     use crate::repo::pack_trailer::{TrailerRead, read_pack_trailer};
     let repo = commands::util::open_repo(
         config,
-        None,
+        pass(config),
         OpenOptions::new().with_index(),
         &CancelToken::new(),
     )
@@ -947,7 +980,14 @@ fn trailer_packs_through_the_server() {
         "{before:?}"
     );
 
-    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &c.config,
+        pass(&c.config),
+        &["s1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
     let mut repo = open(&c.config);
     let stats =
@@ -970,7 +1010,7 @@ fn trailer_packs_through_the_server() {
     let dest = c.tmp.path().join("restore");
     commands::restore::run(
         &c.config,
-        None,
+        pass(&c.config),
         "s3",
         dest.to_str().unwrap(),
         None,
@@ -1000,11 +1040,26 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     c.backup("s2");
     c.write("c", "charlie");
     c.backup("s3");
-    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &c.config,
+        pass(&c.config),
+        &["s1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     // s1's segment is old: the compact sweeps its entries, as the repair
     // below does (it keeps none for young segments).
     age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
-    commands::compact::run(&c.config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run(
+        &c.config,
+        pass(&c.config),
+        0.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let before = entries(&c.config);
     let packs = server_packs(&server).len();
 
@@ -1021,7 +1076,7 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
         let cold = client(&server, c.tmp.path(), cache);
         let result = commands::check::run_with_repair(
             &cold,
-            None,
+            pass(&cold),
             false,
             commands::check::RepairMode::Apply,
             None,
@@ -1051,7 +1106,7 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     let dest = c.tmp.path().join("restore-s2");
     commands::restore::run(
         &cold,
-        None,
+        pass(&cold),
         "s2",
         dest.to_str().unwrap(),
         None,
@@ -1065,7 +1120,7 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
         "bravo".repeat(10_000)
     );
 
-    let stats = commands::pack_maps::run(&cold, None, &CancelToken::new()).unwrap();
+    let stats = commands::pack_maps::run(&cold, pass(&cold), &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_mapped, packs);
     delete_index();
     let (cold, counts) = rebuild("cold-2");
@@ -1104,11 +1159,13 @@ fn age_server_packs(server: &Server, age: std::time::Duration) -> Vec<PathBuf> {
 /// their PUTs (the keys exist). The stored packs have the sealed size, so
 /// the backup uses them and commits, and the snapshot restores. When a
 /// stored pack has another size, the refusal stays the backup's error.
+/// Only plaintext packs repeat their bytes.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn a_pack_the_append_only_server_already_holds_is_used() {
     for tampered in [false, true] {
         let server = Server::start(true);
-        let c = Client::init(&server);
+        let c = Client::init_plaintext(&server);
         c.write("a", &"alpha ".repeat(4096));
         let source_paths = vec![c.source.to_string_lossy().into_owned()];
         let req = commands::backup::BackupRequest {
@@ -1179,7 +1236,7 @@ fn a_pack_the_append_only_server_already_holds_is_used() {
         let dest = c.tmp.path().join("restore");
         commands::restore::run(
             &c.config,
-            None,
+            pass(&c.config),
             "s2",
             dest.to_str().unwrap(),
             None,

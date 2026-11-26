@@ -411,8 +411,8 @@ mod tests {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
-    /// A worker over an initialized plaintext repo `nas` with one source and
-    /// the given global hooks.
+    /// A worker over an initialized repo `nas` (AES-256-GCM, the test
+    /// passphrase in its config) with one source and the given global hooks.
     fn prune_harness(hooks: &[(&str, String)]) -> Harness {
         let h = harness(|tmp| {
             let source = tmp.join("source");
@@ -425,17 +425,24 @@ mod tests {
                 .concat();
             format!(
                 "repositories:\n  - url: {}\n    label: nas\n\
-                 encryption:\n  mode: none\n\
+                 encryption:\n  mode: aes256gcm\n  passphrase: {}\n\
                  cache_dir: {}\n\
                  retention:\n  keep_last: 1\n\
                  hooks:\n{hooks}\
                  sources:\n  - path: {}\n    label: src\n",
                 yaml_str(&tmp.join("repo").display().to_string()),
+                yaml_str(vykar_core::testing::TEST_PASSPHRASE),
                 yaml_str(&tmp.join("cache").display().to_string()),
                 yaml_str(&source.display().to_string()),
             )
         });
-        commands::init::run(&h.ctx.runtime.repos.first().unwrap().config, None).unwrap();
+        vykar_core::testing::with_cheap_kdf(|| {
+            commands::init::run(
+                &h.ctx.runtime.repos.first().unwrap().config,
+                Some(vykar_core::testing::TEST_PASSPHRASE),
+            )
+        })
+        .unwrap();
         h
     }
 

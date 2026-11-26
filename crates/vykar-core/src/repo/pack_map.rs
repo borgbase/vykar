@@ -647,15 +647,15 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{MemoryBackend, chunk_hasher_for, test_repo_plaintext};
+    use crate::testutil::{MemoryBackend, chunk_hasher_for, test_repo};
     use std::sync::Arc;
-    use vykar_crypto::PlaintextEngine;
     use vykar_crypto::aes_gcm::Aes256GcmEngine;
     use vykar_crypto::chacha20_poly1305::ChaCha20Poly1305Engine;
+    use vykar_crypto::testing::DeterministicEngine;
     use vykar_storage::{InnerBackend, delegate_storage_backend};
 
-    fn plain() -> PlaintextEngine {
-        PlaintextEngine::new(chunk_hasher_for([0xAA; 32]))
+    fn plain() -> DeterministicEngine {
+        DeterministicEngine::new(chunk_hasher_for([0xAA; 32]))
     }
 
     fn chunk(i: usize) -> ChunkId {
@@ -816,7 +816,7 @@ mod tests {
     /// A plaintext repository whose index holds `packs` packs of `per_pack`
     /// entries each.
     fn repo_with_packs(packs: u8, per_pack: usize) -> Repo {
-        let mut repo = test_repo_plaintext();
+        let mut repo = test_repo();
         for p in 0..packs {
             for e in entries(per_pack, usize::from(p) * per_pack, 100) {
                 repo.unchecked_writer().chunk_index_mut().add(

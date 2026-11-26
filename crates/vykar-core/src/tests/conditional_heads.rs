@@ -32,6 +32,17 @@ fn sim_of(kind: StoreKind) -> Sim {
     })
 }
 
+/// [`sim_of`] on a plaintext repository, whose clients commit under the
+/// lock on every store: the lock-mode protocol with put-if-absent heads.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+fn plaintext_sim_of(kind: StoreKind) -> Sim {
+    Sim::with_config(SimConfig {
+        kind,
+        encrypted: false,
+        ..SimConfig::default()
+    })
+}
+
 fn tree(name: &str) -> SourceTree {
     SourceTree::seeded(name, 2, FILE_SIZE)
 }
@@ -218,10 +229,12 @@ fn ignoring_backend_falls_back_with_a_warning() {
 /// holder whose create finds its generation taken rebases. Invariants 1-4
 /// and 12 hold; 7 fails, as it must with two holders. The clients back up
 /// different content (identical plaintext states would give identical
-/// heads, which both may count as created).
+/// heads, which both may count as created). Lock holders on a
+/// put-if-absent store: a plaintext repository.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn two_lock_holders_cannot_lose_a_head() {
-    let mut sim = sim_of(StoreKind::Conditional);
+    let mut sim = plaintext_sim_of(StoreKind::Conditional);
     let (a, b) = (sim.client("a"), sim.client("b"));
     let gate = sim.gate(GateRule::new(
         a,
@@ -276,10 +289,12 @@ fn two_lock_holders_cannot_lose_a_head() {
 
 /// Compact's repack batch finds its head's generation taken: compact stops
 /// with "index changed" before deleting the batch's sources, whose repack
-/// outputs are then orphan packs collected by age.
+/// outputs are then orphan packs collected by age. Compact under the lock
+/// on a put-if-absent store: a plaintext repository.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn maintenance_head_taken_stops_before_deletes() {
-    let mut sim = sim_of(StoreKind::Conditional);
+    let mut sim = plaintext_sim_of(StoreKind::Conditional);
     let c = sim.client("c");
     let x = SourceTree::seeded("x", 3, 64 * 1024);
     sim.backup(c, "t0", &x).expect_ok();
@@ -420,7 +435,7 @@ impl Clock for Suspendable {
 fn open(sim: &Sim, c: ClientId, env: HostEnv) -> Repo {
     Repo::open(
         Box::new(sim.store().handle(c)),
-        None,
+        sim.store().passphrase(),
         Some(sim.client_dir(c).join("repo-cache")),
         OpenOptions::new().with_index().host_env(env),
     )
@@ -924,7 +939,7 @@ fn index_agrees(sim: &Sim, c: ClientId, handle: &Repo, chunks: &[&[u8]]) {
     let cold_dir = tempfile::tempdir().unwrap();
     let cold = Repo::open(
         Box::new(sim.store().handle(c)),
-        None,
+        sim.store().passphrase(),
         Some(cold_dir.path().to_path_buf()),
         OpenOptions::new().with_index().host_env(sim.host_env(c)),
     )
@@ -1165,7 +1180,6 @@ impl vykar_storage::ConditionalWrite for RefusesAfterCheck {
 fn a_refusal_after_a_passed_check_fails_the_commit() {
     let mut sim = Sim::with_config(SimConfig {
         kind: StoreKind::Conditional,
-        encrypted: true,
         ..SimConfig::default()
     });
     let a = sim.client("a");

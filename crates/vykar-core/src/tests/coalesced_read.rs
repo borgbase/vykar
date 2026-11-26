@@ -18,9 +18,9 @@ fn repo_on_counting_backend() -> (Repo, WriteSession, PutLog) {
     let (backend, log) = RecordingBackend::new();
     let repo = Repo::init(
         Box::new(backend),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -444,9 +444,9 @@ fn repo_with_cancelling_backend(
     };
     let mut repo = Repo::init(
         Box::new(backend),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -551,9 +551,20 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
     }
 }
 
+/// Flip the middle byte of a chunk's stored blob: inside its ciphertext,
+/// so its authentication fails.
+fn flip_byte_in_stored_blob(repo: &Repo, id: &vykar_types::chunk_id::ChunkId) {
+    let entry = repo.chunk_index().get(id).unwrap();
+    let key = entry.pack_id.storage_key();
+    let mut pack = repo.storage().get(&key).unwrap().unwrap();
+    pack[entry.pack_offset as usize + entry.stored_size as usize / 2] ^= 0x01;
+    repo.storage().put(&key, &pack).unwrap();
+}
+
 /// Flip one byte of `data` inside its stored blob in a plaintext repo. With no
 /// compression and no AEAD the blob stays decodable at the same length, so only
 /// the chunk ID check can notice.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 fn flip_byte_in_stored_chunk(repo: &Repo, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
     let entry = repo.chunk_index().get(id).unwrap();
     let key = entry.pack_id.storage_key();
@@ -568,9 +579,10 @@ fn flip_byte_in_stored_chunk(repo: &Repo, id: &vykar_types::chunk_id::ChunkId, d
     repo.storage().put(&key, &pack).unwrap();
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn plaintext_read_chunk_rejects_corrupt_blob() {
-    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = crate::testutil::plaintext_repo_with_session();
     let data = b"plaintext-chunk-that-will-be-corrupted-on-disk";
     let (id, _, _) = ws
         .store_chunk(&repo, data, Compression::None, PackType::Tree)
@@ -587,9 +599,10 @@ fn plaintext_read_chunk_rejects_corrupt_blob() {
     }
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn plaintext_coalesced_read_rejects_corrupt_blob() {
-    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = crate::testutil::plaintext_repo_with_session();
     let ids = store_chunks(&mut repo, &mut ws, 3);
     let corrupt = "chunk-data-0001-padding-to-make-it-unique";
     flip_byte_in_stored_chunk(&repo, &ids[1], corrupt.as_bytes());
@@ -682,7 +695,7 @@ delegate_storage_backend! {
     }
 }
 
-fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repo, WriteSession, Arc<Probe>) {
+fn repo_on_tuned_backend() -> (Repo, WriteSession, Arc<Probe>) {
     init_test_environment();
     let probe = Arc::new(Probe::default());
     probe.width.store(2, Ordering::SeqCst);
@@ -690,15 +703,11 @@ fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repo, WriteSession, Arc<Probe
         inner: MemoryBackend::new(),
         probe: Arc::clone(&probe),
     };
-    let passphrase = match mode {
-        EncryptionMode::None => None,
-        _ => Some("test-pass"),
-    };
     let repo = Repo::init(
         Box::new(backend),
-        mode,
+        EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        passphrase,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -743,7 +752,7 @@ fn pack_key(repo: &Repo, id: &ChunkId) -> String {
 /// Later groups finishing first must not reorder the output.
 #[test]
 fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let packs = store_packs(&mut repo, &mut ws, &[2; 8]);
     // Interleaved across packs: every pack's first chunk, then every second.
     let order: Vec<&(ChunkId, Vec<u8>)> = (0..2)
@@ -768,7 +777,7 @@ fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
 
 #[test]
 fn parallel_read_overlaps_range_reads_up_to_width() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let packs = store_packs(&mut repo, &mut ws, &[1; 9]);
     let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
     let expected: Vec<u8> = packs.iter().flat_map(|p| p[0].1.clone()).collect();
@@ -799,14 +808,14 @@ fn parallel_read_overlaps_range_reads_up_to_width() {
 /// recorded: group 1's read is slowed so group 4's failure lands first.
 #[test]
 fn parallel_read_returns_the_earliest_failing_group() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let packs = store_packs(&mut repo, &mut ws, &[1; 6]);
     let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
     let chunks = resolve_chunks(&repo, &ids);
     let missing_pack = chunks[1].1;
 
     repo.storage().delete(&missing_pack.storage_key()).unwrap();
-    flip_byte_in_stored_chunk(&repo, &ids[4], &packs[4][0].1);
+    flip_byte_in_stored_blob(&repo, &ids[4]);
     probe.delay_ms.store(50, Ordering::SeqCst);
     probe
         .slow
@@ -829,36 +838,28 @@ fn parallel_read_returns_the_earliest_failing_group() {
     }
 }
 
-/// The same item stream at every width, with and without AEAD.
+/// The same item stream at every width.
 #[test]
 fn item_stream_bytes_identical_across_widths() {
-    for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
-        let (mut repo, mut ws, probe) = repo_on_tuned_backend(mode.clone());
-        // The point is the storage read at each width, not the local cache.
-        repo.set_tree_cache(None);
-        let packs = store_packs(&mut repo, &mut ws, &[3, 1, 2, 3, 3]);
-        let all: Vec<&(ChunkId, Vec<u8>)> = packs.iter().flatten().collect();
-        // A fixed permutation that hops between packs, plus one repeat.
-        let order: Vec<&(ChunkId, Vec<u8>)> = [7, 0, 11, 3, 5, 9, 1, 4, 10, 2, 8, 6, 0]
-            .iter()
-            .map(|&i| all[i])
-            .collect();
-        let ids: Vec<ChunkId> = order.iter().map(|(id, _)| *id).collect();
-        let expected: Vec<u8> = order.iter().flat_map(|(_, d)| d.clone()).collect();
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
+    // The point is the storage read at each width, not the local cache.
+    repo.set_tree_cache(None);
+    let packs = store_packs(&mut repo, &mut ws, &[3, 1, 2, 3, 3]);
+    let all: Vec<&(ChunkId, Vec<u8>)> = packs.iter().flatten().collect();
+    // A fixed permutation that hops between packs, plus one repeat.
+    let order: Vec<&(ChunkId, Vec<u8>)> = [7, 0, 11, 3, 5, 9, 1, 4, 10, 2, 8, 6, 0]
+        .iter()
+        .map(|&i| all[i])
+        .collect();
+    let ids: Vec<ChunkId> = order.iter().map(|(id, _)| *id).collect();
+    let expected: Vec<u8> = order.iter().flat_map(|(_, d)| d.clone()).collect();
 
-        for width in [1, 2, 4, 16] {
-            probe.width.store(width, Ordering::SeqCst);
-            let stream = crate::commands::list::load_item_stream_from_ptrs(
-                &mut repo,
-                &ids,
-                &CancelToken::new(),
-            )
-            .unwrap();
-            assert!(
-                stream == expected,
-                "{mode:?}, width {width}: stream differs"
-            );
-        }
+    for width in [1, 2, 4, 16] {
+        probe.width.store(width, Ordering::SeqCst);
+        let stream =
+            crate::commands::list::load_item_stream_from_ptrs(&mut repo, &ids, &CancelToken::new())
+                .unwrap();
+        assert!(stream == expected, "width {width}: stream differs");
     }
 }
 
@@ -866,7 +867,7 @@ fn item_stream_bytes_identical_across_widths() {
 /// decrypt of the first must not destroy the second.
 #[test]
 fn duplicate_chunk_ids_decode_under_aead() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let ids = store_chunks(&mut repo, &mut ws, 2);
     let chunks = resolve_chunks(&repo, &ids);
     let mut dup_chunks = chunks.clone();
@@ -891,7 +892,7 @@ fn duplicate_chunk_ids_decode_under_aead() {
 /// stream order, with one range read for the pack.
 #[test]
 fn duplicate_ids_non_adjacent_keep_stream_order() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let ids = store_chunks(&mut repo, &mut ws, 3);
     let input = [ids[0], ids[1], ids[0], ids[2], ids[0]];
     let chunks = resolve_chunks(&repo, &input);
@@ -915,7 +916,7 @@ fn duplicate_ids_non_adjacent_keep_stream_order() {
 /// offset: every slot gets its own chunk's bytes.
 #[test]
 fn duplicate_sorting_after_its_first_slot_fills_every_slot() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let ids = store_chunks(&mut repo, &mut ws, 3);
     let input = [ids[2], ids[0], ids[2], ids[1], ids[0]];
     let chunks = resolve_chunks(&repo, &input);
@@ -948,7 +949,7 @@ fn duplicate_sorting_after_its_first_slot_fills_every_slot() {
 /// an error (the second read overlaps the first), not a panic.
 #[test]
 fn two_ids_at_one_location_is_an_error() {
-    let (mut repo, mut ws, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let (mut repo, mut ws, probe) = repo_on_tuned_backend();
     let packs = store_packs(&mut repo, &mut ws, &[2, 1]);
     let ids = [packs[0][0].0, packs[0][1].0, packs[1][0].0];
     let mut chunks = resolve_chunks(&repo, &ids);

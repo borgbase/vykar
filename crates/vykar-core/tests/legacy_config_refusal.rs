@@ -140,6 +140,7 @@ fn gate_0_24_0(bytes: &[u8]) -> Result<(), Refusal> {
 
 const RELEASES: &[(&str, Gate)] = &[("v0.19.1", gate_0_19_1), ("v0.24.0", gate_0_24_0)];
 
+// Plaintext-only: 10-single-protocol step 3 removes None (a config codec value).
 const MODES: &[EncryptionMode] = &[
     EncryptionMode::None,
     EncryptionMode::Aes256Gcm,
@@ -391,7 +392,8 @@ fn old_releases_refuse_upgraded_fixtures_by_version() {
 fn old_releases_refuse_a_new_repository_by_version() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
-    let config = common::make_test_config(&repo_dir);
+    // Plaintext-only: 10-single-protocol step 3 removes this.
+    let config = common::make_plaintext_config(&repo_dir);
     vykar_core::commands::init::run(&config, None).unwrap();
     let bytes = std::fs::read(repo_dir.join("config")).unwrap();
     assert_eq!(bytes[0], 0x89, "a nine-entry map");
@@ -736,7 +738,8 @@ fn old_release_binaries_refuse_v6_map_by_version() {
     let fresh_src = fresh.path().join("src");
     std::fs::create_dir_all(&fresh_src).unwrap();
     std::fs::write(fresh_src.join("file.txt"), b"fresh").unwrap();
-    let fresh_config = common::make_test_config(&fresh_repo);
+    // Plaintext-only: 10-single-protocol step 3 removes this.
+    let fresh_config = common::make_plaintext_config(&fresh_repo);
     vykar_core::commands::init::run(&fresh_config, None).unwrap();
     common::backup_source(&fresh_config, &fresh_src, "src", "s1", None, false);
 

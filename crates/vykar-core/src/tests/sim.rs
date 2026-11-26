@@ -895,7 +895,6 @@ const TESTED_IDS: &[&str] = &[
     "H-racy",
     "H3-conditional",
     "H3-compact-conditional",
-    "H4-conditional",
     "H-mixed-aged-lock",
     "H-mixed-late-create",
     "H-committing-reaped",
@@ -2241,10 +2240,18 @@ fn a_store_clock_step_ages_every_object() {
 /// A young malformed marker gives compact no horizon: compact runs but
 /// deletes no orphan pack, not even one older than T_pack (a crashed
 /// backup's); once 45 min old by its mtime it is reaped and the next
-/// compact deletes the orphans. Invariant 9 no longer skips it.
+/// compact deletes the orphans. Invariant 9 no longer skips it. Compact
+/// under the lock without the marker handshake, which refuses beside a
+/// malformed marker (fail closed): a plaintext repository.
+// Plaintext only to reach lock mode here: 10-single-protocol step 3 moves
+// this to an encrypted repository on a store without put-if-absent, or
+// deletes it with a reason.
 #[test]
 fn malformed_marker_ages_out() {
-    let mut sim = Sim::new();
+    let mut sim = Sim::with_config(crate::sim::SimConfig {
+        encrypted: false,
+        ..crate::sim::SimConfig::default()
+    });
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     let (_marker, packs) = crash_backup_after_upload(&mut sim, a, &tree("x1"));
@@ -3005,6 +3012,18 @@ fn fail_backup_leaving_journal(sim: &mut Sim, x: ClientId, tree: &SourceTree) ->
     packs
 }
 
+/// Storage keys of the packs the current index names, read through the
+/// observer.
+fn indexed_pack_keys(sim: &Sim) -> std::collections::BTreeSet<String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = crate::sim::checker::open_observer(sim.store(), tmp.path()).unwrap();
+    repo.load_chunk_index_uncached().unwrap();
+    repo.chunk_index()
+        .iter()
+        .map(|(_, e)| e.pack_id.storage_key())
+        .collect()
+}
+
 /// The journal rule: a journal whose packs are older than T_pack/2 is not
 /// recovered; the next backup of the same tree uploads its chunks again,
 /// and the old packs stay as orphans for compact.
@@ -3017,9 +3036,14 @@ fn a_journal_older_than_half_t_pack_is_not_recovered() {
     sim.advance(Duration::from_secs(6 * 3600 + 60));
     sim.backup(b, "b1", &tree("x1")).expect_ok();
     let b_packs = sim.store().keys_written_by(b, "packs/");
+    let indexed = indexed_pack_keys(&sim);
     assert!(
-        b_packs.iter().any(|k| x_packs.contains(k)),
-        "b uploaded x's chunks again: x {x_packs:?}, b {b_packs:?}"
+        x_packs.iter().all(|k| !indexed.contains(k)),
+        "b recovered x's journal: the index names x's packs: x {x_packs:?}, indexed {indexed:?}"
+    );
+    assert!(
+        !b_packs.is_empty() && b_packs.iter().all(|k| indexed.contains(k)),
+        "b uploaded x's chunks itself: b {b_packs:?}, indexed {indexed:?}"
     );
     for k in &x_packs {
         assert!(sim.store().object(k).is_some(), "{k} is left as an orphan");

@@ -8,7 +8,7 @@ use crate::snapshot::item::ItemType;
 use vykar_protocol::PACK_HEADER_SIZE;
 
 use super::corruption::{Corruption, apply_corruption, setup_repo};
-use super::helpers::{backup_single_source, init_repo, make_test_config, open_local_repo};
+use super::helpers::{backup_single_source, init_repo, make_test_config, open_local_repo, pass};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -21,7 +21,7 @@ fn has_action(actions: &[RepairAction], pred: impl Fn(&RepairAction) -> bool) ->
 fn plan_only(config: &VykarConfig, verify_data: bool) -> RepairResult {
     commands::check::run_with_repair(
         config,
-        None,
+        pass(config),
         verify_data,
         RepairMode::PlanOnly,
         None,
@@ -33,7 +33,7 @@ fn plan_only(config: &VykarConfig, verify_data: bool) -> RepairResult {
 fn apply_repair(config: &VykarConfig, verify_data: bool) -> RepairResult {
     commands::check::run_with_repair(
         config,
-        None,
+        pass(config),
         verify_data,
         RepairMode::Apply,
         None,
@@ -555,7 +555,7 @@ fn deleted_index_is_rebuilt_from_the_packs() {
         "Apply with deleted index should remove nothing, got: {:?}",
         apply_result.applied
     );
-    let check = commands::check::run(&config, None, true, false).unwrap();
+    let check = commands::check::run(&config, pass(&config), true, false).unwrap();
     assert!(check.errors.is_empty(), "{:?}", check.errors);
 }
 
@@ -586,7 +586,7 @@ fn index_sweep_excludes_doomed_snapshots() {
     let mut config = make_test_config(&repo_dir);
     config.repository.min_pack_size = 8192;
     config.repository.max_pack_size = 8192;
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
 
     backup_single_source(&config, &source_a, "src-a", "snap-A");
     backup_single_source(&config, &source_b, "src-b", "snap-B");
@@ -798,7 +798,7 @@ fn apply_refuses_with_active_sessions() {
     // Apply should fail with ActiveSessions
     let err = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         RepairMode::Apply,
         None,
@@ -936,7 +936,7 @@ fn repair_reclaims_crash_orphan_index_entries() {
     std::fs::create_dir_all(&dest).unwrap();
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-base",
         dest.to_str().unwrap(),
         None,

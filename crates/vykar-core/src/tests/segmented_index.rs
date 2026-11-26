@@ -63,16 +63,15 @@ struct Env {
     repo: Repo,
 }
 
-fn init(format: RepoFormat, encryption: EncryptionMode) -> Env {
+fn init(format: RepoFormat) -> Env {
     crate::testutil::init_test_environment();
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let cache = tempfile::tempdir().unwrap();
-    let pass = (encryption != EncryptionMode::None).then_some("pw");
     let repo = Repo::init_at_format(
         Box::new(Arc::clone(&inner)),
-        encryption,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        pass,
+        Some("pw"),
         None,
         Some(cache.path().to_path_buf()),
         format,
@@ -88,8 +87,13 @@ impl Env {
             inner: Arc::clone(&self.inner),
             ops: Arc::clone(&ops),
         });
-        let pass = self.repo.crypto().is_encrypting().then_some("pw");
-        let repo = Repo::open(storage, pass, Some(self.cache.path().to_path_buf()), opts).unwrap();
+        let repo = Repo::open(
+            storage,
+            Some("pw"),
+            Some(self.cache.path().to_path_buf()),
+            opts,
+        )
+        .unwrap();
         let ops = ops.lock().unwrap().clone();
         (repo, ops)
     }
@@ -107,7 +111,7 @@ fn index_d_gets(ops: &[String]) -> usize {
 
 #[test]
 fn init_writes_an_empty_head_and_no_sidecar() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT);
     let index = env.inner.get("index.h/1").unwrap().unwrap();
     assert_eq!(index[0], ObjectType::IndexHead as u8);
     assert!(env.inner.get("index").unwrap().is_none());
@@ -124,7 +128,7 @@ fn init_writes_an_empty_head_and_no_sidecar() {
 /// with or without the index; `index` and `index.gen` are never read.
 #[test]
 fn open_lists_snapshots_before_the_single_head_get() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT);
     let mut w = env.writer();
     w.commit(&index_with(0..20));
     for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
@@ -152,7 +156,7 @@ fn open_lists_snapshots_before_the_single_head_get() {
 
 #[test]
 fn snapshot_reader_loads_the_head_captured_at_open() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT);
     let mut writer = env.writer();
     let opened_index = index_with(0..20);
     writer.commit(&opened_index);
@@ -182,7 +186,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
         RepoFormat::CURRENT,
     ] {
-        let env = init(format, EncryptionMode::None);
+        let env = init(format);
         let mut w = env.writer();
         w.commit(&index_with(0..100));
         w.fold();
@@ -228,7 +232,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
 /// repository builds the same index.
 #[test]
 fn uncached_and_static_loads_fetch_the_whole_chain() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT);
     let mut w = env.writer();
     w.commit(&index_with(0..30));
     w.fold();
@@ -260,7 +264,7 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
 /// upgrade, or anything else) changes nothing.
 #[test]
 fn an_object_at_index_is_ignored() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT);
     let legacy = crate::tests::helpers::legacy_index_blob(
         &crate::index::LegacyChunkIndex::new(),
         7,
@@ -277,7 +281,7 @@ fn an_object_at_index_is_ignored() {
 /// still proves its key (R2).
 #[test]
 fn prove_key_accepts_an_index_head() {
-    let env = init(RepoFormat::CURRENT, EncryptionMode::Aes256Gcm);
+    let env = init(RepoFormat::CURRENT);
     let blob = env.inner.get(crate::repo::KEY_PRIMARY).unwrap().unwrap();
     let enc: EncryptedKey = rmp_serde::from_slice(&blob).unwrap();
     let key = MasterKey::from_encrypted(&enc, "pw").unwrap();
@@ -315,6 +319,7 @@ fn prove_key_accepts_an_index_head() {
 
 /// The plaintext chunk-ID key follows the chunk hash: a v2 repository keeps
 /// its key as v6 with BLAKE2b, a v3 one as v6 with BLAKE3.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn plaintext_key_follows_the_chunk_hash() {
     let id = [0x42u8; 32];
@@ -343,7 +348,7 @@ fn encrypted_writes_round_trip() {
         RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
         RepoFormat::CURRENT,
     ] {
-        let mut env = init(format, EncryptionMode::Aes256Gcm);
+        let mut env = init(format);
         for round in 0..3u8 {
             let mut ws = env
                 .repo

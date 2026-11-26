@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use super::helpers::{
     FailGet, FaultyPut, PAST_T_PACK, age_repo_objects, backup_single_source, is_base_put,
-    is_head_put, latest_head_key, make_test_config, set_store_now,
+    is_head_put, latest_head_key, make_test_config, pass, set_store_now,
 };
 use crate::commands;
 use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
@@ -38,6 +38,37 @@ fn fixture(format: RepoFormat) -> Fixture {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&source).unwrap();
     let mut config = make_test_config(&repo_dir);
+    let cache = tmp.path().join("cache");
+    config.cache_dir = Some(cache.to_string_lossy().into_owned());
+    Repo::init_at_format(
+        Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
+        EncryptionMode::Aes256Gcm,
+        config.chunker.params(),
+        Some(crate::testing::TEST_PASSPHRASE),
+        Some(&config.repository.init_options()),
+        Some(cache),
+        format,
+    )
+    .unwrap();
+    Fixture {
+        tmp,
+        repo_dir,
+        source,
+        config,
+    }
+}
+
+/// [`fixture`] on a plaintext repository.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+fn plaintext_fixture(format: RepoFormat) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source = tmp.path().join("src");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    let mut config = make_test_config(&repo_dir);
+    config.encryption.mode = crate::config::EncryptionModeConfig::None;
+    config.encryption.passphrase = None;
     let cache = tmp.path().join("cache");
     config.cache_dir = Some(cache.to_string_lossy().into_owned());
     Repo::init_at_format(
@@ -80,7 +111,12 @@ impl Fixture {
         cache: &Path,
         opts: OpenOptions,
     ) -> Result<Repo> {
-        Repo::open(storage, None, Some(cache.to_path_buf()), opts)
+        Repo::open(
+            storage,
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(cache.to_path_buf()),
+            opts,
+        )
     }
 
     fn open(&self, cache: &Path, with_index: bool) -> Result<Repo> {
@@ -138,7 +174,7 @@ impl Fixture {
     }
 
     fn check_clean(&self, config: &VykarConfig) {
-        let result = commands::check::run(config, None, true, false).unwrap();
+        let result = commands::check::run(config, pass(config), true, false).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
@@ -146,7 +182,7 @@ impl Fixture {
         let dest = self.tmp.path().join(format!("restore-{snapshot}"));
         commands::restore::run(
             config,
-            None,
+            pass(config),
             snapshot,
             dest.to_str().unwrap(),
             None,
@@ -194,7 +230,8 @@ fn cold_index(fx: &Fixture, name: &str) -> Vec<String> {
 /// Every backup that stores new chunks appends one backup segment of new
 /// entries and uploads nothing else to `index.d/` (a small
 /// index stays below the fold limits); a backup that stores nothing new
-/// writes no index object and no head (BK-1). Clients with and without a
+/// writes no index object (BK-1), only the next head, as a lock-free
+/// commit does (Q2). Clients with and without a
 /// local cache read the same index, and the snapshots restore.
 #[test]
 fn backups_append_one_segment_each() {
@@ -215,11 +252,19 @@ fn backups_append_one_segment_each() {
         assert_eq!(fx.head().segments.len(), 2);
         assert_eq!(fx.index_objects(), 2);
 
-        // Unchanged files: reuse only, which is not persisted.
+        // Unchanged files: reuse only, which writes no index object. The
+        // lock-free commit writes the head read's state at its generation + 1.
         let before = fx.head();
         fx.backup(&fx.config, "s3");
         let head = fx.head();
-        assert_eq!(head, before, "no head written");
+        assert_eq!(
+            head,
+            IndexHead {
+                generation: before.generation + 1,
+                ..before
+            },
+            "a head only"
+        );
         assert_eq!(fx.index_objects(), 2);
         let repo = fx.open(&fx.cache(), false).unwrap();
         for seg_ref in &head.segments {
@@ -241,7 +286,7 @@ fn backups_append_one_segment_each() {
             }
         }
         drop(repo);
-        let info = commands::info::run(&fx.config, None)
+        let info = commands::info::run(&fx.config, pass(&fx.config))
             .unwrap()
             .index
             .unwrap();
@@ -346,7 +391,14 @@ fn delete_and_compact_sweep_fold_and_collect_garbage() {
     let before = fx.head();
     let chunks_before = fx.open(&fx.cache(), true).unwrap().chunk_index().len();
 
-    commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &fx.config,
+        pass(&fx.config),
+        &["s1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(fx.head(), before, "delete writes no index object");
     assert_eq!(
         fx.open(&fx.cache(), true).unwrap().chunk_index().len(),
@@ -514,10 +566,10 @@ fn maintenance_writes_fold_at_the_hard_limit() {
         counts.push(head.segments.len());
         last = Some(head);
     }
-    // Round 2 repeats round 0's removal after the fold retired it: on a
-    // plaintext repository the segment's name is already named (retired),
-    // so that write folds too.
-    assert_eq!(counts, vec![2, 0, 0, 1, 2]);
+    // Every segment of an encrypted repository has a fresh name, so round 2
+    // appends after the fold, and round 4 reaches the hard limit of three
+    // and folds again.
+    assert_eq!(counts, vec![2, 0, 1, 2, 0]);
     assert!(fx.named_objects_exist(&last.unwrap()));
     assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
 }
@@ -525,9 +577,10 @@ fn maintenance_writes_fold_at_the_hard_limit() {
 /// On a plaintext repository a change repeated from a state the chain
 /// returned to packs to an object name the head already holds; the write
 /// folds instead of naming it twice.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn repeated_plaintext_segment_folds() {
-    let fx = fixture(RepoFormat::CURRENT);
+    let fx = plaintext_fixture(RepoFormat::CURRENT);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
@@ -651,7 +704,14 @@ fn repair_rebuilds_a_broken_chain_from_the_packs() {
     assert!(!err.contains("retry later"), "{err}");
 
     let repair = |mode| {
-        commands::check::run_with_repair(&other, None, false, mode, None, &CancelToken::new())
+        commands::check::run_with_repair(
+            &other,
+            pass(&other),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
     };
     let shown = repair(RepairMode::PlanOnly).unwrap().plan;
     let IndexRecovery::RebuiltFromPacks { cause, counts } = shown.index_recovery else {
@@ -868,7 +928,14 @@ fn repair_heals_a_damaged_chain_from_local_copies() {
         }
 
         let repair = |config: &VykarConfig, mode| {
-            commands::check::run_with_repair(config, None, false, mode, None, &CancelToken::new())
+            commands::check::run_with_repair(
+                config,
+                pass(config),
+                false,
+                mode,
+                None,
+                &CancelToken::new(),
+            )
         };
         let cold = fx.other_client("cold-plan");
         let plan = repair(&cold, RepairMode::PlanOnly).unwrap().plan;
@@ -918,7 +985,7 @@ fn repair_rebuilds_a_missing_head_from_the_packs() {
     fx.remove_heads();
     let plan = commands::check::run_with_repair(
         &fx.config,
-        None,
+        pass(&fx.config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -940,7 +1007,7 @@ fn repair_rebuilds_a_missing_head_from_the_packs() {
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
     commands::check::run_with_repair(
         &fx.config,
-        None,
+        pass(&fx.config),
         false,
         RepairMode::Apply,
         None,
@@ -1013,7 +1080,14 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     fx.backup(&fx.config, "s2");
     fx.write("d", "delta");
     fx.backup(&fx.config, "s3");
-    commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &fx.config,
+        pass(&fx.config),
+        &["s1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
 
     let ops = Arc::new(Mutex::new(Vec::new()));
@@ -1321,7 +1395,14 @@ fn empty_index_folds_to_a_head_without_base() {
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
-    commands::delete::run(&fx.config, None, &["s1", "s2"], false, &CancelToken::new()).unwrap();
+    commands::delete::run(
+        &fx.config,
+        pass(&fx.config),
+        &["s1", "s2"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let entries = fx.open(&fx.cache(), true).unwrap().chunk_index().len();
     assert!(entries > 0);
 
@@ -1339,7 +1420,7 @@ fn empty_index_folds_to_a_head_without_base() {
     let live: Vec<_> = head.live_objects().collect();
     commands::check::run_with_repair(
         &fx.config,
-        None,
+        pass(&fx.config),
         false,
         RepairMode::Apply,
         None,
@@ -1354,7 +1435,7 @@ fn empty_index_folds_to_a_head_without_base() {
         live.iter().all(|n| folded.retired.contains(n)),
         "{folded:?} vs {live:?}"
     );
-    let info = commands::info::run(&fx.config, None).unwrap();
+    let info = commands::info::run(&fx.config, pass(&fx.config)).unwrap();
     assert_eq!(info.index.unwrap().base_bytes, 0);
     assert!(cold_index(&fx, "cold1").is_empty());
     fx.check_clean(&fx.config);
@@ -1514,7 +1595,7 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
     fx.remove_heads();
     commands::check::run_with_repair(
         &fx.config,
-        None,
+        pass(&fx.config),
         false,
         RepairMode::Apply,
         None,
@@ -1647,7 +1728,7 @@ fn truncate_head(fx: &Fixture) {
 fn plan_only(config: &VykarConfig) -> Result<commands::check::RepairResult> {
     commands::check::run_with_repair(
         config,
-        None,
+        pass(config),
         false,
         RepairMode::PlanOnly,
         None,
@@ -1690,7 +1771,7 @@ fn repair_rebuilds_from_a_corrupt_head() {
     assert!(!shown.has_data_loss, "{:?}", shown.actions);
     commands::check::run_with_repair(
         &other,
-        None,
+        pass(&other),
         false,
         RepairMode::ApplyShown {
             has_data_loss: false,
@@ -1838,7 +1919,7 @@ fn repair_with_a_stale_local_cache_keeps_later_snapshots() {
     );
     commands::check::run_with_repair(
         &b,
-        None,
+        pass(&b),
         false,
         RepairMode::Apply,
         None,
@@ -1888,7 +1969,7 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
     commands::check::run_with_repair(
         &cold,
-        None,
+        pass(&cold),
         false,
         RepairMode::ApplyShown {
             has_data_loss: false,
@@ -1911,13 +1992,14 @@ fn repair_refuses_a_newer_index() {
     let fx = fixture(RepoFormat::CURRENT);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
-    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
+    let crypto = Arc::clone(fx.open(&fx.cache(), false).unwrap().crypto());
+    let crypto = crypto.as_ref();
     let newer = pack_head(
         &IndexHead {
             layout: 4,
             ..fx.head()
         },
-        &crypto,
+        crypto,
     )
     .unwrap();
     let featured = pack_head(
@@ -1925,7 +2007,7 @@ fn repair_refuses_a_newer_index() {
             features: vec!["later".into()],
             ..fx.head()
         },
-        &crypto,
+        crypto,
     )
     .unwrap();
     let older = pack_head(
@@ -1933,7 +2015,7 @@ fn repair_refuses_a_newer_index() {
             layout: 2,
             ..fx.head()
         },
-        &crypto,
+        crypto,
     )
     .unwrap();
     let head_path = fx.head_path();
@@ -1969,7 +2051,7 @@ fn repair_refuses_a_newer_index() {
         for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
             let err = commands::check::run_with_repair(
                 &fx.config,
-                None,
+                pass(&fx.config),
                 false,
                 mode,
                 None,
@@ -2015,7 +2097,7 @@ fn backup_with(
     let source_paths = vec![fx.source.to_string_lossy().into_owned()];
     let req = commands::backup::BackupRequest {
         snapshot_name: name,
-        passphrase: None,
+        passphrase: Some(crate::testing::TEST_PASSPHRASE),
         source_paths: &source_paths,
         source_label: "src",
         exclude_patterns: &[],
@@ -2059,7 +2141,7 @@ fn begin_commit_picks_the_fence_of_its_exclusion() {
     let upload = |name: &str| {
         let req = commands::backup::BackupRequest {
             snapshot_name: name,
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "src",
             exclude_patterns: &[],

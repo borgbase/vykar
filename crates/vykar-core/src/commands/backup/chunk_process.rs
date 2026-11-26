@@ -86,7 +86,7 @@ mod tests {
     use super::*;
     use crate::compress::decompress;
     use crate::repo::format::unpack_object_expect_with_context;
-    use vykar_crypto::PlaintextEngine;
+    use vykar_crypto::testing::DeterministicEngine;
 
     use crate::index::ChunkIndex;
     use crate::index::dedup_cache::chunk_id_to_u64;
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn confirmed_presession_hit_retains_no_data() {
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
         let (_dir, prefilter) = table_prefilter(&[(chunk_id, 77)]);
@@ -127,7 +127,7 @@ mod tests {
     /// ruled out by the table and packed in the worker.
     #[test]
     fn filter_false_positive_is_packed_in_worker() {
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
         let mut colliding = *chunk_id.as_bytes();
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn prepared_compressible_chunks_release_excess_capacity() {
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024 * 1024];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
         for compression in [Compression::Lz4, Compression::Zstd { level: 3 }] {
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn pack_chunk_data_roundtrip() {
         let key = [0xAA; 32];
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
+        let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for(key));
         let payload = b"the quick brown fox jumps over the lazy dog, repeatedly!";
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), payload);
 
@@ -219,9 +219,9 @@ mod tests {
         use crate::repo::format::pack_object_with_context;
 
         let key = [0xBB; 32];
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
+        let hasher = || crate::testutil::chunk_hasher_for(key);
         let payload = vec![0x42; 4096];
-        let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
+        let chunk_id = ChunkId::compute(&hasher(), &payload);
 
         let codecs = [
             Compression::None,
@@ -230,16 +230,23 @@ mod tests {
         ];
 
         for codec in codecs {
-            let streaming = pack_chunk_data(&chunk_id, &payload, codec, &engine).unwrap();
+            // A fresh engine per path: both seal under the same first nonce.
+            let streaming = pack_chunk_data(
+                &chunk_id,
+                &payload,
+                codec,
+                &DeterministicEngine::new(hasher()),
+            )
+            .unwrap();
             let compressed = compress(codec, &payload).unwrap();
             let two_step = pack_object_with_context(
                 ObjectType::ChunkData,
                 chunk_id.as_bytes(),
                 &compressed,
-                &engine,
+                &DeterministicEngine::new(hasher()),
             )
             .unwrap();
-            // With PlaintextEngine, output must be byte-identical
+            // With DeterministicEngine, output must be byte-identical
             assert_eq!(
                 streaming, two_step,
                 "{codec:?}: streaming vs two-step mismatch"
@@ -300,7 +307,7 @@ mod tests {
     #[test]
     fn pack_chunk_data_no_realloc() {
         let key = [0xCC; 32];
-        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
+        let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for(key));
         let payload = vec![0x42; 8192];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
 
@@ -309,11 +316,11 @@ mod tests {
             Compression::Lz4,
             Compression::Zstd { level: 3 },
         ] {
-            // PlaintextEngine layout: [tag 1][plaintext]
-            // The streaming function allocates Vec::with_capacity(1 + estimate).
+            // AEAD layout: [tag 1][nonce 12][ciphertext][gcm tag 16]
+            // The streaming function allocates Vec::with_capacity(1 + 12 + estimate + 16).
             // Allocators may round up, so probe for the actual initial capacity.
             let estimate = compressed_size_bound(codec, payload.len());
-            let requested = 1 + estimate;
+            let requested = 1 + 12 + estimate + 16;
             let initial_capacity = Vec::<u8>::with_capacity(requested).capacity();
 
             let packed = pack_chunk_data(&chunk_id, &payload, codec, &engine).unwrap();

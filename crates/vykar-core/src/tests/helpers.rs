@@ -10,6 +10,7 @@ use crate::index::{IndexBlob, LegacyChunkIndex};
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::{OpenOptions, Repo, RepoConfig, RepoFormat};
 use crate::snapshot::SnapshotStats;
+use crate::testing::TEST_PASSPHRASE;
 use vykar_crypto::CryptoEngine;
 
 // Re-exported so `helpers::init_test_environment()` call sites keep working
@@ -27,8 +28,8 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
             ..Default::default()
         },
         encryption: EncryptionConfig {
-            mode: EncryptionModeConfig::None,
-            passphrase: None,
+            mode: EncryptionModeConfig::Aes256Gcm,
+            passphrase: Some(TEST_PASSPHRASE.into()),
             passcommand: None,
         },
         one_file_system: true,
@@ -38,8 +39,14 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
 
 pub fn init_repo(repo_dir: &Path) -> VykarConfig {
     let config = make_test_config(repo_dir);
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
     config
+}
+
+/// The passphrase the config's repository opens with (None only for the
+/// plaintext-only tests that set mode none).
+pub fn pass(config: &VykarConfig) -> Option<&str> {
+    config.encryption.passphrase.as_deref()
 }
 
 /// The `IndexBlob` a v2/v3 binary writes at `index`: zstd-compressed msgpack,
@@ -159,7 +166,7 @@ pub fn open_local_repo(repo_dir: &Path) -> Repo {
     );
     Repo::open(
         storage,
-        None,
+        Some(TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new().with_index(),
     )
@@ -184,8 +191,8 @@ pub fn clear_tree_cache(repo_dir: &Path) {
     }
 }
 
-/// Load the on-disk `SnapshotListCache` for an unencrypted local repo without
-/// going through `Repo::open` (which would heal the cache against the
+/// Load the on-disk `SnapshotListCache` for a test repository (AES-256-GCM,
+/// [`TEST_PASSPHRASE`]) without going through `Repo::open` (which would heal the cache against the
 /// remote `snapshots/` listing). Lets tests observe what delete/prune persisted
 /// to the cache before any reopen.
 pub fn load_snapshot_cache_from_disk(
@@ -199,10 +206,15 @@ pub fn load_snapshot_cache_from_disk(
     let format = decoded.validate().unwrap();
     let repo_config = decoded.into_repo_config();
 
-    // Unencrypted repo: the chunk-ID key is derived from repo_id by the same
-    // format-dependent helper `open()` uses.
-    let key = crate::repo::derive_plaintext_chunk_id_key(&repo_config.id, format);
-    let crypto = vykar_crypto::PlaintextEngine::new(ChunkHasher::new(format.chunk_hash(), key));
+    // The engine `open()` builds: the master key unwrapped from the primary
+    // key copy with the test passphrase.
+    let blob = std::fs::read(repo_dir.join(crate::repo::KEY_PRIMARY)).unwrap();
+    let encrypted = vykar_crypto::key::inspect_key_blob(&blob).unwrap();
+    let key = vykar_crypto::key::MasterKey::from_encrypted(&encrypted, TEST_PASSPHRASE).unwrap();
+    let crypto = vykar_crypto::aes_gcm::Aes256GcmEngine::new(
+        &key.encryption_key,
+        ChunkHasher::new(format.chunk_hash(), key.chunk_id_key),
+    );
 
     crate::repo::snapshot_cache::SnapshotListCache::load(&repo_config.id, &crypto, None)
 }
@@ -238,7 +250,13 @@ pub fn try_backup_single_source(
     source_label: &str,
     snapshot_name: &str,
 ) -> vykar_types::error::Result<commands::backup::BackupOutcome> {
-    try_backup_with(config, None, source_dir, source_label, snapshot_name)
+    try_backup_with(
+        config,
+        pass(config),
+        source_dir,
+        source_label,
+        snapshot_name,
+    )
 }
 
 fn try_backup_with(

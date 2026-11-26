@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-after",
-  "note": "Second campaign of phase F part 2 (random-2155712310828947193): a delayed head PUT, the client's next backup (a fold) writes the same head generation, the late head lands over it, then that backup's index GC, judging by its own head, deletes the segment the late head names (H3 meeting 04 Current issues 3). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the later backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's segment and keeps the first backup's young one); its garbage collection still collects the segment the late head names. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-after-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the 3 h 1 min jump between the fold's listing and its base PUT left the segment younger than the object grace, so the case now takes two 6 h 1 min jumps between the first backup's end and the second backup's upload, before the fold writes anything. The segment is 12 h 2 min old at the collection. Unchanged signatures.",
+  "note": "Second campaign of phase F part 2 (random-2155712310828947193): a delayed head PUT, the client's next backup (a fold) writes the same head generation, the late head lands over it, then that backup's index GC, judging by its own head, deletes the segment the late head names (H3 meeting 04 Current issues 3). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the later backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's segment and keeps the first backup's young one); its garbage collection still collects the segment the late head names. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-after-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the 3 h 1 min jump between the fold's listing and its base PUT left the segment younger than the object grace, so the case now takes two 6 h 1 min jumps between the first backup's end and the second backup's upload, before the fold writes anything. The segment is 12 h 2 min old at the collection. Unchanged signatures. Runs encrypted since 10-single-protocol step 2.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -321,6 +321,7 @@
       0,
       2
     ],
-    "policy": "First"
+    "policy": "First",
+    "template": "Encrypted"
   }
 }

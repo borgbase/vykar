@@ -37,6 +37,8 @@ serde_json.workspace = true
 base64 = "0.23"
 
 [dev-dependencies]
+# vykar_core::testing (cheap KDF): tests create repositories through the library.
+vykar-core = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 ureq.workspace = true
 # `cli_integration` decodes the repository `config` to read its id.

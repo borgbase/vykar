@@ -1415,6 +1415,7 @@ pub(super) fn warn_metadata_err<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::helpers::pass;
 
     #[test]
     fn restore_readers_follow_transfer_width() {
@@ -1652,7 +1653,7 @@ mod tests {
         let mut seen = 0usize;
         let err = restore_with_filter(
             &config,
-            None,
+            pass(&config),
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
@@ -1702,7 +1703,7 @@ mod tests {
         let flag = CancelToken::new();
         let err = restore_with_filter(
             &config,
-            None,
+            pass(&config),
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
@@ -1740,7 +1741,7 @@ mod tests {
         let flag = CancelToken::new();
         let err = restore_with_filter(
             &config,
-            None,
+            pass(&config),
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
@@ -1863,7 +1864,7 @@ mod tests {
         unsafe { libc::umask(0o277) };
         let res = restore_with_filter(
             &config,
-            None,
+            pass(&config),
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
@@ -1914,7 +1915,7 @@ mod tests {
             let sink = crate::repo::control::FnMutSink::new(|e| events.push(e));
             run_with_options(
                 config,
-                None,
+                pass(config),
                 "snap-progress",
                 dest.to_str().unwrap(),
                 None,
@@ -1979,7 +1980,7 @@ mod tests {
 
         let plain = run_with_options(
             &config,
-            None,
+            pass(&config),
             "snap-progress",
             tmp.path().join("dest-plain").to_str().unwrap(),
             None,

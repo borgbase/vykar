@@ -283,24 +283,42 @@ impl StorageBackend for MemoryBackend {
     vykar_storage::unsupported_server_ops!();
 }
 
-/// Create a plaintext repository backed by MemoryBackend.
-pub fn test_repo_plaintext() -> Repo {
+/// An AES-256-GCM repository (cheap KDF, TEST_PASSPHRASE) backed by MemoryBackend.
+pub fn test_repo() -> Repo {
     init_test_environment();
     let storage = Box::new(MemoryBackend::new());
     Repo::init(
         storage,
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
     .expect("failed to init test repo")
 }
 
-/// [`test_repo_plaintext`] with a write session begun over it.
-pub fn test_repo_plaintext_with_session() -> (Repo, WriteSession) {
-    let repo = test_repo_plaintext();
+/// [`test_repo`] with a write session begun over it.
+pub fn test_repo_with_session() -> (Repo, WriteSession) {
+    let repo = test_repo();
+    let ws = repo.begin_write_session(&WriteSessionOptions::default());
+    (repo, ws)
+}
+
+/// A plaintext repository backed by MemoryBackend, with a write session
+/// begun over it, for the tests whose subject is plaintext.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+pub fn plaintext_repo_with_session() -> (Repo, WriteSession) {
+    init_test_environment();
+    let repo = Repo::init(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::None,
+        ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .expect("failed to init test repo");
     let ws = repo.begin_write_session(&WriteSessionOptions::default());
     (repo, ws)
 }

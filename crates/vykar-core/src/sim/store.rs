@@ -88,7 +88,9 @@ pub struct SimConfig {
     pub kind: StoreKind,
     /// The repository the harness initialises on it is encrypted (phase F
     /// part 10b: the lock-free path exists only there), with a cheap KDF
-    /// and the passphrase [`SIM_PASSPHRASE`].
+    /// and the passphrase [`SIM_PASSPHRASE`]. The default since
+    /// 10-single-protocol step 2; `false` only in the plaintext-only tests
+    /// until step 3 removes plaintext repositories.
     pub encrypted: bool,
 }
 
@@ -107,7 +109,7 @@ impl Default for SimConfig {
             append_only: false,
             batch_delete: false,
             kind: StoreKind::Plain,
-            encrypted: false,
+            encrypted: true,
         }
     }
 }

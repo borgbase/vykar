@@ -19,8 +19,9 @@ use vykar_core::config::{
     VykarConfig,
 };
 use vykar_core::repo::control::CancelToken;
-use vykar_core::repo::{OpenOptions, Repo};
+use vykar_core::repo::{ChunkerParams, EncryptionMode, OpenOptions, Repo};
 use vykar_core::snapshot::SnapshotStats;
+pub use vykar_core::testing::TEST_PASSPHRASE;
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
@@ -58,7 +59,8 @@ pub fn init_test_environment() {
     });
 }
 
-/// Plaintext, local-backend config rooted at `repo_dir`.
+/// AES-256-GCM, local-backend config rooted at `repo_dir`, with the
+/// passphrase [`TEST_PASSPHRASE`].
 pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
     init_test_environment();
 
@@ -70,13 +72,52 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
             ..Default::default()
         },
         encryption: EncryptionConfig {
-            mode: EncryptionModeConfig::None,
-            passphrase: None,
+            mode: EncryptionModeConfig::Aes256Gcm,
+            passphrase: Some(TEST_PASSPHRASE.into()),
             passcommand: None,
         },
         one_file_system: true,
         ..Default::default()
     }
+}
+
+/// [`make_test_config`] for a plaintext repository (mode none, no
+/// passphrase), for the tests whose subject is plaintext.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+pub fn make_plaintext_config(repo_dir: &Path) -> VykarConfig {
+    let mut config = make_test_config(repo_dir);
+    config.encryption.mode = EncryptionModeConfig::None;
+    config.encryption.passphrase = None;
+    config
+}
+
+/// The passphrase the config's repository opens with (None only for the
+/// plaintext-only tests that set mode none).
+pub fn pass(config: &VykarConfig) -> Option<&str> {
+    config.encryption.passphrase.as_deref()
+}
+
+/// commands::init::run with the cheap test KDF and the config's passphrase.
+pub fn init_repo(config: &VykarConfig) -> Repo {
+    vykar_core::testing::with_cheap_kdf(|| commands::init::run(config, pass(config))).unwrap()
+}
+
+/// Repo::init on a local backend: AES-256-GCM, [`TEST_PASSPHRASE`], cheap
+/// KDF.
+pub fn init_local_repo(dir: &Path) -> Repo {
+    init_test_environment();
+    let storage = Box::new(LocalBackend::new(dir.to_str().unwrap()).unwrap());
+    vykar_core::testing::with_cheap_kdf(|| {
+        Repo::init(
+            storage,
+            EncryptionMode::Aes256Gcm,
+            ChunkerParams::default(),
+            Some(TEST_PASSPHRASE),
+            None,
+            None,
+        )
+    })
+    .unwrap()
 }
 
 /// Open the repository at `repo_dir` with the chunk index loaded.

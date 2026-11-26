@@ -514,12 +514,12 @@ pub(super) mod tests {
     use crate::repo::session_journal::{JOURNAL_WRITE_INTERVAL, PENDING_INDEX_OBJECT_CONTEXT};
     use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
     use crate::testutil::{MemoryBackend, PackUploadBackend, init_test_environment};
-    use vykar_crypto::PlaintextEngine;
+    use vykar_crypto::testing::DeterministicEngine;
     use vykar_types::error::VykarError;
 
-    /// Create a PlaintextEngine for tests.
-    pub(in crate::repo) fn test_crypto() -> PlaintextEngine {
-        PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+    /// A deterministic AEAD engine for tests.
+    pub(in crate::repo) fn test_crypto() -> DeterministicEngine {
+        DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
     }
 
     /// A self-consistent pack: `PackId` is the hash of its bytes and its one

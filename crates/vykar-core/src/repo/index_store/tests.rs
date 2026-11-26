@@ -7,8 +7,8 @@ use crate::index::table::{self, ChunkTable};
 use crate::index::{ChunkIndex, ChunkIndexEntry, LiveIndex};
 use crate::repo::{EncryptionMode, RepoFormat};
 use crate::testutil::MemoryBackend;
-use vykar_crypto::PlaintextEngine;
 use vykar_crypto::key::MasterKey;
+use vykar_crypto::testing::DeterministicEngine;
 use vykar_storage::{InnerBackend, delegate_storage_backend};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
@@ -51,8 +51,9 @@ impl GetLog {
     }
 }
 
-fn plaintext() -> Arc<dyn CryptoEngine> {
-    Arc::new(PlaintextEngine::new(ChunkHasher::new(
+/// The deterministic AEAD engine: the same writes give the same object names.
+fn deterministic() -> Arc<dyn CryptoEngine> {
+    Arc::new(DeterministicEngine::new(ChunkHasher::new(
         HashAlgorithm::Blake3,
         [7; 32],
     )))
@@ -240,7 +241,7 @@ fn index_d_gets(gets: &[String]) -> usize {
 
 #[test]
 fn head_round_trips_through_storage_encoding() {
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let head = IndexHead::initial();
         let packed = pack_head(&head, crypto.as_ref()).unwrap();
         assert_eq!(packed[0], ObjectType::IndexHead as u8);
@@ -253,7 +254,7 @@ fn head_round_trips_through_storage_encoding() {
 /// generations are ignored.
 #[test]
 fn fetch_head_takes_the_highest_generation() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut head = IndexHead::initial();
     for _ in 0..3 {
@@ -276,7 +277,7 @@ fn fetch_head_takes_the_highest_generation() {
 /// STORE-2: no head; a head under the wrong generation's key.
 #[test]
 fn missing_head_and_misplaced_head() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let err = fetch_head(mem.as_ref(), crypto.as_ref())
         .unwrap_err()
@@ -335,7 +336,7 @@ delegate_storage_backend! {
 /// STORE-3: a 404 after the LIST re-lists; a persistent 404 gives up.
 #[test]
 fn a_head_vanishing_after_the_listing_is_retried() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut head = IndexHead::initial();
     for _ in 0..3 {
@@ -369,7 +370,7 @@ fn a_head_vanishing_after_the_listing_is_retried() {
 /// three new segments.
 #[test]
 fn sync_downloads_once_then_reads_local_files() {
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let log = GetLog::new(Arc::clone(&mem));
         let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -453,7 +454,7 @@ fn sync_downloads_once_then_reads_local_files() {
 /// A head without a base: the segments over the empty table.
 #[test]
 fn sync_of_segments_without_a_base() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let last = index_with(20..90);
@@ -478,7 +479,7 @@ fn sync_of_segments_without_a_base() {
 /// is not used: the base is downloaded.
 #[test]
 fn a_local_table_with_another_entry_count_is_not_used() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let s1 = index_with(0..30);
@@ -513,7 +514,7 @@ fn a_local_table_with_another_entry_count_is_not_used() {
 /// An empty head is the empty index.
 #[test]
 fn sync_of_the_empty_head() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let synced = sync(
         mem.as_ref(),
@@ -533,7 +534,7 @@ fn sync_of_the_empty_head() {
 /// the same run through the live index.
 #[test]
 fn sync_without_cache_dir_keeps_a_scratch_file() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -567,7 +568,7 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
 /// writes none.
 #[test]
 fn sync_without_local_files_verifies_every_object() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -607,7 +608,7 @@ fn sync_without_local_files_verifies_every_object() {
 /// the name check before decryption.
 #[test]
 fn tampered_or_swapped_objects_fail_the_name_check() {
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
         w.commit(&index_with(0..40));
@@ -651,7 +652,7 @@ fn tampered_or_swapped_objects_fail_the_name_check() {
 /// rejected even when every object is intact, and nothing is published.
 #[test]
 fn wrong_recorded_entry_counts_are_rejected() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..40));
@@ -682,7 +683,7 @@ fn wrong_recorded_entry_counts_are_rejected() {
 /// fetched again; the file is valid afterwards.
 #[test]
 fn a_damaged_cached_segment_is_fetched_again() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -725,7 +726,7 @@ fn a_damaged_cached_segment_is_fetched_again() {
 /// and recovers by re-reading the head.
 #[test]
 fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -762,7 +763,7 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
 
 /// A base and one segment on top of it.
 fn base_and_segment() -> (Arc<dyn StorageBackend>, Arc<dyn CryptoEngine>, Writer) {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..40));
@@ -828,7 +829,7 @@ fn missing_base_under_an_unchanged_head_fails_at_once() {
 /// but it still names the missing segment, so it is lost all the same.
 #[test]
 fn missing_object_still_named_by_a_moved_head_fails_at_once() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -854,7 +855,7 @@ fn missing_object_still_named_by_a_moved_head_fails_at_once() {
 /// progress, so the reader retries on that head instead of reporting loss.
 #[test]
 fn missing_retired_object_is_retried_not_reported_lost() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -930,7 +931,7 @@ delegate_storage_backend! {
 /// The error of a reader whose objects vanish on every attempt while the
 /// head keeps moving, and the GETs it made.
 fn moving_head_error() -> (VykarError, Vec<String>) {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let mut heads = Vec::new();
@@ -1205,7 +1206,7 @@ fn gc_head(generation: u64) -> IndexHead {
 /// 201 (unnamed, young) and a foreign file. Everything is old except head
 /// 20, head 2 and object 201.
 fn gc_fixture(storage: &Aged) -> IndexHead {
-    let crypto = plaintext();
+    let crypto = deterministic();
     for g in 1..=20u64 {
         let head = gc_head(g);
         put_head(storage, &head, crypto.as_ref()).unwrap();
@@ -1260,7 +1261,7 @@ const GRACE: IndexGcGrace = IndexGcGrace::DEFAULT;
 fn collect_index_garbage_keeps_recent_young_and_named() {
     let storage = Aged::new();
     let latest = gc_fixture(&storage);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, None);
     assert_eq!(stats.heads_deleted, 2);
     assert_eq!(stats.objects_deleted, 3);
@@ -1270,7 +1271,7 @@ fn collect_index_garbage_keeps_recent_young_and_named() {
     assert_eq!(remaining(&storage), remaining_after_gc());
 
     // A second run finds nothing more.
-    let again = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let again = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!((again.heads_deleted, again.objects_deleted), (0, 0));
 }
 
@@ -1286,18 +1287,18 @@ fn gc_keeps_unnamed_objects_for_twelve_hours_and_heads_for_one() {
     let latest = gc_fixture(&storage);
     let before = remaining(&storage);
     storage.reage_all(std::time::Duration::from_secs(2 * 3600));
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, None);
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (2, 0));
     assert_eq!(remaining(&storage), before);
 
     storage.reage_all(INDEX_OBJECT_GRACE - std::time::Duration::from_secs(60));
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
     assert_eq!(remaining(&storage), before);
 
     storage.reage_all(INDEX_OBJECT_GRACE);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 3));
     assert_eq!(remaining(&storage), remaining_after_gc());
 }
@@ -1309,7 +1310,7 @@ fn collect_index_garbage_lists_objects_before_heads() {
     let storage = Aged::new();
     let latest = gc_fixture(&storage);
     storage.listings.lock().unwrap().clear();
-    collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(
         *storage.listings.lock().unwrap(),
         vec![INDEX_OBJECT_DIR.to_string(), HEAD_PREFIX.to_string()]
@@ -1320,7 +1321,7 @@ fn collect_index_garbage_lists_objects_before_heads() {
 #[test]
 fn collect_index_garbage_keeps_retired_objects_and_records() {
     let storage = Aged::new();
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mut latest = gc_fixture(&storage);
     latest.retired = vec![gc_name(200)];
     put_head(&storage, &latest, crypto.as_ref()).unwrap();
@@ -1345,7 +1346,7 @@ fn collect_index_garbage_keeps_retired_objects_and_records() {
 #[test]
 fn collect_index_garbage_without_mtimes_deletes_nothing() {
     let mem = MemoryBackend::new();
-    let crypto = plaintext();
+    let crypto = deterministic();
     for g in 1..=20u64 {
         put_head(&mem, &gc_head(g), crypto.as_ref()).unwrap();
         mem.put(&object_key(&gc_name(g as u8)), b"x").unwrap();
@@ -1368,7 +1369,7 @@ fn gc_now_is_the_own_heads_mtime() {
         &object_key(&gc_name(202)),
         std::time::Duration::from_secs(10 * 3600),
     );
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, None);
     assert_eq!(stats.objects_deleted, 3, "{stats:?}");
     assert!(!storage.exists(&object_key(&gc_name(200))).unwrap());
@@ -1383,7 +1384,8 @@ fn gc_skips_without_the_own_head() {
     let storage = Aged::new();
     gc_fixture(&storage);
     let before = remaining(&storage);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &gc_head(21), GRACE).unwrap();
+    let stats =
+        collect_index_garbage(&storage, deterministic().as_ref(), &gc_head(21), GRACE).unwrap();
     assert_eq!(stats.skipped, Some("own head not listed"));
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
     assert_eq!(remaining(&storage), before);
@@ -1398,7 +1400,7 @@ fn an_unreadable_retained_head_keeps_every_object() {
     let latest = gc_fixture(&storage);
     storage.put(&head_key(5), b"garbage").unwrap();
     storage.age(&head_key(5));
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, Some("unreadable retained head"));
     assert_eq!(stats.heads_deleted, 2);
     assert_eq!(stats.objects_deleted, 0);
@@ -1411,7 +1413,7 @@ fn a_refused_head_delete_does_not_stop_the_run() {
     let mut storage = Aged::new();
     storage.refused = vec![head_key(1)];
     let latest = gc_fixture(&storage);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.heads_deleted, 1);
     assert!(storage.exists(&head_key(1)).unwrap());
     assert_eq!(stats.objects_deleted, 3);
@@ -1423,7 +1425,7 @@ fn collect_index_garbage_deletes_objects_in_one_batch() {
     let aged = Arc::new(Aged::new());
     let latest = gc_fixture(&aged);
     let storage = BatchDeletes::new(aged, false);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.objects_deleted, 3);
     let batches = storage.batches.lock().unwrap().clone();
     assert_eq!(batches.len(), 1);
@@ -1444,7 +1446,7 @@ fn collect_index_garbage_falls_back_when_the_batch_fails() {
     let aged = Arc::new(Aged::new());
     let latest = gc_fixture(&aged);
     let storage = BatchDeletes::new(aged, true);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(storage.batches.lock().unwrap().len(), 1);
     // The partial batch deleted the first key; its single delete is a no-op.
     assert_eq!(stats.objects_deleted, 3);
@@ -1500,7 +1502,7 @@ fn collect_index_garbage_skips_a_failed_delete() {
         inner: aged,
         key: failing.clone(),
     };
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.objects_deleted, 2);
     let mut expected = remaining_after_gc();
     expected.push(failing);
@@ -1511,7 +1513,7 @@ fn collect_index_garbage_skips_a_failed_delete() {
 #[test]
 fn collect_index_garbage_with_nothing_to_delete_sends_no_request() {
     let aged = Arc::new(Aged::new());
-    let crypto = plaintext();
+    let crypto = deterministic();
     let head = gc_head(1);
     put_head(aged.as_ref(), &head, crypto.as_ref()).unwrap();
     aged.put(&object_key(&gc_name(1)), b"x").unwrap();
@@ -1600,7 +1602,7 @@ fn collect_index_garbage_skips_an_append_only_server() {
     let latest = gc_fixture(&aged);
     let before = remaining(aged.as_ref());
     let storage = AdvertisedServer::new(aged.clone(), true);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, Some("append-only server"));
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
     assert_eq!(*storage.lists.lock().unwrap(), 0);
@@ -1609,7 +1611,7 @@ fn collect_index_garbage_skips_an_append_only_server() {
     assert_eq!(list_head_generations(&storage).unwrap().len(), 20);
 
     let storage = AdvertisedServer::new(aged, false);
-    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    let stats = collect_index_garbage(&storage, deterministic().as_ref(), &latest, GRACE).unwrap();
     assert_eq!(stats.skipped, None);
     assert_eq!((stats.heads_deleted, stats.objects_deleted), (2, 3));
     assert_eq!(*storage.lists.lock().unwrap(), 2);
@@ -1620,7 +1622,7 @@ fn collect_index_garbage_skips_an_append_only_server() {
 /// segment whose kind differs from its head's is not the one it names.
 #[test]
 fn a_backup_segment_with_removals_is_refused() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mut seg = keyed_diff(
         &index_with(0..3),
         &index_with(1..4),
@@ -1663,7 +1665,7 @@ fn a_backup_segment_with_removals_is_refused() {
 /// against the head's reference.
 #[test]
 fn sweep_record_round_trips_through_storage() {
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let rec = SweepRecord {
             version: crate::index::sweep_record::SWEEP_RECORD_VERSION,
             generation: 3,
@@ -1697,7 +1699,7 @@ fn sweep_record_round_trips_through_storage() {
 /// published once and the segments once each.
 #[test]
 fn concurrent_syncs_over_one_cache_dir_succeed() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let s0 = index_with(0..200);
@@ -1739,7 +1741,7 @@ fn concurrent_syncs_over_one_cache_dir_succeed() {
 /// dir while mapped.
 #[test]
 fn sync_downloads_a_base_without_segments_and_persists_it() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let s1 = index_with(0..120);
@@ -1772,7 +1774,7 @@ fn sync_downloads_a_base_without_segments_and_persists_it() {
 /// and the next sync finds it (a damaged table heals).
 #[test]
 fn a_damaged_table_under_the_base_name_heals() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
@@ -1823,7 +1825,7 @@ fn a_damaged_table_under_the_base_name_heals() {
 /// are pruned once old; young ones and the head's are kept.
 #[test]
 fn sync_prunes_old_local_files_the_head_does_not_name() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..60));
@@ -1883,7 +1885,7 @@ fn sync_prunes_old_local_files_the_head_does_not_name() {
 
 #[test]
 fn classify_head_tells_damage_from_newer_heads() {
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let c = crypto.as_ref();
         let initial = IndexHead::initial();
         let packed = pack_head(&initial, c).unwrap();
@@ -2060,7 +2062,7 @@ fn decode_base_payload(crypto: &dyn CryptoEngine, payload: &[u8]) -> (Result<Chu
 #[test]
 fn base_with_a_truncated_zstd_frame_is_object_damage() {
     let payload = zstd_base_payload(&base_body());
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let (ok, _) = decode_base_payload(crypto.as_ref(), &payload);
         assert_eq!(ok.unwrap().len(), 40);
         for cut in [payload.len() / 2, payload.len() - 1] {
@@ -2076,7 +2078,7 @@ fn base_with_a_truncated_zstd_frame_is_object_damage() {
 fn base_with_bytes_after_its_zstd_frame_is_object_damage() {
     let mut payload = zstd_base_payload(&base_body());
     payload.push(0x00);
-    for crypto in [plaintext(), encrypted()] {
+    for crypto in [deterministic(), encrypted()] {
         let (out, empty) = decode_base_payload(crypto.as_ref(), &payload);
         let e = out.unwrap_err();
         assert!(is_object_damage(&e), "{e:?}");
@@ -2088,7 +2090,7 @@ fn base_with_bytes_after_its_zstd_frame_is_object_damage() {
 /// than its head allows is damage.
 #[test]
 fn a_v1_or_oversized_base_body_is_refused() {
-    let crypto = plaintext();
+    let crypto = deterministic();
     let mut v1 = base_body();
     v1[0] = 1;
     let (out, _) = decode_base_payload(crypto.as_ref(), &zstd_base_payload(&v1));

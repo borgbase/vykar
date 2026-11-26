@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::helpers::pass;
 use crate::commands;
 use crate::commands::check::scan_for_test;
 use crate::commands::list::{
@@ -35,7 +36,7 @@ pub(crate) fn backup(
         config,
         commands::backup::BackupRequest {
             snapshot_name: snapshot,
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths,
             source_label: "src",
             exclude_patterns: &[],
@@ -396,7 +397,7 @@ fn a_wrong_index_falls_back_and_check_warns() {
     assert_eq!(warnings[0].0, "snap");
     let plan = commands::check::run_with_repair(
         &config,
-        None,
+        pass(&config),
         false,
         commands::check::RepairMode::PlanOnly,
         None,

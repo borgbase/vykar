@@ -4,15 +4,17 @@ use crate::repo::format::{
     pack_object_streaming, pack_object_with_context, unpack_object, unpack_object_expect,
     unpack_object_expect_with_context, unpack_object_with_context,
 };
+use vykar_crypto::CryptoEngine;
 use vykar_crypto::aes_gcm::Aes256GcmEngine;
-use vykar_crypto::{CryptoEngine, PlaintextEngine};
+use vykar_crypto::testing::DeterministicEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
 use vykar_types::pack_id::PackId;
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn roundtrip_plaintext() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let data = b"manifest data here";
     let packed = pack_object(ObjectType::Manifest, data, &engine).unwrap();
     let (obj_type, unpacked) = unpack_object(&packed, &engine).unwrap();
@@ -32,7 +34,7 @@ fn roundtrip_encrypted() {
 
 #[test]
 fn type_tag_is_first_byte() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let packed = pack_object(ObjectType::Manifest, b"data", &engine).unwrap();
     assert_eq!(packed[0], ObjectType::Manifest as u8);
 
@@ -53,7 +55,7 @@ fn wrong_type_tag_encrypted_fails_aad() {
 
 #[test]
 fn empty_data_fails() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let result = unpack_object(b"", &engine);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -64,7 +66,7 @@ fn empty_data_fails() {
 
 #[test]
 fn unknown_type_tag_fails() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let result = unpack_object(&[0xFF, 0x01, 0x02], &engine);
     assert!(result.is_err());
     assert!(matches!(
@@ -100,7 +102,7 @@ fn object_type_from_u8_invalid() {
 
 #[test]
 fn unpack_expect_rejects_wrong_object_type() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let packed = pack_object(ObjectType::Manifest, b"data", &engine).unwrap();
 
     let err = unpack_object_expect(&packed, ObjectType::ChunkData, &engine).unwrap_err();
@@ -108,9 +110,10 @@ fn unpack_expect_rejects_wrong_object_type() {
     assert!(err.to_string().contains("unexpected object type"));
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn pack_object_streaming_roundtrip_plaintext() {
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let data = b"streaming plaintext data";
     let packed = pack_object_streaming(ObjectType::Manifest, data.len(), &engine, |buf| {
         buf.extend_from_slice(data);
@@ -136,12 +139,13 @@ fn pack_object_streaming_roundtrip_encrypted() {
 
 #[test]
 fn pack_object_streaming_matches_pack_object() {
-    // For plaintext, streaming output should be byte-identical to pack_object
-    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xBB; 32]));
+    // Under the same nonce (a fresh deterministic engine each), streaming
+    // output is byte-identical to pack_object.
+    let engine = || DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xBB; 32]));
     let data = b"verify identical output";
-    let packed_normal = pack_object(ObjectType::ChunkData, data, &engine).unwrap();
+    let packed_normal = pack_object(ObjectType::ChunkData, data, &engine()).unwrap();
     let packed_streaming =
-        pack_object_streaming(ObjectType::ChunkData, data.len(), &engine, |buf| {
+        pack_object_streaming(ObjectType::ChunkData, data.len(), &engine(), |buf| {
             buf.extend_from_slice(data);
             Ok(())
         })
@@ -181,8 +185,8 @@ fn context_bound_unpack_rejects_legacy_object() {
     assert!(matches!(err, VykarError::DecryptionFailed));
 }
 
-fn plaintext_engine() -> PlaintextEngine {
-    PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+fn deterministic_engine() -> DeterministicEngine {
+    DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
 }
 
 fn aes_engine() -> Aes256GcmEngine {
@@ -218,7 +222,7 @@ fn decode(
 fn decode_chunk_round_trips_every_codec() {
     let data = b"chunk payload chunk payload chunk payload".repeat(20);
     let engines: [Box<dyn CryptoEngine>; 2] =
-        [Box::new(aes_engine()), Box::new(plaintext_engine())];
+        [Box::new(aes_engine()), Box::new(deterministic_engine())];
     for engine in &engines {
         let id = ChunkId::compute(engine.chunk_hasher(), &data);
         for codec in [
@@ -278,7 +282,7 @@ fn decode_chunk_decrypt_stage() {
 
 #[test]
 fn decode_chunk_decompress_stage() {
-    let engine = plaintext_engine();
+    let engine = deterministic_engine();
     let id = ChunkId::from_bytes([0x44; 32]);
 
     let raw = chunk_blob(&id, &[0xFF, 1, 2, 3], &engine);
@@ -300,7 +304,7 @@ fn decode_chunk_decompress_stage() {
 
 #[test]
 fn decode_chunk_size_mismatch_only_with_hint() {
-    let engine = plaintext_engine();
+    let engine = deterministic_engine();
     let data = b"sized payload";
     let id = ChunkId::compute(engine.chunk_hasher(), data);
     let raw = chunk_blob(
@@ -322,13 +326,15 @@ fn decode_chunk_size_mismatch_only_with_hint() {
     assert_eq!(decode(&raw, at, &engine, None, false).unwrap(), data);
 }
 
+/// Without an AEAD the chunk ID is always checked.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
-fn decode_chunk_id_check() {
+fn decode_chunk_id_check_plaintext() {
     let data = b"payload stored under the wrong id";
     let wrong = ChunkId::from_bytes([0x55; 32]);
     let payload = compress::compress(Compression::None, data).unwrap();
 
-    let engine = plaintext_engine();
+    let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let raw = chunk_blob(&wrong, &payload, &engine);
     let e = decode(&raw, location(wrong, &raw), &engine, None, false).unwrap_err();
     let actual_id = ChunkId::compute(engine.chunk_hasher(), data);
@@ -336,6 +342,15 @@ fn decode_chunk_id_check() {
         matches!(e.stage, ChunkDecodeStage::IdMismatch { actual } if actual == actual_id),
         "{e:?}"
     );
+}
+
+/// Under an AEAD a blob sealed under the wrong ID authenticates: only the
+/// verifying decode checks the ID.
+#[test]
+fn decode_chunk_id_check() {
+    let data = b"payload stored under the wrong id";
+    let wrong = ChunkId::from_bytes([0x55; 32]);
+    let payload = compress::compress(Compression::None, data).unwrap();
 
     let engine = aes_engine();
     let raw = chunk_blob(&wrong, &payload, &engine);

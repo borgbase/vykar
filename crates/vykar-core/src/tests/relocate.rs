@@ -107,7 +107,7 @@ fn file_bytes(name: &str) -> Vec<u8> {
 /// a compact at threshold 0 repacks the pack holding a.bin (b.bin is dead)
 /// and deletes it.
 fn fixture() -> Fx {
-    let fx = Fx::new(false);
+    let fx = Fx::new();
     let ab = fx.src("ab");
     std::fs::write(ab.join("a.bin"), file_bytes("a")).unwrap();
     std::fs::write(ab.join("b.bin"), file_bytes("b")).unwrap();

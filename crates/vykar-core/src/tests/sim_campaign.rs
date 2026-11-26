@@ -85,14 +85,18 @@ struct CampaignReport {
     searches: Vec<(usize, String, usize, bool, Duration)>,
 }
 
-/// A scenario's family, for the report: which store and template it runs
-/// on (see `sim_exhaustive::campaign_scenarios`).
+/// A scenario's family, for the report: which store it runs on (see
+/// `sim_exhaustive::campaign_scenarios`). Every template is encrypted
+/// (10-single-protocol step 2): on the fallback store its clients take the
+/// lock with the marker handshake, on the conditional store they commit
+/// lock-free, and on the store whose plain PUT replaces heads a lock client
+/// runs beside lock-free ones.
 fn family(case: &Case) -> &'static str {
-    match (case.template, case.storage) {
-        (TemplateKind::Encrypted, StoreKind::ConditionalOverwrite) => "mixed",
-        (TemplateKind::Encrypted, _) => "lockfree",
-        (_, StoreKind::Conditional) => "conditional",
-        _ => "plain",
+    match case.storage {
+        StoreKind::Plain => "plain",
+        StoreKind::Conditional => "lockfree",
+        StoreKind::ConditionalOverwrite => "mixed",
+        _ => "other",
     }
 }
 
@@ -565,7 +569,7 @@ fn stale_session_search() {
 /// What the campaign failed to cover: a family with no completed scenario,
 /// no completed K >= 2 search.
 fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts) -> Vec<String> {
-    let mut gaps: Vec<String> = ["plain", "conditional", "lockfree", "mixed"]
+    let mut gaps: Vec<String> = ["plain", "lockfree", "mixed"]
         .into_iter()
         .filter(|f| counts.get(f).is_none_or(|c| c.0 == 0))
         .map(|f| format!("no {f} scenario completed"))
@@ -588,7 +592,7 @@ fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts
 fn campaign_order_reaches_every_family_early() {
     let all = campaign_scenarios();
     let head = &all[..20];
-    for f in ["plain", "conditional", "lockfree", "mixed"] {
+    for f in ["plain", "lockfree", "mixed"] {
         assert!(
             head.iter().any(|(_, c, k)| *k == 1 && family(c) == f),
             "no K = 1 {f} scenario among the first 20: {:?}",

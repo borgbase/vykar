@@ -1,6 +1,6 @@
 {
   "name": "h1-random",
-  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h1 (default seed): two backups on one hostname; the second one's registration reaps the first one's live lock. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5); kept as a regression: this schedule must stay clean.",
+  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h1 (default seed): two backups on one hostname; the second one's registration reaps the first one's live lock. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5); kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2.",
   "expect": [],
   "at": [
     [
@@ -59,6 +59,7 @@
       0,
       3
     ],
-    "policy": "First"
+    "policy": "First",
+    "template": "Encrypted"
   }
 }

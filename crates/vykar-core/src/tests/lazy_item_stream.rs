@@ -22,9 +22,9 @@ fn repo_on_counting_backend() -> (Repo, crate::repo::WriteSession, PutLog) {
     let (backend, log) = RecordingBackend::new();
     let repo = Repo::init(
         Box::new(backend),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -165,20 +165,22 @@ fn lazy_stream_empty_is_empty() {
     assert_eq!(log.get_range_count(), 0);
 }
 
+/// A location that points at another chunk's bytes surfaces as an
+/// authentication failure (`DecryptionFailed`), not as an item decode
+/// error: the blob is sealed under the other chunk's ID.
 #[test]
-fn lazy_stream_surfaces_chunk_id_mismatch_not_a_decode_error() {
+fn lazy_stream_surfaces_a_misplaced_chunk_as_decryption_failed() {
     let (mut repo, mut ws, _log) = repo_on_counting_backend();
     let (_stream, mut locs) = stored_stream(&mut repo, &mut ws, 200, 64);
-    // Point chunk 3's location at chunk 4's bytes: on a plaintext repo only
-    // the chunk-ID check can notice.
+    // Point chunk 3's location at chunk 4's bytes.
     let (_, p, o, s) = locs[4];
     locs[3] = (locs[3].0, p, o, s);
     let never = CancelToken::new();
     let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, &never);
     let err = paths_of(&mut lazy).unwrap_err();
     assert!(
-        matches!(err, VykarError::InvalidFormat(_)),
-        "expected the chunk-ID mismatch, got {err:?}"
+        matches!(err, VykarError::DecryptionFailed),
+        "expected the authentication failure of the chunk-ID context, got {err:?}"
     );
 }
 
@@ -286,9 +288,9 @@ fn lazy_stream_follows_two_packs_moved_at_two_heads() {
     };
     let mut w = Repo::init(
         local(),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -304,7 +306,7 @@ fn lazy_stream_follows_two_packs_moved_at_two_heads() {
 
     let h = Repo::open(
         local(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new().with_index(),
     )

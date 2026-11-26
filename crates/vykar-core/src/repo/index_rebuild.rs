@@ -576,12 +576,12 @@ mod tests {
     use crate::repo::pack_map::{PackMap, PackMapEntry, pack_map_key};
     use crate::repo::pack_trailer::{parse_footer, trailer_frame_start};
     use crate::testutil::{MemoryBackend, RecordingBackend, chunk_hasher_for};
-    use vykar_crypto::PlaintextEngine;
+    use vykar_crypto::testing::DeterministicEngine;
     use vykar_storage::{InnerBackend, ListedObject, delegate_storage_backend};
     use vykar_types::hash::HashAlgorithm;
 
-    fn plain() -> PlaintextEngine {
-        PlaintextEngine::new(chunk_hasher_for([0xAA; 32]))
+    fn det() -> DeterministicEngine {
+        DeterministicEngine::new(chunk_hasher_for([0xAA; 32]))
     }
 
     fn chunk(i: usize) -> ChunkId {
@@ -596,11 +596,20 @@ mod tests {
     /// Seal a pack of `chunks` (blob `i` is 20 + i bytes), store it, and
     /// return its ID and the locations of its blobs.
     fn put_pack(storage: &dyn StorageBackend, chunks: &[usize]) -> (PackId, Vec<Loc>) {
+        put_pack_with(storage, chunks, &det())
+    }
+
+    /// [`put_pack`] sealed by `crypto`.
+    fn put_pack_with(
+        storage: &dyn StorageBackend,
+        chunks: &[usize],
+        crypto: &dyn CryptoEngine,
+    ) -> (PackId, Vec<Loc>) {
         let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         for &c in chunks {
             w.add_blob(chunk(c), vec![c as u8; 20 + c % 7]).unwrap();
         }
-        let sealed = w.seal(&plain()).unwrap();
+        let sealed = w.seal(crypto).unwrap();
         let id = sealed.pack_id;
         storage
             .put(&id.storage_key(), sealed.data.as_bytes().unwrap())
@@ -620,6 +629,14 @@ mod tests {
         storage.put(&key, &bytes).unwrap();
     }
 
+    /// Seal the trailer of pack `id` again with its body changed by `f`.
+    fn reseal_body(storage: &dyn StorageBackend, id: PackId, f: impl FnOnce(&mut Vec<u8>)) {
+        let key = id.storage_key();
+        let mut bytes = storage.get(&key).unwrap().unwrap();
+        crate::repo::pack_trailer::reseal_trailer_body(&mut bytes, &det(), f);
+        storage.put(&key, &bytes).unwrap();
+    }
+
     fn cut_trailer(storage: &dyn StorageBackend, id: PackId) {
         rewrite(storage, id, |b, start| b.truncate(start));
     }
@@ -635,10 +652,19 @@ mod tests {
         storage: &dyn StorageBackend,
         tables: Vec<Arc<ChunkTable>>,
     ) -> Result<(Summary, Vec<Loc>)> {
+        rebuild_by(storage, tables, &det())
+    }
+
+    /// [`rebuild_with`] reading through `crypto`.
+    fn rebuild_by(
+        storage: &dyn StorageBackend,
+        tables: Vec<Arc<ChunkTable>>,
+        crypto: &dyn CryptoEngine,
+    ) -> Result<(Summary, Vec<Loc>)> {
         let dir = tempfile::tempdir().unwrap();
         rebuild_index_from_packs(
             storage,
-            &plain(),
+            crypto,
             HashAlgorithm::Blake2b,
             || tables,
             &dir.path().join("anchor"),
@@ -723,7 +749,7 @@ mod tests {
     }
 
     fn put_map(storage: &dyn StorageBackend, map: &PackMap) {
-        let (name, stored) = map.seal(&plain()).unwrap();
+        let (name, stored) = map.seal(&det()).unwrap();
         storage.put(&pack_map_key(&name), &stored).unwrap();
     }
 
@@ -795,7 +821,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rebuilt = rebuild_index_from_packs(
             &storage,
-            &plain(),
+            &det(),
             HashAlgorithm::Blake2b,
             Vec::new,
             &dir.path().join("anchor"),
@@ -806,7 +832,7 @@ mod tests {
         let table = ChunkTable::install(rebuilt.body, None, None).unwrap();
         assert_eq!(
             table.pack_trailer_len(&by_trailer),
-            Some(crate::repo::pack_trailer::trailer_frame_len(3, false))
+            Some(crate::repo::pack_trailer::trailer_frame_len(3, true))
         );
         assert_eq!(table.pack_trailer_len(&by_map), Some(0));
         let bytes = storage.get(&by_trailer.storage_key()).unwrap().unwrap();
@@ -868,7 +894,7 @@ mod tests {
     fn rebuild_refuses_a_trailer_from_a_newer_vykar() {
         let storage = MemoryBackend::new();
         let (id, _) = put_pack(&storage, &[1, 2]);
-        rewrite(&storage, id, |b, start| b[start + 6] = 2);
+        reseal_body(&storage, id, |b| b[0] = 2);
         // Store it under the ID of its new bytes, as a newer writer would.
         let bytes = storage.get(&id.storage_key()).unwrap().unwrap();
         storage.delete(&id.storage_key()).unwrap();
@@ -882,15 +908,19 @@ mod tests {
         assert!(err.contains(&newer), "{err}");
     }
 
-    /// The same bytes under the old ID: the version byte rotted, so the pack
-    /// is uncovered and the rebuild goes on.
+    /// Without encryption one flipped byte makes a trailer read as a newer
+    /// version. The same bytes under the old ID: the version byte rotted, so
+    /// the pack is uncovered and the rebuild goes on.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn rebuild_reports_a_rotted_version_byte_as_uncovered() {
+        let plain = vykar_crypto::PlaintextEngine::new(chunk_hasher_for([0xAA; 32]));
         let storage = MemoryBackend::new();
-        let (id, _) = put_pack(&storage, &[1, 2]);
-        let (_, other) = put_pack(&storage, &[3]);
+        let (id, _) = put_pack_with(&storage, &[1, 2], &plain);
+        let (_, other) = put_pack_with(&storage, &[3], &plain);
+        // The body version: [u32 L][object tag][codec tag][version].
         rewrite(&storage, id, |b, start| b[start + 6] = 2);
-        let (rebuilt, locs) = rebuild(&storage);
+        let (rebuilt, locs) = rebuild_by(&storage, Vec::new(), &plain).unwrap();
         assert_eq!(locs, other);
         assert_eq!(rebuilt.uncovered.len(), 1);
         assert_eq!(rebuilt.uncovered[0].pack_id, id);
@@ -986,7 +1016,7 @@ mod tests {
     ) -> Result<Recovered> {
         recover_unindexed_entries(
             storage,
-            &plain(),
+            &det(),
             HashAlgorithm::Blake2b,
             &named.iter().copied().collect(),
             lacks,
@@ -1086,7 +1116,7 @@ mod tests {
         let r = recover(&storage, &[], |_| true).unwrap();
         assert_eq!(
             r.trailer_lens,
-            HashMap::from([(p, trailer_frame_len(3, false))])
+            HashMap::from([(p, trailer_frame_len(3, true))])
         );
         assert_eq!(r.counts.from_trailers, 1);
     }

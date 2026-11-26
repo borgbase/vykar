@@ -3,7 +3,7 @@ use tempfile::TempDir;
 use crate::commands;
 use crate::compress::Compression;
 
-use super::helpers::{make_test_config, source_entry};
+use super::helpers::{make_test_config, pass, source_entry};
 
 /// A REST listener that answers every request with 503; counts requests.
 fn unavailable_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -66,7 +66,12 @@ fn open_repo_cancel_during_retry_wait_is_interrupted() {
     let token = crate::repo::control::CancelToken::new();
     std::thread::scope(|s| {
         let open = s.spawn(|| {
-            commands::util::open_repo(&config, None, crate::repo::OpenOptions::new(), &token)
+            commands::util::open_repo(
+                &config,
+                pass(&config),
+                crate::repo::OpenOptions::new(),
+                &token,
+            )
         });
         wait_first_request(&requests);
         let cancelled_at = std::time::Instant::now();
@@ -100,7 +105,7 @@ fn repair_apply_backend_ignores_the_callers_cancel() {
         let token = crate::repo::control::CancelToken::new();
         let err = std::thread::scope(|s| {
             let repair = s.spawn(|| {
-                commands::check::run_with_repair(&config, None, false, mode, None, &token)
+                commands::check::run_with_repair(&config, pass(&config), false, mode, None, &token)
             });
             wait_first_request(&requests);
             token.cancel();
@@ -124,7 +129,7 @@ fn open_repo_on_empty_storage_includes_url() {
     let config = make_test_config(repo_dir.path());
     let result = commands::util::open_repo(
         &config,
-        None,
+        pass(&config),
         crate::repo::OpenOptions::new(),
         &crate::repo::control::CancelToken::new(),
     );
@@ -157,7 +162,7 @@ fn backup_on_uninitialized_repo_includes_url() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap1",
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: &entry.label,
             exclude_patterns: &config.exclude_patterns,

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use super::helpers::{
     FaultyPut, backup_single_source, downgrade_to_legacy, is_base_put, is_head_put,
-    make_test_config, try_backup_single_source,
+    make_test_config, pass, try_backup_single_source,
 };
 use crate::commands;
 use crate::commands::check::RepairMode;
@@ -45,9 +45,9 @@ fn fixture(legacy: RepoFormat) -> Fixture {
     config.cache_dir = Some(cache.to_string_lossy().into_owned());
     Repo::init_at_format(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         config.chunker.params(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&config.repository.init_options()),
         Some(cache),
         legacy.upgrade_target().unwrap(),
@@ -73,7 +73,7 @@ impl Fixture {
 
     /// Turn the repository into the `legacy` one 0.24 writes for its data.
     fn downgrade(&self) {
-        let format = downgrade_to_legacy(&self.repo_dir, None, &self.cache());
+        let format = downgrade_to_legacy(&self.repo_dir, pass(&self.config), &self.cache());
         assert_eq!(format, self.legacy);
     }
 
@@ -83,14 +83,19 @@ impl Fixture {
         } else {
             OpenOptions::new()
         };
-        Repo::open(self.storage(), None, Some(cache.to_path_buf()), opts)
+        Repo::open(
+            self.storage(),
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(cache.to_path_buf()),
+            opts,
+        )
     }
 
     /// The open `vykar upgrade` does: any format, without the index.
     fn open_legacy(&self, cache: &Path) -> Result<Repo> {
         Repo::open(
             self.storage(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(cache.to_path_buf()),
             OpenOptions::new().legacy_format(),
         )
@@ -171,7 +176,7 @@ impl Fixture {
     }
 
     fn check_clean(&self) {
-        let result = commands::check::run(&self.config, None, true, false).unwrap();
+        let result = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
@@ -245,7 +250,7 @@ fn upgrade_refuses_with_a_live_session() {
         ),
     )
     .unwrap();
-    let err = commands::upgrade::run(&fx.config, None).unwrap_err();
+    let err = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::ActiveSessions(_)),
         "got {err}"
@@ -283,7 +288,7 @@ fn upgrade_moves_the_index_to_a_base() {
         let before = fx.cold_index("cold-before");
         let blob = fx.plant_blob_copy();
 
-        let outcome = commands::upgrade::run(&fx.config, None).unwrap();
+        let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
         let UpgradeOutcome::Upgraded {
             from: f,
             to: t,
@@ -326,7 +331,7 @@ fn upgrade_moves_the_index_to_a_base() {
         fx.check_clean();
 
         assert_eq!(
-            commands::upgrade::run(&fx.config, None).unwrap(),
+            commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap(),
             UpgradeOutcome::AlreadyCurrent {
                 version: to.version()
             }
@@ -339,7 +344,7 @@ fn upgrade_moves_the_index_to_a_base() {
 fn upgrade_of_an_empty_repository() {
     let fx = fixture(RepoFormat::V3);
     fx.downgrade();
-    let outcome = commands::upgrade::run(&fx.config, None).unwrap();
+    let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     assert!(
         matches!(
             outcome,
@@ -403,7 +408,7 @@ fn interrupted_upgrade_resumes_from_the_legacy_index() {
             .to_string();
         assert!(err.contains("vykar upgrade"), "{from:?}: {err}");
 
-        let outcome = commands::upgrade::run(&fx.config, None).unwrap();
+        let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
         assert!(
             matches!(
                 outcome,
@@ -442,7 +447,9 @@ fn a_resume_keeps_what_an_old_client_wrote_in_between() {
     std::fs::write(fx.repo_dir.join("index"), blob).unwrap();
     let expected = sorted_entries(&index.to_live_index());
 
-    assert!(resumed(&commands::upgrade::run(&fx.config, None).unwrap()));
+    assert!(resumed(
+        &commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap()
+    ));
     let repo = fx.open(&fx.tmp.path().join("cold"), true).unwrap();
     assert_eq!(sorted_entries(repo.chunk_index()), expected);
     assert!(!repo.chunk_index().contains(&gone));
@@ -474,7 +481,7 @@ fn upgrade_drops_legacy_entries_at_refcount_zero() {
     let blob = super::helpers::legacy_index_blob(&index, 0x26, crypto.as_ref());
     std::fs::write(fx.repo_dir.join("index"), blob).unwrap();
 
-    commands::upgrade::run(&fx.config, None).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     let repo = fx.open(&fx.tmp.path().join("cold"), true).unwrap();
     assert!(!repo.chunk_index().contains(&zero));
     assert_eq!(sorted_entries(repo.chunk_index()), expected);
@@ -515,9 +522,8 @@ fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
             "resumed: {resume}"
         );
         assert_eq!(repo.index_generation(), head.generation);
-        let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
         assert_eq!(
-            index_store::fetch_head(&*fx.storage(), &crypto).unwrap(),
+            index_store::fetch_head(&*fx.storage(), repo.crypto().as_ref()).unwrap(),
             head
         );
         drop(repo);
@@ -560,7 +566,7 @@ fn upgrade_without_config_overwrite_changes_nothing() {
     assert_eq!(std::fs::read(fx.repo_dir.join("index")).unwrap(), index);
     assert_eq!(fx.index_objects(), 0);
     assert!(fx.heads().is_empty());
-    commands::upgrade::run(&fx.config, None).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     fx.check_clean();
 }
 
@@ -586,7 +592,7 @@ fn upgrade_through(
     });
     let mut repo = Repo::open(
         storage,
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(fx.cache()),
         OpenOptions::new().legacy_format(),
     )
@@ -659,7 +665,7 @@ fn upgrade_failing_before_the_head_keeps_the_legacy_index() {
             assert!(debris.exists(), "{name}");
             assert_eq!(fx.cold_index(&format!("legacy-{name}")), before, "{name}");
 
-            commands::upgrade::run(&fx.config, None).unwrap();
+            commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
             assert_eq!(fx.version(), to.version(), "{name}");
             assert_eq!(fx.heads(), vec![1], "{name}");
             assert_eq!(fx.cold_index(&format!("after-{name}")), before, "{name}");
@@ -725,14 +731,21 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
     assert_legacy_refusal(&fx.open(&fx.tmp.path().join("reader"), true).err().unwrap());
     assert_legacy_refusal(&fx.open(&fx.cache(), true).err().unwrap());
     assert_legacy_refusal(
-        &commands::check::run(&fx.config, None, false, false)
+        &commands::check::run(&fx.config, pass(&fx.config), false, false)
             .err()
             .unwrap(),
     );
     assert_legacy_refusal(
-        &commands::compact::run(&fx.config, None, 0.0, None, false, &CancelToken::new())
-            .err()
-            .unwrap(),
+        &commands::compact::run(
+            &fx.config,
+            pass(&fx.config),
+            0.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .err()
+        .unwrap(),
     );
     fx.write("b", "bravo");
     assert_legacy_refusal(
@@ -744,7 +757,7 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
     assert_eq!(fx.snapshot_names(), ["s1"]);
     assert_eq!(packs(), packs_before);
 
-    let outcome = commands::upgrade::run(&fx.config, None).unwrap();
+    let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     assert!(
         matches!(
             outcome,
@@ -809,7 +822,7 @@ fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
         assert!(!fx.heads().is_empty(), "{resume}");
         assert_legacy_refusal(&fx.open(&fx.tmp.path().join("cold"), true).err().unwrap());
 
-        let outcome = commands::upgrade::run(&fx.config, None).unwrap();
+        let outcome = commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
         assert!(resumed(&outcome), "{resume}: {outcome:?}");
         assert_eq!(fx.version(), 6);
         assert_eq!(fx.cold_index("cold-after"), before, "{resume}");
@@ -905,7 +918,7 @@ fn upgrade_probes_the_server_before_writing() {
         });
         let mut repo = Repo::open(
             storage,
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(fx.cache()),
             OpenOptions::new().legacy_format(),
         )
@@ -967,7 +980,7 @@ fn upgrade_probes_the_server_before_writing() {
 }
 
 fn repair(config: &VykarConfig, mode: RepairMode) -> Result<commands::check::RepairResult> {
-    commands::check::run_with_repair(config, None, false, mode, None, &CancelToken::new())
+    commands::check::run_with_repair(config, pass(config), false, mode, None, &CancelToken::new())
 }
 
 fn resumed(outcome: &UpgradeOutcome) -> bool {
@@ -984,7 +997,7 @@ fn upgrade_interrupted_after_the_switch_finishes_the_cleanup() {
     fx.backup("s1");
     fx.downgrade();
     let legacy = fx.legacy_bytes().unwrap();
-    commands::upgrade::run(&fx.config, None).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     std::fs::write(fx.repo_dir.join("index"), &legacy).unwrap();
     std::fs::write(fx.repo_dir.join("index.gen"), 9u64.to_le_bytes()).unwrap();
 
@@ -992,7 +1005,7 @@ fn upgrade_interrupted_after_the_switch_finishes_the_cleanup() {
     fx.write("b", "bravo");
     fx.backup("s2");
     assert_eq!(
-        commands::upgrade::run(&fx.config, None).unwrap(),
+        commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap(),
         UpgradeOutcome::AlreadyCurrent { version: 6 }
     );
     assert!(fx.legacy_bytes().is_none());
@@ -1017,7 +1030,9 @@ fn check_refuses_a_legacy_repository() {
         assert_eq!(fx.tree(), state);
     }
 
-    assert!(resumed(&commands::upgrade::run(&fx.config, None).unwrap()));
+    assert!(resumed(
+        &commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap()
+    ));
     assert_eq!(fx.cold_index("cold-after"), before);
 }
 
@@ -1037,7 +1052,7 @@ fn an_index_holding_a_head_is_refused() {
     std::fs::write(&path, &bytes).unwrap();
     let state = fx.tree();
 
-    let err = commands::upgrade::run(&fx.config, None)
+    let err = commands::upgrade::run(&fx.config, pass(&fx.config))
         .err()
         .unwrap()
         .to_string();
@@ -1079,7 +1094,11 @@ fn development_versions_4_and_5_are_refused() {
         unsupported(fx.open(&fx.cache(), false).err().unwrap());
         unsupported(fx.open(&fx.cache(), true).err().unwrap());
         unsupported(fx.open_legacy(&fx.cache()).err().unwrap());
-        unsupported(commands::upgrade::run(&fx.config, None).err().unwrap());
+        unsupported(
+            commands::upgrade::run(&fx.config, pass(&fx.config))
+                .err()
+                .unwrap(),
+        );
         assert_eq!(fx.tree(), state, "{version}");
     }
 }
@@ -1099,7 +1118,7 @@ fn unreadable_legacy_index_fails_the_upgrade_and_changes_nothing() {
     fx.plant_blob_copy();
     let state = fx.tree();
 
-    let err = commands::upgrade::run(&fx.config, None)
+    let err = commands::upgrade::run(&fx.config, pass(&fx.config))
         .err()
         .unwrap()
         .to_string();
@@ -1127,7 +1146,7 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
         ("open with index", fx.open(&fx.cache(), true).err().unwrap()),
         (
             "check",
-            commands::check::run(config, None, false, false)
+            commands::check::run(config, pass(config), false, false)
                 .err()
                 .unwrap(),
         ),
@@ -1137,24 +1156,37 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
         ),
         (
             "list",
-            commands::list::list_snapshots(config, None).err().unwrap(),
+            commands::list::list_snapshots(config, pass(config))
+                .err()
+                .unwrap(),
         ),
-        ("info", commands::info::run(config, None).err().unwrap()),
+        (
+            "info",
+            commands::info::run(config, pass(config)).err().unwrap(),
+        ),
         (
             "compact",
-            commands::compact::run(config, None, 0.0, None, false, &CancelToken::new())
+            commands::compact::run(config, pass(config), 0.0, None, false, &CancelToken::new())
                 .err()
                 .unwrap(),
         ),
         (
             "prune",
-            commands::prune::run(config, None, false, false, &[], &[], &CancelToken::new())
-                .err()
-                .unwrap(),
+            commands::prune::run(
+                config,
+                pass(config),
+                false,
+                false,
+                &[],
+                &[],
+                &CancelToken::new(),
+            )
+            .err()
+            .unwrap(),
         ),
         (
             "delete",
-            commands::delete::run(config, None, &["s1"], false, &CancelToken::new())
+            commands::delete::run(config, pass(config), &["s1"], false, &CancelToken::new())
                 .err()
                 .unwrap(),
         ),
@@ -1186,7 +1218,7 @@ fn legacy_open_rejects_load_index() {
     fx.downgrade();
     let err = Repo::open(
         fx.storage(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(fx.cache()),
         OpenOptions::new().legacy_format().with_index(),
     )
@@ -1202,9 +1234,9 @@ fn init_refuses_legacy_formats() {
         let tmp = tempfile::tempdir().unwrap();
         let err = Repo::init_at_format(
             Box::new(LocalBackend::new(tmp.path().to_str().unwrap()).unwrap()),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             crate::repo::ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
             format,
@@ -1259,7 +1291,7 @@ fn upgrade_reads_the_index_with_a_plain_get() {
     let cache = fx.tmp.path().join("empty-cache");
     let mut repo = Repo::open(
         storage,
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(cache),
         OpenOptions::new().legacy_format(),
     )
@@ -1288,7 +1320,7 @@ fn upgrade_reports_packs_no_map_can_describe() {
     fx.backup("s1");
     fx.downgrade();
     crate::repo::pack_map::MAX_ENTRIES_FOR_TEST.with(|c| c.set(Some(1)));
-    let outcome = commands::upgrade::run(&fx.config, None);
+    let outcome = commands::upgrade::run(&fx.config, pass(&fx.config));
     crate::repo::pack_map::MAX_ENTRIES_FOR_TEST.with(|c| c.set(None));
     let UpgradeOutcome::Upgraded {
         packs_mapped,
@@ -1334,7 +1366,7 @@ fn upgrade_stops_on_a_pack_the_legacy_index_describes_inconsistently() {
     drop(repo);
     std::fs::write(fx.repo_dir.join("index"), &blob).unwrap();
 
-    let err = commands::upgrade::run(&fx.config, None)
+    let err = commands::upgrade::run(&fx.config, pass(&fx.config))
         .unwrap_err()
         .to_string();
     assert!(err.contains("inconsistently"), "{err}");
@@ -1355,7 +1387,7 @@ fn garbage_collection_after_a_resumed_upgrade_keeps_the_latest_objects() {
     fx.backup("s1");
     fx.downgrade();
     interrupt_at_the_switch(&fx);
-    commands::upgrade::run(&fx.config, None).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     assert_eq!(fx.heads(), vec![1, 2]);
     let debris = write_debris(&fx);
     let repo = fx.open(&fx.cache(), false).unwrap();
@@ -1393,7 +1425,7 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
     fx.write("a", "alpha");
     fx.backup("s1");
     fx.downgrade();
-    commands::upgrade::run(&fx.config, None).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
     let repo = fx.open(&fx.cache(), true).unwrap();
     let packs: Vec<_> = repo.chunk_index().iter().map(|(_, e)| e.pack_id).collect();
     assert!(
@@ -1402,11 +1434,28 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
             .all(|p| repo.chunk_index().pack_trailer_len(p) == Some(0))
     );
     drop(repo);
-    let first =
-        commands::compact::run(&fx.config, None, 1.0, None, false, &CancelToken::new()).unwrap();
+    // Lock-free compact repacks only packs older than T_pack.
+    super::helpers::age_repo_objects(&fx.repo_dir, &["packs"], super::helpers::PAST_T_PACK);
+    let first = commands::compact::run(
+        &fx.config,
+        pass(&fx.config),
+        1.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(first.packs_repacked > 0, "{first:?}");
-    let second =
-        commands::compact::run(&fx.config, None, 1.0, None, false, &CancelToken::new()).unwrap();
+    super::helpers::age_repo_objects(&fx.repo_dir, &["packs"], super::helpers::PAST_T_PACK);
+    let second = commands::compact::run(
+        &fx.config,
+        pass(&fx.config),
+        1.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(second.packs_repacked, 0, "{second:?}");
     let repo = fx.open(&fx.cache(), true).unwrap();
     for (_, e) in repo.chunk_index().iter() {

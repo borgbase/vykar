@@ -5,9 +5,7 @@ use crate::repo::ChunkerParams;
 use crate::repo::EncryptionMode;
 use crate::repo::pack::PackType;
 use crate::repo::{Repo, WriteSession, WriteSessionOptions};
-use crate::testutil::{
-    MemoryBackend, PutLog, RecordingBackend, test_repo_plaintext, test_repo_plaintext_with_session,
-};
+use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, test_repo, test_repo_with_session};
 use vykar_common::paths;
 
 #[test]
@@ -15,9 +13,9 @@ fn init_creates_required_keys() {
     let storage = Box::new(MemoryBackend::new());
     let repo = Repo::init(
         storage,
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -36,9 +34,9 @@ fn init_twice_fails() {
     let storage = Box::new(MemoryBackend::new());
     let repo = Repo::init(
         storage,
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -47,9 +45,9 @@ fn init_twice_fails() {
     // Try to init again with the same storage (clone the Arc into a new Box)
     let result = Repo::init(
         Box::new(repo.storage().clone()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     );
@@ -60,7 +58,7 @@ fn init_twice_fails() {
 
 #[test]
 fn store_and_read_chunk_roundtrip() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"hello, this is chunk data for testing";
     let (chunk_id, _stored_size, is_new) = ws
         .store_chunk(&repo, data, Compression::None, PackType::Data)
@@ -76,7 +74,7 @@ fn store_and_read_chunk_roundtrip() {
 
 #[test]
 fn store_chunk_dedup() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"duplicate chunk data";
 
     let (id1, _size1, is_new1) = ws
@@ -100,7 +98,7 @@ fn store_chunk_dedup() {
 
 #[test]
 fn store_chunk_with_compression() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"compressible data that should survive lz4 round-trip";
     let (chunk_id, _stored_size, is_new) = ws
         .store_chunk(&repo, data, Compression::Lz4, PackType::Data)
@@ -116,7 +114,7 @@ fn store_chunk_with_compression() {
 
 #[test]
 fn save_state_persists_index() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"persistent chunk";
     ws.store_chunk(&repo, data, Compression::None, PackType::Data)
         .unwrap();
@@ -133,7 +131,7 @@ fn save_state_persists_index() {
 
 #[test]
 fn read_missing_chunk_fails() {
-    let repo = test_repo_plaintext();
+    let repo = test_repo();
     let fake_id = vykar_types::chunk_id::ChunkId::from_bytes([0xFF; 32]);
     let result = repo.read_chunk(&fake_id);
     assert!(
@@ -145,7 +143,7 @@ fn read_missing_chunk_fails() {
 /// one; its explicit location still reads.
 #[test]
 fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"chunk read through a handle without the index";
     let (id, _, _) = ws
         .store_chunk(&repo, data, Compression::None, PackType::Data)
@@ -157,7 +155,7 @@ fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
     let dir = tempfile::tempdir().unwrap();
     let bare = Repo::open(
         Box::new(std::sync::Arc::clone(repo.storage())),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(dir.path().to_path_buf()),
         crate::repo::OpenOptions::new(),
     )
@@ -176,7 +174,7 @@ fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
 
 #[test]
 fn read_chunk_at_roundtrip() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     let data = b"chunk data for read_chunk_at test";
     let (chunk_id, _stored_size, _) = ws
         .store_chunk(&repo, data, Compression::None, PackType::Data)
@@ -204,9 +202,9 @@ fn repo_on_recording_backend() -> (Repo, WriteSession, PutLog) {
     let (backend, log) = RecordingBackend::new();
     let repo = Repo::init(
         Box::new(backend),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -475,9 +473,9 @@ fn init_rejects_oversized_max_pack_size() {
 
     let result = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&oversized_config),
         None,
     );
@@ -497,9 +495,9 @@ fn init_rejects_oversized_max_pack_size() {
 
     let result = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&valid_config),
         None,
     );
@@ -526,9 +524,9 @@ fn flush_on_abort_writes_pending_index() {
     };
     let repo = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )
@@ -668,9 +666,9 @@ fn flush_on_abort_survives_pack_upload_failure() {
     };
     let repo = Repo::init(
         Box::new(FailPackUploadsBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )
@@ -782,9 +780,9 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
 
     let err = Repo::init(
         storage,
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&crate::repo::InitOptions {
             url: Some(url.clone()),
             ..Default::default()
@@ -824,9 +822,9 @@ fn init_creates_the_current_repository_format() {
 
     let repo = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -852,9 +850,9 @@ fn open_rejects_an_unknown_repository_version() {
 
     let repo = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -867,7 +865,7 @@ fn open_rejects_an_unknown_repository_version() {
 
     let result = Repo::open(
         Box::new(repo.storage().clone()),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new(),
     );
@@ -888,9 +886,9 @@ fn open_rejects_oversized_max_pack_size() {
     let storage = Box::new(MemoryBackend::new());
     let repo = Repo::init(
         storage,
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -905,7 +903,7 @@ fn open_rejects_oversized_max_pack_size() {
     // Re-open should fail.
     let result = Repo::open(
         Box::new(repo.storage().clone()),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new().with_index(),
     );
@@ -934,9 +932,9 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> (Repo, WriteSession) {
     };
     let repo = Repo::init(
         Box::new(MemoryBackend::new()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )
@@ -1102,9 +1100,9 @@ fn cross_session_pending_index_recovery() {
     // A store with mtimes: recovery adopts journal packs by their age.
     let repo = Repo::init(
         Box::new(MemoryBackend::with_mtimes()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )
@@ -1141,7 +1139,7 @@ fn cross_session_pending_index_recovery() {
     // Session 2: reopen the same repo with a different session ID.
     let repo2 = Repo::open(
         Box::new(shared_storage),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new().with_index(),
     )
@@ -1224,7 +1222,7 @@ fn initial_session_seed_includes_tree_packs() {
 /// diff an empty index against that state; it is refused instead.
 #[test]
 fn persist_refuses_an_unloaded_index_over_a_non_empty_head() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
     ws.store_chunk(&repo, b"one chunk", Compression::None, PackType::Data)
         .unwrap();
     repo.unchecked_writer().save_session(ws).unwrap();
@@ -1252,9 +1250,9 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     let mem: Arc<dyn vykar_storage::StorageBackend> = Arc::new(MemoryBackend::new());
     let mut repo = Repo::init(
         Box::new(Arc::clone(&mem)),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -1274,7 +1272,7 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     );
     let mut repo = Repo::open(
         Box::new(storage),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         crate::repo::OpenOptions::new(),
     )
@@ -1388,9 +1386,9 @@ fn init_refuses_a_server_without_the_v6_key_dirs() {
         });
     let err = Repo::init(
         Box::new(std::sync::Arc::clone(&storage)),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )

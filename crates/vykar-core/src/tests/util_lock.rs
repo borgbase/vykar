@@ -128,9 +128,9 @@ impl StorageBackend for AdvisoryLockBackend {
 fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repo {
     Repo::init(
         Box::new(backend),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -178,9 +178,9 @@ fn action_flushes_its_session_before_with_repo_lock_releases() {
     };
     let mut repo = Repo::init(
         Box::new(backend.clone()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )
@@ -220,9 +220,9 @@ fn a_failed_save_session_writes_the_journal() {
     };
     let mut repo = Repo::init(
         Box::new(backend.clone()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(&small_config),
         None,
     )

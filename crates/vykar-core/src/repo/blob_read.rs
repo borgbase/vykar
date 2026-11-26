@@ -330,8 +330,8 @@ mod tests {
     use crate::repo::coalesce::MAX_COALESCE_GAP;
     use crate::repo::format::{ChunkDecodeStage, ObjectType, pack_object_with_context};
     use crate::testutil::{MemoryBackend, RecordingBackend, test_chunk_hasher};
-    use vykar_crypto::PlaintextEngine;
     use vykar_crypto::aes_gcm::Aes256GcmEngine;
+    use vykar_crypto::testing::DeterministicEngine;
 
     struct Blob {
         id: ChunkId,
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn read_range_visits_blobs_in_order() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let payloads = payloads(3);
         let (data, blobs) = pack(&crypto, &payloads);
         let storage = store(&data);
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn missing_pack_is_pack_not_found() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (_, blobs) = pack(&crypto, &payloads(2));
         let storage = MemoryBackend::new();
         let (end, visited) = read_all(&storage, &crypto, false, &blobs, span(&blobs));
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn open_failure_is_open_failed() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (data, blobs) = pack(&crypto, &payloads(2));
         let storage = store(&data);
         let (start, len) = span(&blobs);
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn overlapping_blob_is_read_failed_at_its_index() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (data, mut blobs) = pack(&crypto, &payloads(1));
         let storage = store(&data);
         let again = Blob { ..blobs[0] };
@@ -499,56 +499,67 @@ mod tests {
 
     #[test]
     fn decode_error_goes_to_visitor_and_group_continues() {
-        let plaintext = PlaintextEngine::new(test_chunk_hasher());
-        let aes = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
-        let engines: [&dyn CryptoEngine; 2] = [&plaintext, &aes];
-        for crypto in engines {
-            let payloads = payloads(3);
-            let (mut data, blobs) = pack(crypto, &payloads);
-            let mid = &blobs[1];
-            let pos = if crypto.is_encrypting() {
-                // The last byte of the AEAD tag.
-                (mid.offset + u64::from(mid.size) - 1) as usize
-            } else {
-                let blob = &data[mid.offset as usize..][..mid.size as usize];
-                let at = blob
-                    .windows(payloads[1].len())
-                    .position(|w| w == payloads[1].as_slice())
-                    .expect("plaintext payload is stored verbatim");
-                mid.offset as usize + at + 3
-            };
-            data[pos] ^= 0x01;
-            let storage = store(&data);
+        let crypto = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let payloads = payloads(3);
+        let (mut data, blobs) = pack(&crypto, &payloads);
+        let mid = &blobs[1];
+        // The last byte of the AEAD tag.
+        data[(mid.offset + u64::from(mid.size) - 1) as usize] ^= 0x01;
+        let storage = store(&data);
 
-            let (end, visited) = read_all(&storage, crypto, false, &blobs, span(&blobs));
-            let enc = crypto.is_encrypting();
-            assert!(matches!(end, GroupEnd::Done), "encrypting={enc}: {end:?}");
-            assert_eq!(visited.len(), 3);
-            assert_eq!(visited[0].1.as_ref().unwrap(), &payloads[0]);
-            let stage = &visited[1].1.as_ref().unwrap_err().stage;
-            if enc {
-                assert!(matches!(stage, ChunkDecodeStage::Decrypt(_)), "{stage:?}");
-            } else {
-                assert!(
-                    matches!(stage, ChunkDecodeStage::IdMismatch { .. }),
-                    "{stage:?}"
-                );
-            }
-            assert_eq!(visited[2].1.as_ref().unwrap(), &payloads[2]);
+        let (end, visited) = read_all(&storage, &crypto, false, &blobs, span(&blobs));
+        assert!(matches!(end, GroupEnd::Done), "{end:?}");
+        assert_eq!(visited.len(), 3);
+        assert_eq!(visited[0].1.as_ref().unwrap(), &payloads[0]);
+        let stage = &visited[1].1.as_ref().unwrap_err().stage;
+        assert!(matches!(stage, ChunkDecodeStage::Decrypt(_)), "{stage:?}");
+        assert_eq!(visited[2].1.as_ref().unwrap(), &payloads[2]);
+    }
+
+    /// A blob that authenticates but whose content is not its chunk ID's
+    /// (sealed under the wrong ID) fails the verifying read's ID check, at
+    /// its own visit; the group goes on.
+    #[test]
+    fn id_mismatch_goes_to_visitor_and_group_continues() {
+        let crypto = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let payloads = payloads(3);
+        let wrong = id_of(&payloads[0]);
+        let mut data = Vec::new();
+        let mut blobs = Vec::new();
+        for (i, p) in payloads.iter().enumerate() {
+            let id = if i == 1 { wrong } else { id_of(p) };
+            let sealed = seal(id, p, &crypto);
+            blobs.push(Blob {
+                id,
+                offset: data.len() as u64,
+                size: sealed.len() as u32,
+                hint: None,
+            });
+            data.extend_from_slice(&sealed);
         }
+        let storage = store(&data);
+
+        let (end, visited) = read_all(&storage, &crypto, true, &blobs, span(&blobs));
+        assert!(matches!(end, GroupEnd::Done), "{end:?}");
+        assert_eq!(visited.len(), 3);
+        assert_eq!(visited[0].1.as_ref().unwrap(), &payloads[0]);
+        let stage = &visited[1].1.as_ref().unwrap_err().stage;
+        assert!(
+            matches!(stage, ChunkDecodeStage::IdMismatch { actual } if *actual == id_of(&payloads[1])),
+            "{stage:?}"
+        );
+        assert_eq!(visited[2].1.as_ref().unwrap(), &payloads[2]);
     }
 
     #[test]
     fn raw_sink_sees_stored_bytes_of_decoded_blobs_only() {
-        let plaintext = PlaintextEngine::new(test_chunk_hasher());
         let aes = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
-        let engines: [&dyn CryptoEngine; 2] = [&plaintext, &aes];
+        let engines: [&dyn CryptoEngine; 1] = [&aes];
         for crypto in engines {
             let payloads = payloads(3);
             let (mut data, blobs) = pack(crypto, &payloads);
             let mid = &blobs[1];
-            // The middle blob's last byte: the AEAD tag, or plaintext payload
-            // bytes under the ID check.
+            // The middle blob's last byte: the AEAD tag.
             data[(mid.offset + u64::from(mid.size) - 1) as usize] ^= 0x01;
             let storage = store(&data);
             let stored = |b: &Blob| data[b.offset as usize..][..b.size as usize].to_vec();
@@ -589,12 +600,12 @@ mod tests {
 
     #[test]
     fn size_hint_and_verify_are_passed() {
-        let plaintext = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let payloads = payloads(1);
-        let (data, mut blobs) = pack(&plaintext, &payloads);
+        let (data, mut blobs) = pack(&crypto, &payloads);
         blobs[0].hint = Some(payloads[0].len() + 1);
         let storage = store(&data);
-        let (_, visited) = read_all(&storage, &plaintext, false, &blobs, span(&blobs));
+        let (_, visited) = read_all(&storage, &crypto, false, &blobs, span(&blobs));
         assert!(matches!(
             visited[0].1.as_ref().unwrap_err().stage,
             ChunkDecodeStage::SizeMismatch { .. }
@@ -622,7 +633,7 @@ mod tests {
 
     #[test]
     fn stop_before_open_issues_no_request() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (data, blobs) = pack(&crypto, &payloads(2));
         let (storage, log) = RecordingBackend::new();
         storage.put(&pack_id().storage_key(), &data).unwrap();
@@ -650,7 +661,7 @@ mod tests {
 
     #[test]
     fn stop_between_blobs() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (data, blobs) = pack(&crypto, &payloads(3));
         let storage = store(&data);
         let (start, len) = span(&blobs);
@@ -678,7 +689,7 @@ mod tests {
 
     #[test]
     fn visitor_error_short_circuits() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (data, blobs) = pack(&crypto, &payloads(2));
         let storage = store(&data);
         let (start, len) = span(&blobs);
@@ -701,7 +712,7 @@ mod tests {
 
     #[test]
     fn visitor_may_take_plaintext() {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let payloads = payloads(3);
         let (data, blobs) = pack(&crypto, &payloads);
         let storage = store(&data);

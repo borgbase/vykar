@@ -13,6 +13,7 @@ use std::time::Duration;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
+use super::helpers::pass;
 use crate::commands::backup;
 use crate::repo::control::CancelToken;
 
@@ -296,12 +297,33 @@ fn setup() -> (
     (dir, config, src_dir)
 }
 
+/// [`setup`] on a plaintext repository.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+fn setup_plaintext() -> (
+    tempfile::TempDir,
+    crate::config::VykarConfig,
+    std::path::PathBuf,
+) {
+    crate::testutil::init_test_environment();
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(src_dir.join("a.bin"), vec![0x5au8; 64 * 1024]).unwrap();
+    fs::write(src_dir.join("b.txt"), b"hello").unwrap();
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    config.encryption.mode = crate::config::EncryptionModeConfig::None;
+    config.encryption.passphrase = None;
+    crate::commands::init::run(&config, None).unwrap();
+    (dir, config, src_dir)
+}
+
 fn run_backup(
     config: &crate::config::VykarConfig,
     src: &Path,
     shared: &Shared,
 ) -> Result<backup::BackupOutcome> {
-    run_backup_with_passphrase(config, src, shared, None)
+    run_backup_with_passphrase(config, src, shared, pass(config))
 }
 
 fn run_backup_with_passphrase(
@@ -538,7 +560,7 @@ fn pack_deleted_before_commit_fails_backup_many_packs() {
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
     config.repository.min_pack_size = 1;
     config.repository.max_pack_size = 4 * 1024;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     assert_missing_pack_fails_commit(&config, &src);
 }
@@ -562,7 +584,7 @@ fn many_pack_backup_commits() {
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
     config.repository.min_pack_size = 1;
     config.repository.max_pack_size = 4 * 1024;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     run_backup(&config, &src, &Shared::default()).unwrap();
     assert!(
@@ -853,18 +875,19 @@ fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn assert_check_clean(config: &crate::config::VykarConfig) {
-    let result = crate::commands::check::run(config, None, false, false).unwrap();
+    let result = crate::commands::check::run(config, pass(config), false, false).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 /// [`assert_check_clean`] with data verification on.
 fn assert_check_clean_verified(config: &crate::config::VykarConfig) {
-    let result = crate::commands::check::run(config, None, true, false).unwrap();
+    let result = crate::commands::check::run(config, pass(config), true, false).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 fn compact(config: &crate::config::VykarConfig) {
-    crate::commands::compact::run(config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    crate::commands::compact::run(config, pass(config), 0.0, None, false, &CancelToken::new())
+        .unwrap();
 }
 
 fn assert_superset(packs: &[String], config: &crate::config::VykarConfig) {
@@ -882,7 +905,7 @@ fn assert_restores_snap(config: &crate::config::VykarConfig, dest: &Path) {
 fn assert_restores(config: &crate::config::VykarConfig, snapshot: &str, dest: &Path) {
     crate::commands::restore::run(
         config,
-        None,
+        pass(config),
         snapshot,
         dest.to_str().unwrap(),
         None,
@@ -951,9 +974,16 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     let (packs, _) = fail_after_the_index_write(&config, &src, &repo_dir);
 
     // No snapshot names the entries: compact refuses to sweep to empty.
-    let err = crate::commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new())
-        .unwrap_err()
-        .to_string();
+    let err = crate::commands::compact::run(
+        &config,
+        pass(&config),
+        0.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         err.starts_with(crate::commands::compact::MARK_REFUSED),
         "{err}"
@@ -969,7 +999,7 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     let repair = |mode| {
         crate::commands::check::run_with_repair(
             &config,
-            None,
+            pass(&config),
             false,
             mode,
             None,
@@ -1033,7 +1063,7 @@ fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::
         crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     crate::repo::Repo::open(
         storage,
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         Some(cache.to_path_buf()),
         crate::repo::OpenOptions::new().with_index(),
     )
@@ -1095,10 +1125,16 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 /// still runs the check, BK-2/R4; CM-1), and (BK-4) whether the session
 /// found them in an applied segment (reuse by key) or, after a fold, in the
 /// table (reuse by position).
+///
+/// The aged session is reaped by maintenance under the lock, which on a
+/// put-if-absent store only a plaintext repository takes.
+// Plaintext only to reach lock mode here: 10-single-protocol step 3 moves
+// this to an encrypted repository on a store without put-if-absent, or
+// deletes it with a reason.
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     for (new_chunk, fold_first) in [(true, false), (false, false), (true, true), (false, true)] {
-        let (dir, config, src) = setup();
+        let (dir, config, src) = setup_plaintext();
         // A snapshot that stays, so the sweep is not one to empty.
         let src0 = dir.path().join("src0");
         fs::create_dir_all(&src0).unwrap();
@@ -1108,7 +1144,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
         if fold_first {
             let mut repo = crate::commands::util::open_repo(
                 &config,
-                None,
+                pass(&config),
                 crate::repo::OpenOptions::new().with_index(),
                 &CancelToken::new(),
             )
@@ -1160,8 +1196,14 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                     .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 3600))
                     .unwrap();
 
-                crate::commands::delete::run(&other, None, &["s1"], false, &CancelToken::new())
-                    .unwrap();
+                crate::commands::delete::run(
+                    &other,
+                    pass(&other),
+                    &["s1"],
+                    false,
+                    &CancelToken::new(),
+                )
+                .unwrap();
                 assert!(
                     !storage.exists(key).unwrap(),
                     "maintenance reaped the marker"
@@ -1175,7 +1217,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 );
                 let swept = crate::commands::compact::run(
                     &other,
-                    None,
+                    pass(&other),
                     10.0,
                     None,
                     false,

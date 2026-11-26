@@ -2,6 +2,8 @@
 //! recomputed on every read. A same-length bit flip in a stored chunk must be
 //! rejected by restore (file data) and list (item streams) without `--verify`.
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
+
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::pedantic)]
 #![allow(clippy::indexing_slicing)]
@@ -15,7 +17,7 @@ use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 use vykar_types::chunk_id::ChunkId;
 
-use crate::common::{backup_source, make_test_config, open_local_repo};
+use crate::common::{backup_source, make_plaintext_config, open_local_repo};
 
 /// Deterministic incompressible bytes (xorshift64).
 fn noise(len: usize) -> Vec<u8> {
@@ -38,7 +40,7 @@ fn setup(tmp: &Path) -> (VykarConfig, std::path::PathBuf) {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::write(src_dir.join("data.bin"), noise(64 * 1024)).unwrap();
 
-    let config = make_test_config(&repo_dir);
+    let config = make_plaintext_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
     backup_source(&config, &src_dir, "src", "snap", None, false);
     (config, repo_dir)

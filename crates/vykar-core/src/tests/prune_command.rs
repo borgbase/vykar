@@ -7,7 +7,7 @@ use vykar_types::error::VykarError;
 
 use super::helpers::{
     backup_single_source, clear_tree_cache, init_repo, load_snapshot_cache_from_disk,
-    make_test_config, open_local_repo, source_entry,
+    make_test_config, open_local_repo, pass, source_entry,
 };
 
 #[test]
@@ -22,7 +22,7 @@ fn prune_errors_when_no_retention_rules_are_configured() {
     let sources = vec![source_entry(&source_dir, "src-a")];
     let err = commands::prune::run(
         &config,
-        None,
+        pass(&config),
         true,
         false,
         &sources,
@@ -62,7 +62,7 @@ fn prune_dry_run_reports_without_mutating_state() {
     let sources = vec![source_entry(&source_dir, "src-a")];
     let (stats, list_entries) = commands::prune::run(
         &config,
-        None,
+        pass(&config),
         true,
         true,
         &sources,
@@ -96,7 +96,7 @@ fn prune_source_filter_only_prunes_matching_label() {
         keep_last: Some(1),
         ..RetentionConfig::default()
     };
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
 
     backup_single_source(&config, &source_a, "src-a", "snap-a-1");
     std::thread::sleep(Duration::from_millis(2));
@@ -111,7 +111,7 @@ fn prune_source_filter_only_prunes_matching_label() {
     let source_filter = vec!["src-a".to_string()];
     let (stats, _list_entries) = commands::prune::run(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         &sources,
@@ -161,9 +161,16 @@ fn prune_groups_by_label_even_without_configured_sources() {
     std::thread::sleep(Duration::from_millis(2));
     backup_single_source(&config, &source_b, "b", "snap-b");
 
-    let (stats, _) =
-        commands::prune::run(&config, None, false, false, &[], &[], &CancelToken::new())
-            .expect("prune should succeed without a sources block");
+    let (stats, _) = commands::prune::run(
+        &config,
+        pass(&config),
+        false,
+        false,
+        &[],
+        &[],
+        &CancelToken::new(),
+    )
+    .expect("prune should succeed without a sources block");
 
     assert_eq!(stats.pruned, 0);
     assert_eq!(stats.kept, 2);
@@ -203,8 +210,16 @@ fn prune_persists_snapshot_cache_immediately() {
     let before = load_snapshot_cache_from_disk(&repo_dir);
     assert!(before.entries.values().any(|e| e.name == "snap-old"));
 
-    let (stats, _) =
-        commands::prune::run(&config, None, false, false, &[], &[], &CancelToken::new()).unwrap();
+    let (stats, _) = commands::prune::run(
+        &config,
+        pass(&config),
+        false,
+        false,
+        &[],
+        &[],
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(stats.pruned, 1);
     assert_eq!(stats.kept, 1);
 
@@ -226,9 +241,17 @@ fn prune_errors_without_retention_rules_when_sources_empty() {
     std::fs::create_dir_all(&repo_dir).unwrap();
 
     let config = init_repo(&repo_dir);
-    let err = commands::prune::run(&config, None, true, false, &[], &[], &CancelToken::new())
-        .err()
-        .unwrap();
+    let err = commands::prune::run(
+        &config,
+        pass(&config),
+        true,
+        false,
+        &[],
+        &[],
+        &CancelToken::new(),
+    )
+    .err()
+    .unwrap();
     assert!(
         matches!(err, VykarError::Config(msg) if msg.contains("no retention rules configured"))
     );
@@ -280,7 +303,7 @@ fn prune_reads_no_pack_and_writes_no_index() {
     let sources = vec![source_entry(&source_dir, "src-a")];
     let (stats, _) = commands::prune::run(
         &config,
-        None,
+        pass(&config),
         false,
         false,
         &sources,

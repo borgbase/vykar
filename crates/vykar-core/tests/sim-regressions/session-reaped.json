@@ -1,6 +1,6 @@
 {
   "name": "session-reaped",
-  "note": "First SessionReaped case of a 10-minute make sim-campaign (phase F part 2): a same-hostname compact reaps a live backup's session marker. The same-hostname delete before it reaped the backup's young lock and the backup went on to put its snapshot, so it is also TwoLockHolders. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): neither the delete nor the compact reaps the backup's live lock or marker any more; kept as a regression: this schedule must stay clean.",
+  "note": "First SessionReaped case of a 10-minute make sim-campaign (phase F part 2): a same-hostname compact reaps a live backup's session marker. The same-hostname delete before it reaped the backup's young lock and the backup went on to put its snapshot, so it is also TwoLockHolders. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): neither the delete nor the compact reaps the backup's live lock or marker any more; kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2.",
   "expect": [],
   "at": [
     [
@@ -172,6 +172,7 @@
       1,
       1
     ],
-    "policy": "Continue"
+    "policy": "Continue",
+    "template": "Encrypted"
   }
 }

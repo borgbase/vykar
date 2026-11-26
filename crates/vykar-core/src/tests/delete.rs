@@ -4,11 +4,11 @@ use vykar_types::error::VykarError;
 
 use super::helpers::{
     PAST_T_PACK, age_repo_objects, backup_single_source, clear_tree_cache, init_repo,
-    load_snapshot_cache_from_disk, open_local_repo,
+    load_snapshot_cache_from_disk, open_local_repo, pass,
 };
 
 fn compact(config: &crate::config::VykarConfig) -> commands::compact::CompactStats {
-    commands::compact::run(config, None, 10.0, None, false, &CancelToken::new()).unwrap()
+    commands::compact::run(config, pass(config), 10.0, None, false, &CancelToken::new()).unwrap()
 }
 
 #[test]
@@ -20,7 +20,7 @@ fn delete_missing_snapshot_returns_snapshot_not_found() {
 
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["does-not-exist"],
         false,
         &CancelToken::new(),
@@ -47,7 +47,7 @@ fn delete_dry_run_resolves_names_without_mutation() {
 
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-delete-dry"],
         true,
         &CancelToken::new(),
@@ -94,7 +94,7 @@ fn delete_removes_the_snapshot_and_compact_its_chunks() {
 
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-delete-live"],
         false,
         &CancelToken::new(),
@@ -141,7 +141,7 @@ fn delete_persists_snapshot_cache_immediately() {
 
     commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-cache-del"],
         false,
         &CancelToken::new(),
@@ -184,7 +184,7 @@ fn delete_multiple_snapshots_in_single_call() {
     // Delete first two in one call.
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-1", "snap-2"],
         false,
         &CancelToken::new(),
@@ -208,7 +208,7 @@ fn delete_multiple_snapshots_in_single_call() {
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-3",
         restore_dir.to_str().unwrap(),
         None,
@@ -246,7 +246,7 @@ fn delete_fails_fast_if_any_snapshot_missing() {
     // Request deletion of existing + nonexistent — should fail before any mutation.
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-exists", "nonexistent"],
         false,
         &CancelToken::new(),
@@ -277,7 +277,7 @@ fn delete_deduplicates_snapshot_names() {
     // Pass the same name twice — should succeed (deduped to one delete).
     let result = commands::delete::run(
         &config,
-        None,
+        pass(&config),
         &["snap-dup", "snap-dup"],
         false,
         &CancelToken::new(),
@@ -318,8 +318,14 @@ fn delete_reads_no_pack() {
     }
     clear_tree_cache(&repo_dir);
 
-    let result =
-        commands::delete::run(&config, None, &["snap-gone"], false, &CancelToken::new()).unwrap();
+    let result = commands::delete::run(
+        &config,
+        pass(&config),
+        &["snap-gone"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(result.stats.len(), 1);
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     let after = open_local_repo(&repo_dir);

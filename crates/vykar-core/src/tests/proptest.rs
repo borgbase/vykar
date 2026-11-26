@@ -462,7 +462,7 @@ mod backup_restore {
     use proptest::prelude::*;
 
     use crate::commands;
-    use crate::tests::helpers::{backup_single_source, init_repo};
+    use crate::tests::helpers::{backup_single_source, init_repo, pass};
 
     fn arb_nested_file_tree() -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
         let path_strategy = prop_oneof![
@@ -513,7 +513,7 @@ mod backup_restore {
             backup_single_source(&config, &source_dir, "test", "snap-1");
             commands::restore::run(
                 &config,
-                None,
+                pass(&config),
                 "snap-1",
                 restore_dir.to_str().unwrap(),
                 None,

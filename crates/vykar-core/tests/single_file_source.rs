@@ -28,7 +28,7 @@ fn backup_paths(
         config,
         commands::backup::BackupRequest {
             snapshot_name,
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths,
             source_label,
             exclude_patterns: &[],
@@ -56,7 +56,7 @@ fn backup_and_restore_single_file_source() {
     std::fs::write(&file, b"world").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     // Regression check: backing up a regular-file source must NOT crash
     // with "Not a directory (os error 20)".
@@ -66,7 +66,7 @@ fn backup_and_restore_single_file_source() {
     let restore_dir = tmp.path().join("restore-v1");
     let stats = commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap-v1",
         restore_dir.to_str().unwrap(),
         None,
@@ -90,7 +90,7 @@ fn backup_and_restore_single_file_source() {
     let restore_dir2 = tmp.path().join("restore-v2");
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap-v2",
         restore_dir2.to_str().unwrap(),
         None,
@@ -117,7 +117,7 @@ fn backup_mixed_file_and_directory_sources() {
     std::fs::write(&file, b"standalone").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     let source_paths = vec![
         dir.to_string_lossy().to_string(),
@@ -128,7 +128,7 @@ fn backup_mixed_file_and_directory_sources() {
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap",
         restore_dir.to_str().unwrap(),
         None,

@@ -61,7 +61,7 @@ impl Fixture {
         config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
-        commands::init::run(&config, Some(PASS)).unwrap();
+        vykar_core::testing::with_cheap_kdf(|| commands::init::run(&config, Some(PASS))).unwrap();
         if with_snapshot {
             backup_source(&config, &source_dir, "src", "snap1", Some(PASS), false);
         }
@@ -700,6 +700,7 @@ fn dry_run_repair_does_not_backfill_the_missing_copy() {
     );
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn unencrypted_repositories_skip_the_key_phase() {
     let tmp = tempfile::tempdir().unwrap();
@@ -709,7 +710,7 @@ fn unencrypted_repositories_skip_the_key_phase() {
     std::fs::create_dir_all(&source_dir).unwrap();
     std::fs::write(source_dir.join("a.txt"), b"plaintext").unwrap();
 
-    let config = make_test_config(&repo_dir);
+    let config = crate::common::make_plaintext_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
     backup_source(&config, &source_dir, "src", "snap1", None, false);
 

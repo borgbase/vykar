@@ -918,8 +918,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
-    use vykar_crypto::PlaintextEngine;
     use vykar_crypto::aes_gcm::Aes256GcmEngine;
+    use vykar_crypto::testing::DeterministicEngine;
     use vykar_storage::RangeReader;
     use vykar_types::chunk_id::ChunkId;
 
@@ -942,7 +942,7 @@ mod tests {
 
         let payload = b"abc";
         let compressed = crate::compress::compress(Compression::None, payload).unwrap();
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
             dummy_chunk_id(0xAA).as_bytes(),
@@ -1007,7 +1007,7 @@ mod tests {
         let out = temp.path().join("big.bin");
 
         let big_data = vec![0xABu8; MAX_WRITE_BATCH + 1024];
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let cid = chunk_id_of(&big_data);
         let packed = pack_blob(cid, &big_data, &crypto);
 
@@ -1075,7 +1075,7 @@ mod tests {
         let chunk_a = vec![0xAAu8; half];
         let chunk_b = vec![0xBBu8; MAX_WRITE_BATCH - half];
 
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let cid_a = chunk_id_of(&chunk_a);
         let cid_b = chunk_id_of(&chunk_b);
         let packed_a = pack_blob(cid_a, &chunk_a, &crypto);
@@ -1161,7 +1161,7 @@ mod tests {
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 8192];
 
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let cid_a = chunk_id_of(&data_a);
         let cid_b = chunk_id_of(&data_b);
         let packed_a = pack_blob(cid_a, &data_a, &crypto);
@@ -1254,7 +1254,7 @@ mod tests {
 
         let num_chunks = 8u8;
         let chunk_size = 1024usize; // well under MAX_WRITE_BATCH
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
 
         #[allow(clippy::type_complexity)]
         let mut entries: Vec<(ChunkId, Vec<u8>, u32, SmallVec<[WriteTarget; 1]>)> = Vec::new();
@@ -1330,7 +1330,7 @@ mod tests {
         let out = temp.path().join("good.bin");
 
         let payload = b"verify-good-data";
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let cid = ChunkId::compute(&test_chunk_hasher(), payload);
         let packed = pack_blob(cid, payload, &crypto);
 
@@ -1474,10 +1474,11 @@ mod tests {
     /// Plaintext repo: a flipped payload byte survives decode (no AEAD, no
     /// compression, same length) and must be caught by the always-on chunk ID
     /// check even with `verify_chunks = false`.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn process_read_group_plaintext_rejects_corrupt_payload_without_verify() {
         let payload = b"plaintext-payload-that-gets-corrupted";
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = vykar_crypto::PlaintextEngine::new(test_chunk_hasher());
         let cid = chunk_id_of(payload);
         let mut packed = pack_blob(cid, payload, &crypto);
         let pos = packed
@@ -1599,7 +1600,7 @@ mod tests {
 
     /// One pack holding one chunk, plus the `PlannedFile` and `ReadGroup` that
     /// target it. Returns the packed bytes so the caller can build the group.
-    fn one_chunk_pack(crypto: &PlaintextEngine, payload: &[u8]) -> (PackId, Vec<u8>) {
+    fn one_chunk_pack(crypto: &DeterministicEngine, payload: &[u8]) -> (PackId, Vec<u8>) {
         let compressed = crate::compress::compress(Compression::None, payload).unwrap();
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
@@ -1636,7 +1637,7 @@ mod tests {
         let out = temp.path().join("out.bin");
 
         let payload = b"parallel-cancel-payload";
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let (pack_id, packed) = one_chunk_pack(&crypto, payload);
 
         let cancel = CancelToken::new();
@@ -1697,7 +1698,7 @@ mod tests {
 
         let payload = b"parallel-cancel-payload";
         let compressed = crate::compress::compress(Compression::None, payload).unwrap();
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
             dummy_chunk_id(0xC1).as_bytes(),
@@ -1779,24 +1780,20 @@ mod tests {
         }]
     }
 
-    /// Flip one payload byte of a plaintext packed blob (same length, so only
-    /// the chunk-ID check catches it).
+    /// Flip one ciphertext byte of a packed blob (`[tag][nonce][ct+tag]`, no
+    /// compression), so its authentication fails.
     fn corrupt(packed: &mut [u8], payload: &[u8]) {
-        let pos = packed
-            .windows(payload.len())
-            .position(|w| w == payload)
-            .expect("plaintext payload is stored verbatim");
-        packed[pos + payload.len() / 2] ^= 0x01;
+        packed[1 + 12 + payload.len() / 2] ^= 0x01;
     }
 
-    /// A plaintext pack with one blob per payload, blob `i` targeting file `i`.
+    /// A pack with one blob per payload, blob `i` targeting file `i`.
     /// Blobs listed in `corrupt_idx` have a flipped byte.
     fn pack_of(
         pack_id: PackId,
         payloads: &[&[u8]],
         corrupt_idx: &[usize],
     ) -> (Vec<u8>, ReadGroup, Vec<PlannedFile>) {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let entries = payloads
             .iter()
             .enumerate()
@@ -1852,7 +1849,7 @@ mod tests {
         failures: Option<&BatchFailures>,
         counters: &WriteCounters,
     ) -> std::result::Result<(), ReadError> {
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         process_read_group(
             group,
             files,
@@ -1886,8 +1883,8 @@ mod tests {
         let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
         assert!(
             matches!(&err, ReadError::Source(VykarError::ChunkDecode(e))
-                if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
-                    && e.to_string().contains("hash mismatch")),
+                if matches!(e.stage, ChunkDecodeStage::Decrypt(_))
+                    && e.to_string().contains("decryption failed")),
             "got: {err:?}"
         );
     }
@@ -2018,7 +2015,7 @@ mod tests {
         };
         for (swap, with_progress) in [(false, false), (true, false), (false, true), (true, true)] {
             let progress = with_progress.then_some(&batch);
-            let crypto = PlaintextEngine::new(test_chunk_hasher());
+            let crypto = DeterministicEngine::new(test_chunk_hasher());
             let (pack_src, pack_fatal) = (dummy_pack_id(0x30), dummy_pack_id(0x31));
             let storage: Arc<dyn StorageBackend> = Arc::new(BarrierBackend {
                 inner: MemoryBackend::new(),
@@ -2102,7 +2099,7 @@ mod tests {
         assert_eq!(counters.files_done(), 2, "the damaged file is not counted");
         let map = failures.into_map();
         assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![1]);
-        assert!(map[&1].contains("hash mismatch"), "got: {}", map[&1]);
+        assert!(map[&1].contains("decryption failed"), "got: {}", map[&1]);
         assert_eq!(
             std::fs::read(temp.path().join("f0.bin")).unwrap(),
             payloads[0]
@@ -2366,7 +2363,7 @@ mod tests {
     fn stop_mid_group_does_not_flush_the_accumulator() {
         let pack_id = dummy_pack_id(0x55);
         let payloads = payloads(2);
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         // Both blobs fill one file back to back, so the first one is held in
         // the accumulator to be batched with the second.
         let mut file_offset = 0;
@@ -2748,7 +2745,7 @@ mod tests {
             "equal sizes: either may go first"
         );
         let (pack_a, pack_b) = (dummy_pack_id(0x70), dummy_pack_id(0x71));
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let crypto = DeterministicEngine::new(test_chunk_hasher());
         let entries: Vec<(PackId, ChunkId, Vec<u8>)> = payloads
             .iter()
             .zip([pack_a, pack_b])

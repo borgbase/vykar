@@ -130,7 +130,7 @@ fn backup(
         config,
         commands::backup::BackupRequest {
             snapshot_name: snapshot,
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths,
             source_label: label,
             exclude_patterns: &[],
@@ -147,7 +147,7 @@ fn backup(
 }
 
 fn listed_paths(config: &VykarConfig, snapshot: &str) -> Vec<Vec<u8>> {
-    commands::list::list_snapshot_items(config, None, snapshot)
+    commands::list::list_snapshot_items(config, common::pass(config), snapshot)
         .unwrap()
         .iter()
         .map(|i| i.path_bytes().to_vec())
@@ -156,7 +156,7 @@ fn listed_paths(config: &VykarConfig, snapshot: &str) -> Vec<Vec<u8>> {
 
 fn init_repo(repo_dir: &Path) -> VykarConfig {
     let config = make_test_config(repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     config
 }
 
@@ -289,7 +289,7 @@ fn dumps_list_in_name_order_and_run_in_config_order() {
     let dest = tempfile::tempdir().unwrap();
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "s-dumps",
         dest.path().to_str().unwrap(),
         None,

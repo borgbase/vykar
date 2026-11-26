@@ -52,7 +52,7 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
-        template: TemplateKind::Plain,
+        template: TemplateKind::Encrypted,
         lock_clients: vec![],
     }
 }
@@ -257,19 +257,16 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         lock_free_only.push((format!("{name}-stepped-advances-k1-lockfree"), jumps, 1));
         lock_free_only.push((format!("{name}-stepped-k2-lockfree"), c, 2));
     }
-    // Every scenario on the conditional store too (04 step 8, N6): local,
-    // OpenSSH SFTP, AWS S3 and vykar-server all offer put-if-absent. Every
-    // scenario lock-free too (phase F part 10c: the encrypted template on
-    // the conditional store), and the pair and three-client scenarios with
-    // client b in lock mode beside the others on the store whose plain PUT
-    // replaces heads (the mixed verdict).
+    // Every scenario lock-free too (phase F part 10c: the encrypted
+    // template on the conditional store; local, OpenSSH SFTP, AWS S3 and
+    // vykar-server all offer put-if-absent, 04 step 8, N6), and the pair and
+    // three-client scenarios with client b in lock mode beside the others on
+    // the store whose plain PUT replaces heads (the mixed verdict). Families:
+    // 0 plain (the fallback store, lock mode with the marker handshake),
+    // 1 lock-free, 2 mixed. The plaintext template's conditional family went
+    // with 10-single-protocol step 2: encrypted, it is the lock-free one.
     let mut all: Vec<(u32, usize, (String, Case, u32))> = Vec::new();
     for (name, c, k) in out {
-        all.push((
-            k,
-            1,
-            (format!("{name}-conditional"), conditional(c.clone()), k),
-        ));
         // A fault on a lock key never fires in the lock-free family: since
         // phase F part 10d no client there takes the lock (backups and
         // maintenance alike), so such a scenario repeats its no-fault twin.
@@ -277,7 +274,7 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         if !lock_fault {
             all.push((
                 k,
-                2,
+                1,
                 (
                     format!("{name}-lockfree"),
                     encrypted(conditional(c.clone())),
@@ -288,7 +285,7 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         if name.starts_with("pair") || name.starts_with("three") {
             all.push((
                 k,
-                3,
+                2,
                 (
                     format!("{name}-mixed"),
                     encrypted(mixed(c.clone(), vec![1])),
@@ -299,12 +296,12 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         all.push((k, 0, (name, c, k)));
     }
     for (name, c, k) in lock_free_only {
-        all.push((k, 2, (name, c, k)));
+        all.push((k, 1, (name, c, k)));
     }
     // Within one (K, family) the cheapest first; stable, so the build order
     // stays among equals.
     all.sort_by_key(|(k, family, (name, _, _))| (*k, *family, scenario_cost(name)));
-    let mut narrow: Vec<Vec<(String, Case, u32)>> = vec![Vec::new(); 4];
+    let mut narrow: Vec<Vec<(String, Case, u32)>> = vec![Vec::new(); 3];
     let mut wide: Vec<Vec<Vec<(String, Case, u32)>>> = Vec::new();
     for (k, family, s) in all {
         if k == 1 {
@@ -312,7 +309,7 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         } else {
             let at = usize::try_from(k - 2).expect("small K");
             if wide.len() <= at {
-                wide.resize_with(at + 1, || vec![Vec::new(); 4]);
+                wide.resize_with(at + 1, || vec![Vec::new(); 3]);
             }
             wide[at][family].push(s);
         }
@@ -426,20 +423,6 @@ fn assert_clean(name: &str, c: &Case) {
 #[test]
 fn lock_pair_on_distinct_hosts_is_clean() {
     assert_clean("pair-distinct", &lock_pair(HostPlan::Distinct));
-}
-
-/// The same pairs on the conditional store (04 step 8): every schedule is
-/// clean, invariant 12 and every retained head included.
-#[test]
-fn lock_pair_on_a_conditional_store_is_clean() {
-    assert_clean(
-        "pair-distinct-conditional",
-        &conditional(lock_pair(HostPlan::Distinct)),
-    );
-    assert_clean(
-        "pair-hostname-conditional",
-        &conditional(lock_pair(HostPlan::SameHostname)),
-    );
 }
 
 /// [`assert_clean`], and some schedule has a run that committed lock-free
@@ -665,21 +648,6 @@ fn backup_against_compact_is_clean() {
     );
 }
 
-/// The backup against delete + compact on the conditional store (04 step
-/// 8), whole and stepped: every schedule is clean; under the lock no create
-/// meets a taken generation, so the creates change no outcome.
-#[test]
-fn backup_against_compact_is_clean_on_a_conditional_store() {
-    assert_clean(
-        "compact-distinct-conditional",
-        &conditional(commit_vs_compact(HostPlan::Distinct)),
-    );
-    assert_clean(
-        "compact-distinct-stepped-conditional",
-        &conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
-    );
-}
-
 /// The same pair over the young template (c0's segment younger than
 /// T_pack, 04 step 7), whole and stepped: compact's sweep keeps c0's
 /// entries, so the backup's reuse of the shared file holds and it never
@@ -687,7 +655,7 @@ fn backup_against_compact_is_clean_on_a_conditional_store() {
 /// completes.
 #[test]
 fn backup_against_compact_over_a_young_control_never_goes_stale() {
-    let t = Template::young();
+    let t = Template::encrypted_young();
     for (name, c) in [
         (
             "compact-young-distinct",
@@ -697,8 +665,10 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
             "compact-young-distinct-stepped",
             stepped(commit_vs_compact(HostPlan::Distinct)),
         ),
+        // The same search as lock-free-compact-young-stepped, kept here for
+        // the stale count this test asserts on the lock-free route too.
         (
-            "compact-young-distinct-stepped-conditional",
+            "compact-young-distinct-stepped-lock-free",
             conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
         ),
     ] {
@@ -791,7 +761,7 @@ impl Contender {
 /// done (or at the start) every held client is free; anything else is a
 /// preemption.
 fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
-    lock_acquisitions_on(&Template::new(), hosts, bound)
+    lock_acquisitions_on(&Template::encrypted(), hosts, bound)
 }
 
 /// [`lock_acquisitions`] on `template`.
@@ -1205,7 +1175,7 @@ fn measure_bounds() {
     if std::env::var("VYKAR_SIM_MEASURE").ok().as_deref() != Some("1") {
         return;
     }
-    let t = Template::new();
+    let t = Template::encrypted();
     for k in [1, 2] {
         let mut total = Duration::ZERO;
         let bases = [
@@ -1262,15 +1232,13 @@ fn measure_bounds() {
 /// far as they exist before them, on the encrypted template (runs and wall
 /// time, against `PRECOMMIT_MAX_RUNS`): every client still commits under
 /// the lock here, so a lock-free search's size is estimated by its
-/// lock-mode twin. The plaintext twin of the first search gives the
-/// encrypted template's cost per run.
+/// lock-mode twin.
 #[test]
 fn measure_part_10_searches() {
     if std::env::var("VYKAR_SIM_MEASURE").ok().as_deref() != Some("1") {
         return;
     }
     let start = Instant::now();
-    let plain = Template::new();
     let enc = Template::encrypted();
     eprintln!("encrypted template built in {:?}", start.elapsed());
     let start = Instant::now();
@@ -1291,12 +1259,6 @@ fn measure_part_10_searches() {
         (name.to_string(), t, c, 1)
     }
     let searches: Vec<(String, &Template, Case, u32)> = vec![
-        // The plaintext twin: the encrypted template's cost per run.
-        k1(
-            "pair-distinct-conditional (plain)",
-            &plain,
-            conditional(lock_pair(HostPlan::Distinct)),
-        ),
         // 10c.
         k1(
             "lock_free_pair_is_clean: pair-distinct",

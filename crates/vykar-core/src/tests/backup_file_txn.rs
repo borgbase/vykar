@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 
+use super::helpers::pass;
 use crate::commands;
 use crate::commands::backup;
 use crate::config::{CommandDump, VykarConfig};
@@ -45,7 +46,7 @@ fn config_in(dir: &Path) -> VykarConfig {
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
     config.xattrs.enabled = false;
-    commands::init::run(&config, None).unwrap();
+    commands::init::run(&config, pass(&config)).unwrap();
     config
 }
 
@@ -66,14 +67,14 @@ fn unreferenced(config: &VykarConfig) -> commands::compact::UnreferencedReport {
 }
 
 fn check_clean(config: &VykarConfig) {
-    let result = commands::check::run(config, None, true, false).unwrap();
+    let result = commands::check::run(config, pass(config), true, false).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 fn restore(config: &VykarConfig, snapshot: &str, dest: &Path) {
     commands::restore::run(
         config,
-        None,
+        pass(config),
         snapshot,
         dest.to_str().unwrap(),
         None,
@@ -202,8 +203,15 @@ fn drift_in_a_later_segment_skips_the_file_and_keeps_its_chunks() {
     // Once old, compact sweeps them.
     let repo_dir = Path::new(&config.repository.url);
     age_repo_objects(repo_dir, &["index.d", "packs"], PAST_T_PACK);
-    let compacted =
-        commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    let compacted = commands::compact::run(
+        &config,
+        pass(&config),
+        0.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(compacted.chunks_unreferenced > 0, "{compacted:?}");
     assert!(unreferenced(&config).unreferenced.is_empty());
     check_clean(&config);
@@ -224,7 +232,7 @@ fn backup_with_dump(
         config,
         backup::BackupRequest {
             snapshot_name: snapshot,
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "src",
             exclude_patterns: &[],

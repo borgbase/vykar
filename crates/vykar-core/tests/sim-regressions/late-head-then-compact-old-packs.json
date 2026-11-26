@@ -1,6 +1,6 @@
 {
   "name": "late-head-then-compact-old-packs",
-  "note": "LateHeadThenCompact with packs older than T_pack (phase F part 7, built from late-head-then-compact for 04 step 5): two 6 h 1 min jumps between a's uploads and its commit lock, so its packs are 12 h old while its segment is new; a's head PUT is delayed, compact deletes the packs as old orphans and keeps the segment (younger than T_idx), and the late head then names absent packs. Since 04 step 5 orphans younger than T_pack are kept. Fixed by 04 step 8. Since 04 step 7 (phase F part 8b) a's commit refuses: its marker went unrefreshed and its uploads are 12 h old (I8), so a writes no segment and no head and no late head of a's backup exists. The case's IndexHead delay then lands on the next head PUT of client 0, its compact's, which lands after the compact released its lock: LateIndexWrite, the mechanism of late-head-then-compact (04 step 8). Re-promoted with that schedule. So despite its name this seed now shows the LateIndexWrite mechanism of seed late-head-then-compact, not LateHeadThenCompact, whose positive coverage is the scripted test a_late_head_of_a_refreshed_backup_names_packs_compact_deleted (tests/sim.rs). Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-then-compact-old-packs-conditional is the same case on a conditional store.",
+  "note": "LateHeadThenCompact with packs older than T_pack (phase F part 7, built from late-head-then-compact for 04 step 5): two 6 h 1 min jumps between a's uploads and its commit lock, so its packs are 12 h old while its segment is new; a's head PUT is delayed, compact deletes the packs as old orphans and keeps the segment (younger than T_idx), and the late head then names absent packs. Since 04 step 5 orphans younger than T_pack are kept. Fixed by 04 step 8. Since 04 step 7 (phase F part 8b) a's commit refuses: its marker went unrefreshed and its uploads are 12 h old (I8), so a writes no segment and no head and no late head of a's backup exists. The case's IndexHead delay then lands on the next head PUT of client 0, its compact's, which lands after the compact released its lock: LateIndexWrite, the mechanism of late-head-then-compact (04 step 8). Re-promoted with that schedule. So despite its name this seed now shows the LateIndexWrite mechanism of seed late-head-then-compact, not LateHeadThenCompact, whose positive coverage is the scripted test a_late_head_of_a_refreshed_backup_names_packs_compact_deleted (tests/sim.rs). Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-then-compact-old-packs-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2.",
   "expect": [
     "LateIndexWrite"
   ],
@@ -258,6 +258,7 @@
       0,
       0
     ],
-    "policy": "First"
+    "policy": "First",
+    "template": "Encrypted"
   }
 }

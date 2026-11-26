@@ -46,6 +46,9 @@ jobs:
       - name: Module boundaries
         run: sh scripts/check-module-boundaries.sh
 
+      - name: Product features
+        run: sh scripts/check-product-features.sh
+
       - name: Lint (clippy)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

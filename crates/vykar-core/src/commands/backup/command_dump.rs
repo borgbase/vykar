@@ -363,7 +363,7 @@ mod tests {
 
     /// Helper: set up a repo with a write session for streaming dump tests.
     fn setup_test_repo() -> (Repo, WriteSession) {
-        crate::testutil::test_repo_plaintext_with_session()
+        crate::testutil::test_repo_with_session()
     }
 
     #[test]

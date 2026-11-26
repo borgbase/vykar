@@ -11,7 +11,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | Target | What it fuzzes |
 |--------|---------------|
 | `fuzz_pack_scan` | Pack binary parser (`scan_pack_blobs_bytes`) |
-| `fuzz_pack_trailer` | Pack trailer parsers (`PackTrailer::decode_body`, which must re-encode identically, `parse_footer`, `open_trailer_frame`, `read_trailer_from_pack_bytes`) |
+| `fuzz_pack_trailer` | Pack trailer parsers (`PackTrailer::decode_body`, which must re-encode identically, `parse_footer`, `open_trailer_frame`, `read_trailer_from_pack_bytes`; the last two under a deterministic AEAD engine, so raw input reaches their framing and length checks) |
 | `fuzz_pack_map` | Pack map body decoder (`PackMap::decode_body`, which must re-encode identically) |
 | `fuzz_decompress` | LZ4/Zstd decompression (`decompress`, `decompress_metadata`, and the streaming zstd metadata reader against it); chunk decoding with and without a size hint must agree |
 | `fuzz_msgpack_snapshot_meta` | `SnapshotMeta` deserialization |
@@ -22,7 +22,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_index_head` | Index head decode (`IndexHead::decode`), checked to round-trip |
 | `fuzz_index_base_v2` | Index base body version 2 (`validate_base_body`), checked to re-encode identically through `BaseWriter` |
 | `fuzz_index_segment_v2` | Keyed index segment body version 2 (`SegmentBody::decode`), checked to re-encode identically |
-| `fuzz_index_object` | Stored `index.d/` objects through the store-level segment and base decoders of body version 2 (name check, plaintext unpack, zstd, codec, table install), against a buffered reference |
+| `fuzz_index_object` | `index.d/` objects through the store-level segment and base decoders of body version 2 (name check, unpack, zstd, codec, table install), against a buffered reference; the input is the object's plaintext, sealed with a deterministic AEAD engine |
 | `fuzz_repo_config` | Repository `config` decode (map and positional, `RepoConfig::decode`) and `DecodedConfig::validate`, re-encode of a v6 map, pack-size targets, then backup's chunker gate and both chunkers (checked to cut identically) |
 | `fuzz_key_blob` | Key blob screening (`inspect_key_blob`), checked against the KDF bounds; never runs the KDF |
 | `fuzz_restore_paths` | Restore path sanitizer and symlink audit over an item stream, against an independent model |

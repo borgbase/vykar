@@ -299,7 +299,7 @@ pub(super) fn finish_file(
 mod tests {
     use super::*;
     use crate::repo::file_cache::CachedChunkRef;
-    use crate::testutil::test_repo_plaintext_with_session;
+    use crate::testutil::test_repo_with_session;
     use vykar_types::chunk_id::ChunkId;
 
     fn empty_item() -> Item {
@@ -346,7 +346,7 @@ mod tests {
 
         #[test]
         fn presession_hit_records_reference_without_data() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"already stored before this session".to_vec();
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), &data);
             repo.set_session_table_for_test(&mut ws, &index_of(&[(id, 77)]));
@@ -380,7 +380,7 @@ mod tests {
         /// data-less hit recorded by key.
         #[test]
         fn presession_hit_on_an_applied_addition_records_keyed_reuse() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"added by an earlier write".to_vec();
             let (id, size, _) = ws
                 .store_chunk(&repo, &data, Compression::None, PackType::Data)
@@ -420,7 +420,7 @@ mod tests {
         /// the session's must fail loudly, not record a reference.
         #[test]
         fn presession_hit_from_foreign_prefilter_errors() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"already stored before this session".to_vec();
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), &data);
             let index = index_of(&[(id, 77)]);
@@ -449,7 +449,7 @@ mod tests {
         /// the same new chunk must still dedup against each other.
         #[test]
         fn false_positives_packed_in_worker_dedup_within_session() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"new in this session, colliding filter key".to_vec();
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), &data);
             let mut colliding = *id.as_bytes();
@@ -507,7 +507,7 @@ mod tests {
 
         #[test]
         fn plain_store_is_new_once_then_reused() {
-            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let (repo, mut ws) = test_repo_with_session();
             let data = b"one tree chunk of the item stream";
             let first = ws.store(&repo, plain(data), PackType::Tree).unwrap();
             let second = ws.store(&repo, plain(data), PackType::Tree).unwrap();
@@ -526,7 +526,7 @@ mod tests {
 
         #[test]
         fn plain_store_dedups_against_a_worker_chunk() {
-            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let (repo, mut ws) = test_repo_with_session();
             let data = b"a file chunk, later also a dump chunk";
             let mut stats = SnapshotStats::default();
             let mut chunks = Vec::new();
@@ -556,7 +556,7 @@ mod tests {
 
         #[test]
         fn existing_chunk_without_prefilter_errors() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"already stored before this session";
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
             repo.set_session_table_for_test(&mut ws, &index_of(&[(id, 77)]));
@@ -583,7 +583,7 @@ mod tests {
         /// lookup, table included, not the prefilter-miss one.
         #[test]
         fn prepared_chunk_without_prefilter_finds_the_table() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"already stored before this session";
             let id = ChunkId::compute(repo.crypto().chunk_hasher(), data);
             repo.set_session_table_for_test(&mut ws, &index_of(&[(id, 77)]));
@@ -612,7 +612,7 @@ mod tests {
 
         #[test]
         fn commit_file_chunk_accounts_new_and_reused() {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let old = b"already stored before this session";
             let fresh = b"new in this session";
             let old_id = ChunkId::compute(repo.crypto().chunk_hasher(), old);
@@ -729,7 +729,7 @@ mod tests {
         /// Finishes a read file whose `pre_meta` differs from its walk metadata
         /// and checks what every read file gets; returns the events.
         fn run_read(old_has_path: bool, verbose: bool) -> Vec<BackupProgressEvent> {
-            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let (repo, mut ws) = test_repo_with_session();
             let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
             let (mut old, mut new) = caches();
             if old_has_path {
@@ -846,7 +846,7 @@ mod tests {
 
         #[test]
         fn finish_file_cache_hit_keeps_walk_metadata() {
-            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let (repo, mut ws) = test_repo_with_session();
             let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
             let (old, mut new) = caches();
             let walk = meta(0);
@@ -926,7 +926,7 @@ mod tests {
 
         #[test]
         fn finish_file_dump_defers_item() {
-            let (repo, mut ws) = test_repo_plaintext_with_session();
+            let (repo, mut ws) = test_repo_with_session();
             let mut listing = ListingWriter::new(repo.crypto().chunk_hasher(), Compression::None);
             let mut items = Vec::new();
             let mut stats = SnapshotStats::default();
@@ -984,7 +984,7 @@ mod tests {
     /// `nfiles` alone.
     #[test]
     fn commit_cache_hit_does_not_count_the_file() {
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         let data = b"cached content";
         let (id, csize, _) = ws
             .store_chunk(
@@ -1014,7 +1014,7 @@ mod tests {
         // via `reuse_cached_chunk_ref` must surface as an error, never as
         // a silent downgrade to a cache miss (that would mask repo/index
         // corruption). This guards the invariant called out in the plan.
-        let (repo, mut ws) = test_repo_plaintext_with_session();
+        let (repo, mut ws) = test_repo_with_session();
         let mut item = empty_item();
         let mut stats = SnapshotStats::default();
         let phantom = CachedChunks::Single(CachedChunkRef {
@@ -1044,7 +1044,7 @@ mod tests {
 
         /// A session over a table holding one chunk; returns that chunk's ID.
         fn session_over_one_chunk() -> (Repo, WriteSession, ChunkId) {
-            let (mut repo, mut ws) = test_repo_plaintext_with_session();
+            let (mut repo, mut ws) = test_repo_with_session();
             let data = b"in the table before this session";
             let table_chunk = ChunkId::compute(repo.crypto().chunk_hasher(), data);
             let mut index = ChunkIndex::new();

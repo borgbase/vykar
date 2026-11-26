@@ -52,6 +52,8 @@ slint-build = "~1.19"
 winresource = "0.1"
 
 [dev-dependencies]
+# vykar_core::testing (cheap KDF): tests create repositories through the library.
+vykar-core = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 # Real `Repo::open` in the passphrase-retry regression tests, and
 # hand-built malformed key blobs for the corruption case.

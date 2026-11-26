@@ -750,8 +750,10 @@ mod tests {
         ChunkId::from_bytes([byte; 32])
     }
 
-    fn engine() -> vykar_crypto::PlaintextEngine {
-        vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+    fn engine() -> vykar_crypto::testing::DeterministicEngine {
+        vykar_crypto::testing::DeterministicEngine::new(crate::testutil::chunk_hasher_for(
+            [0xAA; 32],
+        ))
     }
 
     fn aes_engine() -> vykar_crypto::aes_gcm::Aes256GcmEngine {
@@ -1048,11 +1050,11 @@ mod tests {
                     let stage = staged.then_some(&local as &dyn StorageBackend);
 
                     let (mut closing, mut sealing) = twin_writers(algo, target, &blobs, stage);
-                    let closed = closing.close(false).unwrap();
+                    let closed = closing.close(true).unwrap();
                     assert!(!closing.has_pending());
                     assert!(closing.buffer.is_none());
                     assert_eq!(closing.current_size, 0);
-                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), false));
+                    assert_eq!(closed.trailer_len, trailer_frame_len(blobs.len(), true));
                     let (pack_id, data) = closed.tail.finish(&engine()).unwrap();
                     let sealed = sealing.seal(&engine()).unwrap();
                     assert_eq!(pack_id, sealed.pack_id, "{algo:?} staged={staged}");
@@ -1064,8 +1066,8 @@ mod tests {
                     assert_eq!(closed.len, a.len() as u64);
                     assert_eq!(PackId::compute(&a, algo), pack_id);
 
-                    // Encrypting: the trailer's nonce is random, so compare
-                    // the layout, not the bytes.
+                    // The product engine: the trailer's nonce is random, so
+                    // compare the layout, not the bytes.
                     let dir = tempfile::tempdir().unwrap();
                     let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
                     let stage = staged.then_some(&local as &dyn StorageBackend);
@@ -1085,8 +1087,8 @@ mod tests {
         }
     }
 
-    /// A pack closed for an encrypting engine cannot be finished with a
-    /// plaintext one: the frame would not have the length the index
+    /// A pack closed for a plaintext engine cannot be finished with an
+    /// encrypting one: the frame would not have the length the index
     /// records. A staged pack's temp file is discarded.
     #[test]
     fn finish_refuses_another_engines_trailer() {
@@ -1098,7 +1100,7 @@ mod tests {
             let mut w = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake3);
             w.add_blob_to(stage, dummy_chunk_id(1), vec![1; 10])
                 .unwrap();
-            let closed = w.close(true).unwrap();
+            let closed = w.close(false).unwrap();
             let err = closed
                 .tail
                 .finish(&engine())
@@ -1128,7 +1130,7 @@ mod tests {
         let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake3);
         w.add_blob_to(Some(&backend), dummy_chunk_id(1), vec![1; 10])
             .unwrap();
-        let closed = w.close(false).unwrap();
+        let closed = w.close(true).unwrap();
         assert!(!w.has_pending());
         assert!(w.buffer.is_none());
         assert!(
@@ -1230,26 +1232,27 @@ mod tests {
             PACK_HEADER_SIZE + 104 + 54 + trailer_frame_len_upper(2)
         );
         assert!(w.buffer_capacity() > w.heap_len());
-        for crypto in [&engine() as &dyn CryptoEngine, &aes_engine()] {
-            let mut w2 = PackWriter::new(PackType::Data, 32 * 1024 * 1024, HashAlgorithm::Blake3);
-            w2.add_blob(dummy_chunk_id(1), vec![1; 100]).unwrap();
-            let open = w2.heap_len();
-            let closed = w2.close(crypto.is_encrypting()).unwrap();
-            assert_eq!(closed.tail.heap_bytes() as u64, closed.len);
-            assert!(closed.tail.heap_bytes() <= open);
-            assert_eq!(w2.heap_len(), 0);
-        }
+        let mut w2 = PackWriter::new(PackType::Data, 32 * 1024 * 1024, HashAlgorithm::Blake3);
+        w2.add_blob(dummy_chunk_id(1), vec![1; 100]).unwrap();
+        let open = w2.heap_len();
+        let closed = w2.close(true).unwrap();
+        assert_eq!(closed.tail.heap_bytes() as u64, closed.len);
+        assert!(closed.tail.heap_bytes() <= open);
+        assert_eq!(w2.heap_len(), 0);
     }
 
     /// A plaintext trailer is smaller than the encrypting one the crossing
     /// blob reserves room for: the AEAD's 28 bytes stay spare.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn crossing_target_plaintext_leaves_aead_room_spare() {
         let target = 1024 * 1024;
         let mut w = PackWriter::new(PackType::Data, target, HashAlgorithm::Blake3);
         w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
         w.add_blob(dummy_chunk_id(2), vec![2; 128]).unwrap();
-        let SealedData::Memory(data) = w.seal(&engine()).unwrap().data else {
+        let plaintext =
+            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let SealedData::Memory(data) = w.seal(&plaintext).unwrap().data else {
             panic!("no stage given, so the pack is heap-buffered");
         };
         assert_eq!(data.capacity() - data.len(), 28);
@@ -1278,28 +1281,38 @@ mod tests {
         assert!(w.first_blob_time.is_none());
     }
 
-    /// Golden-byte regression test: magic, blobs, then the trailer frame
-    /// (plaintext engine, so deterministic). Any change to wire format or
-    /// byte ordering will fail this.
+    /// Golden-byte regression test: magic, blobs, then the trailer frame,
+    /// sealed by the deterministic engine. Any change to wire format or byte
+    /// ordering will fail this. The trailer's plaintext is pinned separately
+    /// and checked by decrypting the frame with the product AES-GCM engine.
     #[test]
     fn seal_deterministic_bytes() {
+        use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
+        use crate::repo::pack_trailer::TRAILER_CONTEXT;
+        use vykar_crypto::testing::DETERMINISTIC_KEY;
+
         // Hard-coded expected output. Structure:
-        //   [0..9]   VGERPACK\x01  — magic + version
-        //   [9..15]  blob 0: 4B len LE (2) + 2B data (0xDE 0xAD)
-        //   [15..22] blob 1: 4B len LE (3) + 3B data (0xBE 0xEF 0x42)
-        //   [22..128] trailer frame: 4B len LE (102) + trailer blob
+        //   [0..9]     VGERPACK\x01  — magic + version
+        //   [9..15]    blob 0: 4B len LE (2) + 2B data (0xDE 0xAD)
+        //   [15..22]   blob 1: 4B len LE (3) + 3B data (0xBE 0xEF 0x42)
+        //   [22..156]  trailer frame: 4B len LE (130) + trailer object
+        //              (tag 12, 12B nonce, 89B ciphertext, 16B GCM tag)
+        //              + footer (4B len LE (130) + "VYKTRLR1")
+        // The plaintext trailer frame was 102 bytes; the AEAD adds 28.
         #[rustfmt::skip]
-        const EXPECTED: &[u8] = &[
+        const PREFIX: &[u8] = &[
             // Pack header: VGERPACK + version 1
             0x56, 0x47, 0x45, 0x52, 0x50, 0x41, 0x43, 0x4b, 0x01,
             // Blob 0: len=2 LE, data=0xDE 0xAD
             0x02, 0x00, 0x00, 0x00, 0xde, 0xad,
             // Blob 1: len=3 LE, data=0xBE 0xEF 0x42
             0x03, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x42,
-            // Trailer frame: len=102 LE
-            0x66, 0x00, 0x00, 0x00,
-            // Object tag 12 (PackTrailer), codec 0 (none)
-            0x0c, 0x00,
+        ];
+        // What the trailer object decrypts to.
+        #[rustfmt::skip]
+        const TRAILER_PLAINTEXT: &[u8] = &[
+            // Codec 0 (none)
+            0x00,
             // Body: version 1, pack type 0 (data), count 2 LE
             0x01, 0x00, 0x02, 0x00, 0x00, 0x00,
             // Entry 0: chunk id 0xAA x32, offset 13, size 2, kind 0
@@ -1314,9 +1327,29 @@ mod tests {
             0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
             0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
             0x13, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
-            // Footer: L=102 LE, "VYKTRLR1"
-            0x66, 0x00, 0x00, 0x00,
-            0x56, 0x59, 0x4b, 0x54, 0x52, 0x4c, 0x52, 0x31,
+        ];
+        // The deterministic engine's sealing of TRAILER_PLAINTEXT: nonce 0,
+        // ciphertext, GCM tag.
+        #[rustfmt::skip]
+        const SEALED_TRAILER: &[u8] = &[
+            // Nonce 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Ciphertext (89 bytes)
+            0x77, 0xfa, 0x92, 0x5b, 0x1a, 0xae, 0xe2, 0x98,
+            0xba, 0x40, 0x2a, 0xbe, 0xbf, 0xbf, 0x48, 0xd8,
+            0x3a, 0x05, 0x67, 0x4b, 0xf9, 0xba, 0x12, 0x24,
+            0x90, 0x25, 0xd3, 0xe6, 0xee, 0xf3, 0x94, 0xab,
+            0x5a, 0x53, 0xf0, 0xaf, 0xe5, 0x4f, 0xea, 0xd7,
+            0x90, 0x24, 0xb9, 0x2b, 0x09, 0x0e, 0x87, 0x00,
+            0x95, 0xa7, 0x11, 0xb5, 0x5d, 0xcb, 0xb0, 0x4f,
+            0x5b, 0xbe, 0x6b, 0x5a, 0x23, 0xe0, 0x2f, 0x6e,
+            0x2a, 0xca, 0x56, 0xef, 0xc2, 0x9d, 0x30, 0x22,
+            0xcf, 0x80, 0x34, 0x43, 0x3f, 0x37, 0xbd, 0x13,
+            0x7c, 0x15, 0x61, 0x65, 0xc1, 0xf9, 0x8b, 0x53,
+            0x63,
+            // GCM tag
+            0xb2, 0x46, 0x3d, 0x76, 0xda, 0x8e, 0x59, 0x16,
+            0xf4, 0xb2, 0xa6, 0x60, 0xe5, 0x36, 0x04, 0x0c,
         ];
 
         let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
@@ -1325,13 +1358,36 @@ mod tests {
             .unwrap();
 
         let sealed = w.seal(&engine()).unwrap();
+        let data = memory_bytes(&sealed.data);
 
-        assert_eq!(EXPECTED.len(), 128);
+        assert_eq!(data.len(), 156);
+        assert_eq!(&data[..22], PREFIX, "header and blobs are stored as given");
+        assert_eq!(&data[22..26], &130u32.to_le_bytes(), "trailer frame length");
+        assert_eq!(data[26], 0x0c, "object tag 12 (PackTrailer)");
         assert_eq!(
-            memory_bytes(&sealed.data),
-            EXPECTED,
+            &data[27..144],
+            SEALED_TRAILER,
             "pack wire format regression"
         );
+        assert_eq!(&data[144..148], &130u32.to_le_bytes(), "footer length");
+        assert_eq!(&data[148..], b"VYKTRLR1", "footer magic");
+        assert_eq!(
+            &data[27..39],
+            &vykar_crypto::testing::DeterministicEngine::nonce(0)
+        );
+
+        let aes = vykar_crypto::aes_gcm::Aes256GcmEngine::new(
+            &DETERMINISTIC_KEY,
+            crate::testutil::chunk_hasher_for([0xAA; 32]),
+        );
+        let opened = unpack_object_expect_with_context(
+            &data[26..144],
+            ObjectType::PackTrailer,
+            TRAILER_CONTEXT,
+            &aes,
+        )
+        .unwrap();
+        assert_eq!(opened, TRAILER_PLAINTEXT);
     }
 
     /// Roundtrip: seal a pack, then parse it back via scan_pack_blobs.

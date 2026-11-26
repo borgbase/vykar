@@ -3,7 +3,7 @@ use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::pack_trailer::{TrailerPackType, parse_footer, read_trailer_from_pack_bytes};
-use crate::testutil::{test_repo_plaintext, test_repo_plaintext_with_session};
+use crate::testutil::{test_repo, test_repo_with_session};
 
 /// Helper: store two distinct chunks in a write session of their own and
 /// save it, returning their chunk IDs.
@@ -36,7 +36,7 @@ fn store_two_chunks(
 
 #[test]
 fn compact_clean_repo_no_repacking() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
 
     // Store chunks — all live, no dead blobs
     store_two_chunks(&mut repo);
@@ -82,7 +82,7 @@ fn assert_trailer_matches_index(repo: &crate::repo::Repo, key: &str, pack_type: 
 /// whatever the threshold.
 #[test]
 fn compact_ignores_trailer_only_overhead() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     store_two_chunks(&mut repo);
     for threshold in [0.0, 1.0, 10.0] {
         let stats = compact_repo_without_mark(
@@ -104,7 +104,7 @@ fn compact_ignores_trailer_only_overhead() {
 /// compact.
 #[test]
 fn compact_is_idempotent_after_repack() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     let (id_a, _id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
@@ -137,7 +137,7 @@ fn compact_is_idempotent_after_repack() {
 /// pack's index entries.
 #[test]
 fn client_repack_writes_a_trailer() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
@@ -191,7 +191,7 @@ vykar_storage::delegate_storage_backend! {
 /// no pack footer.
 #[test]
 fn compact_reads_no_pack_footer() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     store_two_chunks(&mut repo);
     let counting = std::sync::Arc::new(CountingFooterReads {
         inner: std::sync::Arc::clone(repo.storage()),
@@ -223,7 +223,7 @@ fn compact_reads_no_pack_footer() {
 /// its real frame.
 #[test]
 fn client_repack_records_the_output_trailer_length() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
@@ -258,9 +258,12 @@ fn client_repack_records_the_output_trailer_length() {
 /// A repack's output with the ID of a pack the listing showed as an orphan
 /// (the same blobs repacked by an earlier, interrupted run) is live once the
 /// repack has written it: the compact that wrote it does not delete it.
+/// Only a plaintext trailer repeats its bytes, so only there can a repack
+/// reproduce an orphan's ID.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn compact_keeps_an_orphan_its_repack_rewrote() {
-    let mut repo = test_repo_plaintext();
+    let (mut repo, _) = crate::testutil::plaintext_repo_with_session();
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
@@ -314,7 +317,7 @@ fn compact_keeps_an_orphan_its_repack_rewrote() {
 
 #[test]
 fn compact_after_delete_repacks() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
     // Remove chunk A from the index (as a sweep does once nothing references it)
@@ -346,7 +349,7 @@ fn compact_after_delete_repacks() {
 
 #[test]
 fn compact_threshold_filters() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
 
     // Store 10 chunks, then delete 1 — that's ~10% dead
     let mut ids = Vec::new();
@@ -379,7 +382,7 @@ fn compact_threshold_filters() {
 
 #[test]
 fn compact_dry_run_does_not_modify() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
     // Remove chunk A to create dead blobs
@@ -414,7 +417,7 @@ fn compact_dry_run_does_not_modify() {
 
 #[test]
 fn compact_empty_pack_deleted() {
-    let (mut repo, mut ws) = test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = test_repo_with_session();
 
     // Store a single chunk and flush
     let (id_a, _, _) = ws
@@ -493,9 +496,9 @@ fn repo_on_recording_backend(
     };
     let repo = crate::repo::Repo::init_at_format(
         Box::new(backend),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
         crate::repo::RepoFormat::CURRENT,
@@ -874,9 +877,9 @@ mod server_side {
         });
         let mut repo = Repo::init_at_format(
             storage,
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
             format,
@@ -1345,7 +1348,7 @@ mod server_side {
         let dir = tempfile::tempdir().unwrap();
         let cold = Repo::open(
             Box::new(Arc::clone(repo.storage())),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(dir.path().to_path_buf()),
             OpenOptions::new().with_index(),
         )
@@ -1576,7 +1579,7 @@ vykar_storage::delegate_storage_backend! {
 #[test]
 fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
     for dry_run in [true, false] {
-        let mut repo = test_repo_plaintext();
+        let mut repo = test_repo();
         store_two_chunks(&mut repo);
         let recorder = std::sync::Arc::new(SweepRecorder {
             inner: std::sync::Arc::clone(repo.storage()),
@@ -1631,7 +1634,7 @@ vykar_storage::delegate_storage_backend! {
 /// claimed.
 #[test]
 fn compact_honours_shutdown_during_analysis() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = test_repo();
     store_two_chunks(&mut repo);
     let counter = std::sync::Arc::new(SizeCounter {
         inner: std::sync::Arc::clone(repo.storage()),
@@ -1789,9 +1792,9 @@ mod store_clock_ages {
         let shared: Arc<dyn StorageBackend> = backend.clone();
         let mut repo = Repo::init(
             Box::new(shared),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
         )
@@ -1855,9 +1858,9 @@ mod store_clock_ages {
         init_test_environment();
         let mut repo = Repo::init(
             Box::new(MemoryBackend::new()),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
         )
@@ -1896,9 +1899,9 @@ fn repo_with_mtimes() -> (
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> = mem.clone();
     let repo = crate::repo::Repo::init(
         Box::new(storage),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -2084,9 +2087,9 @@ fn a_pack_uploaded_during_the_mark_is_not_analysed() {
     let storage: Arc<dyn StorageBackend> = wrapped.clone();
     let mut repo = crate::repo::Repo::init(
         Box::new(storage),
-        crate::repo::EncryptionMode::None,
+        crate::repo::EncryptionMode::Aes256Gcm,
         crate::repo::ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )

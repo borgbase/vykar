@@ -1,9 +1,13 @@
 #![no_main]
+//! Input: a trailer body, a trailer frame or a pack. The body decoder is
+//! fuzzed directly; the frame and pack readers run under a deterministic
+//! AEAD engine, so on raw input they reach the framing and length checks
+//! before decryption.
 use libfuzzer_sys::fuzz_target;
 use vykar_core::repo::pack_trailer::{
     PackTrailer, open_trailer_frame, parse_footer, read_trailer_from_pack_bytes,
 };
-use vykar_crypto::PlaintextEngine;
+use vykar_crypto::testing::DeterministicEngine;
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
@@ -16,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
             "decoded trailer body must re-encode identically"
         );
     }
-    let engine = PlaintextEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]));
+    let engine = DeterministicEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]));
     let _ = parse_footer(data);
     let _ = open_trailer_frame(data, &engine);
     let _ = read_trailer_from_pack_bytes(data, &engine);

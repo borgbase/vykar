@@ -534,11 +534,12 @@ mod tests {
                 .concat();
             format!(
                 "repositories:\n  - url: {}\n    label: nas\n\
-                 encryption:\n  mode: none\n\
+                 encryption:\n  mode: aes256gcm\n  passphrase: {}\n\
                  cache_dir: {}\n\
                  hooks:\n{hooks}\
                  sources:\n  - path: {}\n    label: src\n",
                 quoted(&tmp.join("volume").join("repo").display().to_string()),
+                quoted(vykar_core::testing::TEST_PASSPHRASE),
                 quoted(&tmp.join("cache").display().to_string()),
                 quoted(&source.display().to_string()),
             )
@@ -603,8 +604,13 @@ mod tests {
         let mut h = unavailable_harness(Some(&mount));
         let volume = h.tmp.path().join("volume");
         std::fs::create_dir_all(volume.join("repo")).unwrap();
-        vykar_core::commands::init::run(&h.ctx.runtime.repos.first().unwrap().config, None)
-            .unwrap();
+        vykar_core::testing::with_cheap_kdf(|| {
+            vykar_core::commands::init::run(
+                &h.ctx.runtime.repos.first().unwrap().config,
+                Some(vykar_core::testing::TEST_PASSPHRASE),
+            )
+        })
+        .unwrap();
         std::fs::rename(&volume, h.tmp.path().join("store")).unwrap();
 
         handle_backup_all(&mut h.ctx, true);

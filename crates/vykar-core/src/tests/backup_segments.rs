@@ -17,15 +17,15 @@ use crate::repo::{
 };
 use crate::testutil::MemoryBackend;
 
-use super::helpers::{backup_single_source, make_test_config};
+use super::helpers::{backup_single_source, make_test_config, pass};
 
 fn init(mem: &Arc<dyn StorageBackend>) -> Repo {
     crate::testutil::init_test_environment();
     Repo::init(
         Box::new(Arc::clone(mem)),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )
@@ -36,7 +36,7 @@ fn init(mem: &Arc<dyn StorageBackend>) -> Repo {
 fn open(mem: &Arc<dyn StorageBackend>) -> Repo {
     Repo::open(
         Box::new(Arc::clone(mem)),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         OpenOptions::new().with_index(),
     )
@@ -150,7 +150,7 @@ fn a_first_backup_into_an_empty_repository_dedups_within_itself() {
     std::fs::write(src.join("a.bin"), &data).unwrap();
     std::fs::write(src.join("b.bin"), &data).unwrap();
     let config = make_test_config(&repo_dir);
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
     let stats = backup_single_source(&config, &src, "src", "s1");
     assert!(
         stats.deduplicated_size <= stats.original_size / 2 + 4096,

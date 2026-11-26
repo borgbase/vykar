@@ -25,7 +25,9 @@ use vykar_core::index::{
     encode_pending_journal,
 };
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
-use vykar_core::repo::format::{ObjectType, pack_object_with_context};
+use vykar_core::repo::format::{
+    ObjectType, pack_object_with_context, unpack_object_expect_with_context,
+};
 use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
@@ -33,6 +35,7 @@ use vykar_core::repo::{ChunkerParams, EncryptionMode, LegacyRepoConfig, RepoConf
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_core::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
+use vykar_crypto::testing::DeterministicEngine;
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
@@ -59,10 +62,11 @@ fn write_seed(target: &str, name: &str, data: &[u8]) {
     fs::write(dir.join(name), data).unwrap();
 }
 
-/// The engine every sealed seed pack's trailer is written with: plaintext,
-/// so the trailer (and the corpus) stays deterministic.
-fn seed_engine() -> PlaintextEngine {
-    PlaintextEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]))
+/// The engine every sealed seed pack's trailer is written with: the
+/// deterministic AEAD engine, fresh per call, so the trailer (and the
+/// corpus) stays deterministic.
+fn seed_engine() -> DeterministicEngine {
+    DeterministicEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]))
 }
 
 fn seed_pack_scan() {
@@ -359,14 +363,30 @@ fn base_v2_body(n: u8) -> Vec<u8> {
     w.finish().unwrap()
 }
 
+/// Seeds of `fuzz_index_object`: the plaintext of a packed segment and of
+/// packed bases (the target seals its input itself).
 fn seed_index_object() {
-    let engine = PlaintextEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]));
+    let engine = seed_engine();
     let (_, segment) =
         vykar_core::fuzzing::pack_segment_v2(&all_sections_segment_v2(), &engine).unwrap();
-    write_seed("fuzz_index_object", "segment", &segment);
+    let plain = unpack_object_expect_with_context(
+        &segment,
+        ObjectType::IndexSegment,
+        vykar_core::fuzzing::SEGMENT_CONTEXT,
+        &engine,
+    )
+    .unwrap();
+    write_seed("fuzz_index_object", "segment", &plain);
     for (name, n) in [("base_empty", 0u8), ("base_three_packs", 9)] {
         let (_, base) = vykar_core::fuzzing::pack_base_body(&base_v2_body(n), &engine).unwrap();
-        write_seed("fuzz_index_object", name, &base);
+        let plain = unpack_object_expect_with_context(
+            &base,
+            ObjectType::IndexBase,
+            vykar_core::fuzzing::BASE_CONTEXT,
+            &engine,
+        )
+        .unwrap();
+        write_seed("fuzz_index_object", name, &plain);
     }
 }
 
@@ -700,6 +720,8 @@ fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u3
         version,
         id: vec![0x42; 32],
         chunker_params: chunker,
+        // Plaintext-only: 10-single-protocol step 3 removes this (a config
+        // codec value).
         encryption: EncryptionMode::None,
         created: fixed_time(),
         min_pack_size: min_pack,
@@ -718,6 +740,8 @@ fn repo_config_v6(
     RepoConfig::new_v6(
         vec![0x42; 32],
         chunker,
+        // Plaintext-only: 10-single-protocol step 3 removes this (a config
+        // codec value).
         EncryptionMode::None,
         fixed_time(),
         min_pack,
@@ -938,8 +962,10 @@ fn seed_metadata_msgpack() {
 }
 
 /// Chunk-ID key of `fuzz_plaintext_read`.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 const PLAINTEXT_CHUNK_ID_KEY: [u8; 32] = [0x5A; 32];
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 fn seed_plaintext_read() {
     let plaintext: &[u8] = b"plaintext chunk read path, plaintext chunk read path";
     let frame = ZSTD_EMPTY_COMPRESSED_BLOCK;

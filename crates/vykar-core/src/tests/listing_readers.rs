@@ -198,8 +198,8 @@ fn listed(fx: &Fx, name: &str) -> Vec<Item> {
 // ---------------------------------------------------------------------------
 
 /// A tree of at least 4 tree chunks in snapshot "s1".
-fn four_chunks(encrypted: bool) -> Fx {
-    with_four_tree_chunks(encrypted, "s1", |fx, dirs| {
+fn four_chunks() -> Fx {
+    with_four_tree_chunks("s1", |fx, dirs| {
         write_tree(&fx.src("src"), "t", dirs);
         fx.backup(&fx.src("src"), "s1");
     })
@@ -207,8 +207,8 @@ fn four_chunks(encrypted: bool) -> Fx {
 
 /// [`four_chunks`], then a modified file in `t-00`, a new one in `t-01`
 /// and a deleted one in `t-02`, backed up as "s2".
-fn changed(encrypted: bool) -> Fx {
-    let fx = four_chunks(encrypted);
+fn changed() -> Fx {
+    let fx = four_chunks();
     let src = fx.src("src");
     std::fs::write(src.join("t-00/f-0005.txt"), "changed content").unwrap();
     std::fs::write(src.join("t-01/new.txt"), "a new file").unwrap();
@@ -227,7 +227,7 @@ fn set(ids: &[ChunkId]) -> HashSet<ChunkId> {
 
 #[test]
 fn list_by_chunk_matches_the_whole_stream_decode() {
-    let fx = four_chunks(true);
+    let fx = four_chunks();
     let ptrs = fx.item_ptrs("s1");
     let oracle = items_of(&fx, "s1");
     assert!(!oracle.is_empty());
@@ -272,7 +272,7 @@ fn list_by_chunk_matches_the_whole_stream_decode() {
 
 #[test]
 fn list_by_chunk_repeats_a_repeated_pointer() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     edit_item_ptrs(&fx.open(), "s1", |p| p.push(p[0]));
     let oracle = items_of(&fx, "s1");
     let first = decode_items(&fx.open().read_chunk(&fx.item_ptrs("s1")[0]).unwrap());
@@ -282,7 +282,7 @@ fn list_by_chunk_repeats_a_repeated_pointer() {
 
 #[test]
 fn readers_reject_a_chunk_that_ends_inside_an_entry() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     fx.backup(&fx.src("src"), "s2");
     assert_eq!(fx.item_ptrs("s1"), fx.item_ptrs("s2"));
     let oracle = items_of(&fx, "s1");
@@ -312,7 +312,7 @@ fn readers_reject_a_chunk_that_ends_inside_an_entry() {
 
 #[test]
 fn list_refuses_a_dangling_pointer_even_when_cached() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     let id = fx.item_ptrs("s1")[0];
     fx.edit_index(|repo| {
         repo.unchecked_writer()
@@ -334,37 +334,35 @@ fn list_refuses_a_dangling_pointer_even_when_cached() {
 
 #[test]
 fn diff_decodes_only_non_shared_chunks() {
-    for encrypted in [false, true] {
-        let fx = changed(encrypted);
-        let (p1, p2) = (set(&fx.item_ptrs("s1")), set(&fx.item_ptrs("s2")));
-        let (entries, stats) = diff(&fx, "s1", "s2");
-        assert_eq!(
-            entries,
-            oracle_diff(items_of(&fx, "s1"), items_of(&fx, "s2"))
-        );
-        let kinds: Vec<(&str, DiffChangeKind)> = entries
-            .iter()
-            .map(|e| (e.path.as_str(), e.change))
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                ("t-00/f-0005.txt", DiffChangeKind::Modified),
-                ("t-01/new.txt", DiffChangeKind::Added),
-                ("t-02/f-0007.txt", DiffChangeKind::Removed),
-            ]
-        );
-        assert_eq!(stats.full, None);
-        assert_eq!(stats.decoded_chunks, p1.symmetric_difference(&p2).count());
-        assert!(stats.decoded_chunks < p1.union(&p2).count());
-        assert!(stats.shared > 0);
-        assert_eq!(stats.shared, p1.intersection(&p2).count());
-    }
+    let fx = changed();
+    let (p1, p2) = (set(&fx.item_ptrs("s1")), set(&fx.item_ptrs("s2")));
+    let (entries, stats) = diff(&fx, "s1", "s2");
+    assert_eq!(
+        entries,
+        oracle_diff(items_of(&fx, "s1"), items_of(&fx, "s2"))
+    );
+    let kinds: Vec<(&str, DiffChangeKind)> = entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.change))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("t-00/f-0005.txt", DiffChangeKind::Modified),
+            ("t-01/new.txt", DiffChangeKind::Added),
+            ("t-02/f-0007.txt", DiffChangeKind::Removed),
+        ]
+    );
+    assert_eq!(stats.full, None);
+    assert_eq!(stats.decoded_chunks, p1.symmetric_difference(&p2).count());
+    assert!(stats.decoded_chunks < p1.union(&p2).count());
+    assert!(stats.shared > 0);
+    assert_eq!(stats.shared, p1.intersection(&p2).count());
 }
 
 #[test]
 fn diff_refuses_a_dangling_pointer_in_a_shared_chunk() {
-    let fx = changed(false);
+    let fx = changed();
     let p2 = set(&fx.item_ptrs("s2"));
     let id = *fx
         .item_ptrs("s1")
@@ -386,7 +384,7 @@ fn diff_refuses_a_dangling_pointer_in_a_shared_chunk() {
 
 #[test]
 fn diff_of_identical_listings_decodes_nothing() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     fx.backup(&fx.src("src"), "s2");
     assert_eq!(fx.item_ptrs("s1"), fx.item_ptrs("s2"));
     let (entries, stats) = diff(&fx, "s1", "s2");
@@ -397,7 +395,7 @@ fn diff_of_identical_listings_decodes_nothing() {
 
 #[test]
 fn diff_ignores_where_shared_chunks_sit() {
-    let fx = changed(false);
+    let fx = changed();
     let (before, before_stats) = diff(&fx, "s1", "s2");
     edit_item_ptrs(&fx.open(), "s2", |p| p.reverse());
     let (entries, stats) = diff(&fx, "s1", "s2");
@@ -412,7 +410,7 @@ fn diff_ignores_where_shared_chunks_sit() {
 
 #[test]
 fn diff_falls_back_on_a_repeated_pointer() {
-    let fx = changed(false);
+    let fx = changed();
     edit_item_ptrs(&fx.open(), "s2", |p| p.push(p[0]));
     let (entries, stats) = diff(&fx, "s1", "s2");
     // The fast path gives the same rows here; the reason is the real check.
@@ -425,7 +423,7 @@ fn diff_falls_back_on_a_repeated_pointer() {
 
 #[test]
 fn diff_falls_back_on_a_duplicate_path_in_decoded_chunks() {
-    let fx = changed(false);
+    let fx = changed();
     let p1 = set(&fx.item_ptrs("s1"));
     let p2 = fx.item_ptrs("s2");
     // A non-shared chunk k of s2 with a shared chunk j after it.
@@ -468,7 +466,7 @@ fn diff_falls_back_on_a_duplicate_path_in_decoded_chunks() {
 /// would find the dump's path if backup did not exclude it.
 #[cfg(unix)]
 fn dumps_next_to_a_directory_source() -> Fx {
-    let fx = Fx::new(false);
+    let fx = Fx::new();
     let src = fx.src("src");
     write_tree(&src, "t", 2);
     std::fs::create_dir(src.join("vykar-dumps")).unwrap();
@@ -571,7 +569,7 @@ fn diff_falls_back_on_nested_segments() {
 #[cfg(unix)]
 #[test]
 fn diff_with_hard_links_matches_today() {
-    let fx = Fx::new(false);
+    let fx = Fx::new();
     let src = fx.src("src");
     std::fs::write(src.join("a"), "original").unwrap();
     std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
@@ -599,7 +597,7 @@ fn diff_compares_non_utf8_names_by_raw_bytes() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    let fx = Fx::new(false);
+    let fx = Fx::new();
     let src = fx.src("src");
     let (n80, n81) = (OsStr::from_bytes(b"n\x80"), OsStr::from_bytes(b"n\x81"));
     if std::fs::write(src.join(n80), "same").is_err()
@@ -630,7 +628,7 @@ fn diff_compares_non_utf8_names_by_raw_bytes() {
 
 #[test]
 fn find_decodes_each_distinct_tree_chunk_once() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     let src = fx.src("src");
     std::fs::write(src.join("t-01/f-0002.txt"), "changed content").unwrap();
     fx.backup(&src, "s2");
@@ -660,7 +658,7 @@ fn find_decodes_each_distinct_tree_chunk_once() {
 /// is skipped (readers register no marker); the rest are found as they are.
 #[test]
 fn find_skips_a_snapshot_deleted_during_the_run() {
-    let fx = changed(false);
+    let fx = changed();
     let mut repo = fx.open();
     let entries: Vec<SnapshotEntry> = ["s1", "s2"].iter().map(|n| entry(&repo, n)).collect();
     std::fs::remove_file(fx.repo_dir.join(entries[0].id.storage_key())).unwrap();
@@ -672,7 +670,7 @@ fn find_skips_a_snapshot_deleted_during_the_run() {
 
 #[test]
 fn find_counts_a_repeated_pointer_per_occurrence() {
-    let fx = four_chunks(false);
+    let fx = four_chunks();
     fx.backup(&fx.src("src"), "s2");
     edit_item_ptrs(&fx.open(), "s1", |p| p.push(p[0]));
     for names in [&["s1"][..], &["s1", "s2"]] {

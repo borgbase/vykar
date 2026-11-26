@@ -24,7 +24,7 @@ use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, Repo, RepoFormat, RepoWriter};
 
 use super::helpers::{
-    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, source_entry,
+    PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, pass, source_entry,
 };
 
 /// GETs of heads (`index.h/`) and of `index.d/` objects.
@@ -129,7 +129,7 @@ impl Env {
         let repo_dir = dir.path().join("repo");
         let cache_dir = dir.path().join("cache");
         let mut config = make_test_config(&repo_dir);
-        commands::init::run_at_format(&config, None, format).unwrap();
+        commands::init::run_at_format(&config, pass(&config), format).unwrap();
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
         config.retention = RetentionConfig {
             keep_last: Some(1),
@@ -195,7 +195,7 @@ impl Env {
             &self.config,
             backup::BackupRequest {
                 snapshot_name: name,
-                passphrase: None,
+                passphrase: Some(crate::testing::TEST_PASSPHRASE),
                 source_paths: &source_paths,
                 source_label: label,
                 exclude_patterns: &[],
@@ -266,7 +266,13 @@ impl Env {
 
     /// Open over `storage` with this client's cache dir.
     fn open(&self, storage: Box<dyn StorageBackend>, opts: OpenOptions) -> Repo {
-        Repo::open(storage, None, Some(self.cache_dir.clone()), opts).unwrap()
+        Repo::open(
+            storage,
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(self.cache_dir.clone()),
+            opts,
+        )
+        .unwrap()
     }
 
     /// Open with the index over plain local storage and a throwaway cache
@@ -275,7 +281,7 @@ impl Env {
         let cache = tempfile::tempdir_in(self.dir.path()).unwrap();
         Repo::open(
             self.local(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(cache.path().to_path_buf()),
             OpenOptions::new().with_index(),
         )
@@ -290,7 +296,7 @@ impl Env {
     }
 
     fn assert_check_clean(&self) {
-        let result = commands::check::run(&self.config, None, true, false).unwrap();
+        let result = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
         assert!(
             result.errors.is_empty(),
             "check errors: {:?}",
@@ -358,7 +364,7 @@ fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast(
 
         let (stats, _) = commands::prune::run(
             &env.config,
-            None,
+            pass(&env.config),
             false,
             false,
             &env.sources(&["a"]),
@@ -369,7 +375,15 @@ fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast(
         assert_eq!(stats.pruned, 1);
         assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
         let before = env.open_fresh().index_head().unwrap().clone();
-        commands::compact::run(&env.config, None, 100.0, None, false, &CancelToken::new()).unwrap();
+        commands::compact::run(
+            &env.config,
+            pass(&env.config),
+            100.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let remote = env.open_fresh();
         assert_ne!(
@@ -399,14 +413,27 @@ fn compact_leaves_the_table_at_the_new_state() {
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
         env.backup(&src, "a", "s2");
         // s1's data pack now holds a live chunk (one.bin) and a dead one.
-        commands::delete::run(&env.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+        commands::delete::run(
+            &env.config,
+            pass(&env.config),
+            &["s1"],
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
         // s1's segment is old, so its entries are swept (04 step 7).
         age_repo_objects(&env.repo_dir, &["index.d", "packs"], PAST_T_PACK);
         let before = env.open_fresh().index_generation();
 
-        let stats =
-            commands::compact::run(&env.config, None, 0.0, None, false, &CancelToken::new())
-                .unwrap();
+        let stats = commands::compact::run(
+            &env.config,
+            pass(&env.config),
+            0.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert!(stats.packs_repacked > 0, "{stats:?}");
 
         let remote = env.open_fresh();
@@ -435,7 +462,7 @@ fn maintenance_on_a_host_without_caches_segmented() {
     env.backup(&src, "a", "s2");
     let (stats, _) = commands::prune::run(
         &env.config,
-        None,
+        pass(&env.config),
         false,
         false,
         &env.sources(&["a"]),
@@ -452,8 +479,15 @@ fn maintenance_on_a_host_without_caches_segmented() {
     fs::create_dir_all(&other_cache).unwrap();
     let mut config = env.config.clone();
     config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
-    let swept =
-        commands::compact::run(&config, None, 100.0, None, false, &CancelToken::new()).unwrap();
+    let swept = commands::compact::run(
+        &config,
+        pass(&config),
+        100.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(swept.chunks_unreferenced > 0, "{swept:?}");
 
     let remote = env.open_fresh();
@@ -478,7 +512,7 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         env.backup(&src, "a", "s2");
         let (stats, _) = commands::prune::run(
             &env.config,
-            None,
+            pass(&env.config),
             false,
             false,
             &env.sources(&["a"]),
@@ -541,7 +575,15 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         );
         drop(remote);
 
-        commands::compact::run(&env.config, None, 100.0, None, false, &CancelToken::new()).unwrap();
+        commands::compact::run(
+            &env.config,
+            pass(&env.config),
+            100.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
         env.assert_check_clean();
     }
 }
@@ -793,7 +835,7 @@ fn compact_does_not_delete_packs_committed_after_open() {
         fs::create_dir_all(&dest).unwrap();
         commands::restore::run(
             &env.config,
-            None,
+            pass(&env.config),
             "s2",
             dest.to_str().unwrap(),
             None,

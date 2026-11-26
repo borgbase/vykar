@@ -25,6 +25,13 @@ fn set_vykar_passphrase(value: Option<&str>) {
     reset_env_passphrase_cache();
 }
 
+/// [`make_test_config`] without its passphrase: these tests resolve it.
+fn config_without_passphrase(repo_dir: &std::path::Path) -> crate::config::VykarConfig {
+    let mut config = make_test_config(repo_dir);
+    config.encryption.passphrase = None;
+    config
+}
+
 #[cfg(not(windows))]
 fn print_script(text: &str) -> String {
     format!("printf '{text}'")
@@ -35,13 +42,14 @@ fn print_script(text: &str) -> String {
     format!("Write-Output \"{text}\"")
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn resolve_passphrase_returns_none_when_encryption_mode_is_none() {
     let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::None;
     config.encryption.passcommand = Some(print_script("cmd-pass"));
     set_vykar_passphrase(Some("env-pass"));
@@ -64,7 +72,7 @@ fn resolve_passphrase_uses_expected_precedence() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
 
     set_vykar_passphrase(Some("env-pass"));
@@ -104,7 +112,7 @@ fn resolve_passphrase_surfaces_passcommand_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = Some("exit 7".into());
@@ -125,7 +133,7 @@ fn resolve_passphrase_passcommand_handles_shell_quoting() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     // Single quotes inside the command — sh -c must handle them correctly.
@@ -146,7 +154,7 @@ fn resolve_passphrase_passcommand_gets_null_stdin() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     // A passcommand that drains stdin must see EOF immediately rather than
@@ -172,7 +180,7 @@ fn resolve_passphrase_passes_prompt_context() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
@@ -206,7 +214,7 @@ fn init_reuses_the_probed_configured_passphrase_without_rerunning_passcommand() 
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
     let marker = tmp.path().join("runs");
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passcommand = Some(counting_passcommand(&marker, "cmd-pass"));
     set_vykar_passphrase(None);
@@ -238,7 +246,7 @@ fn init_uses_env_passphrase_without_prompting() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
@@ -259,7 +267,7 @@ fn init_confirms_an_interactively_entered_passphrase() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
@@ -284,7 +292,7 @@ fn init_rejects_empty_and_mismatched_passphrases() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
@@ -312,7 +320,7 @@ fn init_rejects_an_empty_configured_passphrase() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passcommand = None;
     set_vykar_passphrase(None);
@@ -334,7 +342,7 @@ fn init_rejects_an_empty_pre_resolved_passphrase() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = Some(String::new());
     set_vykar_passphrase(None);
@@ -358,7 +366,7 @@ fn init_cancellation_of_either_prompt_is_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
@@ -375,13 +383,14 @@ fn init_cancellation_of_either_prompt_is_not_an_error() {
     assert!(matches!(second, InitPassphrase::Cancelled));
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn init_needs_no_passphrase_for_an_unencrypted_repo() {
     let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    let mut config = make_test_config(&repo_dir);
+    let mut config = config_without_passphrase(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::None;
     config.encryption.passphrase = Some("ignored".into());
     set_vykar_passphrase(Some("env-pass"));

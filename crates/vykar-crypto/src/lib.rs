@@ -268,6 +268,9 @@ macro_rules! impl_aead_engine {
 
 pub mod aes_gcm;
 pub mod chacha20_poly1305;
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
 
 /// No-encryption engine. Still computes deterministic chunk IDs.
 pub struct PlaintextEngine {
@@ -326,6 +329,7 @@ mod tests {
         ChunkHasher::new(HashAlgorithm::Blake2b, key)
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_encrypt_is_identity() {
         let engine = PlaintextEngine::new(hasher([0xAA; 32]));
@@ -334,6 +338,7 @@ mod tests {
         assert_eq!(encrypted, data);
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_decrypt_is_identity() {
         let engine = PlaintextEngine::new(hasher([0xAA; 32]));
@@ -342,6 +347,7 @@ mod tests {
         assert_eq!(decrypted, data);
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_chunk_hasher_round_trips() {
         let key = [0xBB; 32];
@@ -350,6 +356,7 @@ mod tests {
         assert_eq!(engine.chunk_hasher().algorithm(), HashAlgorithm::Blake2b);
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_roundtrip_ignores_aad() {
         let engine = PlaintextEngine::new(hasher([0xCC; 32]));
@@ -359,6 +366,7 @@ mod tests {
         assert_eq!(decrypted, data);
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn plaintext_decrypt_in_place_is_identity() {
         let engine = PlaintextEngine::new(hasher([0xCC; 32]));

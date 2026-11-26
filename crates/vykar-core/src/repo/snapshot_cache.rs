@@ -394,10 +394,10 @@ mod tests {
     use crate::chunker::ChunkerParams;
     use crate::snapshot::{SNAPSHOT_META_FIELD_COUNT, SnapshotMeta};
     use crate::testutil::MemoryBackend;
-    use vykar_crypto::PlaintextEngine;
+    use vykar_crypto::testing::DeterministicEngine;
 
-    fn test_crypto() -> PlaintextEngine {
-        PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+    fn test_crypto() -> DeterministicEngine {
+        DeterministicEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
     }
 
     fn make_snapshot_meta(name: &str) -> SnapshotMeta {

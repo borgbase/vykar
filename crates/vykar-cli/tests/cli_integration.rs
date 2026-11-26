@@ -98,6 +98,100 @@ impl CliFixture {
         ]
     }
 
+    /// Create every repository `cfg` names, as `vykar init` would, through
+    /// the library with the cheap test KDF; their identity pins and caches go
+    /// where this fixture's vykar children look for them.
+    fn init_repos(&self, cfg: &str) {
+        self.init_where(cfg, |_| true);
+    }
+
+    /// [`Self::init_repos`] for the repository labelled `label` only
+    /// (`vykar init -R <label>`).
+    fn init_repo_labelled(&self, cfg: &str, label: &str) {
+        self.init_where(cfg, |r| r.label.as_deref() == Some(label));
+    }
+
+    fn init_where(&self, cfg: &str, pick: impl Fn(&vykar_core::config::ResolvedRepo) -> bool) {
+        let repos = vykar_core::config::load_and_resolve(Path::new(cfg)).unwrap();
+        let mut initialized = 0;
+        for repo in repos.into_iter().filter(|r| pick(r)) {
+            let mut config = repo.config;
+            if config.cache_dir.is_none() {
+                config.cache_dir = Some(self.child_cache_root().to_string_lossy().into_owned());
+            }
+            // A configured passcommand runs here as it would in the child.
+            // Only a config that names no passphrase source falls back to the
+            // test passphrase; a named source that yields nothing is a broken
+            // fixture.
+            let named =
+                config.encryption.passphrase.is_some() || config.encryption.passcommand.is_some();
+            let resolved = vykar_core::app::passphrase::resolve_passphrase(
+                &config,
+                repo.label.as_deref(),
+                |_| Ok(None),
+            )
+            .unwrap();
+            let pass = match resolved {
+                Some(p) => p.to_string(),
+                None if named => panic!(
+                    "{cfg}: repository {:?} names a passphrase source that resolves to nothing",
+                    repo.label
+                ),
+                None => TEST_PASS.to_string(),
+            };
+            vykar_core::testing::with_cheap_kdf(|| {
+                vykar_core::commands::init::run(&config, Some(&pass))
+            })
+            .unwrap();
+            initialized += 1;
+        }
+        assert!(initialized > 0, "{cfg} names no repository to initialize");
+    }
+
+    /// Flip the middle byte of the stored blob of the chunk of the file
+    /// `name` in the latest snapshot of the single repository `cfg` names.
+    fn flip_byte_in_chunk_of(&self, cfg: &str, name: &str) {
+        let repo = vykar_core::config::load_and_resolve(Path::new(cfg))
+            .unwrap()
+            .remove(0);
+        let mut config = repo.config;
+        config.cache_dir = Some(self.child_cache_root().to_string_lossy().into_owned());
+        let snapshot = vykar_core::commands::list::list_snapshots(&config, Some(TEST_PASS))
+            .unwrap()
+            .last()
+            .unwrap()
+            .name
+            .clone();
+        let items =
+            vykar_core::commands::list::list_snapshot_items(&config, Some(TEST_PASS), &snapshot)
+                .unwrap();
+        let item = items.iter().find(|i| i.path.ends_with(name)).unwrap();
+        let storage = Box::new(LocalBackend::new(&config.repository.url).unwrap());
+        let opened = Repo::open(
+            storage,
+            Some(TEST_PASS),
+            None,
+            OpenOptions::new().with_index(),
+        )
+        .unwrap();
+        let entry = opened.chunk_index().get(&item.chunks[0].id).unwrap();
+        let path = Path::new(&config.repository.url).join(entry.pack_id.storage_key());
+        let mut pack = std::fs::read(&path).unwrap();
+        pack[entry.pack_offset as usize + entry.stored_size as usize / 2] ^= 0x01;
+        std::fs::write(&path, pack).unwrap();
+    }
+
+    /// The vykar cache root of this fixture's children: `paths::cache_dir()`
+    /// (`XDG_CACHE_HOME` and `LOCALAPPDATA` are `cache_dir`; macOS uses
+    /// `$HOME/Library/Caches`) joined with `vykar`.
+    fn child_cache_root(&self) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            self.home_dir.join("Library").join("Caches").join("vykar")
+        } else {
+            self.cache_dir.join("vykar")
+        }
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
@@ -212,7 +306,27 @@ fn yaml_quote_path(path: &Path) -> String {
     format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn write_plain_config(config_path: &Path, repo_dir: &Path) {
+/// The passphrase of every repository these tests create through the library.
+const TEST_PASS: &str = vykar_core::testing::TEST_PASSPHRASE;
+
+/// The `encryption:` section of a test config: AES-256-GCM with
+/// [`TEST_PASS`].
+fn enc_yaml() -> String {
+    format!("encryption:\n  mode: aes256gcm\n  passphrase: \"{TEST_PASS}\"\n")
+}
+
+fn write_test_config(config_path: &Path, repo_dir: &Path) {
+    let config = format!(
+        "repositories:\n  - url: {}\n{}sources: []\n",
+        yaml_quote_path(repo_dir),
+        enc_yaml()
+    );
+    std::fs::write(config_path, config).unwrap();
+}
+
+/// [`write_test_config`] for a plaintext repository.
+// Plaintext-only: 10-single-protocol step 3 removes this.
+fn write_plaintext_config(config_path: &Path, repo_dir: &Path) {
     let config = format!(
         "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\n",
         yaml_quote_path(repo_dir)
@@ -228,7 +342,7 @@ fn write_sources_config(
     keep_last: usize,
 ) {
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nretention:\n  keep_last: {}\nsources:\n  - path: {}\n    label: src-a\n  - path: {}\n    label: src-b\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nretention:\n  keep_last: {}\nsources:\n  - path: {}\n    label: src-a\n  - path: {}\n    label: src-b\n",
         yaml_quote_path(repo_dir),
         keep_last,
         yaml_quote_path(source_a),
@@ -247,7 +361,13 @@ fn parse_snapshot_name(output: &str) -> String {
 
 fn delete_pack_for_first_chunk(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repo::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
+    let repo = Repo::open(
+        storage,
+        Some(TEST_PASS),
+        None,
+        OpenOptions::new().with_index(),
+    )
+    .unwrap();
     let (_chunk_id, entry) = repo
         .chunk_index()
         .iter()
@@ -263,7 +383,13 @@ fn delete_pack_for_first_chunk(repo_dir: &Path) {
 
 fn corrupt_first_snapshot(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repo::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
+    let repo = Repo::open(
+        storage,
+        Some(TEST_PASS),
+        None,
+        OpenOptions::new().with_index(),
+    )
+    .unwrap();
     let entry = repo
         .manifest()
         .snapshots
@@ -276,7 +402,7 @@ fn corrupt_first_snapshot(repo_dir: &Path) {
 #[test]
 fn cli_init_backup_list_restore_info_roundtrip() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("alpha.txt"), b"alpha file\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -325,7 +451,7 @@ fn cli_init_backup_list_restore_info_roundtrip() {
 #[test]
 fn cli_init_writes_repository_format_v6() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     fx.run_ok(&["--config", &cfg, "init"]);
@@ -357,19 +483,21 @@ fn init_empty_v3(repo_dir: &Path) {
 
     std::fs::create_dir_all(repo_dir).unwrap();
     let storage = || Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repo::init(
-        storage(),
-        vykar_core::repo::EncryptionMode::None,
-        vykar_core::repo::ChunkerParams::default(),
-        None,
-        None,
-        None,
-    )
+    vykar_core::testing::with_cheap_kdf(|| {
+        Repo::init(
+            storage(),
+            vykar_core::repo::EncryptionMode::Aes256Gcm,
+            vykar_core::repo::ChunkerParams::default(),
+            Some(TEST_PASS),
+            None,
+            None,
+        )
+    })
     .unwrap();
     let cache = TempDir::new().unwrap();
     let repo = Repo::open(
         storage(),
-        None,
+        Some(TEST_PASS),
         Some(cache.path().to_path_buf()),
         OpenOptions::new(),
     )
@@ -418,7 +546,7 @@ fn init_empty_v3(repo_dir: &Path) {
 #[test]
 fn cli_upgrade_moves_a_v3_repository_to_v6() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     init_empty_v3(&fx.repo_dir);
 
@@ -450,13 +578,13 @@ fn cli_upgrade_moves_a_v3_repository_to_v6() {
 #[test]
 fn cli_delete_dry_run_then_real_delete() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("delete.txt"), b"delete me\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     let backup_out = fx.run_ok(&["--config", &cfg, "backup", &source]);
     let snapshot = parse_snapshot_name(&backup_out);
 
@@ -490,7 +618,7 @@ fn cli_prune_list_source_filter_and_mutation() {
     std::fs::write(fx.source_b.join("b.txt"), b"b-v1").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let a1_out = fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
     let snap_a1 = parse_snapshot_name(&a1_out);
@@ -545,7 +673,7 @@ fn cli_prune_compact_runs_compact_hooks() {
     write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
     std::fs::write(fx.source_a.join("a.txt"), b"a-v1").unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
     std::fs::write(fx.source_a.join("a.txt"), b"a-v2").unwrap();
     fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
@@ -598,7 +726,7 @@ fn cli_prune_compact_skipped_prune_does_not_compact() {
         ],
     );
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let output = fx.run(&["--config", &cfg, "prune", "--compact"]);
     assert!(output.status.success(), "{}", stderr(&output));
@@ -619,7 +747,7 @@ fn cli_prune_compact_failed_prune_does_not_compact() {
         ],
     );
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let output = fx.run(&["--config", &cfg, "prune", "--compact"]);
     assert!(!output.status.success(), "{}", stderr(&output));
@@ -629,7 +757,7 @@ fn cli_prune_compact_failed_prune_does_not_compact() {
 #[test]
 fn cli_snapshot_find_timeline_and_filters() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
@@ -640,7 +768,7 @@ fn cli_snapshot_find_timeline_and_filters() {
     std::fs::write(fx.source_a.join("sub/deep.rs"), b"fn main() {}").unwrap();
     std::fs::write(fx.source_a.join("big.bin"), vec![0u8; 2048]).unwrap();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // First backup
     let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
@@ -764,13 +892,13 @@ fn cli_snapshot_find_timeline_and_filters() {
 #[test]
 fn cli_delete_repo_with_flag() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("repo-del.txt"), b"delete repo\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     assert!(fx.repo_dir.join("config").exists());
@@ -783,13 +911,13 @@ fn cli_delete_repo_with_flag() {
 #[test]
 fn cli_check_verify_data_detects_tampered_pack() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("check.txt"), b"check data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     let check_ok = fx.run_ok(&["--config", &cfg, "check", "--verify-data"]);
@@ -803,6 +931,7 @@ fn cli_check_verify_data_detects_tampered_pack() {
 
 /// Plaintext repos verify chunk IDs on every read, so a same-length bit flip in
 /// a pack fails `restore` even without `--verify`.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn cli_restore_detects_flipped_byte_in_plaintext_pack() {
     let fx = CliFixture::new();
@@ -856,7 +985,7 @@ fn cli_restore_detects_flipped_byte_in_plaintext_pack() {
 fn cli_restore_continue_on_error_skips_damaged_file() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\ncompression:\n  algorithm: none\nsources: []\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\ncompression:\n  algorithm: none\nsources: []\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
@@ -866,28 +995,10 @@ fn cli_restore_continue_on_error_skips_damaged_file() {
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
-
-    let pack_path = std::fs::read_dir(fx.repo_dir.join("packs"))
-        .unwrap()
-        .flatten()
-        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
-        .map(|e| e.path())
-        .find(|p| {
-            std::fs::read(p)
-                .unwrap()
-                .windows(content.len())
-                .any(|w| w == content)
-        })
-        .unwrap();
-    let mut pack = std::fs::read(&pack_path).unwrap();
-    let pos = pack
-        .windows(content.len())
-        .position(|w| w == content)
-        .unwrap();
-    pack[pos + content.len() / 2] ^= 0x01;
-    std::fs::write(&pack_path, pack).unwrap();
+    // The stored blob of bad.txt's chunk, flipped inside its ciphertext.
+    fx.flip_byte_in_chunk_of(&cfg, "bad.txt");
 
     let strict = fx._tmp.path().join("restore-strict");
     let strict_str = strict.to_string_lossy().to_string();
@@ -911,7 +1022,7 @@ fn cli_restore_continue_on_error_skips_damaged_file() {
     assert_eq!(out.status.code(), Some(3), "stderr:\n{err}");
     let damaged: Vec<&str> = err.lines().filter(|l| l.starts_with("damaged: ")).collect();
     assert_eq!(damaged.len(), 1, "{err}");
-    assert!(damaged[0].contains("bad.txt") && damaged[0].contains("hash mismatch"));
+    assert!(damaged[0].contains("bad.txt") && damaged[0].contains("decryption failed"));
     assert!(
         !lenient.join("bad.txt").exists(),
         "damaged file must be absent"
@@ -925,7 +1036,7 @@ fn cli_restore_continue_on_error_skips_damaged_file() {
 #[test]
 fn cli_restore_latest_alias() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("latest.txt"), b"latest test\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -933,7 +1044,7 @@ fn cli_restore_latest_alias() {
     let restore = fx._tmp.path().join("restore-latest");
     let restore_str = restore.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     let restore_out = fx.run_ok(&["--config", &cfg, "restore", "latest", &restore_str]);
@@ -948,7 +1059,7 @@ fn cli_restore_latest_alias() {
 #[test]
 fn cli_restore_missing_dest_fails() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     // "restore latest" without a dest should fail with a usage error
@@ -962,12 +1073,12 @@ fn cli_restore_missing_dest_fails() {
 #[test]
 fn cli_snapshot_list_latest_alias() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Snapshot 1: only old.txt
     std::fs::write(fx.source_a.join("old.txt"), b"old\n").unwrap();
@@ -987,7 +1098,7 @@ fn cli_snapshot_list_latest_alias() {
 #[test]
 fn cli_snapshot_list_path_filter() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
@@ -999,7 +1110,7 @@ fn cli_snapshot_list_path_filter() {
     std::fs::write(fx.source_a.join("subx/d"), b"d\n").unwrap();
     std::fs::write(fx.source_a.join("top"), b"top\n").unwrap();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     for filter in ["sub", "./sub/"] {
@@ -1038,13 +1149,13 @@ fn cli_snapshot_list_path_filter() {
 #[test]
 fn cli_snapshot_info_latest_alias() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("info.txt"), b"info\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Snapshot 1
     fx.run_ok(&["--config", &cfg, "backup", &source]);
@@ -1064,12 +1175,12 @@ fn cli_snapshot_info_latest_alias() {
 #[test]
 fn cli_snapshot_diff_reports_file_content_changes() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     std::fs::write(fx.source_a.join("modified.txt"), b"before").unwrap();
     std::fs::write(fx.source_a.join("removed.txt"), b"removed").unwrap();
@@ -1107,7 +1218,7 @@ fn cli_snapshot_diff_resolves_in_multi_repo_config() {
     std::fs::create_dir_all(&repo_b).unwrap();
 
     let config = format!(
-        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\n",
         yaml_quote_path(&fx.repo_dir),
         yaml_quote_path(&repo_b),
     );
@@ -1115,8 +1226,7 @@ fn cli_snapshot_diff_resolves_in_multi_repo_config() {
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.init_repos(&cfg);
 
     // Two snapshots in repo-b only.
     std::fs::write(fx.source_a.join("modified.txt"), b"before").unwrap();
@@ -1147,7 +1257,7 @@ fn cli_snapshot_diff_errors_when_snapshots_in_different_repos() {
     std::fs::create_dir_all(&repo_b).unwrap();
 
     let config = format!(
-        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\n",
         yaml_quote_path(&fx.repo_dir),
         yaml_quote_path(&repo_b),
     );
@@ -1155,8 +1265,7 @@ fn cli_snapshot_diff_errors_when_snapshots_in_different_repos() {
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.init_repos(&cfg);
 
     std::fs::write(fx.source_a.join("a.txt"), b"a").unwrap();
     let out_a = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-a", &source]);
@@ -1180,12 +1289,12 @@ fn cli_snapshot_diff_errors_when_snapshots_in_different_repos() {
 #[test]
 fn cli_snapshot_diff_empty_diff_reports_no_changes() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     std::fs::write(fx.source_a.join("only.txt"), b"unchanged").unwrap();
     let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
@@ -1204,13 +1313,13 @@ fn cli_snapshot_diff_empty_diff_reports_no_changes() {
 #[test]
 fn cli_snapshot_delete_latest_rejects_alias() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("del.txt"), b"del\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     let (stdout, stderr) = fx.run_err(&["--config", &cfg, "snapshot", "delete", "latest"]);
@@ -1224,12 +1333,12 @@ fn cli_snapshot_delete_latest_rejects_alias() {
 #[test]
 fn cli_bulk_snapshot_delete() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
     let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
@@ -1264,15 +1373,14 @@ fn cli_bulk_delete_requires_repo_flag_with_multiple_repos() {
 
     // Config with two repositories.
     let config = format!(
-        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\n",
         yaml_quote_path(&fx.repo_dir),
         yaml_quote_path(&repo_b),
     );
     std::fs::write(&fx.config_path, config).unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.init_repos(&cfg);
 
     let source = fx.source_a.to_string_lossy().to_string();
     std::fs::write(fx.source_a.join("file.txt"), b"data").unwrap();
@@ -1303,7 +1411,7 @@ fn cli_bulk_delete_requires_repo_flag_with_multiple_repos() {
 #[test]
 fn cli_backup_threads_out_of_range_rejected() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
@@ -1320,7 +1428,7 @@ fn cli_backup_threads_out_of_range_rejected() {
 fn cli_daemon_rejects_disabled_schedule() {
     let fx = CliFixture::new();
     // Default config has schedule.enabled=false
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "daemon"]);
@@ -1363,14 +1471,14 @@ fn cli_daemon_on_startup_and_shutdown() {
 
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     // Init repo first
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Spawn daemon as a background process
     let mut child = Command::new(vykar_binary_path())
@@ -1429,13 +1537,13 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
 
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Spawn the first daemon — it should acquire the scheduler lock.
     let mut first = Command::new(vykar_binary_path())
@@ -1512,11 +1620,11 @@ fn cli_empty_config_exits_with_error() {
 #[test]
 fn cli_compact_report_unreferenced_prints_counts() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     let out = fx.run_ok(&["--config", &cfg, "compact", "--report-unreferenced"]);
@@ -1537,7 +1645,7 @@ fn cli_compact_report_unreferenced_prints_counts() {
 #[test]
 fn cli_compact_report_unreferenced_conflicts_with_dry_run() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     let (_, err) = fx.run_err(&[
         "--config",
@@ -1552,13 +1660,13 @@ fn cli_compact_report_unreferenced_conflicts_with_dry_run() {
 #[test]
 fn cli_check_repair_dry_run_prints_plan() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     corrupt_first_snapshot(&fx.repo_dir);
@@ -1583,11 +1691,11 @@ fn cli_check_repair_dry_run_prints_plan() {
 #[test]
 fn cli_check_repair_dry_run_reports_a_rebuild_of_a_damaged_chain() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     std::fs::write(fx.source_a.join("a.txt"), b"alpha\n").unwrap();
     fx.run_ok(&["--config", &cfg, "backup", &source]);
     std::fs::write(fx.source_a.join("b.txt"), b"bravo\n").unwrap();
@@ -1625,11 +1733,11 @@ fn cli_check_repair_dry_run_reports_a_rebuild_of_a_damaged_chain() {
 #[test]
 fn cli_check_repair_dry_run_reports_an_unreadable_head() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     std::fs::write(fx.source_a.join("a.txt"), b"alpha\n").unwrap();
     fx.run_ok(&["--config", &cfg, "backup", &source]);
     std::fs::write(fx.source_a.join("b.txt"), b"bravo\n").unwrap();
@@ -1656,13 +1764,13 @@ fn cli_check_repair_dry_run_reports_an_unreadable_head() {
 #[test]
 fn cli_check_repair_yes_repairs_then_clean() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     corrupt_first_snapshot(&fx.repo_dir);
@@ -1683,13 +1791,13 @@ fn cli_check_repair_yes_repairs_then_clean() {
 #[test]
 fn cli_check_repair_noninteractive_aborts_tier2() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     corrupt_first_snapshot(&fx.repo_dir);
@@ -1713,13 +1821,13 @@ fn cli_check_repair_noninteractive_aborts_tier2() {
 #[test]
 fn cli_check_repair_positive_prompt_applies() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     corrupt_first_snapshot(&fx.repo_dir);
@@ -1741,13 +1849,13 @@ fn cli_check_repair_positive_prompt_applies() {
 #[test]
 fn cli_check_repair_safe_auto_apply() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     // No corruption — safe plan (the index sweep only)
@@ -1777,13 +1885,13 @@ fn cli_check_repair_safe_auto_apply() {
 #[test]
 fn cli_check_repair_yes_clean_repo() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
     let source = fx.source_a.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
     // No corruption — --yes should still work on a clean repo
@@ -1907,13 +2015,13 @@ fn cli_daemon_sighup_reloads_config() {
     // Start with empty sources and a 2-second interval so the second cycle
     // fires quickly after SIGHUP reload reschedules.
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"2s\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"2s\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -1927,7 +2035,7 @@ fn cli_daemon_sighup_reloads_config() {
     // Write a file and update config to include the source directory
     std::fs::write(fx.source_a.join("reload-test.txt"), b"reload data\n").unwrap();
     let new_config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources:\n  - {}\nschedule:\n  enabled: true\n  every: \"2s\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources:\n  - {}\nschedule:\n  enabled: true\n  every: \"2s\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir),
         yaml_quote_path(&fx.source_a),
     );
@@ -1970,7 +2078,7 @@ fn cli_daemon_sighup_picks_up_changed_passphrase() {
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     write_config("right");
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     write_config("wrong");
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
@@ -2018,13 +2126,13 @@ fn cli_daemon_sighup_picks_up_changed_passphrase() {
 fn cli_daemon_sighup_invalid_config_keeps_old() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2064,13 +2172,13 @@ fn cli_daemon_sighup_invalid_config_keeps_old() {
 fn cli_daemon_sighup_empty_repos_rejected() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2108,13 +2216,13 @@ fn cli_daemon_sighup_empty_repos_rejected() {
 fn cli_daemon_sighup_schedule_disabled_rejected() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2125,7 +2233,7 @@ fn cli_daemon_sighup_schedule_disabled_rejected() {
 
     // Overwrite config with schedule.enabled: false
     let disabled_config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: false\n  every: \"1h\"\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: false\n  every: \"1h\"\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, disabled_config).unwrap();
@@ -2152,13 +2260,13 @@ fn cli_daemon_sighup_schedule_disabled_rejected() {
 fn cli_daemon_on_startup_not_retriggered_on_reload() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2196,13 +2304,13 @@ fn cli_daemon_on_startup_not_retriggered_on_reload() {
 fn cli_daemon_sigusr1_triggers_immediate_backup() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: false\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: false\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2237,13 +2345,13 @@ fn cli_daemon_sigusr1_triggers_immediate_backup() {
 fn cli_daemon_sigusr1_preserves_schedule() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2306,7 +2414,7 @@ fn cli_daemon_per_repo_schedule_runs_only_due_repo() {
         "repositories:\n  \
            - url: {}\n    label: repo-a\n    schedule:\n      enabled: true\n      every: \"2s\"\n      on_startup: true\n  \
            - url: {}\n    label: repo-b\n\
-         encryption:\n  mode: none\n\
+         encryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\n\
          schedule:\n  enabled: true\n  every: \"1h\"\n\
          sources:\n  - {}\n",
         yaml_quote_path(&fx.repo_dir),
@@ -2316,8 +2424,7 @@ fn cli_daemon_per_repo_schedule_runs_only_due_repo() {
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2360,7 +2467,7 @@ fn cli_daemon_starts_when_only_one_repo_enables_schedule() {
         "repositories:\n  \
            - url: {}\n    label: repo-a\n  \
            - url: {}\n    label: repo-b\n    schedule:\n      enabled: true\n      every: \"1h\"\n\
-         encryption:\n  mode: none\n\
+         encryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\n\
          schedule:\n  enabled: false\n\
          sources: []\n",
         yaml_quote_path(&fx.repo_dir),
@@ -2369,8 +2476,7 @@ fn cli_daemon_starts_when_only_one_repo_enables_schedule() {
     std::fs::write(&fx.config_path, config).unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+    fx.init_repos(&cfg);
 
     let (mut child, logs) = spawn_daemon(&fx, &cfg);
 
@@ -2389,7 +2495,7 @@ fn cli_daemon_starts_when_only_one_repo_enables_schedule() {
 fn cli_daemon_trust_repo_rejected() {
     let fx = CliFixture::new();
     let config = format!(
-        "repositories:\n  - url: {}\nencryption:\n  mode: none\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n",
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources: []\nschedule:\n  enabled: true\n  every: \"1h\"\n",
         yaml_quote_path(&fx.repo_dir)
     );
     std::fs::write(&fx.config_path, config).unwrap();
@@ -2446,7 +2552,7 @@ fn write_two_repo_sources_config(
          \x20   label: repo-a\n\
          \x20 - url: {}\n\
          \x20   label: repo-b\n\
-         encryption:\n  mode: none\n\
+         encryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\n\
          retention:\n  keep_last: 5\n\
          sources:\n\
          \x20 - path: {}\n\
@@ -2464,7 +2570,7 @@ fn write_two_repo_sources_config(
 #[test]
 fn cli_bare_source_without_repo_rejected() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "-S", "src-a"]);
@@ -2477,7 +2583,7 @@ fn cli_bare_source_without_repo_rejected() {
 #[test]
 fn cli_bare_repo_source_with_subcommand_rejected() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "-R", "repo-a", "backup"]);
@@ -2495,7 +2601,7 @@ fn cli_bare_repo_source_filters_cycle() {
     std::fs::write(fx.source_b.join("b.txt"), b"bbb").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Run full cycle filtered to src-a only
     let out = fx.run_ok(&[
@@ -2531,7 +2637,7 @@ fn cli_bare_invalid_source_fails_backup_check_still_runs() {
     std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
 
     // Run with invalid source label — should fail overall
     let (stdout, stderr) = fx.run_err(&[
@@ -2574,7 +2680,7 @@ fn cli_bare_multi_repo_skips_missing_local() {
     std::fs::write(fx.source_b.join("b.txt"), b"bbb").unwrap();
 
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.init_repo_labelled(&cfg, "repo-a");
 
     // Bare command across both repos — repo-b is missing, should be skipped
     let output = fx.run(&["--config", &cfg]);
@@ -2605,7 +2711,7 @@ fn cli_bare_multi_repo_missing_local_runs_hooks_then_skips() {
     );
     std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
     let cfg = fx.config_path.to_string_lossy().to_string();
-    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.init_repo_labelled(&cfg, "repo-a");
 
     let log = fx._tmp.path().join("hooks.log");
     let mut config = std::fs::read_to_string(&fx.config_path).unwrap();
@@ -2634,7 +2740,7 @@ fn cli_bare_multi_repo_missing_local_runs_hooks_then_skips() {
 fn cli_bare_single_repo_missing_is_skipped() {
     let fx = CliFixture::new();
     let missing_repo = fx._tmp.path().join("nonexistent_repo");
-    write_plain_config(&fx.config_path, &missing_repo);
+    write_test_config(&fx.config_path, &missing_repo);
     let cfg = fx.config_path.to_string_lossy().to_string();
 
     let output = fx.run(&["--config", &cfg]);
@@ -2655,7 +2761,7 @@ fn cli_bare_single_repo_missing_with_repo_flag_errors() {
     let missing_repo = fx._tmp.path().join("nonexistent_repo");
     std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
     let config = format!(
-        "repositories:\n  - url: {}\n    label: nas\nencryption:\n  mode: none\nsources:\n  - path: {}\n    label: src\n",
+        "repositories:\n  - url: {}\n    label: nas\nencryption:\n  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\nsources:\n  - path: {}\n    label: src\n",
         yaml_quote_path(&missing_repo),
         yaml_quote_path(&fx.source_a)
     );
@@ -2728,7 +2834,7 @@ fn hook_log(log: &Path) -> Vec<String> {
 }
 
 #[cfg(unix)]
-const PLAIN: &str = "  mode: none\n";
+const PLAIN: &str = "  mode: aes256gcm\n  passphrase: \"vykar-test-passphrase\"\n";
 
 /// Initializes `<tmp>/volume/repo` and moves `volume` to `store`, returning
 /// a `before_backup` command that moves it back, as a mount would, and logs
@@ -2739,7 +2845,7 @@ fn init_then_unmount(fx: &CliFixture, cfg: &str) -> String {
     let volume = tmp.join("volume");
     let store = tmp.join("store");
     std::fs::create_dir_all(volume.join("repo")).unwrap();
-    fx.run_ok(&["--config", cfg, "init"]);
+    fx.init_repos(cfg);
     std::fs::rename(&volume, &store).unwrap();
     format!(
         "mv '{}' '{}' && echo before_backup >> '{}'",
@@ -2841,7 +2947,7 @@ fn cli_bare_present_encrypted_repo_resolves_passphrase_before_hooks() {
     let log = write_unavailable_config(&fx, None, &encryption, "");
     let cfg = fx.config_path.to_string_lossy().to_string();
     std::fs::create_dir_all(fx._tmp.path().join("volume").join("repo")).unwrap();
-    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.init_repos(&cfg);
     let _ = std::fs::remove_file(&log);
 
     let output = fx.run(&["--config", &cfg]);
@@ -3065,10 +3171,11 @@ fn cli_key_export_writes_the_armor_to_stdout() {
     assert!(!err.contains("BEGIN VYKAR REPOSITORY KEY"), "{err}");
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn cli_key_export_refuses_an_unencrypted_repository() {
     let fx = CliFixture::new();
-    write_plain_config(&fx.config_path, &fx.repo_dir);
+    write_plaintext_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     fx.run_ok(&["--config", &cfg, "init"]);
 

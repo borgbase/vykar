@@ -41,13 +41,13 @@ fn lifecycle_delete_compact_check_and_restore() {
     let payload_v2: Vec<u8> = (0u32..512 * 1024).map(|i| (i % 199) as u8).collect();
     std::fs::write(source_dir.join("data.bin"), &payload_v1).unwrap();
 
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     backup_source(
         &config,
         &source_dir,
         "src-a",
         "snap-v1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
@@ -58,12 +58,18 @@ fn lifecycle_delete_compact_check_and_restore() {
         &source_dir,
         "src-a",
         "snap-v2",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
-    let delete_result =
-        commands::delete::run(&config, None, &["snap-v1"], false, &CancelToken::new()).unwrap();
+    let delete_result = commands::delete::run(
+        &config,
+        common::pass(&config),
+        &["snap-v1"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(delete_result.warnings.is_empty());
     let stats = delete_result
         .stats
@@ -74,12 +80,19 @@ fn lifecycle_delete_compact_check_and_restore() {
     // snap-v1's backup segment and packs are old: the sweep takes its
     // entries (compact keeps those of segments younger than T_pack).
     common::age_repo_objects(&repo_dir, &["index.d", "packs"], common::PAST_T_PACK);
-    let compact_stats =
-        commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    let compact_stats = commands::compact::run(
+        &config,
+        common::pass(&config),
+        0.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(compact_stats.chunks_unreferenced > 0);
     assert!(compact_stats.space_freed > 0);
 
-    let check = commands::check::run(&config, None, true, false).unwrap();
+    let check = commands::check::run(&config, common::pass(&config), true, false).unwrap();
     assert!(
         check.errors.is_empty(),
         "check errors: {:?}",
@@ -94,7 +107,7 @@ fn lifecycle_delete_compact_check_and_restore() {
     let restore_dir = tmp.path().join("restore");
     let extract_stats = commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap-v2",
         restore_dir.to_str().unwrap(),
         None,
@@ -113,7 +126,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         "new file"
     );
 
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     assert!(repo.manifest().find_snapshot("snap-v1").is_none());
     assert!(repo.manifest().find_snapshot("snap-v2").is_some());
 }
@@ -137,13 +150,13 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         ..RetentionConfig::default()
     };
 
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     backup_source(
         &config,
         &source_a,
         "src-a",
         "snap-a1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
     std::thread::sleep(Duration::from_millis(2));
@@ -152,7 +165,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         &source_b,
         "src-b",
         "snap-b1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
     std::thread::sleep(Duration::from_millis(2));
@@ -162,7 +175,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         &source_a,
         "src-a",
         "snap-a2",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
@@ -173,7 +186,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     let source_filter = vec!["src-a".to_string()];
     let (prune_stats, list_entries) = commands::prune::run(
         &config,
-        None,
+        common::pass(&config),
         false,
         true,
         &sources,
@@ -189,18 +202,25 @@ fn prune_compact_check_and_restore_kept_snapshots() {
 
     // The pruned snapshot's segment and packs are old (see above).
     common::age_repo_objects(&repo_dir, &["index.d", "packs"], common::PAST_T_PACK);
-    let compact_stats =
-        commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    let compact_stats = commands::compact::run(
+        &config,
+        common::pass(&config),
+        0.0,
+        None,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(
         compact_stats.packs_repacked > 0
             || compact_stats.packs_deleted_empty > 0
             || compact_stats.space_freed > 0
     );
 
-    let check = commands::check::run(&config, None, true, false).unwrap();
+    let check = commands::check::run(&config, common::pass(&config), true, false).unwrap();
     assert!(check.errors.is_empty());
 
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let names: Vec<_> = repo
         .manifest()
         .snapshots
@@ -215,7 +235,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     let restore_a = tmp.path().join("restore-a");
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap-a2",
         restore_a.to_str().unwrap(),
         None,
@@ -232,7 +252,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     let restore_b = tmp.path().join("restore-b");
     commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap-b1",
         restore_b.to_str().unwrap(),
         None,
@@ -338,30 +358,22 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
 /// by their BLAKE3 digest.
 #[test]
 fn v3_pack_names_survive_backup_and_compaction() {
-    for (mode, passphrase) in [
-        (EncryptionModeConfig::None, None),
-        (
-            EncryptionModeConfig::Aes256Gcm,
-            Some("pack-naming-passphrase"),
-        ),
-    ] {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        let source_dir = tmp.path().join("source");
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        std::fs::create_dir_all(&source_dir).unwrap();
+    let passphrase = Some("pack-naming-passphrase");
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
 
-        let mut config = make_test_config(&repo_dir);
-        config.encryption.mode = mode;
-        config.chunker = ChunkerConfig {
-            min_size: 8 * 1024,
-            avg_size: 16 * 1024,
-            max_size: 64 * 1024,
-        };
-        commands::init::run(&config, passphrase).unwrap();
+    let mut config = make_test_config(&repo_dir);
+    config.chunker = ChunkerConfig {
+        min_size: 8 * 1024,
+        avg_size: 16 * 1024,
+        max_size: 64 * 1024,
+    };
+    vykar_core::testing::with_cheap_kdf(|| commands::init::run(&config, passphrase)).unwrap();
 
-        exercise_pack_naming(&config, passphrase, &source_dir, HashAlgorithm::Blake3);
-    }
+    exercise_pack_naming(&config, passphrase, &source_dir, HashAlgorithm::Blake3);
 }
 
 #[test]
@@ -387,17 +399,17 @@ fn command_dump_failure_does_not_mutate_repository_state() {
     std::fs::write(source_dir.join("stable.txt"), b"stable-data").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     backup_source(
         &config,
         &source_dir,
         "src-a",
         "snap-baseline",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
-    let before = open_local_repo(&repo_dir, None);
+    let before = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let snapshots_before = before.manifest().snapshots.len();
     let chunks_before = before.chunk_index().len();
     drop(before);
@@ -414,7 +426,7 @@ fn command_dump_failure_does_not_mutate_repository_state() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap-atomic-fail",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "src-a",
             exclude_patterns: &exclude_patterns,
@@ -429,7 +441,7 @@ fn command_dump_failure_does_not_mutate_repository_state() {
     );
     assert!(result.is_err());
 
-    let after = open_local_repo(&repo_dir, None);
+    let after = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     assert_eq!(after.manifest().snapshots.len(), snapshots_before);
     assert_eq!(after.chunk_index().len(), chunks_before);
     assert!(after.manifest().find_snapshot("snap-atomic-fail").is_none());
@@ -446,7 +458,7 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
     std::fs::write(source_dir.join("locked.txt"), b"lock-test-data").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
     let guard = lock::acquire_lock(&storage, &HostEnv::system()).unwrap();
@@ -459,7 +471,7 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap-while-locked",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "src-a",
             exclude_patterns: &exclude_patterns,
@@ -481,10 +493,10 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
         &source_dir,
         "src-a",
         "snap-after-lock",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     assert!(repo.manifest().find_snapshot("snap-after-lock").is_some());
 }
 
@@ -524,18 +536,18 @@ fn restore_downloads_the_index_when_the_local_table_is_gone() {
     std::fs::create_dir_all(&source_dir).unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
     backup_source(
         &config,
         &source_dir,
         "src",
         "snap1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let repo_id = repo.config().id.clone();
     drop(repo);
     let tables = chunk_tables(&repo_id);
@@ -547,7 +559,7 @@ fn restore_downloads_the_index_when_the_local_table_is_gone() {
     let restore_dir = tmp.path().join("restore");
     let stats = commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap1",
         restore_dir.to_str().unwrap(),
         None,
@@ -585,18 +597,18 @@ fn one_file_repo(
     std::fs::create_dir_all(&source_dir).unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
     backup_source(
         &config,
         &source_dir,
         "src",
         "snap1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
-    let mut repo = open_local_repo(&repo_dir, None);
+    let mut repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let items =
         commands::list::load_snapshot_items(&mut repo, "snap1", &CancelToken::new()).unwrap();
     let file = items
@@ -631,7 +643,7 @@ fn restore_reads_the_local_table_without_index_downloads() {
     let restore_dir = tmp.path().join("restore");
     let stats = commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap1",
         restore_dir.to_str().unwrap(),
         None,
@@ -657,7 +669,7 @@ fn restore_reports_an_unreadable_data_chunk() {
         let tmp = tempfile::tempdir().unwrap();
         let (config, _, _, data_chunk) = one_file_repo(tmp.path());
         let repo_dir = tmp.path().join("repo");
-        let repo = open_local_repo(&repo_dir, None);
+        let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
         let pack_id = repo.chunk_index().get(&data_chunk).unwrap().pack_id;
         drop(repo);
         std::fs::remove_file(repo_dir.join(pack_id.storage_key())).unwrap();
@@ -665,7 +677,7 @@ fn restore_reports_an_unreadable_data_chunk() {
         let restore_dir = tmp.path().join("restore");
         let result = commands::restore::run_with_options(
             &config,
-            None,
+            common::pass(&config),
             "snap1",
             restore_dir.to_str().unwrap(),
             None,
@@ -700,7 +712,7 @@ fn restore_streams_a_multi_chunk_item_stream() {
     let source_dir = tmp.path().join("source");
     std::fs::create_dir_all(&repo_dir).unwrap();
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     // Enough entries for an item stream of several 32-512 KiB chunks.
     const N: usize = 6000;
     for d in 0..20 {
@@ -715,10 +727,10 @@ fn restore_streams_a_multi_chunk_item_stream() {
         &source_dir,
         "src",
         "snap1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let ptrs = commands::list::load_snapshot_meta(&repo, "snap1")
         .unwrap()
         .item_ptrs
@@ -729,7 +741,7 @@ fn restore_streams_a_multi_chunk_item_stream() {
     let restore_dir = tmp.path().join("restore");
     let stats = commands::restore::run(
         &config,
-        None,
+        common::pass(&config),
         "snap1",
         restore_dir.to_str().unwrap(),
         None,
@@ -786,14 +798,14 @@ fn two_snapshot_repo(tmp: &std::path::Path) -> (vykar_core::config::VykarConfig,
     std::fs::create_dir_all(&source_dir).unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
     std::fs::write(source_dir.join("a.txt"), b"first").unwrap();
     backup_source(
         &config,
         &source_dir,
         "src",
         "snap1",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
     std::fs::write(source_dir.join("b.txt"), b"second").unwrap();
@@ -802,11 +814,11 @@ fn two_snapshot_repo(tmp: &std::path::Path) -> (vykar_core::config::VykarConfig,
         &source_dir,
         "src",
         "snap2",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let ids = (repo.config().id.clone(), repo.index_generation());
     drop(repo);
     (config, ids.0, ids.1)
@@ -818,7 +830,13 @@ fn open_counting_repo(repo_dir: &std::path::Path) -> (Repo, Arc<AtomicUsize>) {
         inner: LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
         index_gets: index_gets.clone(),
     });
-    let repo = Repo::open(storage, None, None, OpenOptions::new()).unwrap();
+    let repo = Repo::open(
+        storage,
+        Some(common::TEST_PASSPHRASE),
+        None,
+        OpenOptions::new(),
+    )
+    .unwrap();
     (repo, index_gets)
 }
 
@@ -897,7 +915,7 @@ fn file_cache_survives_label_rename() {
     std::fs::write(source_dir.join("b.txt"), b"bravo").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     // First backup with "old-label".
     backup_source(
@@ -905,7 +923,7 @@ fn file_cache_survives_label_rename() {
         &source_dir,
         "old-label",
         "snap-old",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
@@ -921,7 +939,7 @@ fn file_cache_survives_label_rename() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap-new",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "new-label",
             exclude_patterns: &exclude_patterns,
@@ -978,7 +996,7 @@ fn parent_fallback_survives_label_rename() {
     std::fs::write(source_dir.join("b.txt"), b"bravo").unwrap();
 
     let config = make_test_config(&repo_dir);
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     // First backup with "old-label".
     backup_source(
@@ -986,17 +1004,15 @@ fn parent_fallback_survives_label_rename() {
         &source_dir,
         "old-label",
         "snap-old",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
     // Delete the local file cache to force a cold start (parent fallback path).
-    {
-        let repo = open_local_repo(&repo_dir, None);
-        let filecache = filecache_path(&repo.config().id);
-        drop(repo);
-        let _ = std::fs::remove_file(&filecache);
-    }
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
+    let filecache = filecache_path(&repo.config().id);
+    drop(repo);
+    let _ = std::fs::remove_file(&filecache);
 
     // Second backup with "new-label", same paths, same files.
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
@@ -1010,7 +1026,7 @@ fn parent_fallback_survives_label_rename() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap-new",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "new-label",
             exclude_patterns: &exclude_patterns,
@@ -1063,7 +1079,7 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
     std::fs::create_dir_all(&cache_dir).unwrap();
     let mut config = make_test_config(&repo_dir);
     config.cache_dir = Some(cache_dir.to_string_lossy().to_string());
-    commands::init::run(&config, None).unwrap();
+    common::init_repo(&config);
 
     // Step 1: filesystem backup to populate the file cache on disk.
     std::fs::write(source_dir.join("data.txt"), b"hello world").unwrap();
@@ -1072,12 +1088,12 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
         &source_dir,
         "src-a",
         "snap-fs",
-        None,
+        common::pass(&config),
         config.xattrs.enabled,
     );
 
     // Step 2: locate the filecache file and snapshot its contents + mtime.
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     let repo_id_hex = hex::encode(&repo.config().id);
     drop(repo);
 
@@ -1104,7 +1120,7 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
         &config,
         commands::backup::BackupRequest {
             snapshot_name: "snap-dump",
-            passphrase: None,
+            passphrase: Some(common::TEST_PASSPHRASE),
             source_paths: &[],
             source_label: "dump-only",
             exclude_patterns: &exclude_patterns,
@@ -1135,6 +1151,6 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
     );
 
     // Verify the dump-only snapshot was actually created.
-    let repo = open_local_repo(&repo_dir, None);
+    let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
     assert!(repo.manifest().find_snapshot("snap-dump").is_some());
 }

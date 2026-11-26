@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-write",
-  "note": "First LateSnapshotWrite case of a 10-minute make sim-campaign (phase F part 2): a delayed snapshot PUT lands after compact swept its chunks. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the compact runs less than T_pack after the late snapshot's head, so the late snapshot's own new chunks, added by its young backup segment, survive the sweep, and the chunk it shares (shared.bin) is marked through b1: the released snapshot PUT names chunks that exist, no signature. late-snapshot-write-old-segment shows the hazard with the segment older than T_pack. Fixed by 04 step 8.",
+  "note": "First LateSnapshotWrite case of a 10-minute make sim-campaign (phase F part 2): a delayed snapshot PUT lands after compact swept its chunks. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the compact runs less than T_pack after the late snapshot's head, so the late snapshot's own new chunks, added by its young backup segment, survive the sweep, and the chunk it shares (shared.bin) is marked through b1: the released snapshot PUT names chunks that exist, no signature. late-snapshot-write-old-segment shows the hazard with the segment older than T_pack. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2.",
   "expect": [],
   "at": [
     [
@@ -349,6 +349,7 @@
       0,
       1
     ],
-    "policy": "Continue"
+    "policy": "Continue",
+    "template": "Encrypted"
   }
 }

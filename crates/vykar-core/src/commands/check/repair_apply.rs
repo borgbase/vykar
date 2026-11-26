@@ -602,6 +602,7 @@ mod tests {
     use crate::commands::check::scan::{ScanOptions, integrity_scan};
     use crate::repo::ChunkerParams;
     use crate::repo::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY};
+    use crate::tests::helpers::pass;
     use crate::testutil::MemoryBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -928,7 +929,7 @@ mod tests {
         let mut config = make_test_config(&repo_dir);
         config.repository.min_pack_size = 1;
         config.repository.max_pack_size = 1;
-        crate::commands::init::run(&config, None).unwrap();
+        crate::commands::init::run(&config, pass(&config)).unwrap();
         backup_single_source(&config, &src_a, "src-a", "snap-a");
         backup_single_source(&config, &src_b, "src-b", "snap-b");
 
@@ -1057,7 +1058,7 @@ mod tests {
         // A second repair, on a healthy backend, succeeds.
         let repaired = crate::commands::check::run_with_repair(
             &config,
-            None,
+            pass(&config),
             false,
             RepairMode::Apply,
             None,
@@ -1079,7 +1080,7 @@ mod tests {
             "{:?}",
             repaired.applied
         );
-        let check = crate::commands::check::run(&config, None, true, false).unwrap();
+        let check = crate::commands::check::run(&config, pass(&config), true, false).unwrap();
         assert!(check.errors.is_empty(), "{:?}", check.errors);
         let mut repo = open_local_repo(&repo_dir);
         for (name, old) in [("snap-a", id_a), ("snap-b", id_b)] {
@@ -1252,7 +1253,7 @@ mod tests {
             &config,
             crate::commands::backup::BackupRequest {
                 snapshot_name: "snap1",
-                passphrase: None,
+                passphrase: Some(crate::testing::TEST_PASSPHRASE),
                 source_paths: &paths,
                 source_label: "src",
                 exclude_patterns: &[],

@@ -96,7 +96,7 @@ delegate_storage_backend! {
 /// An encrypted repository (both key copies present, so the open has
 /// nothing to backfill) with `s1` and `s2`.
 fn fixture() -> Fx {
-    let fx = Fx::new(true);
+    let fx = Fx::new();
     let one = fx.src("one");
     std::fs::write(one.join("a.txt"), b"first file").unwrap();
     std::fs::create_dir_all(one.join("sub")).unwrap();

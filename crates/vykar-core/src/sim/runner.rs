@@ -295,8 +295,8 @@ impl Drop for Sim {
 }
 
 impl Sim {
-    /// A store of the default config, whose kind is
-    /// [`with_store_kind`]'s when called inside it.
+    /// A store of the default config (an encrypted repository), whose kind
+    /// is [`with_store_kind`]'s when called inside it.
     pub fn new() -> Self {
         Self::with_config(SimConfig {
             kind: DEFAULT_KIND.with(std::cell::Cell::get),
@@ -305,9 +305,9 @@ impl Sim {
     }
 
     /// Creates the store, registers client "init" and runs Init as run 0.
-    /// With `config.encrypted` the repository is AES-256-GCM with the
-    /// passphrase [`SIM_PASSPHRASE`] and a cheap KDF
-    /// (`repo::with_cheap_kdf`; Init runs inline, on this thread).
+    /// The repository is AES-256-GCM with the passphrase [`SIM_PASSPHRASE`]
+    /// and a cheap KDF (`repo::with_cheap_kdf`; Init runs inline, on this
+    /// thread), unless `config.encrypted` is false (plaintext-only tests).
     pub fn with_config(config: SimConfig) -> Self {
         let encrypted = config.encrypted;
         let mut sim = Self::from_store(SimStore::new(config));
@@ -316,6 +316,7 @@ impl Sim {
             let mode = if encrypted {
                 EncryptionMode::Aes256Gcm
             } else {
+                // Plaintext-only: 10-single-protocol step 3 removes this.
                 EncryptionMode::None
             };
             let repo = crate::repo::with_cheap_kdf(|| {
@@ -876,6 +877,7 @@ impl Sim {
                     passcommand: None,
                 }
             } else {
+                // Plaintext-only: 10-single-protocol step 3 removes this.
                 EncryptionConfig {
                     mode: EncryptionModeConfig::None,
                     passphrase: None,

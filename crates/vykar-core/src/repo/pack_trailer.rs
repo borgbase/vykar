@@ -508,18 +508,44 @@ fn read_exact(
     Ok(Some(data))
 }
 
+/// Test support: seal the trailer of the pack `pack` again with its body
+/// changed by `edit`, as a newer or a broken writer would have sealed it,
+/// so an AEAD engine still authenticates it. The frame keeps its length.
+#[cfg(test)]
+pub(crate) fn reseal_trailer_body(
+    pack: &mut Vec<u8>,
+    crypto: &dyn CryptoEngine,
+    edit: impl FnOnce(&mut Vec<u8>),
+) {
+    let trailer = read_trailer_from_pack_bytes(pack, crypto).unwrap().unwrap();
+    let mut body = trailer.encode_body();
+    edit(&mut body);
+    let tagged = compress::compress(Compression::None, &body).unwrap();
+    let object =
+        pack_object_with_context(ObjectType::PackTrailer, TRAILER_CONTEXT, &tagged, crypto)
+            .unwrap();
+    let len = parse_footer(pack).unwrap();
+    let start = trailer_frame_start(pack.len() as u64, len).unwrap() as usize;
+    let n = pack.len();
+    pack.truncate(start + 4);
+    pack.extend_from_slice(&object);
+    pack.extend_from_slice(&len.to_le_bytes());
+    pack.extend_from_slice(TRAILER_MAGIC);
+    assert_eq!(pack.len(), n, "the resealed frame keeps its length");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::repo::pack::{PackType, PackWriter};
     use crate::testutil::{RecordingBackend, chunk_hasher_for};
-    use vykar_crypto::PlaintextEngine;
     use vykar_crypto::aes_gcm::Aes256GcmEngine;
     use vykar_crypto::chacha20_poly1305::ChaCha20Poly1305Engine;
+    use vykar_crypto::testing::DeterministicEngine;
     use vykar_types::hash::HashAlgorithm;
 
-    fn plain() -> PlaintextEngine {
-        PlaintextEngine::new(chunk_hasher_for([0xAA; 32]))
+    fn det() -> DeterministicEngine {
+        DeterministicEngine::new(chunk_hasher_for([0xAA; 32]))
     }
 
     fn aes() -> Aes256GcmEngine {
@@ -557,8 +583,8 @@ mod tests {
     #[test]
     fn roundtrip_all_engines() {
         let chacha = ChaCha20Poly1305Engine::new(&[0x33; 32], chunk_hasher_for([0x44; 32]));
-        let (plain, aes) = (plain(), aes());
-        let engines: [&dyn CryptoEngine; 3] = [&plain, &aes, &chacha];
+        let (det, aes) = (det(), aes());
+        let engines: [&dyn CryptoEngine; 3] = [&det, &aes, &chacha];
         for engine in engines {
             for n in [1, 2, 10_000] {
                 let t = trailer(n, TrailerPackType::Tree);
@@ -685,7 +711,7 @@ mod tests {
         );
         assert!(PackTrailer::open_blob(&wrong_tag, &aes).is_err(), "tag");
         assert!(
-            PackTrailer::open_blob(&blob, &plain()).is_err(),
+            PackTrailer::open_blob(&blob, &det()).is_err(),
             "other engine"
         );
 
@@ -722,20 +748,18 @@ mod tests {
         );
         assert_eq!(trailer_frame_start(10, 200), None);
 
-        let blob = trailer(1, TrailerPackType::Data)
-            .seal_blob(&plain())
-            .unwrap();
+        let blob = trailer(1, TrailerPackType::Data).seal_blob(&det()).unwrap();
         let mut frame = (blob.len() as u32).to_le_bytes().to_vec();
         frame.extend_from_slice(&blob);
-        assert!(open_trailer_frame(&frame, &plain()).is_ok());
+        assert!(open_trailer_frame(&frame, &det()).is_ok());
         frame[0] ^= 1;
-        assert!(open_trailer_frame(&frame, &plain()).is_err(), "prefix != L");
-        assert!(open_trailer_frame(&frame[..3], &plain()).is_err());
+        assert!(open_trailer_frame(&frame, &det()).is_err(), "prefix != L");
+        assert!(open_trailer_frame(&frame[..3], &det()).is_err());
     }
 
     #[test]
     fn read_from_pack_bytes() {
-        for crypto in [&plain() as &dyn CryptoEngine, &aes()] {
+        for crypto in [&det() as &dyn CryptoEngine, &aes()] {
             let (pack, entries) = sealed_pack(5, crypto);
             let t = read_trailer_from_pack_bytes(&pack, crypto)
                 .unwrap()
@@ -748,21 +772,21 @@ mod tests {
         let mut old = vykar_protocol::PACK_MAGIC.to_vec();
         old.push(1);
         old.extend_from_slice(&[2, 0, 0, 0, 0xde, 0xad, 3, 0, 0, 0, 0xbe, 0xef, 0x42]);
-        assert_eq!(read_trailer_from_pack_bytes(&old, &plain()).unwrap(), None);
-        assert!(read_trailer_from_pack_bytes(b"garbage", &plain()).is_err());
+        assert_eq!(read_trailer_from_pack_bytes(&old, &det()).unwrap(), None);
+        assert!(read_trailer_from_pack_bytes(b"garbage", &det()).is_err());
 
         // A trailer whose last blob ends past the frame start.
         let t = PackTrailer::for_blobs(TrailerPackType::Data, [(id(0), 2), (id(1), 4)]).unwrap();
-        let blob = t.seal_blob(&plain()).unwrap();
+        let blob = t.seal_blob(&det()).unwrap();
         let mut bad = old.clone();
         bad.extend_from_slice(&(blob.len() as u32).to_le_bytes());
         bad.extend_from_slice(&blob);
-        assert!(read_trailer_from_pack_bytes(&bad, &plain()).is_err());
+        assert!(read_trailer_from_pack_bytes(&bad, &det()).is_err());
     }
 
     #[test]
     fn read_pack_trailer_tail_and_second_read() {
-        let crypto = plain();
+        let crypto = det();
         let (backend, log) = RecordingBackend::new();
         // Small: one tail read. 2 000 blobs: the trailer (~82 KB) is longer
         // than the tail read, so a second read fetches the frame.
@@ -792,20 +816,19 @@ mod tests {
             TrailerRead::PackMissing
         ));
 
-        let (mut pack, _) = sealed_pack(3, &crypto);
+        let (pack, _) = sealed_pack(3, &crypto);
         let n = pack.len();
-        let len = u32::from_le_bytes(pack[n - 12..n - 8].try_into().unwrap());
-        let start = n - 4 - len as usize;
-        // The frame: [len][tag][codec][version][pack type]...
-        pack[start + 6] = 9; // body version
-        backend.put("packs/00/newer", &pack).unwrap();
+        // The body: [version][pack type]...
+        let mut newer = pack.clone();
+        reseal_trailer_body(&mut newer, &crypto, |b| b[0] = 9);
+        backend.put("packs/00/newer", &newer).unwrap();
         assert!(matches!(
             read_pack_trailer(&backend, "packs/00/newer", n as u64, &crypto).unwrap(),
             TrailerRead::Damaged(VykarError::UnsupportedVersion(9))
         ));
-        pack[start + 6] = TRAILER_BODY_VERSION;
-        pack[start + 7] = 7; // pack type
-        backend.put("packs/00/bad", &pack).unwrap();
+        let mut bad = pack;
+        reseal_trailer_body(&mut bad, &crypto, |b| b[1] = 7);
+        backend.put("packs/00/bad", &bad).unwrap();
         assert!(matches!(
             read_pack_trailer(&backend, "packs/00/bad", n as u64, &crypto).unwrap(),
             TrailerRead::Damaged(VykarError::InvalidFormat(_))

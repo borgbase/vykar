@@ -41,7 +41,6 @@ fn backup_call(name: &str) -> Call {
 fn encrypted(kind: StoreKind) -> Sim {
     Sim::with_config(SimConfig {
         kind,
-        encrypted: true,
         ..SimConfig::default()
     })
 }

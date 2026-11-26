@@ -232,6 +232,27 @@ fn steps_writing(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64>
         .collect()
 }
 
+/// Whether `c` wrote no lock key. Lock-free clients (an encrypted
+/// repository on a store that honours put-if-absent, 04 step 9) take no
+/// lock, so a lock scenario run on them has nothing to build on.
+fn took_no_lock(sim: &Sim, c: ClientId) -> bool {
+    !sim.store()
+        .keys_written_by(c, "locks/")
+        .iter()
+        .any(|k| k.ends_with(".json"))
+}
+
+/// The outcome of a lock scenario whose clients took no lock.
+fn no_lock_taken(evidence: String) -> HazardOutcome {
+    HazardOutcome::PrerequisiteNotReproduced {
+        prerequisite: "a lock held by a",
+        evidence: format!(
+            "lock-free clients take no lock
+{evidence}"
+        ),
+    }
+}
+
 fn lock_violation(report: &Report, run: usize, kind: ViolationKind) -> bool {
     report.has_kind(kind, &format!("run {run}"))
 }
@@ -355,6 +376,11 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         None => {
             let rb = sim.join(sb);
             if !allowed(&rb, AllowedError::Locked) {
+                if took_no_lock(&sim, a) && took_no_lock(&sim, b) {
+                    sim.resume(ga);
+                    let ra = sim.join(sa);
+                    return Ok(no_lock_taken(outcomes(&ra, &rb)));
+                }
                 return Err(broken(format!(
                     "b ended before its fence check, not Locked: {:?}",
                     rb.outcome
@@ -506,7 +532,19 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
             names: vec!["t0".into(), "t2".into()],
         },
     );
-    reach(&sim, g_fence, "a's first fence check")?;
+    if sim
+        .poll_paused(g_fence, GATE_TIMEOUT)
+        .map_err(broken)?
+        .is_none()
+    {
+        let ra = sim.join(sa);
+        if took_no_lock(&sim, a) {
+            return Ok(no_lock_taken(format!("a: {:?}", ra.outcome)));
+        }
+        return Err(broken(
+            "a's first fence check: the run ended without reaching its gate; retarget the gate",
+        ));
+    }
     sim.advance(Duration::from_secs(3 * 3600 + 60));
     sim.step_store_clock(chrono::Duration::hours(3));
     let delete_t1 = || Call::Delete {
@@ -822,53 +860,6 @@ pub fn h4_segment_regression() -> Report {
     out
 }
 
-/// H4-conditional: H4's schedule on a conditional store. Compact a, its
-/// lock reaped, and backup b both create the generation after a's sweep:
-/// b finds it taken and rebases (or a stops before its deletes), so no head
-/// names a pack a deleted and t1 restores. Invariant 7 is not judged: the
-/// lost lock is the fallback lock's (H2's family, part 10); the report
-/// holds every other STEP8 violation, and a `DisallowedError` "scenario"
-/// unless one of the two met a taken generation.
-pub fn h4_conditional_regression() -> Report {
-    let mut out = Report::default();
-    let (sim, a, b, ra, rb) =
-        match h4_runs(Hosts::StoreStepped, Order::Interleaved, BackupGate::Segment) {
-            Ok(Ok(run)) => run,
-            Ok(Err(outcome)) | Err(outcome) => {
-                out.add(
-                    ViolationKind::DisallowedError,
-                    "scenario",
-                    format!("{outcome:?}"),
-                );
-                return out;
-            }
-        };
-    let report = sim.check_invariants(Invariant::STEP8);
-    out.violations.extend(
-        report
-            .violations
-            .into_iter()
-            .filter(|v| v.invariant != Invariant::LockExclusion),
-    );
-    out.not_evaluated.extend(report.not_evaluated);
-    let taken = sim.store().log().iter().any(|r| {
-        (r.client == a || r.client == b)
-            && r.key.starts_with("index.h/")
-            && r.outcome == super::log::OpOutcome::Exists
-    }) || allowed(&ra, AllowedError::IndexChanged);
-    if !taken {
-        out.add(
-            ViolationKind::DisallowedError,
-            "scenario",
-            format!(
-                "neither writer met a taken generation\n{}",
-                outcomes(&ra, &rb)
-            ),
-        );
-    }
-    out
-}
-
 /// H4-skew: H4's old route, b's wall clock 6 h 1 min ahead. Since 04 step 5
 /// b judges a's lock by its mtime on the store's clock and does not reap
 /// it: the run ends early with b `Locked` and a `Ok`. Anything else is a
@@ -991,6 +982,9 @@ fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
         Ok(run) => run,
         Err(outcome) => return Ok(outcome),
     };
+    if took_no_lock(&sim, a) {
+        return Ok(no_lock_taken(outcomes(&ra, &rb)));
+    }
     let report = sim.check_invariants(CHECKED);
     controls(&report)?;
     let key = lock_key_of(&sim, &ra);

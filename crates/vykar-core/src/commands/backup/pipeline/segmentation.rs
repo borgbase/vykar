@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn segment_out_of_order() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn segment_file_identity_mismatch() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn segment_nested_start() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn segment_without_start() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
 
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn incomplete_accumulator_check() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn segment_count_mismatch() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn segment_happy_path() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
@@ -432,7 +432,7 @@ mod tests {
     /// correctly.
     #[test]
     fn skip_large_file_drains_and_restores_stats() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
 
         // Open the transaction just like validate_segment_accum would for
         // segment 0, over byte counters of all zeros; then dirty them so we
@@ -483,7 +483,7 @@ mod tests {
     /// no-op — drain count of zero, stats untouched.
     #[test]
     fn skip_large_file_no_accum_is_noop() {
-        let (_repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+        let (_repo, mut ws) = crate::testutil::test_repo_with_session();
         let mut stats = SnapshotStats {
             deduplicated_size: 7,
             ..Default::default()

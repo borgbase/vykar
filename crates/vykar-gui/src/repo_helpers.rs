@@ -505,14 +505,16 @@ mod tests {
             )
             .expect("local backend"),
         );
-        vykar_core::repo::Repo::init(
-            storage,
-            vykar_core::repo::EncryptionMode::Aes256Gcm,
-            vykar_core::repo::ChunkerParams::default(),
-            Some(pass),
-            None,
-            None,
-        )
+        vykar_core::testing::with_cheap_kdf(|| {
+            vykar_core::repo::Repo::init(
+                storage,
+                vykar_core::repo::EncryptionMode::Aes256Gcm,
+                vykar_core::repo::ChunkerParams::default(),
+                Some(pass),
+                None,
+                None,
+            )
+        })
         .expect("init encrypted repo");
         repo_dir
     }
@@ -737,6 +739,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    // Plaintext-only: 10-single-protocol step 3 removes this.
     #[test]
     fn unencrypted_repo_runs_with_none_passphrase() {
         let mut cache = HashMap::new();

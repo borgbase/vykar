@@ -1626,8 +1626,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("filecache");
         std::fs::write(&path, b"not a file cache").unwrap();
-        let crypto =
-            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let crypto = vykar_crypto::testing::DeterministicEngine::new(
+            crate::testutil::chunk_hasher_for([0xAA; 32]),
+        );
         assert!(FileCache::read_mergeable(&path, &crypto).is_none());
         assert!(FileCache::read_mergeable(&dir.path().join("absent"), &crypto).is_none());
         let truncated = &plaintext[..plaintext.len() / 2];

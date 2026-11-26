@@ -11,6 +11,7 @@
 	fuzz-check \
 	fuzz-list \
 	lint \
+	product-features \
 	sim-campaign \
 	test \
 	test-all \
@@ -28,6 +29,9 @@ fmt-check:
 boundaries:
 	sh scripts/check-module-boundaries.sh
 
+product-features:
+	sh scripts/check-product-features.sh
+
 lint: boundaries
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -40,7 +44,7 @@ test-all:
 doc-check:
 	RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps --all-features
 
-pre-commit: fmt-check lint doc-check test-all
+pre-commit: fmt-check lint doc-check product-features test-all
 
 APP_BUNDLE = target/release/Vykar Backup.app
 

@@ -28,6 +28,7 @@ use crate::common::backup_source;
 use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
 
 /// One fixture per encryption mode.
+// Plaintext-only: 10-single-protocol step 3 removes "none".
 const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
 
 /// BLAKE3 of each archive as committed. A mismatch means the archive was
@@ -180,7 +181,7 @@ fn v3_fixtures_open_only_for_upgrade() {
 /// new pack.
 #[test]
 fn v3_fixture_backup_is_refused_and_leaves_no_session() {
-    let fx = extract("none");
+    let fx = extract("aes256gcm");
     let config = fx.config();
     let packs_before = pack_files(&fx);
     let source_paths = vec![fx.source_dir().to_string_lossy().to_string()];

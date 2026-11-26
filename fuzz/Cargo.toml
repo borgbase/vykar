@@ -23,7 +23,7 @@ blake3 = "1"
 argon2 = "0.6"
 
 vykar-core = { path = "../crates/vykar-core", default-features = false, features = ["fuzzing"] }
-vykar-crypto = { path = "../crates/vykar-crypto" }
+vykar-crypto = { path = "../crates/vykar-crypto", features = ["testing"] }
 vykar-types = { path = "../crates/vykar-types" }
 vykar-protocol = { path = "../crates/vykar-protocol" }
 

@@ -46,9 +46,9 @@ impl Env {
         let setup_cache = tmp.path().join("setup-cache");
         let mut repo = Repo::init(
             Box::new(storage),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             Some(setup_cache),
         )
@@ -82,7 +82,7 @@ impl Env {
         );
         let repo = Repo::open(
             Box::new(storage),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(self.cache.clone()),
             OpenOptions::new().with_index(),
         )
@@ -95,7 +95,7 @@ impl Env {
         let storage = LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap();
         Repo::open(
             Box::new(storage),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             Some(self.cache.clone()),
             OpenOptions::new().with_file_cache(),
         )

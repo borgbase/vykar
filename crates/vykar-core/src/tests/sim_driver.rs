@@ -98,8 +98,9 @@ fn driven_backups(o: &Outcome) -> Vec<RunRecord> {
 /// Every op of a driven backup's commit window (after its lock step,
 /// through its snapshot PUT) is issued inside a machine step and is one
 /// that step declares; `Local` steps issue none; each head and snapshot
-/// PUT step issues exactly one write. Lock steps touch only `locks/`,
-/// finish steps only `sessions/` and `locks/`.
+/// PUT step issues exactly one write. Lock steps touch only `locks/` and
+/// `sessions/` (the lock holder's half of the marker handshake, on an
+/// encrypted repository), finish steps only `sessions/` and `locks/`.
 fn check_guard(name: &str, o: &Outcome) {
     let log = o.sim.store().log();
     let entry_of = |rec: &OpRecord| {
@@ -132,7 +133,7 @@ fn check_guard(name: &str, o: &Outcome) {
             match label {
                 "upload" | "crash" => {}
                 "lock" => assert!(
-                    r.key.starts_with("locks/"),
+                    r.key.starts_with("locks/") || r.key.starts_with("sessions/"),
                     "lock step touched {}: {}",
                     r.key,
                     context()
@@ -771,14 +772,12 @@ fn on(kind: TemplateKind, c: &Case) -> Case {
     }
 }
 
-/// Both templates (phase F part 10b): the determinism tests run on each.
-/// Encrypted objects get random nonces, so pack and index object names
-/// differ between runs there; a driver decision that read one would show.
-fn both_templates() -> [(TemplateKind, Template); 2] {
-    [
-        (TemplateKind::Plain, Template::new()),
-        (TemplateKind::Encrypted, Template::encrypted()),
-    ]
+/// The template the determinism tests run on: the encrypted one (since
+/// 10-single-protocol step 2 every template is). Encrypted objects get
+/// random nonces, so pack and index object names differ between runs; a
+/// driver decision that read one would show.
+fn templates() -> [(TemplateKind, Template); 1] {
+    [(TemplateKind::Encrypted, Template::encrypted())]
 }
 
 /// The compact cases of the op-order and determinism tests, no time jumps:
@@ -859,7 +858,7 @@ fn outcomes(o: &Outcome) -> Vec<String> {
 /// which.
 #[test]
 fn stepped_compact_issues_the_ops_of_the_whole_one() {
-    for (kind, t) in both_templates() {
+    for (kind, t) in templates() {
         stepped_compact_issues_the_ops_of_the_whole_one_on(kind, &t);
     }
 }
@@ -929,7 +928,7 @@ fn check_stepped_decisions(name: &str, o: &Outcome) -> usize {
 #[test]
 fn stepped_compact_replays_identically() {
     let mut most = 0;
-    for (kind, t) in both_templates() {
+    for (kind, t) in templates() {
         most = most.max(stepped_compact_replays_identically_on(
             kind,
             &t,
@@ -1010,7 +1009,7 @@ fn stepped_compact_replays_identically_on(
 /// as measured. A change of compact's op order fails here first.
 #[test]
 fn stepped_compact_steps_in_this_order() {
-    for (kind, t) in both_templates() {
+    for (kind, t) in templates() {
         let (_, c) = &compact_cases()[1];
         stepped_compact_steps_in_this_order_on(&t, &on(kind, c));
     }
@@ -1067,7 +1066,7 @@ fn stepped_cases_with_jumps_and_crashes() -> Vec<(String, Case)> {
 /// crashes replays identically.
 #[test]
 fn stepped_compact_with_jumps_and_crashes_is_deterministic() {
-    for (kind, t) in both_templates() {
+    for (kind, t) in templates() {
         stepped_compact_with_jumps_and_crashes_is_deterministic_on(kind, &t);
     }
 }
@@ -1097,7 +1096,7 @@ fn stepped_compact_with_jumps_and_crashes_is_deterministic_on(kind: TemplateKind
 /// time jump: it holds the maintenance lock for its whole run.
 #[test]
 fn no_jump_is_offered_inside_a_stepped_compact() {
-    let t = Template::new();
+    let t = Template::encrypted();
     let mut inside_seen = 0;
     for (name, c) in stepped_cases_with_jumps_and_crashes() {
         let o = run_case(&t, &c);
@@ -1132,7 +1131,7 @@ fn no_jump_is_offered_inside_a_stepped_compact() {
 /// end state is clean.
 #[test]
 fn crash_inside_a_stepped_compact() {
-    let t = Template::new();
+    let t = Template::encrypted();
     let base = Case {
         crash: true,
         ..stepped(&Case {

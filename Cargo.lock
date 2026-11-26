@@ -7725,6 +7725,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vykar-common",
+ "vykar-core",
  "vykar-crypto",
  "vykar-protocol",
  "vykar-server",

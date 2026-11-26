@@ -2017,9 +2017,9 @@ mod tests {
         };
         let mut repo = Repo::init(
             Box::new(backend),
-            EncryptionMode::None,
+            EncryptionMode::Aes256Gcm,
             crate::repo::ChunkerParams::default(),
-            None,
+            Some(crate::testing::TEST_PASSPHRASE),
             None,
             None,
         )

@@ -2,6 +2,8 @@
 //! swap in an `encryption: none` repository. A client whose own config asks for
 //! encryption must refuse it rather than silently upload plaintext (#208).
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
+
 #![allow(clippy::unwrap_used, clippy::panic)]
 #![allow(clippy::pedantic)]
 
@@ -17,7 +19,7 @@ use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
-use crate::common::make_test_config;
+use crate::common::{make_plaintext_config, make_test_config};
 
 const PASS: &str = "correct horse battery staple";
 
@@ -26,9 +28,9 @@ const PASS: &str = "correct horse battery staple";
 fn plaintext_repo(tmp: &Path, mode: EncryptionModeConfig) -> VykarConfig {
     let repo_dir = tmp.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
-    commands::init::run(&make_test_config(&repo_dir), None).unwrap();
+    commands::init::run(&make_plaintext_config(&repo_dir), None).unwrap();
 
-    let mut config = make_test_config(&repo_dir);
+    let mut config = make_plaintext_config(&repo_dir);
     config.encryption.mode = mode;
     // Fresh cache dir: no identity pin for this URL.
     config.cache_dir = Some(tmp.join("client-cache").to_string_lossy().into_owned());
@@ -136,6 +138,6 @@ fn encrypting_config_opens_encrypted_repo() {
     let mut config = make_test_config(&repo_dir);
     config.encryption.mode = EncryptionModeConfig::Auto;
     config.cache_dir = Some(tmp.path().join("cache").to_string_lossy().into_owned());
-    commands::init::run(&config, Some(PASS)).unwrap();
+    vykar_core::testing::with_cheap_kdf(|| commands::init::run(&config, Some(PASS))).unwrap();
     open_repo(&config, Some(PASS), OpenOptions::new(), &CancelToken::new()).unwrap();
 }

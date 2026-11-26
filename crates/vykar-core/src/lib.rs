@@ -34,6 +34,10 @@ pub mod fuzzing;
 #[doc(hidden)]
 pub mod sim;
 
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
+
 #[cfg(feature = "measure")]
 #[doc(hidden)]
 pub mod measure;

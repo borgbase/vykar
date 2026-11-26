@@ -1,4 +1,5 @@
 #![no_main]
+// Plaintext-only: 10-single-protocol step 3 removes this.
 //! The read path of an unencrypted repository through `decode_chunk_into`,
 //! checked against the unpack + decompress composition: pack scan, envelope,
 //! decompression, then the chunk-ID check that is the only integrity check

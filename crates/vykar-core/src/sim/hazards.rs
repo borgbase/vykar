@@ -19,8 +19,12 @@
 //! that honour put-if-absent: each hazard states what it does on the
 //! conditional store ([`OnConditional`]); the scenarios run there under
 //! [`with_store_kind`], and their conditional twins are regressions
-//! (H3-conditional, H3-compact-conditional, H4-conditional). Every
-//! regression names the store kinds it holds on. H-racy is a known hazard of
+//! (H3-conditional, H3-compact-conditional). Every regression names the
+//! store kinds it holds on. Since 10-single-protocol step 2 every scenario
+//! runs on an encrypted repository, so the fallback store means lock mode
+//! with the marker handshake and the conditional store means lock-free
+//! clients, which take no lock: the lock hazards have no prerequisite
+//! there, and the lock regressions hold on the fallback store only. H-racy is a known hazard of
 //! a store that passes the sequential check yet lets a late create win.
 //!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
@@ -116,7 +120,9 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         fixed_by: "not planned: a history of this installation's own boot IDs; \
                    04 step 5 narrows it for markers",
         run: interleavings::h1_late_clone,
-        conditional: OnConditional::Reproduces,
+        // Lock-free clients take no lock (10-single-protocol step 2: the
+        // conditional store's clients are encrypted, so lock-free).
+        conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {
         id: "H2",
@@ -124,7 +130,8 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                   (route: the store's clock steps 3 h forward)",
         fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
         run: interleavings::h2_lock_refresh_resurrects,
-        conditional: OnConditional::Reproduces,
+        // Lock-free clients take no lock (10-single-protocol step 2).
+        conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {
         id: "H4",
@@ -135,7 +142,10 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                    and the backup's creates of one generation: one wins, the backup \
                    rebases); the fallback keeps it",
         run: interleavings::h4_compact_deletes_after_lost_lock,
-        conditional: OnConditional::Closed("H4-conditional"),
+        // Lock-free clients take no lock (10-single-protocol step 2); the
+        // regression H4-conditional, of a lock-mode compact losing its lock
+        // on that store, went with the plaintext template.
+        conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {
         id: "H-racy",
@@ -210,7 +220,8 @@ pub const REGRESSIONS: &[Regression] = &[
                   one booted after the holder's write) and containers (installation ID, \
                   boot ID and uptime, PID namespace)",
         run: interleavings::h1_regression,
-        kinds: BOTH_KINDS,
+        // Its subject is a lock, which lock-free clients never take.
+        kinds: &[StoreKind::Plain],
     },
     Regression {
         id: "H1-session",
@@ -239,7 +250,8 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "a client 6 h 1 min ahead no longer reaps compact's live lock \
                   (store-clock ages)",
         run: interleavings::h4_skew_regression,
-        kinds: BOTH_KINDS,
+        // Its subject is a lock, which lock-free clients never take.
+        kinds: &[StoreKind::Plain],
     },
     Regression {
         id: "H3-compact-young",
@@ -260,14 +272,6 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "on a conditional store the late head cannot replace compact's head; the \
                   index names no pack compact deleted",
         run: h3_compact_conditional_regression,
-        kinds: &[StoreKind::Conditional],
-    },
-    Regression {
-        id: "H4-conditional",
-        summary: "on a conditional store compact (its lock lost) and the backup both create \
-                  the next head: one wins, the backup rebases; nothing names a deleted pack \
-                  (the lost lock stays invariant 7's)",
-        run: interleavings::h4_conditional_regression,
         kinds: &[StoreKind::Conditional],
     },
 ];
@@ -676,7 +680,6 @@ pub fn h_racy() -> HazardOutcome {
 pub fn h_mixed_aged_lock() -> HazardOutcome {
     let mut sim = Sim::with_config(SimConfig {
         kind: StoreKind::ConditionalOverwrite,
-        encrypted: true,
         ..SimConfig::default()
     });
     let (l, f) = (sim.client("l"), sim.client("f"));
@@ -731,7 +734,6 @@ pub fn h_mixed_aged_lock() -> HazardOutcome {
 pub fn h_committing_reaped() -> HazardOutcome {
     let mut sim = Sim::with_config(SimConfig {
         kind: StoreKind::Conditional,
-        encrypted: true,
         ..SimConfig::default()
     });
     let (a, b) = (sim.client("a"), sim.client("b"));
@@ -805,7 +807,6 @@ pub fn h_committing_reaped() -> HazardOutcome {
 pub fn h_mixed_late_create() -> HazardOutcome {
     let mut sim = Sim::with_config(SimConfig {
         kind: StoreKind::ConditionalOverwrite,
-        encrypted: true,
         ..SimConfig::default()
     });
     let (f, l) = (sim.client("f"), sim.client("l"));

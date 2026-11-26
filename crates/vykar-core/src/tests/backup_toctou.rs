@@ -21,6 +21,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use super::helpers::pass;
 use crate::commands::backup;
 
 fn init() {
@@ -43,7 +44,7 @@ fn backup_to(
         config,
         backup::BackupRequest {
             snapshot_name,
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "test",
             exclude_patterns: &[],
@@ -79,7 +80,7 @@ fn intra_read_truncation_is_skipped_with_warning() {
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     // Large-enough file that the chunk loop will do at least one read before
     // the hook fires.
@@ -130,7 +131,7 @@ fn intra_read_append_large_one_worker_is_skipped_with_warning() {
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     let file = src_dir.join("big.bin");
     let data = vec![0x5au8; 64 * 1024];
@@ -181,7 +182,7 @@ fn intra_read_append_parallel_large_is_skipped_with_warning() {
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     let file = src_dir.join("big.bin");
     let data = vec![0x5au8; 64 * 1024];
@@ -229,7 +230,7 @@ fn intra_read_append_parallel_small_is_skipped_with_warning() {
     config.chunker.min_size = 32 * 1024;
     config.chunker.avg_size = 64 * 1024;
     config.chunker.max_size = 128 * 1024;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     let file = src_dir.join("small.bin");
     let data = vec![0x5au8; 4 * 1024];
@@ -278,7 +279,7 @@ fn intra_read_append_small_skips_only_the_mutated_file() {
     config.chunker.min_size = 32 * 1024;
     config.chunker.avg_size = 64 * 1024;
     config.chunker.max_size = 128 * 1024;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     let good = src_dir.join("a-good.bin");
     write_file(&good, &vec![0x11u8; 4 * 1024]);
@@ -326,7 +327,7 @@ fn soft_open_error_skips_bad_commits_good() {
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     // Two files: one good, one unreadable.
     let good = src_dir.join("good.bin");
@@ -374,7 +375,7 @@ fn unreadable_directory_is_a_soft_error_not_a_dataless_skip() {
 
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
     config.limits.threads = 1;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     write_file(&src_dir.join("good.bin"), &vec![0x11u8; 4 * 1024]);
     let locked = src_dir.join("locked");

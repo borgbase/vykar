@@ -140,7 +140,7 @@ fn fence_refreshes_lock_file() {
 fn fence_blocks_persist_index() {
     crate::testutil::init_test_environment();
 
-    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = crate::testutil::test_repo_with_session();
 
     // Store a chunk to dirty the index.
     ws.store_chunk(&repo, b"hello world", Compression::None, PackType::Data)
@@ -165,7 +165,7 @@ fn fence_blocks_persist_index() {
 fn fence_blocks_persist_index_via_mark_dirty() {
     crate::testutil::init_test_environment();
 
-    let mut repo = crate::testutil::test_repo_plaintext();
+    let mut repo = crate::testutil::test_repo();
 
     // Edit the index so save_state will try to persist it.
     repo.unchecked_writer().chunk_index_mut().add(
@@ -197,7 +197,7 @@ fn fence_blocks_persist_index_via_mark_dirty() {
 fn fence_none_allows_writes() {
     crate::testutil::init_test_environment();
 
-    let (mut repo, mut ws) = crate::testutil::test_repo_plaintext_with_session();
+    let (mut repo, mut ws) = crate::testutil::test_repo_with_session();
 
     // Store a chunk.
     ws.store_chunk(&repo, b"hello world", Compression::None, PackType::Data)
@@ -218,9 +218,9 @@ fn maintenance_lock_fence_blocks_stale_write() {
     let storage = MemoryBackend::new();
     let mut repo = Repo::init(
         Box::new(storage),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         None,
     )

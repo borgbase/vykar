@@ -221,6 +221,7 @@ fn v3_upgrade_interrupted_at_every_write_completes() {
     interrupted_at_every_write("v3", "aes256gcm", 3, "blake3");
 }
 
+// Plaintext-only: 10-single-protocol step 3 moves this to an encrypted v2 fixture.
 #[test]
 fn v2_upgrade_interrupted_at_every_write_completes() {
     interrupted_at_every_write("v2", "none", 2, "blake2b");

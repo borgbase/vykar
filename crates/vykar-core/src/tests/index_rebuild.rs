@@ -31,21 +31,27 @@ struct Fx {
 }
 
 impl Fx {
+    /// A repository with its passphrase in its config.
     fn new() -> Self {
-        Self::with_encryption(false)
+        Self::with_mode(EncryptionModeConfig::Aes256Gcm)
     }
 
-    /// A repository, AES-GCM encrypted when `encrypted`.
-    fn with_encryption(encrypted: bool) -> Self {
+    /// A plaintext repository.
+    // Plaintext-only: 10-single-protocol step 3 removes this.
+    fn plaintext() -> Self {
+        Self::with_mode(EncryptionModeConfig::None)
+    }
+
+    fn with_mode(mode: EncryptionModeConfig) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         let source = tmp.path().join("src");
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::create_dir_all(&source).unwrap();
         let mut config = make_test_config(&repo_dir);
-        if encrypted {
-            config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
-            config.encryption.passphrase = Some("index-rebuild".into());
+        if mode == EncryptionModeConfig::None {
+            config.encryption.mode = mode;
+            config.encryption.passphrase = None;
         }
         commands::init::run(&config, pass(&config)).unwrap();
         config.cache_dir = Some(tmp.path().join("cache").to_string_lossy().into_owned());
@@ -131,6 +137,15 @@ impl Fx {
     }
 
     /// The ID of the pack at `path` (below the repository).
+    /// Seal the trailer of the pack at `path` again with its body changed
+    /// by `f`, under the repository's engine.
+    fn reseal_trailer(&self, path: &Path, f: impl FnOnce(&mut Vec<u8>)) {
+        let repo = self.open();
+        let mut bytes = std::fs::read(path).unwrap();
+        crate::repo::pack_trailer::reseal_trailer_body(&mut bytes, repo.crypto().as_ref(), f);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
     fn pack_id_of(&self, path: &Path) -> PackId {
         PackId::from_storage_key(path.strip_prefix(&self.repo_dir).unwrap().to_str().unwrap())
             .unwrap()
@@ -299,8 +314,8 @@ fn cut_trailer(path: &Path) {
 
 /// Three backups sharing a large file, then `s1` deleted and a compact at
 /// threshold 0, so a pack written by compact exists.
-fn three_backups_and_a_compact(encrypted: bool) -> Fx {
-    let mut fx = Fx::with_encryption(encrypted);
+fn three_backups_and_a_compact() -> Fx {
+    let mut fx = Fx::new();
     fx.write("a.bin", &data(1, 300_000));
     fx.write("b.bin", &data(2, 50_000));
     fx.backup("s1");
@@ -327,21 +342,11 @@ fn three_backups_and_a_compact(encrypted: bool) -> Fx {
 /// **The done criterion of the rebuild.** With `index`, every object in
 /// `index.d/` and the client cache gone, `check --repair` on a cold client
 /// rebuilds the index from the pack trailers (one of them written by
-/// compact), loses nothing, and the repository works as before.
+/// compact, all read through the AEAD), loses nothing, and the repository
+/// works as before.
 #[test]
 fn repair_restores_every_snapshot_after_index_and_index_d_are_deleted() {
-    restores_every_snapshot_after_the_index_is_deleted(false);
-}
-
-/// The done criterion on an encrypted repository: the trailers are read
-/// through the AEAD.
-#[test]
-fn repair_restores_every_snapshot_of_an_encrypted_repository() {
-    restores_every_snapshot_after_the_index_is_deleted(true);
-}
-
-fn restores_every_snapshot_after_the_index_is_deleted(encrypted: bool) {
-    let fx = three_backups_and_a_compact(encrypted);
+    let fx = three_backups_and_a_compact();
     let before = {
         let repo = fx.open();
         let mut v: Vec<String> = repo
@@ -407,11 +412,11 @@ fn verify_data_reports_a_damaged_trailer_and_repair_maps_the_pack() {
     fx.backup("s1");
     let pack = fx.pack_of_largest();
     let pack_id = fx.pack_id_of(&pack);
-    // Not the footer: the pack type byte, after the length prefix, the
-    // envelope tag, the codec tag and the body version.
+    // Not the footer: a byte inside the trailer's sealed frame, which then
+    // fails authentication.
     edit_pack(&pack, |b, start| b[start + 7] = 0xFF);
 
-    let result = commands::check::run(&fx.config, None, true, false).unwrap();
+    let result = commands::check::run(&fx.config, pass(&fx.config), true, false).unwrap();
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
     assert!(
         result.errors[0].message.contains("trailer"),
@@ -435,7 +440,7 @@ fn verify_data_reports_a_damaged_trailer_and_repair_maps_the_pack() {
     );
     assert_eq!(fx.pack_maps(), 1);
 
-    let result = commands::check::run(&fx.config, None, true, true).unwrap();
+    let result = commands::check::run(&fx.config, pass(&fx.config), true, true).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let again = repair(&fx.config, true, RepairMode::PlanOnly).unwrap().plan;
     assert_eq!(write_pack_maps_of(&again), None, "{:?}", again.actions);
@@ -471,7 +476,7 @@ fn verify_data_reports_a_trailer_that_disagrees_with_the_index() {
     bytes.extend_from_slice(&blob);
     std::fs::write(&pack, &bytes).unwrap();
 
-    let result = commands::check::run(&fx.config, None, true, false).unwrap();
+    let result = commands::check::run(&fx.config, pass(&fx.config), true, false).unwrap();
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
     assert!(
         result.errors[0].message.contains("lists 1 of"),
@@ -574,12 +579,11 @@ fn rebuild_refuses_objects_of_a_newer_vykar() {
             std::fs::write(dir.join(&name), &object).unwrap();
             format!("packmaps/{name}")
         } else {
-            // The body version: after the length prefix and both tags. The
-            // pack is renamed to the ID of its new bytes, as a newer writer
-            // would have named it.
+            // The body version, sealed again. The pack is renamed to the ID
+            // of its new bytes, as a newer writer would have named it.
             let hash = fx.open().content_hash();
             let pack = fx.pack_of_largest();
-            edit_pack(&pack, |b, start| b[start + 6] = 2);
+            fx.reseal_trailer(&pack, |b| b[0] = 2);
             let bytes = std::fs::read(&pack).unwrap();
             let key = PackId::compute(&bytes, hash).storage_key();
             let renamed = fx.repo_dir.join(&key);
@@ -606,9 +610,10 @@ fn rebuild_refuses_objects_of_a_newer_vykar() {
 /// Without encryption one flipped byte makes a trailer read as a newer
 /// version. The pack no longer matches its ID, so it is damaged: uncovered,
 /// and the repair goes on.
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn rebuild_treats_a_rotted_trailer_version_as_damage() {
-    let mut fx = Fx::new();
+    let mut fx = Fx::plaintext();
     fx.write("a.bin", &data(1, 200_000));
     fx.backup("s1");
     let pack = fx.pack_of_largest();
@@ -658,7 +663,7 @@ fn repair_maps_a_pack_whose_map_is_partial() {
     assert_eq!(write_pack_maps_of(&applied.plan), Some(&[pack_id][..]));
     assert_eq!(fx.pack_maps(), 2);
 
-    let result = commands::check::run(&fx.config, None, true, true).unwrap();
+    let result = commands::check::run(&fx.config, pass(&fx.config), true, true).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let again = repair(&fx.config, true, RepairMode::PlanOnly).unwrap().plan;
     assert_eq!(write_pack_maps_of(&again), None, "{:?}", again.actions);
@@ -726,7 +731,7 @@ fn rebuild_after_removing_a_corrupt_chunk_leaves_it_out() {
     assert_eq!(rebuilt(&result.plan).1.from_maps, 1);
     let repo = commands::util::open_repo(
         &cold,
-        None,
+        pass(&cold),
         OpenOptions::new().with_index(),
         &CancelToken::new(),
     )

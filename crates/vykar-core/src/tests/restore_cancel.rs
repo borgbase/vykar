@@ -15,7 +15,7 @@ use crate::commands;
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 
-use super::helpers::{backup_single_source, init_repo};
+use super::helpers::{backup_single_source, init_repo, pass};
 
 fn fixture(tmp: &Path) -> (VykarConfig, std::path::PathBuf) {
     let repo_dir = tmp.join("repo");
@@ -56,7 +56,7 @@ fn pre_cancelled_restore_run_writes_nothing() {
     flag.cancel();
     let err = commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-1",
         dest.to_str().unwrap(),
         None,
@@ -85,7 +85,7 @@ fn pre_cancelled_restore_run_selected_writes_nothing() {
     flag.cancel();
     let err = commands::restore::run_selected(
         &config,
-        None,
+        pass(&config),
         "snap-1",
         dest.to_str().unwrap(),
         &selected,
@@ -112,7 +112,7 @@ fn restore_with_unset_flag_completes_normally() {
     let flag = CancelToken::new();
     let stats = commands::restore::run(
         &config,
-        None,
+        pass(&config),
         "snap-1",
         dest.to_str().unwrap(),
         None,

@@ -59,14 +59,14 @@ impl Fixture {
         }
         extra(&src_dir);
 
-        let mut config = make_test_config(&repo_dir);
-        let passphrase = if encrypted {
+        let (config, passphrase) = if encrypted {
+            let mut config = make_test_config(&repo_dir);
             config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
-            Some(PASS)
+            (config, Some(PASS))
         } else {
-            None
+            (crate::common::make_plaintext_config(&repo_dir), None)
         };
-        commands::init::run(&config, passphrase).unwrap();
+        vykar_core::testing::with_cheap_kdf(|| commands::init::run(&config, passphrase)).unwrap();
         backup_source(&config, &src_dir, "src", "snap", passphrase, false);
         let dest = tmp.path().join("restore");
         Self {
@@ -193,6 +193,7 @@ fn corrupt_chunk_restores_the_rest(encrypted: bool) {
     fx.assert_no_staging();
 }
 
+// Plaintext-only: 10-single-protocol step 3 removes this.
 #[test]
 fn plaintext_corrupt_chunk_restores_the_rest() {
     corrupt_chunk_restores_the_rest(false);
@@ -207,7 +208,7 @@ fn encrypted_corrupt_chunk_restores_the_rest() {
 /// damage was found stay in `Written.bytes`, which never decreases.
 #[test]
 fn progress_skips_the_damaged_file() {
-    let fx = Fixture::new(false, FILES, |_| {});
+    let fx = Fixture::new(true, FILES, |_| {});
     let (_, b_chunk) = fx.file_chunk("b.bin");
     fx.flip_byte_in_chunk(&b_chunk);
 
@@ -248,10 +249,10 @@ fn progress_skips_the_damaged_file() {
 
 #[test]
 fn deleted_pack_damages_every_file_in_it() {
-    let fx = Fixture::new(false, FILES, |_| {});
+    let fx = Fixture::new(true, FILES, |_| {});
     let (a_rel, a_chunk) = fx.file_chunk("a.bin");
     let pack = {
-        let repo = open_local_repo(&fx.repo_dir, None);
+        let repo = open_local_repo(&fx.repo_dir, fx.passphrase);
         repo.chunk_index().get(&a_chunk).unwrap().pack_id
     };
     std::fs::remove_file(fx.repo_dir.join(pack.storage_key())).unwrap();
@@ -268,10 +269,10 @@ fn deleted_pack_damages_every_file_in_it() {
 
 #[test]
 fn chunk_missing_from_index_is_damage() {
-    let fx = Fixture::new(false, FILES, |_| {});
+    let fx = Fixture::new(true, FILES, |_| {});
     let (b_rel, b_chunk) = fx.file_chunk("b.bin");
     {
-        let mut repo = open_local_repo(&fx.repo_dir, None);
+        let mut repo = open_local_repo(&fx.repo_dir, fx.passphrase);
         vykar_core::commands::util::with_maintenance_lock(&mut repo, |w| {
             w.chunk_index_mut().remove(&b_chunk).unwrap();
             w.save_state()
@@ -299,13 +300,13 @@ fn chunk_missing_from_index_is_damage() {
 #[cfg(unix)]
 #[test]
 fn damaged_hardlink_representative_drops_the_whole_group() {
-    let fx = Fixture::new(false, &[("h1.bin", 7), ("ok.bin", 8)], |src| {
+    let fx = Fixture::new(true, &[("h1.bin", 7), ("ok.bin", 8)], |src| {
         std::fs::hard_link(src.join("h1.bin"), src.join("h2.bin")).unwrap();
         std::fs::hard_link(src.join("h1.bin"), src.join("h3.bin")).unwrap();
     });
     let intact = commands::restore::run(
         &fx.config,
-        None,
+        fx.passphrase,
         "snap",
         fx.dest.with_extension("intact").to_str().unwrap(),
         None,
@@ -338,7 +339,7 @@ fn damaged_hardlink_representative_drops_the_whole_group() {
 
 #[test]
 fn strict_mode_wraps_source_failure_and_publishes_nothing() {
-    let fx = Fixture::new(false, FILES, |_| {});
+    let fx = Fixture::new(true, FILES, |_| {});
     let (_, b_chunk) = fx.file_chunk("b.bin");
     fx.flip_byte_in_chunk(&b_chunk);
 
@@ -348,14 +349,14 @@ fn strict_mode_wraps_source_failure_and_publishes_nothing() {
     };
     assert!(
         matches!(&**inner, VykarError::ChunkDecode(e)
-            if matches!(e.stage, ChunkDecodeStage::IdMismatch { .. })
-                && e.to_string().contains("hash mismatch")),
+            if matches!(e.stage, ChunkDecodeStage::Decrypt(_))
+                && e.to_string().contains("decryption failed")),
         "inner variant must be preserved, got: {inner:?}"
     );
     let source = std::error::Error::source(&err).expect("inner error is the source");
     assert_eq!(source.to_string(), inner.to_string());
     let msg = err.to_string();
-    assert!(msg.contains("hash mismatch"), "got: {msg}");
+    assert!(msg.contains("decryption failed"), "got: {msg}");
     assert!(
         msg.contains("no restored files were published"),
         "got: {msg}"
@@ -368,7 +369,7 @@ fn strict_mode_wraps_source_failure_and_publishes_nothing() {
 /// before any read stays its own error; the worker-phase mapping is unit-tested
 /// as `restore_error_wraps_only_source_failures`.
 fn strict_mode_does_not_wrap_destination_preflight_errors() {
-    let fx = Fixture::new(false, FILES, |_| {});
+    let fx = Fixture::new(true, FILES, |_| {});
     std::fs::create_dir_all(&fx.dest).unwrap();
     std::fs::write(fx.dest.join("occupied"), b"x").unwrap();
     let err = fx.restore(false).unwrap_err();

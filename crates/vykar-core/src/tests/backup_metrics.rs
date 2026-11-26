@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use super::helpers::pass;
 use crate::commands::backup::BackupOutcome;
 use crate::repo::memory_budget::MemorySnapshot;
 use crate::tests::helpers::{make_test_config, try_backup_single_source};
@@ -38,7 +39,7 @@ fn backup_with_threads(dir: &Path, threads: usize, small_files: bool) -> BackupO
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
 
     write_distinct_files(&src);
     if small_files {
@@ -202,7 +203,7 @@ fn remote_budget_lends_sealed_packs_and_settles() {
     config.chunker.max_size = 4096;
     config.repository.min_pack_size = 1024;
     config.repository.max_pack_size = 1024;
-    crate::commands::init::run(&config, None).unwrap();
+    crate::commands::init::run(&config, pass(&config)).unwrap();
     write_distinct_files(&src);
 
     let source_paths = vec![src.to_string_lossy().to_string()];
@@ -213,7 +214,7 @@ fn remote_budget_lends_sealed_packs_and_settles() {
         &config,
         crate::commands::backup::BackupRequest {
             snapshot_name: "snap",
-            passphrase: None,
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
             source_paths: &source_paths,
             source_label: "test",
             exclude_patterns: &[],

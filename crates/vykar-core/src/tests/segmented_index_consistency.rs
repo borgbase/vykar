@@ -66,7 +66,13 @@ struct Fixture {
 
 fn open(repo_dir: &Path, cache: &Path, opts: OpenOptions) -> Repo {
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
-    Repo::open(Box::new(storage), None, Some(cache.to_path_buf()), opts).unwrap()
+    Repo::open(
+        Box::new(storage),
+        Some(crate::testing::TEST_PASSPHRASE),
+        Some(cache.to_path_buf()),
+        opts,
+    )
+    .unwrap()
 }
 
 /// A v6 repository with the hard fold limit at `hard_segments` segments.
@@ -79,9 +85,9 @@ fn fixture(hard_segments: usize) -> Fixture {
     fs::create_dir_all(&scratch).unwrap();
     Repo::init(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
-        EncryptionMode::None,
+        EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
-        None,
+        Some(crate::testing::TEST_PASSPHRASE),
         None,
         Some(dir.path().join("cache")),
     )

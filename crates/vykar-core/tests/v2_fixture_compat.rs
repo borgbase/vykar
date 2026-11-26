@@ -30,6 +30,7 @@ use crate::common::{backup_source, exercise_pack_naming};
 use vykar_types::hash::HashAlgorithm;
 
 /// One fixture per encryption mode.
+// Plaintext-only: 10-single-protocol step 3 removes "none".
 const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
 
 fn extract(mode: &str) -> Fixture {

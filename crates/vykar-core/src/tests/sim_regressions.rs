@@ -7,13 +7,15 @@
 //! seed for a trace (name from `VYKAR_SIM_PROMOTE_NAME`, else the file
 //! stem).
 //!
-//! A seed without `storage` runs on the fallback store (`StoreKind::Plain`,
-//! every seed recorded before 04 step 8); a `<name>-conditional` seed is
-//! the same case on the conditional store (phase F part 9), with what that
-//! store leaves of the hazard; a `<name>-lockfree` seed is the same case on
-//! the encrypted template and the conditional store, where its backups
-//! commit lock-free (phase F part 10c: each lock decision becomes the commit
-//! mark and the probe of `locks/`), and a `mixed-…` seed has a lock client
+//! Every seed runs on the encrypted template (since 10-single-protocol
+//! step 2; the plaintext template went, and with it the `<name>-conditional`
+//! seeds of phase F part 9, which were that template on the conditional
+//! store). A seed without `storage` runs on the fallback store
+//! (`StoreKind::Plain`, every seed recorded before 04 step 8), where its
+//! clients take the lock with the marker handshake; a `<name>-lockfree` seed
+//! is the same case on the conditional store, where its backups commit
+//! lock-free (phase F part 10c: each lock decision becomes the commit mark
+//! and the probe of `locks/`), and a `mixed-…` seed has a lock client
 //! beside a lock-free one.
 
 // Printing a seed is the point of the promotion helper; every other path

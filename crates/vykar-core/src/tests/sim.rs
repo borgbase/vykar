@@ -820,9 +820,11 @@ fn h5_after_lost_update_compact_refuses() {
     expect_not_reproduced("H5", hazards::h5_with(LateHead::AfterB));
 }
 
+/// H5-repair is a regression: repair re-indexes b1 from b's packs, the
+/// compact T_pack later deletes none of them and b1 restores.
 #[test]
-fn known_hazard_h5_repair_does_not_help() {
-    hazards::assert_reproduces("H5-repair");
+fn h5_repair_reindexes_the_lost_update() {
+    expect_not_reproduced("H5-repair", hazards::h5_repair_with(LateHead::AfterB));
 }
 
 #[test]
@@ -951,8 +953,8 @@ fn known_hazard_h_committing_reaped() {
 }
 
 /// What each known hazard does on a store that honours put-if-absent: H3,
-/// H3-compact and H4 are closed (their twins are regressions), H5-repair
-/// loses its prerequisite, the lock hazards remain.
+/// H3-compact and H4 are closed (their twins are regressions), the lock
+/// hazards remain.
 #[test]
 fn known_hazards_on_a_conditional_store() {
     for h in KNOWN_HAZARDS {

@@ -12,7 +12,8 @@
 //! moved H2-marker (non-resurrecting marker refresh). 04 step 5 (ages on
 //! the store's clock) moved H4's skew route there (H4-skew) and kept H4 on
 //! a store clock step; H3-compact-young is a regression, and H3-compact and
-//! H5-repair now need orphans older than T_pack.
+//! H5-repair now need orphans older than T_pack. 10-single-protocol step 1
+//! (repair re-indexes the chunks the index lost) moved H5-repair there.
 //!
 //! 04 step 8 (put-if-absent heads) closes H3, H3-compact and H4 on stores
 //! that honour put-if-absent: each hazard states what it does on the
@@ -98,14 +99,6 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                    finds its generation taken); the fallback keeps it",
         run: h3_late_head_put,
         conditional: OnConditional::Closed("H3-conditional"),
-    },
-    KnownHazard {
-        id: "H5-repair",
-        summary: "check --repair between H3 and compact removes the snapshot \
-                  instead of re-indexing it",
-        fixed_by: "05-index-gc-format.md (rebuild from packs)",
-        run: h5_repair_then_compact,
-        conditional: OnConditional::NoPrerequisite,
     },
     KnownHazard {
         id: "H3-compact",
@@ -201,6 +194,14 @@ pub const REGRESSIONS: &[Regression] = &[
         run: h5_regression,
         // Built on H3's lost update, which a conditional store does not
         // produce (H3-conditional).
+        kinds: &[StoreKind::Plain],
+    },
+    Regression {
+        id: "H5-repair",
+        summary: "after a lost update, check --repair re-indexes the snapshot from the packs \
+                  instead of removing it; a compact T_pack later keeps its packs and it restores",
+        run: h5_repair_regression,
+        // Built on H3's lost update (fallback store only).
         kinds: &[StoreKind::Plain],
     },
     Regression {
@@ -1017,24 +1018,93 @@ pub fn h5_with(late: LateHead) -> HazardOutcome {
     }
 }
 
-/// `check --repair` between H3 and the compact of H5.
+/// H5-repair as a regression: after H3, `check --repair` by `c` must
+/// re-index b1 (`ReindexChunks`) and remove no snapshot, and the compact
+/// T_pack + 1 min later must succeed. The report holds every violation of
+/// the step-1 invariants afterwards (b1 and c0 restore, invariants 2 and 3,
+/// `IndexIntegrity`, `AllowedErrors`), a `DisallowedError` for a failed
+/// or removing repair or compact, and `PackAbsent` for every pack of `b`
+/// that is gone.
+pub fn h5_repair_regression() -> Report {
+    let mut out = Report::default();
+    let (mut sim, _, b, c) = match h3_setup(LateHead::AfterB) {
+        Ok(s) => s,
+        Err(e) => {
+            out.add(ViolationKind::DisallowedError, "setup", e);
+            return out;
+        }
+    };
+    if !b1_unindexed(&sim.check_invariants(Invariant::STEP1)) {
+        out.add(
+            ViolationKind::DisallowedError,
+            "setup",
+            "setup: no lost update",
+        );
+        return out;
+    }
+    let b_packs = sim.store().keys_written_by(b, "packs/");
+    let repair = sim.check_repair(c);
+    if !repair.is_ok() {
+        out.add(
+            ViolationKind::DisallowedError,
+            format!("run {} check --repair", repair.index),
+            format!("repair failed: {}", repair.detail()),
+        );
+        return out;
+    }
+    if !repair.removed().is_empty() {
+        out.add(
+            ViolationKind::DisallowedError,
+            format!("run {} check --repair", repair.index),
+            format!("repair removed {:?}", repair.removed()),
+        );
+    }
+    if !repair.detail().contains("ReindexChunks") {
+        out.add(
+            ViolationKind::DisallowedError,
+            format!("run {} check --repair", repair.index),
+            format!("repair did not re-index: {}", repair.detail()),
+        );
+    }
+    sim.advance(ORPHANS_OLD);
+    let run = sim.compact(c);
+    if !run.is_ok() {
+        out.add(
+            ViolationKind::DisallowedError,
+            format!("run {} compact", run.index),
+            format!("compact failed: {}", run.detail()),
+        );
+    }
+    for v in sim.check_invariants(Invariant::STEP1).violations {
+        out.add(v.kind, v.subject, v.detail);
+    }
+    if b_packs.is_empty() {
+        out.add(ViolationKind::PackAbsent, "b", "b wrote no packs");
+    }
+    for k in b_packs {
+        if sim.store().object(&k).is_none() {
+            out.add(ViolationKind::PackAbsent, "b", format!("pack {k} gone"));
+        }
+    }
+    out
+}
+
+/// `check --repair` between H3 and the compact of H5, on an H3 setup whose
+/// landing is set by `late`.
 ///
 /// Since 04 step 5 the compact runs T_pack + 1 min after the repair: the
 /// packs the repair left without entries are true orphans, kept while
 /// younger than T_pack.
 ///
-/// Observed on `f7181ea` plus this harness, three runs, all the same:
-/// repair applies `RemoveDanglingSnapshot { "b1", missing_chunks: 1 }` and
-/// `RemoveUnreferencedEntries`, so b1 is gone after the repair; the compact
-/// that follows deletes 4 orphan packs (b's two, and a's two, which no
-/// snapshot references once the repair swept the index). Repair does not stop H5: it
-/// turns the lost update into a silent removal. Invariants 2 and 3 are
-/// violated for b1, invariants 1, 4 and 8 hold, and b's packs are gone.
-pub fn h5_repair_then_compact() -> HazardOutcome {
-    h5_repair_with(LateHead::AfterB)
-}
-
-/// H5-repair on an H3 setup whose landing is set by `late`.
+/// Observed before 10-single-protocol step 1, on `f7181ea` plus this
+/// harness, three runs, all the same: repair applied
+/// `RemoveDanglingSnapshot { "b1", missing_chunks: 1 }` and
+/// `RemoveUnreferencedEntries`, so b1 was gone after the repair; the compact
+/// that followed deleted 4 orphan packs (b's two, and a's two, which no
+/// snapshot referenced once the repair swept the index): a silent removal.
+/// Since that step the repair re-indexes b1 from b's packs (`ReindexChunks`),
+/// b1 survives the compact and restores, and b's packs stay
+/// (`NotReproduced`; the regression is [`h5_repair_regression`]).
 pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
     let (mut sim, _, b, c) = match h3_setup(late) {
         Ok(s) => s,
@@ -1093,6 +1163,8 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
         HazardOutcome::Reproduced { evidence }
     } else if b1_after_compact
         && !report.violated_for(Invariant::CommittedSnapshotsRestore, "b1")
+        && !report.violated(Invariant::AcknowledgedCommitsDurable)
+        && !report.violated(Invariant::NoSilentRemoval)
         && survive
     {
         HazardOutcome::NotReproduced { evidence }

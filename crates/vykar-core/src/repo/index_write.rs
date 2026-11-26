@@ -32,6 +32,7 @@
 //! recent head can finish and a concurrent writer's fresh object survives;
 //! only right after this handle created the latest head.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +52,7 @@ use crate::index::head::{SegmentKind, SweepState};
 use crate::index::segment_v2::SegmentBody;
 use crate::index::sweep_record::SweepRecord;
 use crate::index::table::{self, ChunkTable, IndexState};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -768,22 +770,7 @@ impl Repo {
         cause: IndexLoss,
         cancel: &CancelToken,
     ) -> Result<(LiveIndex, RepairIndexLoad)> {
-        let dir = self.cache_dir();
-        let own = self.chunk_index.table().cloned();
-        let local_tables = || {
-            let mut tables: Vec<Arc<ChunkTable>> = own.into_iter().collect();
-            if let Some(dir) = dir.as_deref() {
-                for (name, path) in table::list_base_tables(dir) {
-                    if tables.iter().any(|t| t.base_name() == Some(name)) {
-                        continue;
-                    }
-                    if let Some(t) = ChunkTable::open_file(&path) {
-                        tables.push(Arc::new(t));
-                    }
-                }
-            }
-            tables
-        };
+        let local_tables = self.local_tables_for_repair();
         let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
         let rebuilt = index_rebuild::rebuild_index_from_packs(
             self.storage.as_ref(),
@@ -805,6 +792,92 @@ impl Repo {
             packs_from_local_tables: rebuilt.from_local_tables,
         };
         Ok((index, load))
+    }
+
+    /// The verified base tables of this machine for a repair: the
+    /// repository's own, if loaded, and every `index_base.*` file in its
+    /// cache dir. Opened only when the returned closure is called.
+    fn local_tables_for_repair(&self) -> impl FnOnce() -> Vec<Arc<ChunkTable>> + use<> {
+        let dir = self.cache_dir();
+        let own = self.chunk_index.table().cloned();
+        move || {
+            let mut tables: Vec<Arc<ChunkTable>> = own.into_iter().collect();
+            if let Some(dir) = dir.as_deref() {
+                for (name, path) in table::list_base_tables(dir) {
+                    if tables.iter().any(|t| t.base_name() == Some(name)) {
+                        continue;
+                    }
+                    if let Some(t) = ChunkTable::open_file(&path) {
+                        tables.push(Arc::new(t));
+                    }
+                }
+            }
+            tables
+        }
+    }
+
+    /// `check --repair`: entries, for chunks the loaded index lacks, of the
+    /// listed packs it names none of
+    /// ([`index_rebuild::recover_unindexed_entries`]). Read-only. Errors are
+    /// framed like the rebuild's: nothing was changed.
+    pub(crate) fn unindexed_pack_entries(
+        &self,
+        cancel: &CancelToken,
+    ) -> Result<index_rebuild::Recovered> {
+        let named: HashSet<PackId> = self.chunk_index.iter().map(|(_, e)| e.pack_id).collect();
+        index_rebuild::recover_unindexed_entries(
+            self.storage.as_ref(),
+            self.crypto.as_ref(),
+            self.content_hash(),
+            &named,
+            |id| !self.chunk_index.contains(id),
+            self.local_tables_for_repair(),
+            self.request_width(),
+            cancel,
+        )
+        .map_err(reindex_refusal)
+    }
+
+    /// Add `ids`' entries from `recovered` to the in-memory index (a
+    /// present chunk is left alone), with their packs' trailer lengths, and
+    /// mark the index dirty. Returns the number of chunks added and their
+    /// packs (sorted, deduplicated).
+    pub(crate) fn add_recovered_entries(
+        &mut self,
+        recovered: &index_rebuild::Recovered,
+        ids: impl IntoIterator<Item = ChunkId>,
+    ) -> (usize, Vec<PackId>) {
+        let mut added = 0;
+        let mut packs = Vec::new();
+        for id in ids {
+            let Some(&(pack, offset, size)) = recovered.entries.get(&id) else {
+                continue;
+            };
+            if self.chunk_index.contains(&id) {
+                continue;
+            }
+            // Every pack an entry names needs a trailer length in an index
+            // write: the trailer's where it was read, else 0 (a map or a
+            // local table described the pack), as the rebuild records it.
+            // A length the index already knows is kept.
+            if self.chunk_index.pack_trailer_len(&pack).is_none()
+                || recovered.trailer_lens.contains_key(&pack)
+            {
+                self.chunk_index.set_pack_trailer(
+                    pack,
+                    recovered.trailer_lens.get(&pack).copied().unwrap_or(0),
+                );
+            }
+            self.chunk_index.add(id, size, pack, offset);
+            added += 1;
+            packs.push(pack);
+        }
+        packs.sort_unstable_by_key(|p| *p.as_bytes());
+        packs.dedup();
+        if added > 0 {
+            self.index_dirty = true;
+        }
+        (added, packs)
     }
 }
 
@@ -875,6 +948,16 @@ fn rebuild_refusal(e: VykarError) -> VykarError {
         VykarError::Interrupted => e,
         e => VykarError::Other(format!(
             "rebuilding the index from the packs: {e}. Nothing was changed"
+        )),
+    }
+}
+
+/// The error of a failed lookup of the entries the index lost.
+pub(crate) fn reindex_refusal(e: VykarError) -> VykarError {
+    match e {
+        VykarError::Interrupted => e,
+        e => VykarError::Other(format!(
+            "re-indexing the chunks the index lost from the packs: {e}. Nothing was changed"
         )),
     }
 }

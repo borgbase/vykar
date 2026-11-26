@@ -293,6 +293,21 @@ pub enum VykarError {
     #[error("chunk not found in index: {0}")]
     ChunkNotInIndex(crate::chunk_id::ChunkId),
 
+    /// A live snapshot names a tree chunk, or references a data chunk,
+    /// that the index has no entry for (compact's mark, the unreferenced
+    /// report). The index lost entries: `check --repair` re-indexes them
+    /// from the packs when they still describe them.
+    #[error(
+        "snapshot '{snapshot}' {} chunk {chunk}, which is not in the index",
+        live_chunk_role(*tree)
+    )]
+    LiveChunkNotInIndex {
+        snapshot: String,
+        chunk: crate::chunk_id::ChunkId,
+        /// A tree chunk the snapshot names, else a data chunk it references.
+        tree: bool,
+    },
+
     /// A pack answered 404 to a read, and no newer head relocated its chunks.
     #[error("pack not found: {0}")]
     PackNotFound(crate::pack_id::PackId),
@@ -344,10 +359,11 @@ pub enum VykarError {
     /// nothing was changed. The text starts with vykar-core's
     /// `commands::compact::MARK_REFUSED`; the simulator matches the variant.
     /// The inner error is in the text and deliberately not a `source`, so a
-    /// chain printer does not print it twice.
+    /// chain printer does not print it twice. The advice that ends the text
+    /// depends on the cause ([`mark_refusal_advice`]).
     #[error(
-        "compact refused: the live snapshots could not be marked, nothing was changed: {0}. \
-         Run `vykar check` for details"
+        "compact refused: the live snapshots could not be marked, nothing was changed: {0}. {advice}",
+        advice = mark_refusal_advice(.0)
     )]
     MarkRefused(Box<VykarError>),
 
@@ -420,6 +436,23 @@ pub enum VykarError {
 
     #[error("{0}")]
     Other(String),
+}
+
+/// The verb of [`VykarError::LiveChunkNotInIndex`]'s text.
+fn live_chunk_role(tree: bool) -> &'static str {
+    if tree { "names tree" } else { "references" }
+}
+
+/// What a refused mark tells the user to do: `check --repair` when the
+/// index lost entries of a live snapshot, else to look with `check`.
+pub fn mark_refusal_advice(cause: &VykarError) -> &'static str {
+    match cause {
+        VykarError::LiveChunkNotInIndex { .. } => {
+            "The index lost entries a live snapshot needs; run `vykar check --repair`, which \
+             re-indexes them from the packs that hold them"
+        }
+        _ => "Run `vykar check` for details",
+    }
 }
 
 /// The end of [`VykarError::SlowIndexWrite`]'s text.
@@ -767,6 +800,7 @@ mod tests {
     #[test]
     fn typed_variants_keep_their_texts() {
         let p = crate::pack_id::PackId::from_bytes([0x07; 32]);
+        let c = crate::chunk_id::ChunkId::from_bytes([0x09; 32]);
         let cases = [
             (VykarError::PackNotFound(p), format!("pack not found: {p}")),
             (
@@ -797,6 +831,35 @@ mod tests {
                 "compact refused: the live snapshots could not be marked, nothing was changed: \
                  x. Run `vykar check` for details"
                     .into(),
+            ),
+            (
+                VykarError::LiveChunkNotInIndex {
+                    snapshot: "s".into(),
+                    chunk: c,
+                    tree: true,
+                },
+                format!("snapshot 's' names tree chunk {c}, which is not in the index"),
+            ),
+            (
+                VykarError::LiveChunkNotInIndex {
+                    snapshot: "s".into(),
+                    chunk: c,
+                    tree: false,
+                },
+                format!("snapshot 's' references chunk {c}, which is not in the index"),
+            ),
+            (
+                VykarError::MarkRefused(Box::new(VykarError::LiveChunkNotInIndex {
+                    snapshot: "s".into(),
+                    chunk: c,
+                    tree: true,
+                })),
+                format!(
+                    "compact refused: the live snapshots could not be marked, nothing was \
+                     changed: snapshot 's' names tree chunk {c}, which is not in the index. \
+                     The index lost entries a live snapshot needs; run `vykar check --repair`, \
+                     which re-indexes them from the packs that hold them"
+                ),
             ),
             (
                 VykarError::SlowIndexWrite {

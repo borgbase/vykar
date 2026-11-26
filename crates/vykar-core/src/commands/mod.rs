@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod check;
 pub mod compact;
+pub mod compact_refusal;
 pub mod delete;
 pub mod delete_repo;
 pub mod diff;

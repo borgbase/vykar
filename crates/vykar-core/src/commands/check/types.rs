@@ -393,6 +393,14 @@ pub enum RepairAction {
         dropped_paths: Vec<String>,
         reasons: Vec<String>,
     },
+    /// Entries the index lost, for chunks live snapshots reference, found in
+    /// packs the index named none of (their pack maps, trailers or this
+    /// machine's chunk tables) and added before the scan the plan was built
+    /// from; the repair's index write stores them. Never data loss.
+    ReindexChunks {
+        pack_ids: Vec<PackId>,
+        chunk_count: usize,
+    },
     /// Write pack maps for these packs from the repaired index, so a later
     /// rebuild of the index does not depend on their trailers or on this
     /// machine's cache. Never data loss.

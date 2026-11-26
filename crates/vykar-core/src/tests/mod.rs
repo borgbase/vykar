@@ -40,6 +40,7 @@ mod proptest;
 mod prune;
 mod prune_command;
 mod readers_read_only;
+mod reindex;
 mod relocate;
 mod repair;
 mod repo;

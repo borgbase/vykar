@@ -234,6 +234,7 @@ fn is_safe_action(action: &RepairAction) -> bool {
         RepairAction::RemoveUnreferencedEntries
             | RepairAction::RestoreKeyCopy { .. }
             | RepairAction::WritePackMaps { .. }
+            | RepairAction::ReindexChunks { .. }
     )
 }
 
@@ -384,6 +385,13 @@ fn format_repair_action(action: &RepairAction) -> String {
             }
             out
         }
+        RepairAction::ReindexChunks {
+            pack_ids,
+            chunk_count,
+        } => format!(
+            "Re-index {chunk_count} chunk(s) the index lost, from {} pack(s) it did not name",
+            pack_ids.len()
+        ),
         RepairAction::WritePackMaps { pack_ids } => format!(
             "Write pack maps for {} pack(s) whose index entries are not described by the packs \
              themselves",
@@ -474,6 +482,20 @@ mod tests {
         assert!(
             lines.last().unwrap().contains("are removed by this repair"),
             "{lines:?}"
+        );
+    }
+
+    /// Re-indexing loses nothing: it is listed under "Safe:".
+    #[test]
+    fn reindexing_is_a_safe_action() {
+        let action = RepairAction::ReindexChunks {
+            pack_ids: vec![PackId::from_bytes([1; 32]), PackId::from_bytes([2; 32])],
+            chunk_count: 7,
+        };
+        assert!(is_safe_action(&action));
+        assert_eq!(
+            format_repair_action(&action),
+            "Re-index 7 chunk(s) the index lost, from 2 pack(s) it did not name"
         );
     }
 

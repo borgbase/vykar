@@ -109,6 +109,30 @@ export component OverviewPage inherits Rectangle {
             }
         }
 
+        // Warning state: a non-blocking banner above the metrics.
+        if !root.repo.has_error && root.repo.warning != "": Rectangle {
+            property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+            border-width: 1px;
+            border-color: #f9a825;
+            border-radius: 6px;
+            background: dark ? #3a321f : #fff8e1;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                alignment: start;
+                Text {
+                    text: "Compact is refusing";
+                    font-weight: 700;
+                    color: #f9a825;
+                }
+                Text {
+                    text: root.repo.warning;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
         // Metric cards
         if !root.repo.has_error: HorizontalLayout {
             spacing: 10px;

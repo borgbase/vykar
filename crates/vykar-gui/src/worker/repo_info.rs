@@ -32,6 +32,20 @@ fn ok_repo_info(repo_name: &str, url: &str, stats: &InfoStats) -> RepoInfoData {
         size: format_bytes(stats.unique_stored_size).into(),
         has_error: false,
         error: SharedString::default(),
+        warning: stats
+            .compact_refused
+            .as_ref()
+            .map(|r| {
+                format!(
+                    "Compact has refused since {}: {}",
+                    r.first
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S"),
+                    r.detail
+                )
+                .into()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -44,6 +58,7 @@ fn error_repo_info(repo_name: &str, url: &str, error: &str) -> RepoInfoData {
         size: METRIC_PLACEHOLDER.into(),
         has_error: true,
         error: error.into(),
+        warning: SharedString::default(),
     }
 }
 

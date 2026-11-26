@@ -39,7 +39,7 @@ const BATCH_THRESHOLD: usize = 3;
 /// Returns `true` if the error is a transient I/O failure (not proven
 /// corruption). Crypto, deserialization, format, and decompression errors are
 /// considered evidence of corruption.
-fn is_transient_io(err: &VykarError) -> bool {
+pub(super) fn is_transient_io(err: &VykarError) -> bool {
     err.io_error().is_some()
 }
 

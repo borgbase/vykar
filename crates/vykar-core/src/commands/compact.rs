@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info, warn};
 
+use super::compact_refusal;
 use super::mark;
 use super::util::{
     MaintenanceSession, list_live_sessions_registered, list_live_sessions_under_lock, open_repo,
@@ -259,8 +260,8 @@ pub(crate) fn report_unreferenced_on_repo(
             e
         } else {
             VykarError::Other(format!(
-                "cannot report unreferenced chunks, nothing was changed: {e}. \
-                 Run `vykar check` for details"
+                "cannot report unreferenced chunks, nothing was changed: {e}. {}",
+                vykar_types::error::mark_refusal_advice(&e)
             ))
         }
     };
@@ -408,7 +409,33 @@ fn report_under_lock(repo: &mut Repo, cancel: &CancelToken) -> Result<Unreferenc
 /// while compact works, is replaced in [`mark_and_sweep_lock_free`] (the
 /// second session listing, the re-read head, the incremental re-mark) and
 /// [`persist_batch_lock_free`] (the relocation rebase).
+///
+/// A mark refused because a live snapshot needs a chunk the index lacks
+/// ([`VykarError::MarkRefused`] of [`VykarError::LiveChunkNotInIndex`]) is
+/// recorded in this machine's repository cache dir, and a compact whose
+/// mark completed clears the record ([`compact_refusal`]).
 pub(crate) fn run_on_repo(
+    repo: &mut Repo,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    cancel: &CancelToken,
+) -> Result<CompactStats> {
+    let result = run_on_repo_inner(repo, threshold, max_repack_size, dry_run, cancel);
+    let dir = repo.cache_dir();
+    match &result {
+        Err(e @ VykarError::MarkRefused(cause))
+            if matches!(**cause, VykarError::LiveChunkNotInIndex { .. }) =>
+        {
+            compact_refusal::record(dir.as_deref(), &e.to_string());
+        }
+        Ok(stats) if stats.sweep_skipped.is_none() => compact_refusal::clear(dir.as_deref()),
+        _ => {}
+    }
+    result
+}
+
+fn run_on_repo_inner(
     repo: &mut Repo,
     threshold: f64,
     max_repack_size: Option<u64>,

@@ -328,6 +328,10 @@ fn restore_key_copies(
 }
 
 /// Execute repair actions in the correct order.
+///
+/// A [`RepairAction::ReindexChunks`] in the plan is already applied to the
+/// in-memory index: its entries were added before the scan the plan was
+/// built from; the full fold of step 7 stores them.
 pub(super) fn execute_repair(
     repo: &mut RepoWriter<'_>,
     plan: &RepairPlan,
@@ -357,6 +361,23 @@ pub(super) fn execute_repair(
     // it is the one repair that only ever adds redundancy, and a failure here
     // must not be masked by whatever the snapshot passes do next.
     restore_key_copies(repo, plan, &mut applied, &mut repair_errors);
+
+    // Step 0.5: re-indexed entries. In the in-memory index already (see
+    // above); step 7's index write persists them.
+    for action in &plan.actions {
+        if let RepairAction::ReindexChunks {
+            pack_ids,
+            chunk_count,
+        } = action
+        {
+            tracing::info!(
+                chunks = chunk_count,
+                packs = pack_ids.len(),
+                "re-indexed the chunks the index lost from packs the index named none of"
+            );
+            applied.push(action.clone());
+        }
+    }
 
     // Step 1: Remove corrupted snapshot blobs from storage.
     // If any delete fails, abort before the index sweep — we cannot enumerate

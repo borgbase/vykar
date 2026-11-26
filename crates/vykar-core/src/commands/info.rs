@@ -32,6 +32,10 @@ pub struct InfoStats {
     pub format: RepoFormat,
     /// Shape of the index (absent on a handle without a head).
     pub index: Option<IndexLayoutStats>,
+    /// The last compact on this machine refused its mark because the index
+    /// lacks a chunk a live snapshot needs, and no compact has marked since
+    /// (nor a repair applied): [`crate::commands::compact_refusal`].
+    pub compact_refused: Option<crate::commands::compact_refusal::CompactRefusal>,
 }
 
 /// Shape of a segmented index: its base and the segments written since.
@@ -102,5 +106,6 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
             segments: head.segments.len(),
             segment_bytes: head.segments.iter().map(|s| s.size).sum(),
         }),
+        compact_refused: crate::commands::compact_refusal::read(repo.cache_dir().as_deref()),
     })
 }

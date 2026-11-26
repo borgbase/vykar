@@ -18,6 +18,7 @@ impl From<&RepoInfoData> for RepoInfo {
             size: d.size.clone(),
             has_error: d.has_error,
             error: d.error.clone(),
+            warning: d.warning.clone(),
         }
     }
 }

@@ -751,10 +751,11 @@ pub(crate) fn mark_live(
     for k in 0..set.len() {
         let id = set.id(k);
         let Some(p) = positions.find(id) else {
-            return Err(VykarError::Other(format!(
-                "snapshot '{}' names tree chunk {id}, which is not in the index",
-                name(k)
-            )));
+            return Err(VykarError::LiveChunkNotInIndex {
+                snapshot: name(k),
+                chunk: *id,
+                tree: true,
+            });
         };
         set_bit(&bits, p);
         add_count(counts.as_deref(), p, set.occurrences(k));
@@ -829,10 +830,11 @@ pub(crate) fn mark_live(
             references += tally.references;
             if let Some(id) = tally.missing {
                 collect_failed = true;
-                return Err(VykarError::Other(format!(
-                    "snapshot '{}' references chunk {id}, which is not in the index",
-                    name(k)
-                )));
+                return Err(VykarError::LiveChunkNotInIndex {
+                    snapshot: name(k),
+                    chunk: id,
+                    tree: false,
+                });
             }
             if let Some(e) = tally.error {
                 if matches!(e, VykarError::Interrupted) {

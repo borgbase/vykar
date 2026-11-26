@@ -112,6 +112,9 @@ pub(crate) struct RepoInfoData {
     /// Human-readable failure reason shown in the Overview error banner /
     /// sidebar tooltip; empty when `has_error` is false.
     pub error: SharedString,
+    /// Shown as a non-blocking banner above the metrics (a compact that
+    /// keeps refusing); empty when there is nothing to say.
+    pub warning: SharedString,
 }
 
 /// Multi-row selection state for the Snapshots table. Indices align with

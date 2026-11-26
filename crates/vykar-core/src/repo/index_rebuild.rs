@@ -11,7 +11,7 @@
 //! pack still matches its ID: without encryption one flipped byte also
 //! produces it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -26,8 +26,8 @@ use vykar_types::pack_id::PackId;
 
 use super::bounded::try_for_each_bounded;
 use super::control::CancelToken;
-use super::pack_listing::list_packs;
-use super::pack_map::read_pack_maps;
+use super::pack_listing::{ListedPack, list_packs};
+use super::pack_map::{PackMapScan, read_pack_maps};
 use super::pack_trailer::{TrailerRead, read_pack_trailer};
 use crate::index::base_v2::BaseWriter;
 use crate::index::table::{ChunkTable, TableFileWriter};
@@ -105,25 +105,22 @@ fn inside(offset: u64, size: u32, len: u64) -> bool {
     offset >= FIRST_BLOB_OFFSET && offset.saturating_add(u64::from(size)) <= len
 }
 
-/// Rebuild the chunk index from the packs. `local_tables` is called at most
-/// once, only when some pack has neither a usable map nor a usable trailer,
-/// and returns verified chunk tables of this machine. `hash` is the
-/// repository's pack ID hash.
-pub(crate) fn rebuild_index_from_packs(
+/// The listed packs, sorted by ID, without duplicates.
+fn listed_packs(
     storage: &dyn StorageBackend,
-    crypto: &dyn CryptoEngine,
-    hash: HashAlgorithm,
-    local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
-    anchor: &Path,
     width: usize,
     cancel: &CancelToken,
-) -> Result<Rebuilt> {
-    let maps = read_pack_maps(storage, crypto, width, true, cancel)?;
+) -> Result<Vec<ListedPack>> {
     let mut packs = list_packs(storage, width)?;
     cancel.check()?;
     packs.sort_by_key(|p| *p.pack_id.as_bytes());
     packs.dedup_by_key(|p| p.pack_id);
-    let slots: Vec<(u32, &super::pack_listing::ListedPack)> = packs
+    Ok(packs)
+}
+
+/// Each pack with its slot (its position in `packs`).
+fn slots_of(packs: &[ListedPack]) -> Result<Vec<(u32, &ListedPack)>> {
+    packs
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -131,8 +128,41 @@ pub(crate) fn rebuild_index_from_packs(
                 .map(|slot| (slot, p))
                 .map_err(|_| VykarError::Other("more than u32::MAX packs".into()))
         })
-        .collect::<Result<_>>()?;
+        .collect()
+}
 
+/// What [`describe_packs`] found for listed packs.
+struct Described {
+    /// (chunk, slot, offset, stored size); unsorted, duplicates kept.
+    found: Vec<Found>,
+    /// `trailer_len` by slot (trailer-described packs, and local-table
+    /// packs whose table records one).
+    trailers: HashMap<u32, u32>,
+    /// `packs`, `from_maps`, `from_trailers`, `from_local_tables`,
+    /// `uncovered`, `damaged_maps` (`entries` left 0).
+    counts: RebuildCounts,
+    /// In slot order.
+    uncovered: Vec<UncoveredPack>,
+    /// In slot order.
+    from_local_tables: Vec<PackId>,
+}
+
+/// Describe each pack of `slots` (slot i is `slots[i]`; slots compare
+/// like pack IDs): its entry in `maps`, else its trailer, else this
+/// machine's tables (`local_tables`, called at most once, only for a
+/// pack neither describes). Storage errors and a trailer of a newer
+/// vykar abort; damage makes a pack uncovered.
+#[allow(clippy::too_many_arguments)]
+fn describe_packs(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    hash: HashAlgorithm,
+    maps: PackMapScan,
+    slots: &[(u32, &ListedPack)],
+    local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
+    width: usize,
+    cancel: &CancelToken,
+) -> Result<Described> {
     let found: Mutex<Vec<Found>> = Mutex::new(Vec::new());
     // trailer_len by pack slot, for packs described by their trailer.
     let trailers: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::new());
@@ -144,7 +174,7 @@ pub(crate) fn rebuild_index_from_packs(
             .unwrap_or_else(PoisonError::into_inner)
             .push((slot, outcome));
     };
-    try_for_each_bounded(width, &slots, |&(slot, pack)| -> Result<()> {
+    try_for_each_bounded(width, slots, |&(slot, pack)| -> Result<()> {
         cancel.check()?;
         let len = match pack.size {
             Some(len) => len,
@@ -358,6 +388,47 @@ pub(crate) fn rebuild_index_from_packs(
         })
         .collect();
     counts.uncovered = uncovered.len();
+    Ok(Described {
+        found,
+        trailers,
+        counts,
+        uncovered,
+        from_local_tables,
+    })
+}
+
+/// Rebuild the chunk index from the packs. `local_tables` is called at most
+/// once, only when some pack has neither a usable map nor a usable trailer,
+/// and returns verified chunk tables of this machine. `hash` is the
+/// repository's pack ID hash.
+pub(crate) fn rebuild_index_from_packs(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    hash: HashAlgorithm,
+    local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
+    anchor: &Path,
+    width: usize,
+    cancel: &CancelToken,
+) -> Result<Rebuilt> {
+    let maps = read_pack_maps(storage, crypto, width, true, cancel)?;
+    let packs = listed_packs(storage, width, cancel)?;
+    let slots = slots_of(&packs)?;
+    let Described {
+        mut found,
+        trailers,
+        mut counts,
+        uncovered,
+        from_local_tables,
+    } = describe_packs(
+        storage,
+        crypto,
+        hash,
+        maps,
+        &slots,
+        local_tables,
+        width,
+        cancel,
+    )?;
 
     // The lowest (pack ID, offset) of each chunk.
     found.sort_unstable_by_key(|&(id, slot, offset, _)| (*id.as_bytes(), slot, offset));
@@ -406,6 +477,95 @@ pub(crate) fn rebuild_index_from_packs(
         counts,
         uncovered,
         from_local_tables,
+    })
+}
+
+/// Entries for chunks an index lacks, from the listed packs it names none
+/// of (`check --repair` after a lost index update).
+#[derive(Debug, Default)]
+pub(crate) struct Recovered {
+    /// Chunk -> (pack, offset, stored size): the lowest (pack ID, offset)
+    /// per chunk that `lacks` accepted.
+    pub entries: HashMap<ChunkId, (PackId, u64, u32)>,
+    /// `trailer_len` of the packs `entries` use, where known.
+    pub trailer_lens: HashMap<PackId, u32>,
+    /// Over the unindexed packs; `entries` = `entries.len()`.
+    pub counts: RebuildCounts,
+    /// Unindexed packs nothing describes, in pack ID order.
+    pub uncovered: Vec<UncoveredPack>,
+}
+
+/// Describe, with [`rebuild_index_from_packs`]'s precedence, the listed
+/// packs `named` does not contain, and keep the entries of chunks `lacks`
+/// accepts. Lists first and reads pack maps only when an unindexed pack
+/// exists. Read-only; same errors as the rebuild.
+///
+/// A chunk whose entry was lost while its pack still has entries in the
+/// index is not found: that would need every pack's trailer, i.e. a rebuild.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recover_unindexed_entries(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    hash: HashAlgorithm,
+    named: &HashSet<PackId>,
+    lacks: impl Fn(&ChunkId) -> bool,
+    local_tables: impl FnOnce() -> Vec<Arc<ChunkTable>>,
+    width: usize,
+    cancel: &CancelToken,
+) -> Result<Recovered> {
+    let mut packs = listed_packs(storage, width, cancel)?;
+    packs.retain(|p| !named.contains(&p.pack_id));
+    if packs.is_empty() {
+        return Ok(Recovered::default());
+    }
+    let maps = read_pack_maps(storage, crypto, width, true, cancel)?;
+    let slots = slots_of(&packs)?;
+    let Described {
+        mut found,
+        trailers,
+        mut counts,
+        uncovered,
+        from_local_tables: _,
+    } = describe_packs(
+        storage,
+        crypto,
+        hash,
+        maps,
+        &slots,
+        local_tables,
+        width,
+        cancel,
+    )?;
+    found.retain(|f| lacks(&f.0));
+    found.sort_unstable_by_key(|&(id, slot, offset, _)| (*id.as_bytes(), slot, offset));
+    found.dedup_by_key(|e| e.0);
+    let mut entries = HashMap::with_capacity(found.len());
+    let mut trailer_lens = HashMap::new();
+    for (chunk_id, slot, offset, stored_size) in found {
+        let pack_id = slots
+            .get(slot as usize)
+            .map(|(_, p)| p.pack_id)
+            .ok_or_else(|| VykarError::Other("BUG: recovered entry names no listed pack".into()))?;
+        if let Some(&t) = trailers.get(&slot) {
+            trailer_lens.insert(pack_id, t);
+        }
+        entries.insert(chunk_id, (pack_id, u64::from(offset), stored_size));
+    }
+    counts.entries = entries.len() as u64;
+    info!(
+        packs = counts.packs,
+        from_maps = counts.from_maps,
+        from_trailers = counts.from_trailers,
+        from_local_tables = counts.from_local_tables,
+        uncovered = counts.uncovered,
+        entries = counts.entries,
+        "described the packs the index names none of"
+    );
+    Ok(Recovered {
+        entries,
+        trailer_lens,
+        counts,
+        uncovered,
     })
 }
 
@@ -817,5 +977,117 @@ mod tests {
         assert_eq!(locs, sorted(expected));
         assert_eq!(rebuilt.counts.packs, 1);
         assert!(rebuilt.uncovered.is_empty());
+    }
+
+    fn recover(
+        storage: &dyn StorageBackend,
+        named: &[PackId],
+        lacks: impl Fn(&ChunkId) -> bool,
+    ) -> Result<Recovered> {
+        recover_unindexed_entries(
+            storage,
+            &plain(),
+            HashAlgorithm::Blake2b,
+            &named.iter().copied().collect(),
+            lacks,
+            Vec::new,
+            2,
+            &CancelToken::new(),
+        )
+    }
+
+    fn entry_of(l: &Loc) -> (ChunkId, (PackId, u64, u32)) {
+        (l.0, (l.1, l.2, l.3))
+    }
+
+    #[test]
+    fn recover_skips_named_packs_and_known_chunks() {
+        let storage = MemoryBackend::new();
+        let (p1, _) = put_pack(&storage, &[1, 2]);
+        let (_, l2) = put_pack(&storage, &[3, 4]);
+        let r = recover(&storage, &[p1], |c| *c != chunk(4)).unwrap();
+        let three = l2.iter().find(|l| l.0 == chunk(3)).unwrap();
+        assert_eq!(r.entries, HashMap::from([entry_of(three)]));
+        assert_eq!((r.counts.packs, r.counts.entries), (1, 1));
+        assert!(r.uncovered.is_empty());
+    }
+
+    /// A map describes its pack even when it omits one of its chunks (an
+    /// earlier repair dropped it as corrupt): the trailer is not read.
+    #[test]
+    fn recover_prefers_a_map_over_the_trailer() {
+        let storage = MemoryBackend::new();
+        let (_, locs) = put_pack(&storage, &[1, 2]);
+        put_map(&storage, &map_of(&locs[..1]));
+        let r = recover(&storage, &[], |_| true).unwrap();
+        assert_eq!(r.entries, HashMap::from([entry_of(&locs[0])]));
+        assert_eq!((r.counts.from_maps, r.counts.from_trailers), (1, 0));
+        assert!(r.trailer_lens.is_empty());
+    }
+
+    #[test]
+    fn recover_takes_the_lowest_pack_and_offset() {
+        let storage = MemoryBackend::new();
+        let (a, la) = put_pack(&storage, &[1, 2]);
+        let (b, lb) = put_pack(&storage, &[3, 1]);
+        let r = recover(&storage, &[], |_| true).unwrap();
+        let low = if a.as_bytes() < b.as_bytes() {
+            &la
+        } else {
+            &lb
+        };
+        let one = low.iter().find(|l| l.0 == chunk(1)).unwrap();
+        assert_eq!(r.entries[&chunk(1)], entry_of(one).1);
+        assert_eq!(r.entries.len(), 3);
+    }
+
+    /// Fails every read of a pack map.
+    struct MapsFail {
+        inner: MemoryBackend,
+    }
+
+    impl InnerBackend for MapsFail {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for MapsFail;
+        except [get];
+
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            if key.starts_with(crate::repo::pack_map::PACK_MAP_PREFIX) {
+                return Err(VykarError::Other("injected pack map read".into()));
+            }
+            self.inner.get(key)
+        }
+    }
+
+    #[test]
+    fn recover_reads_no_map_without_unindexed_packs() {
+        let inner = MemoryBackend::new();
+        let (p1, l1) = put_pack(&inner, &[1, 2]);
+        put_map(&inner, &map_of(&l1));
+        let storage = MapsFail { inner };
+        let r = recover(&storage, &[p1], |_| true).unwrap();
+        assert!(r.entries.is_empty());
+        assert_eq!(r.counts, RebuildCounts::default());
+        // With an unindexed pack the maps are read.
+        put_pack(&storage, &[3]);
+        let err = recover(&storage, &[p1], |_| true).err().unwrap();
+        assert!(err.to_string().contains("injected pack map read"), "{err}");
+    }
+
+    #[test]
+    fn recover_records_trailer_lengths() {
+        let storage = MemoryBackend::new();
+        let (p, _) = put_pack(&storage, &[1, 2, 3]);
+        let r = recover(&storage, &[], |_| true).unwrap();
+        assert_eq!(
+            r.trailer_lens,
+            HashMap::from([(p, trailer_frame_len(3, false))])
+        );
+        assert_eq!(r.counts.from_trailers, 1);
     }
 }

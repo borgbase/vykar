@@ -1,3 +1,4 @@
+mod reindex;
 mod repair_apply;
 mod repair_plan;
 mod runner;

@@ -102,6 +102,24 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
         })
         .unwrap_or_else(|| "never".to_string());
     add_kv_row(&mut t2, theme, "Last sweep", last_sweep);
+    if let Some(refusal) = &stats.compact_refused {
+        let local = |t: chrono::DateTime<chrono::Utc>| {
+            t.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        add_kv_row(
+            &mut t2,
+            theme,
+            "Compact",
+            format!(
+                "refused since {}, last at {}: {}",
+                local(refusal.first),
+                local(refusal.last),
+                refusal.detail
+            ),
+        );
+    }
     add_kv_row(&mut t2, theme, "Unique chunks", stats.unique_chunks);
     println!("{t2}");
     Ok(())

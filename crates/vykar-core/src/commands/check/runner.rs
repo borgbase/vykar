@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::reindex::{self, Reindexed};
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
 use super::repair_plan::{add_pack_maps, build_repair_plan};
 use super::scan::{ScanOptions, ScanResult, integrity_scan};
@@ -42,11 +43,14 @@ fn group_by_pack(index: &LiveIndex) -> PackChunks {
 /// machine's chunk tables get pack maps. Pack maps are left out of the plan,
 /// with a warning, when the storage cannot hold them (an older server); when
 /// asking the server fails, the error is returned (nothing has changed yet).
+/// `reindexed`: what was re-indexed before `scan`, shown as the first
+/// action after the key copies.
 fn plan_repair(
     repo: &Repo,
     scan: &ScanResult,
     pack_chunks: &PackChunks,
     load: &RepairIndexLoad,
+    reindexed: Option<&Reindexed>,
 ) -> Result<RepairPlan> {
     let name_to_id: HashMap<String, SnapshotId> = repo
         .manifest()
@@ -55,6 +59,20 @@ fn plan_repair(
         .map(|e| (e.name.clone(), e.id))
         .collect();
     let mut plan = build_repair_plan(scan, pack_chunks, &name_to_id);
+    if let Some(r) = reindexed {
+        let at = plan
+            .actions
+            .iter()
+            .position(|a| !matches!(a, RepairAction::RestoreKeyCopy { .. }))
+            .unwrap_or(plan.actions.len());
+        plan.actions.insert(
+            at,
+            RepairAction::ReindexChunks {
+                pack_ids: r.pack_ids.clone(),
+                chunk_count: r.chunk_count,
+            },
+        );
+    }
     plan.index_recovery = load.recovery;
     plan.uncovered_packs = load.uncovered_packs.clone();
     add_pack_maps(&mut plan.actions, &mut load.packs_from_local_tables.clone());
@@ -101,6 +119,56 @@ fn refuse_repair_if_plan_changed(mode: RepairMode, plan: &RepairPlan) -> Result<
         ));
     }
     Ok(())
+}
+
+/// The scan a repair plans from: `first`, or, when
+/// [`reindex::reindex_lost_entries`] added entries, a second scan on the
+/// re-indexed index, with the check result of `first` (what was wrong).
+/// Progress events then run twice.
+#[allow(clippy::type_complexity)]
+fn scan_for_repair(
+    repo: &mut Repo,
+    config: &VykarConfig,
+    scan_opts: &ScanOptions,
+    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    load: &RepairIndexLoad,
+    cancel: &CancelToken,
+) -> Result<(ScanResult, Option<Reindexed>, Option<CheckResult>)> {
+    let first = integrity_scan(repo, config, scan_opts, progress, cancel)?;
+    // Refuse before building the plan so a dry-run never presents a
+    // misleading executable plan for a too-new repo, and in Apply before
+    // the delete probe and execute_repair, so not even the probe object is
+    // written when a too-new snapshot is present.
+    refuse_repair_if_unreadable_snapshots(&first)?;
+    let Some(reindexed) = reindex::reindex_lost_entries(repo, &first, load, cancel)? else {
+        return Ok((first, None, None));
+    };
+    let found = CheckResult::from(first);
+    let scan = integrity_scan(repo, config, scan_opts, progress, cancel)?;
+    refuse_repair_if_unreadable_snapshots(&scan)?;
+    Ok((scan, Some(reindexed), Some(found)))
+}
+
+/// The check result of a repair that scanned twice: the problems the first
+/// scan found (what was wrong), then those only the second found; the
+/// counters and item impacts of the second.
+fn merge_check_results(first: Option<CheckResult>, second: CheckResult) -> CheckResult {
+    let Some(first) = first else {
+        return second;
+    };
+    let seen: HashSet<(String, String)> = first
+        .errors
+        .iter()
+        .map(|e| (e.context.clone(), e.message.clone()))
+        .collect();
+    let mut errors = first.errors;
+    errors.extend(
+        second
+            .errors
+            .into_iter()
+            .filter(|e| !seen.contains(&(e.context.clone(), e.message.clone()))),
+    );
+    CheckResult { errors, ..second }
 }
 
 impl From<ScanResult> for CheckResult {
@@ -618,13 +686,16 @@ pub(crate) fn run_with_repair_on_repo(
         let load = repo.load_chunk_index_for_repair(cancel)?;
         repo.refresh_snapshot_list()?;
 
-        let scan = integrity_scan(repo, config, &scan_opts, &mut progress, cancel)?;
+        let (scan, reindexed, found) =
+            scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
 
-        // Refuse before building the plan so a dry-run never presents a
-        // misleading executable RemoveUnreferencedEntries plan for a too-new repo.
-        refuse_repair_if_unreadable_snapshots(&scan)?;
-
-        let plan = plan_repair(repo, &scan, &group_by_pack(repo.chunk_index()), &load)?;
+        let plan = plan_repair(
+            repo,
+            &scan,
+            &group_by_pack(repo.chunk_index()),
+            &load,
+            reindexed.as_ref(),
+        )?;
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
@@ -632,7 +703,7 @@ pub(crate) fn run_with_repair_on_repo(
         cancel.check()?;
 
         Ok(RepairResult {
-            check_result: scan.into(),
+            check_result: merge_check_results(found, scan.into()),
             plan,
             applied: Vec::new(),
             repair_errors: Vec::new(),
@@ -646,15 +717,11 @@ pub(crate) fn run_with_repair_on_repo(
             let load = repo.load_chunk_index_for_repair(cancel)?;
             repo.refresh_snapshot_list()?;
 
-            let scan = integrity_scan(repo, config, &scan_opts, &mut progress, cancel)?;
-
-            // Refuse right after the under-lock scan — before the delete
-            // probe and execute_repair — so not even the probe object is
-            // written when a too-new snapshot is present.
-            refuse_repair_if_unreadable_snapshots(&scan)?;
+            let (scan, reindexed, found) =
+                scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
 
             let pack_chunks = group_by_pack(repo.chunk_index());
-            let plan = plan_repair(repo, &scan, &pack_chunks, &load)?;
+            let plan = plan_repair(repo, &scan, &pack_chunks, &load, reindexed.as_ref())?;
 
             // Before the delete probe.
             refuse_repair_if_plan_changed(mode, &plan)?;
@@ -686,9 +753,11 @@ pub(crate) fn run_with_repair_on_repo(
 
             // Execute the repair
             let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
+            // The repair wrote the index: a compact marks again.
+            crate::commands::compact_refusal::clear(repo.cache_dir().as_deref());
 
             Ok(RepairResult {
-                check_result: scan.into(),
+                check_result: merge_check_results(found, scan.into()),
                 plan,
                 applied,
                 repair_errors,
@@ -774,7 +843,7 @@ mod tests {
             uncovered_packs: Vec::new(),
             packs_from_local_tables: vec![PackId::from_bytes([7; 32])],
         };
-        plan_repair(&repo, &scan, &PackChunks::new(), &load)
+        plan_repair(&repo, &scan, &PackChunks::new(), &load, None)
     }
 
     fn writes_pack_maps(plan: &RepairPlan) -> bool {

@@ -100,14 +100,21 @@ fn make_tree(root: &Path) -> bool {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let raw_dir = root.join(OsStr::from_bytes(b"n\x80"));
-        if std::fs::create_dir(&raw_dir).is_ok() {
-            std::fs::write(raw_dir.join("child"), "x").unwrap();
-            std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").unwrap();
-            std::fs::write(root.join("né"), "x").unwrap();
-            std::fs::write(root.join("\u{10000}"), "x").unwrap();
-        } else {
-            eprintln!("filesystem refuses non-UTF-8 names; skipping those entries");
+        match std::fs::create_dir(&raw_dir) {
+            Ok(()) => {
+                std::fs::write(raw_dir.join("child"), "x").unwrap();
+                std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").unwrap();
+            }
+            // Linux filesystems take any name; only elsewhere (APFS) is a
+            // refusal a reason to skip. Same rule as vykar-core's
+            // testutil::try_raw_name.
+            Err(e) if !cfg!(target_os = "linux") && e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("filesystem refuses non-UTF-8 names; skipping those entries");
+            }
+            Err(e) => panic!("creating {}: {e}", raw_dir.display()),
         }
+        std::fs::write(root.join("né"), "x").unwrap();
+        std::fs::write(root.join("\u{10000}"), "x").unwrap();
     }
     mixed_case
 }

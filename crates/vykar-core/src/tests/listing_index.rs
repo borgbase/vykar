@@ -52,7 +52,7 @@ pub(crate) fn backup(
 }
 
 /// A repository with one backup of `source` (created by `make`).
-pub(crate) fn repo_with(make: impl FnOnce(&Path)) -> (tempfile::TempDir, VykarConfig) {
+pub(crate) fn repo_with<R>(make: impl FnOnce(&Path) -> R) -> (tempfile::TempDir, VykarConfig) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source = tmp.path().join("source");
@@ -67,7 +67,9 @@ pub(crate) fn repo_with(make: impl FnOnce(&Path)) -> (tempfile::TempDir, VykarCo
 
 /// Names whose dfs-name order differs from the byte order of the joined
 /// path, non-UTF-8 names, a backslash name and a directory of 3,000 files.
-pub(crate) fn make_awkward(root: &Path) {
+/// Returns whether the non-UTF-8 names were created (not where the
+/// filesystem refuses them, as APFS does).
+pub(crate) fn make_awkward(root: &Path) -> bool {
     for top in [
         "z", "é", "b", "B", "C", "ab", "a b", "a-b", "a.b", "a", "Zeta", "0", "_x",
     ] {
@@ -90,22 +92,28 @@ pub(crate) fn make_awkward(root: &Path) {
         std::fs::write(big.join(format!("file-{f:05}")), format!("{f}")).unwrap();
     }
     #[cfg(unix)]
-    {
+    let raw = {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
-        let raw = root.join(OsStr::from_bytes(b"n\x80"));
-        std::fs::create_dir(&raw).unwrap();
-        std::fs::write(raw.join("child"), "x").unwrap();
-        std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").unwrap();
+        let raw_dir = root.join(OsStr::from_bytes(b"n\x80"));
+        let raw = crate::testutil::try_raw_name(&raw_dir, |p| std::fs::create_dir(p));
+        if raw {
+            std::fs::write(raw_dir.join("child"), "x").unwrap();
+            std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").unwrap();
+        }
         std::fs::write(root.join("né"), "x").unwrap();
         std::fs::write(root.join("\u{10000}"), "x").unwrap();
         std::fs::write(root.join("a\\b"), "x").unwrap();
-    }
+        raw
+    };
+    #[cfg(not(unix))]
+    let raw = false;
+    raw
 }
 
-pub(crate) fn make_big(root: &Path) {
+pub(crate) fn make_big(root: &Path) -> bool {
     make_tree_cut_source(root);
-    make_awkward(root);
+    make_awkward(root)
 }
 
 /// Every entry of the snapshot, by a scan: (path, is a directory).
@@ -305,14 +313,17 @@ fn reads_through_the_index_equal_the_scan() {
 #[cfg(unix)]
 #[test]
 fn non_utf8_and_backslash_names() {
-    let (tmp, _config) = repo_with(make_awkward);
+    let mut raw = false;
+    let (tmp, _config) = repo_with(|r| raw = make_awkward(r));
     let repo_dir = tmp.path().join("repo");
     let mut repo = open_local_repo(&repo_dir);
     let meta = load_snapshot_meta(&repo, "snap").unwrap();
     let view = ListingView::new(&meta);
-    let (got, stats) = read(&mut repo, &view, b"n\x80", false);
-    assert!(stats.via_index);
-    assert_eq!(got, vec![b"n\x80/child".to_vec()]);
+    if raw {
+        let (got, stats) = read(&mut repo, &view, b"n\x80", false);
+        assert!(stats.via_index);
+        assert_eq!(got, vec![b"n\x80/child".to_vec()]);
+    }
     let (top, _) = read(&mut repo, &view, b"", false);
     assert!(top.contains(&b"a\\b".to_vec()));
     let (in_a, stats) = read(&mut repo, &view, b"a", false);
@@ -424,7 +435,8 @@ fn list_under(repo: &Repo, meta: &SnapshotMeta, dir: &str) -> (Vec<String>, List
 /// For every directory display path and a few odd filters, the listing
 /// under it equals the whole listing filtered by display path. With
 /// `indexed`, every clean filter without U+FFFD reads through the index.
-fn assert_list_under_equals_the_filter(repo_dir: &Path, indexed: bool) {
+/// With `raw`, the non-UTF-8 names of `make_awkward` exist.
+fn assert_list_under_equals_the_filter(repo_dir: &Path, indexed: bool, raw: bool) {
     let repo = open_local_repo(repo_dir);
     let meta = load_snapshot_meta(&repo, "snap").unwrap();
     let mut all: Vec<(String, bool)> = Vec::new();
@@ -474,27 +486,31 @@ fn assert_list_under_equals_the_filter(repo_dir: &Path, indexed: bool) {
         }
     }
     #[cfg(unix)]
-    {
+    if raw {
         let (got, _) = list_under(&repo, &meta, "n\u{FFFD}");
         assert_eq!(
             got,
             vec!["n\u{FFFD}".to_string(), "n\u{FFFD}/child".to_string()]
         );
     }
+    #[cfg(not(unix))]
+    let _ = raw;
 }
 
 #[test]
 fn list_under_equals_the_display_filter() {
-    let (tmp, _config) = repo_with(make_awkward);
-    assert_list_under_equals_the_filter(&tmp.path().join("repo"), true);
+    let mut raw = false;
+    let (tmp, _config) = repo_with(|r| raw = make_awkward(r));
+    assert_list_under_equals_the_filter(&tmp.path().join("repo"), true, raw);
 }
 
 #[test]
 fn list_under_without_an_index() {
-    let (tmp, _config) = repo_with(make_awkward);
+    let mut raw = false;
+    let (tmp, _config) = repo_with(|r| raw = make_awkward(r));
     let repo_dir = tmp.path().join("repo");
     reseal(&repo_dir, "snap", |m| m.ext = None);
-    assert_list_under_equals_the_filter(&repo_dir, false);
+    assert_list_under_equals_the_filter(&repo_dir, false, raw);
 }
 
 #[test]
@@ -539,10 +555,10 @@ pub(crate) fn dumps() -> Vec<CommandDump> {
 
 /// A repository with snapshot `name` of two roots (in non-name order),
 /// each filled by `make`, plus two command dumps. Returns the roots.
-pub(crate) fn multi_root_repo(
+pub(crate) fn multi_root_repo<R>(
     tmp: &Path,
     name: &str,
-    make: impl Fn(&Path),
+    make: impl Fn(&Path) -> R,
 ) -> (VykarConfig, Vec<std::path::PathBuf>) {
     let repo_dir = tmp.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();

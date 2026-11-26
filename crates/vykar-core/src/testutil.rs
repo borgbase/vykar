@@ -836,9 +836,81 @@ pub(crate) fn save_and_resume(repo: &mut Repo, ws: &mut WriteSession) {
     *ws = repo.begin_write_session(&WriteSessionOptions::default());
 }
 
+/// Whether a filesystem refusal of non-UTF-8 names is acceptable here.
+/// Linux filesystems take any byte except '/' and NUL, so a refusal there is
+/// a bug to report, not a reason to skip.
+#[cfg(unix)]
+const RAW_NAME_REFUSAL_ALLOWED: bool = !cfg!(target_os = "linux");
+
+/// Create the non-UTF-8-named entry `path` with `create` and return whether
+/// it exists. A refusal by the filesystem (`EILSEQ`, as APFS answers) is
+/// reported on stderr and returns false where such refusals are allowed;
+/// on Linux, and for any other error, this panics.
+#[cfg(unix)]
+pub(crate) fn try_raw_name(
+    path: &std::path::Path,
+    create: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> bool {
+    raw_name_outcome(path, create(path), RAW_NAME_REFUSAL_ALLOWED)
+}
+
+#[cfg(unix)]
+#[allow(clippy::print_stderr, reason = "reports skipped fixture entries")]
+fn raw_name_outcome(
+    path: &std::path::Path,
+    result: std::io::Result<()>,
+    refusal_allowed: bool,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) if refusal_allowed && e.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!(
+                "{}: filesystem refuses non-UTF-8 names; skipping those entries",
+                path.display()
+            );
+            false
+        }
+        Err(e) => panic!("creating {}: {e}", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_name_refusal_is_a_skip_where_allowed() {
+        let refused = Err(std::io::Error::from_raw_os_error(libc::EILSEQ));
+        assert!(!raw_name_outcome(std::path::Path::new("x"), refused, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "creating")]
+    fn raw_name_refusal_fails_where_names_must_work() {
+        let refused = Err(std::io::Error::from_raw_os_error(libc::EILSEQ));
+        raw_name_outcome(std::path::Path::new("x"), refused, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "creating")]
+    fn raw_name_other_errors_fail() {
+        let failed = Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+        raw_name_outcome(std::path::Path::new("x"), failed, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_name_is_created_here() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OsStr::from_bytes(b"n\x80"));
+        assert!(try_raw_name(&path, |p| std::fs::create_dir(p)));
+        assert!(path.symlink_metadata().is_ok());
+    }
 
     #[test]
     fn memory_backend_append_only_follows_the_table() {

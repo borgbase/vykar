@@ -1514,27 +1514,31 @@ mod tests {
             created.push(p.as_bytes().to_vec());
         }
 
-        let mut raw = false;
         #[cfg(unix)]
-        {
+        let raw = {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
-            // Some filesystems (APFS/HFS+) reject non-UTF-8 names; then only
-            // the UTF-8 names are tested.
-            if fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").is_ok() {
-                raw = true;
+            // Some filesystems (APFS) refuse non-UTF-8 names; then only the
+            // UTF-8 names below are tested.
+            let raw = crate::testutil::try_raw_name(&root.join(OsStr::from_bytes(b"\xff")), |p| {
+                fs::write(p, "x")
+            });
+            fs::write(root.join("\u{10000}"), "x").unwrap();
+            created.push("\u{10000}".as_bytes().to_vec());
+            fs::write(root.join("né"), "x").unwrap();
+            created.push("né".as_bytes().to_vec());
+            if raw {
                 created.push(b"\xff".to_vec());
-                fs::write(root.join("\u{10000}"), "x").unwrap();
-                created.push("\u{10000}".as_bytes().to_vec());
-                fs::write(root.join("né"), "x").unwrap();
-                created.push("né".as_bytes().to_vec());
                 let d = root.join(OsStr::from_bytes(b"n\x80"));
                 fs::create_dir(&d).unwrap();
                 created.push(b"n\x80".to_vec());
                 fs::write(d.join("c"), "x").unwrap();
                 created.push(b"n\x80/c".to_vec());
             }
-        }
+            raw
+        };
+        #[cfg(not(unix))]
+        let raw = false;
         AwkwardTree {
             created,
             raw,

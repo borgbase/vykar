@@ -102,8 +102,9 @@ impl Restorer<'_> {
     }
 }
 
-/// Small directories, non-UTF-8 names and a symlink.
-fn make_small(root: &Path) {
+/// Small directories, non-UTF-8 names and a symlink. Returns whether the
+/// non-UTF-8 names were created.
+fn make_small(root: &Path) -> bool {
     for top in ["a", "b", "a-b", "é"] {
         for mid in 0..2 {
             let m = root.join(top).join(format!("m{mid}"));
@@ -115,15 +116,21 @@ fn make_small(root: &Path) {
         std::fs::write(root.join(format!("{top}.txt")), top).unwrap();
     }
     #[cfg(unix)]
-    {
+    let raw = {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
-        let raw = root.join(OsStr::from_bytes(b"n\x80"));
-        std::fs::create_dir(&raw).unwrap();
-        std::fs::write(raw.join("child"), "c").unwrap();
-        std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "ff").unwrap();
+        let raw_dir = root.join(OsStr::from_bytes(b"n\x80"));
+        let raw = crate::testutil::try_raw_name(&raw_dir, |p| std::fs::create_dir(p));
+        if raw {
+            std::fs::write(raw_dir.join("child"), "c").unwrap();
+            std::fs::write(root.join(OsStr::from_bytes(b"\xff")), "ff").unwrap();
+        }
         std::os::unix::fs::symlink("a/m0/f0", root.join("ln")).unwrap();
-    }
+        raw
+    };
+    #[cfg(not(unix))]
+    let raw = false;
+    raw
 }
 
 #[cfg(unix)]

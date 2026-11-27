@@ -588,18 +588,17 @@ fn marker_lost_at_every_write(
             landed.step
         );
 
-        // Finding (not converged, reported): the rewritten snapshot's PUT
-        // landed and the old blob's DELETE was refused, so two blobs name
-        // t1 (a crash between the two leaves the same). Repair looks
-        // snapshots up by name, so the rerun depends on which of the two
-        // the listing puts first: its sweep can abort ("cannot load snapshot
-        // 't1' while sweeping the index"). Both blobs are asserted to stay;
-        // the rerun is not judged here.
-        if landed.op.is_write() && landed.key.starts_with("snapshots/") {
-            // The old blob's DELETE was not even attempted (`tried` above).
+        // The rewritten snapshot's PUT landed and the old blob's DELETE was
+        // not even attempted (`tried` above), so two blobs name t1 (a crash
+        // between the two leaves the same). The rerun below removes the
+        // rewrite, rewrites the original again and deletes it: one blob of
+        // t1 is left (`tests::check_command::\
+        // a_repair_interrupted_at_the_old_blobs_delete_converges_on_rerun`
+        // covers both listing orders).
+        let two_blobs = landed.op.is_write() && landed.key.starts_with("snapshots/");
+        if two_blobs {
             assert!(sim.store().object(&landed.key).is_some(), "{at}");
-            cases.push(landed);
-            continue;
+            assert_eq!(sim.store().keys("snapshots/").len(), 3, "{at}");
         }
 
         // A3: a rerun converges; what the aborted run uploaded is an orphan
@@ -621,7 +620,12 @@ fn marker_lost_at_every_write(
                 "{at}: {key}, uploaded by the aborted run, neither collected nor indexed"
             );
         }
-        for name in snapshot_names(&mut sim, c) {
+        let names = snapshot_names(&mut sim, c);
+        if two_blobs {
+            assert_eq!(names, ["t0", "t1"], "{at}: one blob of t1 is left");
+            assert!(sim.store().object(&landed.key).is_none(), "{at}");
+        }
+        for name in names {
             sim.restore(c, &name).expect_ok();
         }
         sim.check_invariants(after_rerun).assert_clean();

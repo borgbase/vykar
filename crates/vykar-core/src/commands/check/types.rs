@@ -373,6 +373,17 @@ pub enum RepairAction {
         snapshot_name: String,
         missing_chunks: usize,
     },
+    /// Delete `snapshot_id`, an item-level rewrite of `snapshot_name` that an
+    /// interrupted repair published while the original, `kept_id`, stayed:
+    /// two objects of one name. Every item of the deleted object is in the
+    /// kept one, so this is never data loss; the plan treats the kept
+    /// original as if the interrupted run had not happened (it is rewritten
+    /// again when it still needs it).
+    RemoveInterruptedRewrite {
+        snapshot_name: String,
+        snapshot_id: SnapshotId,
+        kept_id: SnapshotId,
+    },
     /// Rewrite one key copy from the other. Never data-loss: `check` only runs
     /// after `Repo::open` succeeded, so a key was established and `from`
     /// is the copy that carries it.

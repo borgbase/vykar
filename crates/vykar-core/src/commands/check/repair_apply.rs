@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::types::{IntegrityIssue, RepairAction, RepairPlan};
 use crate::commands::list::{
     for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
+    load_snapshot_meta_of,
 };
 use crate::commands::mark::{
     MarkOptions, MissingRefs, TreeChunkSet, default_decode_threads, mark_live,
@@ -215,9 +216,10 @@ fn apply_item_level_rewrites(
             }
             // The exclusion is gone: a rollback would be refused too and
             // read as "duplicate blobs". Both blobs stay, under one name, as
-            // after a crash between the two writes; repair looks snapshots
-            // up by name, so a rerun does not reliably converge on that
-            // (`tests::sim_exclusion::an_item_level_repair_whose_marker_is_lost_writes_nothing_more`).
+            // after a crash between the two writes; a rerun removes the
+            // rewrite and repairs the original again
+            // (`repair_plan::reconcile_duplicate_names`,
+            // `tests::sim_exclusion::an_item_level_repair_whose_marker_is_lost_writes_nothing_more`).
             Err(e) if exclusion_lost(&e) => {
                 tracing::warn!(
                     snapshot = rw.new_entry.name,
@@ -441,6 +443,31 @@ pub(super) fn execute_repair(
         }
     }
 
+    // Step 0.75: Remove the rewrites an interrupted repair left beside their
+    // originals. The manifest lacks them already (the scan and plan ran
+    // without them); a failed delete aborts, since a rewrite of the
+    // original below would leave two objects of the name again.
+    for action in &plan.actions {
+        if let RepairAction::RemoveInterruptedRewrite {
+            snapshot_name,
+            snapshot_id,
+            ..
+        } = action
+        {
+            match repo.storage().delete(&snapshot_id.storage_key()) {
+                Ok(()) => applied.push(action.clone()),
+                Err(e) if exclusion_lost(&e) => return Err(e),
+                Err(e) => {
+                    return Err(VykarError::Other(format!(
+                        "aborting repair: failed to remove snapshot object {snapshot_id}, a \
+                         rewrite of '{snapshot_name}' an interrupted repair left beside the \
+                         original: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
     // Step 1: Remove corrupted snapshot blobs from storage.
     // If any delete fails, abort before the index sweep — we cannot enumerate
     // the corrupt snapshot's chunks, so persisting a sweep would drop live
@@ -571,7 +598,8 @@ pub(super) fn execute_repair(
     // The sweep's mark only reads (reads are not checked), so the wrapped
     // errors below cannot be the exclusion's.
     for entry in &surviving_entries {
-        let meta = match load_snapshot_meta(repo, &entry.name) {
+        // By the entry's own object, not the first of its name.
+        let meta = match load_snapshot_meta_of(repo, entry) {
             Ok(m) => m,
             Err(e) => {
                 return Err(VykarError::Other(format!(

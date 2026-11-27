@@ -2,8 +2,17 @@ use std::collections::{HashMap, HashSet};
 
 use super::scan::ScanResult;
 use super::types::{IndexRecovery, IntegrityIssue, RepairAction, RepairPlan};
+use crate::commands::list::{
+    for_each_decoded_item, load_item_stream_of_meta, load_snapshot_meta_of,
+};
 use crate::index::ChunkIndexEntry;
+use crate::repo::Repo;
+use crate::repo::control::CancelToken;
+use crate::repo::manifest::SnapshotEntry;
+use crate::snapshot::SnapshotMeta;
+use crate::snapshot::item::Item;
 use vykar_types::chunk_id::ChunkId;
+use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
 
@@ -521,6 +530,153 @@ pub(super) fn add_pack_maps(actions: &mut Vec<RepairAction>, packs: &mut Vec<Pac
     pack_ids.append(packs);
     pack_ids.sort_by_key(|p| *p.as_bytes());
     pack_ids.dedup();
+}
+
+/// Reconcile the snapshot names more than one object carries, before the
+/// scan. The scan, the plan and the repair look snapshots up by name, so
+/// with two objects of one name they would check one object twice and act
+/// on the other (an interrupted rewrite's rerun deleted the blob of one
+/// entry and kept that entry, then failed its sweep with "snapshot not
+/// found").
+///
+/// The one such pair repair recognises is its own: an item-level rewrite
+/// (`DropItemsFromSnapshot`) PUTs the rewritten object, then DELETEs the
+/// original, and a run interrupted between the two leaves both. The rewrite
+/// copies every field of the original's metadata but the listing ones
+/// (`item_ptrs`, `stats`, `ext`, `format_version`) and keeps the original's
+/// items, in order, but the dropped ones. So when two objects of one name
+/// agree on those fields and one's items are the other's with some left out
+/// (or all kept), the one with fewer is removed from `repo`'s manifest and
+/// planned for deletion ([`RepairAction::RemoveInterruptedRewrite`]): every
+/// item it has the kept one has too, so the choice cannot lose data,
+/// whichever object is which. The scan then sees the original alone and
+/// plans its rewrite again; equal objects keep the one listed first.
+///
+/// Any other name carried by more than one object refuses the repair,
+/// before anything is written. Reads the item streams of both objects of
+/// every such name (through the loaded index).
+pub(super) fn reconcile_duplicate_names(
+    repo: &mut Repo,
+    cancel: &CancelToken,
+) -> Result<Vec<RepairAction>> {
+    use std::collections::BTreeMap;
+
+    let mut by_name: BTreeMap<String, Vec<SnapshotEntry>> = BTreeMap::new();
+    for entry in &repo.manifest().snapshots {
+        by_name
+            .entry(entry.name.clone())
+            .or_default()
+            .push(entry.clone());
+    }
+    let mut actions = Vec::new();
+    for (name, entries) in by_name {
+        if entries.len() < 2 {
+            continue;
+        }
+        let refuse = |why: String| {
+            let ids: Vec<String> = entries.iter().map(|e| e.id.to_hex()).collect();
+            VykarError::Other(format!(
+                "aborting repair: {} snapshot objects carry the name '{name}' ({}), and {why}; \
+                 nothing was changed",
+                entries.len(),
+                ids.join(", ")
+            ))
+        };
+        let [first, second] = entries.as_slice() else {
+            return Err(refuse(
+                "an interrupted repair leaves at most two; repair cannot tell which to keep".into(),
+            ));
+        };
+        let (kept, removed) = match superseded_rewrite(repo, first, second, cancel) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                return Err(refuse(
+                    "they are not a snapshot and its rewrite by an interrupted repair; repair \
+                     cannot tell which to keep"
+                        .into(),
+                ));
+            }
+            Err(e @ VykarError::Interrupted) => return Err(e),
+            Err(e) => {
+                return Err(refuse(format!(
+                    "repair cannot read both to tell whether one is a rewrite an interrupted \
+                     repair left: {e}"
+                )));
+            }
+        };
+        tracing::warn!(
+            snapshot = name,
+            kept = %kept.id,
+            removed = %removed.id,
+            "two snapshot objects carry one name: an interrupted repair's rewrite beside its \
+             original; the rewrite is removed and the original repaired again"
+        );
+        let removed_id = removed.id;
+        actions.push(RepairAction::RemoveInterruptedRewrite {
+            snapshot_name: name,
+            snapshot_id: removed_id,
+            kept_id: kept.id,
+        });
+        repo.manifest_mut().snapshots.retain(|e| e.id != removed_id);
+    }
+    Ok(actions)
+}
+
+/// Of two objects of one name, `(kept, removed)` when one is the other with
+/// items left out (see [`reconcile_duplicate_names`]); `None` when they are
+/// not.
+fn superseded_rewrite<'a>(
+    repo: &mut Repo,
+    first: &'a SnapshotEntry,
+    second: &'a SnapshotEntry,
+    cancel: &CancelToken,
+) -> Result<Option<(&'a SnapshotEntry, &'a SnapshotEntry)>> {
+    let meta_first = load_snapshot_meta_of(repo, first)?;
+    let meta_second = load_snapshot_meta_of(repo, second)?;
+    if !same_but_listing(&meta_first, &meta_second) {
+        return Ok(None);
+    }
+    let items_first = items_of(repo, &meta_first, cancel)?;
+    let items_second = items_of(repo, &meta_second, cancel)?;
+    Ok(if is_subsequence(&items_second, &items_first) {
+        Some((first, second))
+    } else if is_subsequence(&items_first, &items_second) {
+        Some((second, first))
+    } else {
+        None
+    })
+}
+
+/// Whether `a` and `b` agree on every field an item-level rewrite copies
+/// from the original (all but the listing's: `item_ptrs`, `stats`, `ext`
+/// and `format_version`).
+fn same_but_listing(a: &SnapshotMeta, b: &SnapshotMeta) -> bool {
+    a.name == b.name
+        && a.hostname == b.hostname
+        && a.username == b.username
+        && a.time == b.time
+        && a.time_end == b.time_end
+        && a.chunker_params == b.chunker_params
+        && a.comment == b.comment
+        && a.source_label == b.source_label
+        && a.source_paths == b.source_paths
+        && a.label == b.label
+}
+
+fn items_of(repo: &mut Repo, meta: &SnapshotMeta, cancel: &CancelToken) -> Result<Vec<Item>> {
+    let stream = load_item_stream_of_meta(repo, meta, cancel)?;
+    let mut items = Vec::new();
+    for_each_decoded_item(&stream, |item| {
+        items.push(item);
+        Ok(())
+    })?;
+    Ok(items)
+}
+
+/// Whether `sub` is `sup` with zero or more items left out, in order.
+fn is_subsequence(sub: &[Item], sup: &[Item]) -> bool {
+    let mut sup = sup.iter();
+    sub.iter().all(|item| sup.any(|s| s == item))
 }
 
 #[cfg(test)]

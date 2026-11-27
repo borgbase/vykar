@@ -228,10 +228,18 @@ impl SnapshotListCache {
         Ok(())
     }
 
-    /// Convert to a Vec of SnapshotEntry, sorted chronologically by time.
+    /// Convert to a Vec of SnapshotEntry, sorted chronologically by time,
+    /// then by ID. The ID makes the order total: entries of one time (the two
+    /// objects of one name an interrupted `check --repair` rewrite leaves)
+    /// come in the same order on every open, not in hash-map order, so a
+    /// lookup by name finds the same one.
     pub fn to_entries(&self) -> Vec<SnapshotEntry> {
         let mut entries: Vec<SnapshotEntry> = self.entries.values().cloned().collect();
-        entries.sort_by_key(|e| e.time);
+        entries.sort_by(|a, b| {
+            a.time
+                .cmp(&b.time)
+                .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+        });
         entries
     }
 }

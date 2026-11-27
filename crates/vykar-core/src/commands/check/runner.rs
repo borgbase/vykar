@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::reindex::{self, Reindexed};
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
-use super::repair_plan::{add_pack_maps, build_repair_plan};
+use super::repair_plan::{add_pack_maps, build_repair_plan, reconcile_duplicate_names};
 use super::scan::{ScanOptions, ScanResult, integrity_scan};
 use super::server_verify::try_server_verify;
 use super::types::{
@@ -51,6 +51,7 @@ fn plan_repair(
     pack_chunks: &PackChunks,
     load: &RepairIndexLoad,
     reindexed: Option<&Reindexed>,
+    reconciled: Vec<RepairAction>,
 ) -> Result<RepairPlan> {
     let name_to_id: HashMap<String, SnapshotId> = repo
         .manifest()
@@ -59,12 +60,12 @@ fn plan_repair(
         .map(|e| (e.name.clone(), e.id))
         .collect();
     let mut plan = build_repair_plan(scan, pack_chunks, &name_to_id);
+    let at = plan
+        .actions
+        .iter()
+        .position(|a| !matches!(a, RepairAction::RestoreKeyCopy { .. }))
+        .unwrap_or(plan.actions.len());
     if let Some(r) = reindexed {
-        let at = plan
-            .actions
-            .iter()
-            .position(|a| !matches!(a, RepairAction::RestoreKeyCopy { .. }))
-            .unwrap_or(plan.actions.len());
         plan.actions.insert(
             at,
             RepairAction::ReindexChunks {
@@ -73,6 +74,8 @@ fn plan_repair(
             },
         );
     }
+    // First after the key copies: what the scan ran without.
+    plan.actions.splice(at..at, reconciled);
     plan.index_recovery = load.recovery;
     plan.uncovered_packs = load.uncovered_packs.clone();
     add_pack_maps(&mut plan.actions, &mut load.packs_from_local_tables.clone());
@@ -688,6 +691,7 @@ pub(crate) fn run_with_repair_on_repo(
     if mode == RepairMode::PlanOnly {
         let load = repo.load_chunk_index_for_repair(cancel)?;
         repo.refresh_snapshot_list()?;
+        let reconciled = reconcile_duplicate_names(repo, cancel)?;
 
         let (scan, reindexed, found) =
             scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
@@ -698,6 +702,7 @@ pub(crate) fn run_with_repair_on_repo(
             &group_by_pack(repo.chunk_index()),
             &load,
             reindexed.as_ref(),
+            reconciled,
         )?;
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
@@ -724,12 +729,20 @@ pub(crate) fn run_with_repair_on_repo(
             repo.commit_mode()?;
             let load = repo.load_chunk_index_for_repair(cancel)?;
             repo.refresh_snapshot_list()?;
+            let reconciled = reconcile_duplicate_names(repo, cancel)?;
 
             let (scan, reindexed, found) =
                 scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
 
             let pack_chunks = group_by_pack(repo.chunk_index());
-            let plan = plan_repair(repo, &scan, &pack_chunks, &load, reindexed.as_ref())?;
+            let plan = plan_repair(
+                repo,
+                &scan,
+                &pack_chunks,
+                &load,
+                reindexed.as_ref(),
+                reconciled,
+            )?;
 
             // Before the delete probe.
             refuse_repair_if_plan_changed(mode, &plan)?;
@@ -852,7 +865,7 @@ mod tests {
             uncovered_packs: Vec::new(),
             packs_from_local_tables: vec![PackId::from_bytes([7; 32])],
         };
-        plan_repair(&repo, &scan, &PackChunks::new(), &load, None)
+        plan_repair(&repo, &scan, &PackChunks::new(), &load, None, Vec::new())
     }
 
     fn writes_pack_maps(plan: &RepairPlan) -> bool {

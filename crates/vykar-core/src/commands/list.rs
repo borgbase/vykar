@@ -432,11 +432,17 @@ pub fn load_snapshot_meta(repo: &Repo, snapshot_name: &str) -> Result<SnapshotMe
         .manifest()
         .find_snapshot(snapshot_name)
         .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
+    load_snapshot_meta_of(repo, entry)
+}
 
+/// [`load_snapshot_meta`] of the object `entry` names, not of the first
+/// entry with its name: for a caller that must tell two objects carrying one
+/// name apart (`check --repair`).
+pub(crate) fn load_snapshot_meta_of(repo: &Repo, entry: &SnapshotEntry) -> Result<SnapshotMeta> {
     let meta_data = repo
         .storage()
         .get(&entry.id.storage_key())?
-        .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
+        .ok_or_else(|| VykarError::SnapshotNotFound(entry.name.clone()))?;
     decode_snapshot_meta(&entry.id, &meta_data, repo.crypto().as_ref())
 }
 
@@ -501,9 +507,19 @@ pub fn load_snapshot_item_stream_from_storage(
     cancel: &CancelToken,
 ) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
+    load_item_stream_of_meta(repo, &snapshot_meta, cancel)
+}
+
+/// The item stream of `meta`, read like
+/// [`load_snapshot_item_stream_from_storage`].
+pub(crate) fn load_item_stream_of_meta(
+    repo: &mut Repo,
+    meta: &SnapshotMeta,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>> {
     resolve_and_read(
         repo,
-        &snapshot_meta.item_ptrs,
+        &meta.item_ptrs,
         resolve_through_index,
         cancel,
         TreeChunkSource::Storage,

@@ -359,6 +359,15 @@ fn format_repair_action(action: &RepairAction) -> String {
         } => {
             format!("Remove snapshot '{snapshot_name}' with {missing_chunks} unresolvable chunk(s)")
         }
+        RepairAction::RemoveInterruptedRewrite {
+            snapshot_name,
+            snapshot_id,
+            kept_id,
+        } => format!(
+            "Remove snapshot object {snapshot_id}, a rewrite of '{snapshot_name}' that an \
+             interrupted repair left beside the original {kept_id} (it holds nothing the \
+             original lacks; the original is repaired as planned below)"
+        ),
         RepairAction::DropItemsFromSnapshot {
             snapshot_name,
             item_indices,

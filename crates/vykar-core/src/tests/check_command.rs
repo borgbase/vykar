@@ -1920,3 +1920,404 @@ fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
     assert_eq!(count, 3);
     assert!(issues.is_empty(), "{issues:?}");
 }
+
+// ---------------------------------------------------------------------------
+// An item-level repair interrupted between its rewrite's PUT and the old
+// blob's DELETE: two blobs under one snapshot name
+// ---------------------------------------------------------------------------
+
+/// Fails the DELETE of `key` as a lost exclusion: the repair stops there
+/// with nothing more written and both blobs stored, as after a crash
+/// between the rewrite's PUT and the DELETE.
+struct LoseExclusionAtDelete {
+    inner: Arc<dyn StorageBackend>,
+    key: String,
+}
+
+impl vykar_storage::InnerBackend for LoseExclusionAtDelete {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for LoseExclusionAtDelete;
+    except [delete, batch_delete];
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if key == self.key {
+            return Err(VykarError::MarkerLostDuringCommit);
+        }
+        self.inner.delete(key)
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+}
+
+/// A repository left by an item-level repair of `snap-drop` that was
+/// interrupted at the old blob's DELETE, beside an undamaged `snap-keep`.
+struct InterruptedRewrite {
+    tmp: tempfile::TempDir,
+    config: crate::config::VykarConfig,
+    repo_dir: std::path::PathBuf,
+    source_dir: std::path::PathBuf,
+    keep_dir: std::path::PathBuf,
+    /// The snapshot as backed up (the original, with the lost file).
+    original: vykar_types::snapshot_id::SnapshotId,
+    /// The rewrite the interrupted repair published.
+    rewrite: vykar_types::snapshot_id::SnapshotId,
+    /// Paths of the files whose data pack was lost.
+    dropped: std::collections::HashSet<String>,
+}
+
+const DROP_FILES: [&str; 3] = ["alpha.bin", "beta.bin", "gamma.bin"];
+
+fn snapshot_keys(repo_dir: &std::path::Path) -> Vec<String> {
+    let mut keys = LocalBackend::new(repo_dir.to_str().unwrap())
+        .unwrap()
+        .list("snapshots/")
+        .unwrap();
+    keys.sort();
+    keys
+}
+
+fn interrupted_item_repair() -> InterruptedRewrite {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let keep_dir = tmp.path().join("keep");
+    for d in [&repo_dir, &source_dir, &keep_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    for (i, name) in DROP_FILES.iter().enumerate() {
+        let payload: Vec<u8> = (0..2048u32)
+            .map(|x| (x as u8).wrapping_add(i as u8))
+            .collect();
+        std::fs::write(source_dir.join(name), payload).unwrap();
+    }
+    std::fs::write(keep_dir.join("keep.txt"), b"kept, never damaged").unwrap();
+
+    let config = init_repo_small_packs(&repo_dir);
+    backup_single_source(&config, &source_dir, "src-drop", "snap-drop");
+    let (deleted_pack, affected) = pick_data_only_pack(&repo_dir);
+    assert!(!affected.is_empty() && affected.len() < DROP_FILES.len());
+    let original = affected[0].3;
+    let dropped = affected.iter().map(|(_, p, _, _)| p.clone()).collect();
+    std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
+    // After the damage, so the lost pack is none of its.
+    backup_single_source(&config, &keep_dir, "src-keep", "snap-keep");
+    let before = snapshot_keys(&repo_dir);
+
+    // The repair, its exclusion lost at the old blob's DELETE.
+    let storage = LoseExclusionAtDelete {
+        inner: Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
+        key: original.storage_key(),
+    };
+    let mut repo = crate::repo::Repo::open(
+        Box::new(storage),
+        Some(crate::testing::TEST_PASSPHRASE),
+        config.cache_dir.as_ref().map(std::path::PathBuf::from),
+        commands::check::repair_open_options(RepairMode::Apply),
+    )
+    .unwrap();
+    let err = commands::check::run_with_repair_on_repo(
+        &mut repo,
+        &config,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, VykarError::MarkerLostDuringCommit), "{err}");
+    drop(repo);
+
+    let after = snapshot_keys(&repo_dir);
+    let added: Vec<&String> = after.iter().filter(|k| !before.contains(k)).collect();
+    assert_eq!(added.len(), 1, "the rewrite was published: {after:?}");
+    assert!(
+        after.contains(&original.storage_key()),
+        "the original stays"
+    );
+    let rewrite = vykar_types::snapshot_id::SnapshotId::from_hex(
+        added[0].strip_prefix("snapshots/").unwrap(),
+    )
+    .unwrap();
+    let repo = open_local_repo(&repo_dir);
+    let named: Vec<_> = repo
+        .manifest()
+        .snapshots
+        .iter()
+        .filter(|e| e.name == "snap-drop")
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(named.len(), 2, "two blobs carry the name: {named:?}");
+
+    InterruptedRewrite {
+        tmp,
+        config,
+        repo_dir,
+        source_dir,
+        keep_dir,
+        original,
+        rewrite,
+        dropped,
+    }
+}
+
+impl InterruptedRewrite {
+    /// Store the rewrite's blob again under `to` (an ID chosen to sort before
+    /// or after the original's), deleting it under its own ID: the same
+    /// snapshot, listed on the other side of the original.
+    fn rekey_rewrite(&mut self, to: vykar_types::snapshot_id::SnapshotId) {
+        self.rekey_rewrite_with(to, |_| {});
+    }
+
+    /// [`Self::rekey_rewrite`], with `change` applied to its metadata.
+    fn rekey_rewrite_with(
+        &mut self,
+        to: vykar_types::snapshot_id::SnapshotId,
+        change: impl FnOnce(&mut crate::snapshot::SnapshotMeta),
+    ) {
+        use crate::repo::format::{ObjectType, pack_object_with_context};
+        let repo = open_local_repo(&self.repo_dir);
+        let blob = repo
+            .storage()
+            .get(&self.rewrite.storage_key())
+            .unwrap()
+            .unwrap();
+        let mut meta = crate::commands::list::decode_snapshot_meta(
+            &self.rewrite,
+            &blob,
+            repo.crypto().as_ref(),
+        )
+        .unwrap();
+        change(&mut meta);
+        let packed = pack_object_with_context(
+            ObjectType::SnapshotMeta,
+            to.as_bytes(),
+            &rmp_serde::to_vec(&meta).unwrap(),
+            repo.crypto().as_ref(),
+        )
+        .unwrap();
+        repo.storage().put(&to.storage_key(), &packed).unwrap();
+        repo.storage().delete(&self.rewrite.storage_key()).unwrap();
+        self.rewrite = to;
+    }
+
+    /// One blob per snapshot, the original of `snap-drop` gone; a check finds
+    /// nothing, and both snapshots restore as backed up, `snap-drop` without
+    /// the dropped files.
+    fn assert_converged(&self) {
+        let keys = snapshot_keys(&self.repo_dir);
+        assert_eq!(keys.len(), 2, "one blob per snapshot: {keys:?}");
+        assert!(
+            !keys.contains(&self.original.storage_key()),
+            "the original is gone: {keys:?}"
+        );
+        let repo = open_local_repo(&self.repo_dir);
+        let names: Vec<&str> = repo
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.contains(&"snap-drop") && names.contains(&"snap-keep"),
+            "{names:?}"
+        );
+        drop(repo);
+
+        let check = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+
+        for (name, dir, files) in [
+            ("snap-drop", &self.source_dir, DROP_FILES.as_slice()),
+            ("snap-keep", &self.keep_dir, ["keep.txt"].as_slice()),
+        ] {
+            let dest = self.tmp.path().join(format!("restored-{name}"));
+            std::fs::create_dir_all(&dest).unwrap();
+            commands::restore::run(
+                &self.config,
+                pass(&self.config),
+                name,
+                dest.to_str().unwrap(),
+                None,
+                false,
+                false,
+                &CancelToken::new(),
+            )
+            .unwrap_or_else(|e| panic!("restore {name}: {e}"));
+            for file in files {
+                let restored = walk_find_file(&dest, file);
+                if self.dropped.iter().any(|p| p.ends_with(file)) {
+                    assert!(restored.is_none(), "{name}: {file} was dropped");
+                } else {
+                    let restored =
+                        restored.unwrap_or_else(|| panic!("{name}: {file} missing after restore"));
+                    assert_eq!(
+                        std::fs::read(&restored).unwrap(),
+                        std::fs::read(dir.join(file)).unwrap(),
+                        "{name}: {file}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A rerun of the repair on the two blobs converges, whichever of them the
+/// listing puts first: the rewrite listed before the original, and after.
+#[test]
+fn a_repair_interrupted_at_the_old_blobs_delete_converges_on_rerun() {
+    for rewrite_first in [true, false] {
+        let mut fx = interrupted_item_repair();
+        let mut id = [0u8; 32];
+        if rewrite_first {
+            id[31] = 1;
+        } else {
+            id = [0xff; 32];
+            id[31] = 0xfe;
+        }
+        fx.rekey_rewrite(vykar_types::snapshot_id::SnapshotId::from_bytes(id));
+        let order: Vec<_> = open_local_repo(&fx.repo_dir)
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|e| e.id)
+            .filter(|id| *id == fx.rewrite || *id == fx.original)
+            .collect();
+        let want = if rewrite_first {
+            [fx.rewrite, fx.original]
+        } else {
+            [fx.original, fx.rewrite]
+        };
+        assert_eq!(
+            order, want,
+            "rewrite_first={rewrite_first}: the listing order"
+        );
+
+        // The dry run plans the rewrite's removal and changes nothing.
+        let keys = snapshot_keys(&fx.repo_dir);
+        let shown = commands::check::run_with_repair(
+            &fx.config,
+            pass(&fx.config),
+            false,
+            RepairMode::PlanOnly,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap_or_else(|e| panic!("rewrite_first={rewrite_first}: dry run: {e}"));
+        let removes_rewrite = |actions: &[RepairAction]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    RepairAction::RemoveInterruptedRewrite { snapshot_name, snapshot_id, kept_id }
+                        if snapshot_name == "snap-drop"
+                            && *snapshot_id == fx.rewrite
+                            && *kept_id == fx.original
+                )
+            })
+        };
+        assert!(
+            removes_rewrite(&shown.plan.actions),
+            "rewrite_first={rewrite_first}: {:?}",
+            shown.plan.actions
+        );
+        assert!(
+            shown.plan.actions.iter().any(|a| matches!(
+                a,
+                RepairAction::DropItemsFromSnapshot { snapshot_id, .. } if *snapshot_id == fx.original
+            )),
+            "rewrite_first={rewrite_first}: the original is rewritten again: {:?}",
+            shown.plan.actions
+        );
+        assert_eq!(
+            snapshot_keys(&fx.repo_dir),
+            keys,
+            "the dry run changed nothing"
+        );
+
+        let rerun = commands::check::run_with_repair(
+            &fx.config,
+            pass(&fx.config),
+            false,
+            RepairMode::Apply,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap_or_else(|e| panic!("rewrite_first={rewrite_first}: rerun: {e}"));
+        assert!(
+            rerun.repair_errors.is_empty(),
+            "rewrite_first={rewrite_first}: {:?}",
+            rerun.repair_errors
+        );
+        assert!(
+            removes_rewrite(&rerun.applied),
+            "rewrite_first={rewrite_first}: {:?}",
+            rerun.applied
+        );
+        fx.assert_converged();
+
+        // And it stays converged: a further repair finds nothing to do.
+        let again = commands::check::run_with_repair(
+            &fx.config,
+            pass(&fx.config),
+            false,
+            RepairMode::PlanOnly,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert!(
+            again
+                .plan
+                .actions
+                .iter()
+                .all(|a| matches!(a, RepairAction::RemoveUnreferencedEntries)),
+            "rewrite_first={rewrite_first}: {:?}",
+            again.plan.actions
+        );
+    }
+}
+
+/// Two objects of one name that are not a snapshot and its rewrite (here
+/// the second differs in a field a rewrite copies) refuse the repair, dry
+/// run included, before anything is written: repair cannot tell which to
+/// keep.
+#[test]
+fn a_repair_refuses_two_objects_of_one_name_it_did_not_leave() {
+    let mut fx = interrupted_item_repair();
+    let mut id = [0xff; 32];
+    id[31] = 0xfe;
+    fx.rekey_rewrite_with(
+        vykar_types::snapshot_id::SnapshotId::from_bytes(id),
+        |meta| {
+            meta.comment = "another snapshot".into();
+        },
+    );
+    let keys = snapshot_keys(&fx.repo_dir);
+    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
+        let err = commands::check::run_with_repair(
+            &fx.config,
+            pass(&fx.config),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("2 snapshot objects carry the name 'snap-drop'")
+                && err.contains(&fx.original.to_hex())
+                && err.contains(&fx.rewrite.to_hex())
+                && err.contains("nothing was changed"),
+            "{mode:?}: {err}"
+        );
+        assert_eq!(snapshot_keys(&fx.repo_dir), keys, "{mode:?}");
+    }
+}

@@ -49,7 +49,7 @@ vykar mount -S personal
 
 ## Encryption by default
 
-Encryption is on unless you explicitly disable it. Vykar auto-selects AES-256-GCM or ChaCha20-Poly1305 based on hardware support. Chunk IDs use keyed hashing to prevent content fingerprinting against the repository.
+Every repository is encrypted; there is no unencrypted mode. Vykar auto-selects AES-256-GCM or ChaCha20-Poly1305 based on hardware support. Chunk IDs use keyed hashing to prevent content fingerprinting against the repository.
 
 
 ## The repository is untrusted

@@ -335,7 +335,7 @@ See [Recipes](/recipes) for PostgreSQL, MySQL, MongoDB, and Docker examples.
 
 ## Encryption
 
-Encryption is enabled by default (`auto` mode with Argon2id key derivation). You only need an `encryption` section to supply a passcommand, force a specific algorithm, or disable encryption.
+Encryption is enabled by default (`auto` mode with Argon2id key derivation). You only need an `encryption` section to supply a passcommand or force a specific algorithm.
 
 ```yaml
 encryption:
@@ -345,11 +345,11 @@ encryption:
 
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
-| `mode` | `"auto"` | `"auto"`, `"aes256gcm"`, `"chacha20poly1305"`, `"none"` | Encryption algorithm. `auto` benchmarks at init |
+| `mode` | `"auto"` | `"auto"`, `"aes256gcm"`, `"chacha20poly1305"` | Encryption algorithm. `auto` benchmarks at init |
 | `passphrase` | — | string (quoted) | Inline passphrase (not recommended for production) |
 | `passcommand` | — | string (quoted) | Shell command that prints the passphrase |
 
-`none` mode requires no passphrase and creates no key file. Chunk data (file contents and item streams) is still checksummed via keyed chunk IDs (BLAKE3 in repository format v3, keyed BLAKE2b-256 in v2), verified on every read to detect storage corruption, but is not authenticated against tampering. See [Architecture — Plaintext Mode](/architecture#plaintext-mode-none) for details.
+Every repository is encrypted; there is no unencrypted mode. A config that says `mode: "none"` anywhere (at the top level or for one repository) fails to load as a whole, naming the repositories that say it, so no repository in that file can be used until the line is removed or changed. A repository created unencrypted by vykar 0.24 or earlier is not opened by this vykar: create a new repository and back up into it; vykar 0.24 can still restore from the old one.
 
 `passcommand` runs through the platform shell:
 
@@ -358,7 +358,7 @@ encryption:
 
 This applies to `hooks` and `command_dumps` as well. On Windows, when vykar itself has no console — the GUI, a scheduled task, a service — the script runs with no console window of its own, so nothing flashes on screen. Run from a terminal, the script inherits that terminal and prints to it as usual.
 
-For `vykar daemon`, encrypted repositories must have a non-interactive passphrase source available (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE`).
+For `vykar daemon`, every repository must have a non-interactive passphrase source available (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE`).
 
 ## Compression
 
@@ -513,7 +513,7 @@ hostname: MyMachine
 |-------|---------|--------|-------------|
 | `hostname` | — | string | Override hostname in snapshots. Defaults to system short hostname at runtime |
 
-This only affects snapshot metadata — lock files and session markers always use the raw system hostname.
+This only affects snapshot metadata — session markers (and the legacy lock key of a v2/v3 upgrade) always use the raw system hostname.
 
 ## Retention
 

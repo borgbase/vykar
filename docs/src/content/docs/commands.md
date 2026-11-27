@@ -11,8 +11,8 @@ See [Configure and Initialize](/init-setup).
 | Command | Description |
 |---------|-------------|
 | `vykar config` | Generate a starter configuration file |
-| `vykar init` | Initialize a new backup repository |
-| `vykar info` | Show repository statistics (snapshot counts and size totals) |
+| `vykar init` | Initialize a new backup repository (records its [commit mode](/maintenance#commit-mode)) |
+| `vykar info` | Show repository statistics (snapshot counts and size totals) and the commit mode |
 | `vykar key export` | Print the passphrase-protected repository key as an armored text block for safekeeping |
 | `vykar key import` | Restore the repository key from an export — works on a repository that can no longer be opened |
 
@@ -51,7 +51,7 @@ See [Maintain the Repository](/maintenance).
 | `vykar check` | Verify repository integrity (`--verify-data` for full content verification, `--repair` to fix problems) |
 | `vykar snapshot delete` | Delete one or more snapshots (the space is freed by the next `compact`) |
 | `vykar delete` | Delete an entire repository permanently |
-| `vykar break-lock` | Remove any lock files left by vykar 0.24 or an interrupted upgrade (without asking), then the session markers left by killed processes (lists them and asks first) |
+| `vykar break-lock` | Remove leftover lock files under `locks/` (vykar 0.24, an interrupted upgrade) without asking, then list every session marker and remove them all after confirmation; without a terminal it fails when any marker exists (see [Remove stale session markers](/maintenance#remove-stale-session-markers)) |
 | `vykar upgrade` | Upgrade a v2/v3 repository to format v6 in place, writing a pack map for every existing pack (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)); `--commit-mode single|multi` switches a v6 repository's commit mode (see [Commit mode](/maintenance#commit-mode)) |
 
 ## Common flags

@@ -19,10 +19,10 @@ How Vykar compares with Borg, Restic, Rustic and Kopia. Other tools change, so c
 
 | Aspect | Borg | Restic | Rustic | Kopia | Vykar |
 |--------|------|--------|--------|-------|-------|
-| Concurrent backups | v1: exclusive; v2: shared locks | Shared locks for backup | [Lock-free](https://rustic.cli.rs/docs/commands/backup.html) | [Concurrent multi-client](https://kopia.io/docs/advanced/architecture/) | Session-based (commit serialized) |
+| Concurrent backups | v1: exclusive; v2: shared locks | Shared locks for backup | [Lock-free](https://rustic.cli.rs/docs/commands/backup.html) | [Concurrent multi-client](https://kopia.io/docs/advanced/architecture/) | Session-based; concurrent commits on storage with put-if-absent, one at a time otherwise |
 | Repository access | SSH, append-only | rest-server, append-only | Via rustic-server | Built-in server with ACLs | REST server, append-only, quotas |
 | Crash recovery | Checkpoints, rollback | Atomic rename | Atomic rename ([caveats](https://github.com/rustic-rs/rustic/discussions/1537)) | Atomic blobs ([caveats](https://github.com/kopia/kopia/issues/4305)) | Journals + two-phase commit |
-| Prune / GC safety | Exclusive lock | Exclusive lock | Two-phase delete (23h) | Time-based GC (24h min) | Session-aware lock |
+| Prune / GC safety | Exclusive lock | Exclusive lock | Two-phase delete (23h) | Time-based GC (24h min) | Mark-and-sweep in sessions; 12 h grace for unreferenced packs (no lock) |
 | Data verification | `check --repair`, full verify | `check --read-data`, repair | Restic-compat check | Verify + optional ECC | `check --verify-data`, server offload |
 | Unchanged-file reuse | Persistent local filecache (v1 repo-wide; v2 per-series) | Parent snapshot tree | Parent snapshot tree(s) | Previous snapshot manifests/dirs | Per-source local filecache with parent-snapshot fallback |
 

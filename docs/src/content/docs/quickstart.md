@@ -23,7 +23,7 @@ vykar config
 
 ## Initialize and back up
 
-Initialize the repository (prompts for passphrase if encrypted):
+Initialize the repository (prompts for a passphrase):
 
 ```bash
 vykar init
@@ -71,6 +71,6 @@ vykar restore a1b2c3d4 /tmp/restored
 
 ## Next steps
 
-- [Back up your repository key](/init-setup#back-up-your-repository-key) -- the passphrase alone cannot open an encrypted repository
+- [Back up your repository key](/init-setup#back-up-your-repository-key) -- the passphrase alone cannot open a repository
 - [Schedule backups](/daemon) -- run unattended with systemd, launchd, or Docker
 - [Back Up](/backup), [Restore](/restore), and [Maintain the Repository](/maintenance) cover each step in detail

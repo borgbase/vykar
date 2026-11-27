@@ -73,11 +73,10 @@ fn with_legacy_upgrade_lock<T>(
     if let Err(release_err) = lock.release() {
         if result.is_ok() {
             tracing::warn!(
-                "the operation completed successfully, but releasing the repository lock \
-                 failed: {release_err}. The advisory lock at `{key}` may persist; future \
-                 operations on this repository may be blocked for up to 6 hours until \
-                 automatic stale-lock cleanup, or run `vykar break-lock` to clear it \
-                 manually."
+                "the upgrade completed successfully, but releasing its legacy lock key \
+                 `{key}` failed: {release_err}. The leftover key does not affect this vykar, \
+                 which no longer reads `locks/`, and vykar 0.24 cannot open the upgraded \
+                 repository anyway; `vykar break-lock` removes it."
             );
         } else {
             tracing::warn!("failed to release repository lock: {release_err}");

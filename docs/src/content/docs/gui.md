@@ -10,6 +10,7 @@ Vykar includes a desktop GUI for managing repositories, running backups, and bro
 - List snapshots, browse their contents, and restore files
 - Run in the system tray with periodic background backups
 - Uses the same `vykar.yaml` as the CLI and auto-reloads config changes
+- Recovery: **Clear Sessions** (Advanced page) removes leftover vykar 0.24 lock files and every session marker of the selected repository after a confirmation, like `vykar break-lock`; use it only when nothing is using the repository
 
 Background backups follow the [`schedule`](/configuration#schedule) section of the config. On Linux and macOS the GUI and `vykar daemon` share one scheduler lock, so only one of them schedules at a time. On Windows that lock is not implemented yet — run only one of the two there, or both will schedule backups.
 

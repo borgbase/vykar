@@ -36,7 +36,7 @@ The URL selects the backend — a local path, S3, SFTP, or a REST server. See [S
 
 ## Encryption
 
-Encryption is enabled by default (`mode: "auto"`). During `init`, vykar benchmarks AES-256-GCM and ChaCha20-Poly1305, chooses one, and stores that concrete mode in the repository config. No config is needed unless you want to force a mode or disable encryption with `mode: "none"`.
+Encryption is enabled by default (`mode: "auto"`). During `init`, vykar benchmarks AES-256-GCM and ChaCha20-Poly1305, chooses one, and stores that concrete mode in the repository config. No config is needed unless you want to force a mode. Every repository is encrypted; there is no unencrypted mode.
 
 The passphrase is requested interactively at init time. You can also supply it via:
 
@@ -50,7 +50,7 @@ The passphrase is requested interactively at init time. You can also supply it v
 vykar init
 ```
 
-This creates the repository structure at the configured URL. For encrypted repositories, you will be prompted to enter a passphrase.
+This creates the repository structure at the configured URL and prompts for a passphrase. When the storage does not pass vykar's put-if-absent check, `init` also prints `Commit mode: single-writer (<reason>)`: backups on that repository commit one at a time (see [Commit mode](/maintenance#commit-mode)).
 
 If your config has multiple repositories, use `--repo` / `-R` to initialize one entry at a time:
 

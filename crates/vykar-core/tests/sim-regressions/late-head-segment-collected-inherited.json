@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected-inherited",
-  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's old segment). Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-inherited-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the jumps of 61 s, 61 s and 6 h 1 min left compact's segment younger than the object grace, so the case now takes two 6 h 1 min jumps between the backup's head create and the release of compact's late head (the collection's \"now\" is the mtime of the key the late PUT overwrote, so they age the segment without touching the backup's own write); the 61 s jumps are dropped (MAX_ADVANCES). Unchanged signatures. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature.",
+  "note": "Fourth campaign of phase F part 2 (random-1795425925400230078): compact's head PUT is delayed, the same client's next backup (a fold) writes that head generation, the late head lands over it, the backup's index GC deletes compact's segment the late head names, and later commits carry the name on in their chains. Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's old segment). Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-inherited-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the jumps of 61 s, 61 s and 6 h 1 min left compact's segment younger than the object grace, so the case now takes two 6 h 1 min jumps between the backup's head create and the release of compact's late head (the collection's \"now\" is the mtime of the key the late PUT overwrote, so they age the segment without touching the backup's own write); the 61 s jumps are dropped (MAX_ADVANCES). Unchanged signatures. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -57,7 +57,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -183,6 +183,14 @@
       "release"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Some(Allowed(StaleChunksDuringCommit))",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -238,8 +246,8 @@
       0,
       0,
       0,
-      7,
-      7,
+      6,
+      6,
       2
     ],
     "policy": "First",

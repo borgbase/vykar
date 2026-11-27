@@ -1,0 +1,207 @@
+{
+  "name": "marker-gap-suspend-before-head",
+  "note": "Promoted by 10-single-protocol step 10 (fix F1 of its diff review) from the full campaign's random-1939883399661275399 (fallback store, single-writer): backup a's marker record gaps (a 6 h 1 min jump before its probe), its fence passes the pack-age term with its packs about 6 h old, and a second 6 h 1 min jump lands between its fence and its head step. Before the fix the head step re-checked only the index objects' age: a's head index.h/3 landed with its packs 43320 s old, invariant 11 flagged it (OldPackCommittedAfterMarkerGap) and the case was Unknown; the fence after the head refused the snapshot and no pack went missing. Since the fix the head step runs the pack-age term again: a ends Allowed(StaleChunksDuringCommit) with no request of index.h/ at its put-head, and the case shows no signature.",
+  "expect": [],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-exclusive"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Crash": {
+          "client": 1
+        }
+      },
+      "crash"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head"
+    ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(StaleChunksDuringCommit))"
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ]
+    ],
+    "faults": [],
+    "crash": true,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      0,
+      0,
+      0,
+      0,
+      0,
+      7,
+      0,
+      4,
+      0
+    ],
+    "policy": "First",
+    "template": "Encrypted"
+  }
+}

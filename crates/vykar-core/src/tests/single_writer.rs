@@ -71,7 +71,7 @@ fn expect_class(run: &RunRecord, class: AllowedError) {
 
 /// `c`'s `n`th listing of `sessions/` with mtimes (the open lists first,
 /// then a single-writer backup lists before its mark, after it, and its
-/// probe of `locks/` lists once more).
+/// pre-head listing lists once more).
 fn sessions_listing(c: ClientId, n: u32) -> GateRule {
     GateRule::new(
         c,
@@ -402,6 +402,12 @@ fn a_lost_update_of_two_full_backups_is_refused_by_compact_and_repaired() {
     assert!(
         report.violated_for(Invariant::CommittedSnapshotsRestore, "b1"),
         "b1 kept its index coverage: {report}"
+    );
+    // The residual's third route (two backups): the single-writer race.
+    assert_eq!(
+        crate::sim::driver::classify_end_state(&sim).1,
+        std::collections::BTreeSet::from([crate::sim::Signature::SingleWriterHeadRace]),
+        "{report}"
     );
 
     let rc = sim.compact(c);

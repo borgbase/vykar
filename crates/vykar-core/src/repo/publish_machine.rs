@@ -16,7 +16,8 @@
 //!   is not foldable.
 //!
 //! A backup's write also runs the commit rule's pack-age term at its fence
-//! ([`HeadCheck`]), the last step before the head PUT on every path.
+//! ([`HeadCheck`]), the last step before the head PUT on every path, and
+//! again at the head step before its first request.
 //!
 //! The head step creates the head (04 step 8, [`index_store::create_head`]):
 //! put-if-absent on a multi-writer repository (its check runs at the fence,
@@ -79,7 +80,8 @@ pub(crate) struct PublishMachine {
     /// A fold added a backup's additions to the index as edits: an error
     /// before the head PUT drops them again.
     added: bool,
-    /// A backup's pack-age term, run at the fence before the head PUT.
+    /// A backup's pack-age term, run at the fence and again at the head
+    /// step, before its first request.
     head_check: Option<HeadCheck>,
     /// This write created its head.
     wrote_head: bool,
@@ -101,8 +103,9 @@ pub(crate) struct HeadCheck {
 }
 
 impl HeadCheck {
-    /// [`sessions::head_landing_check`] with [`HEAD_LANDING_ALLOWANCE`]: the
-    /// fence is the last step before the head PUT on every path.
+    /// [`sessions::head_landing_check`] with [`HEAD_LANDING_ALLOWANCE`], at
+    /// the fence (the last step before the head PUT on every path) and again
+    /// at the head step, just before its first request.
     ///
     /// [`HEAD_LANDING_ALLOWANCE`]: super::ages::HEAD_LANDING_ALLOWANCE
     fn run(&self, repo: &super::Repo) -> Result<()> {
@@ -1225,6 +1228,20 @@ fn write_step(
             {
                 return Err(slow_index_write(early));
             }
+            // The pack-age term again, from the record alone (no request),
+            // with the same allowance and the same refusal as at the fence:
+            // a suspend or clock jump between the fence and this step would
+            // otherwise land a head naming packs past T_PACK, which a compact
+            // may already have deleted as old orphans. What stays open is a
+            // suspend between this check and the head request reaching
+            // storage, which no client-side check closes: up to
+            // HEAD_LANDING_ALLOWANCE + MARGIN it is absorbed by the term's
+            // allowance and PACK_AGE_LIMIT's margin; past that the check
+            // after the request returned (zero allowance) keeps the snapshot
+            // from being written, but the head has landed.
+            if let Some(check) = head_check {
+                check.run(repo)?;
+            }
             let packed = match w.packed_head.take() {
                 Some(packed) => packed,
                 None => index_store::pack_head(&w.head, repo.crypto.as_ref())?,
@@ -1389,5 +1406,101 @@ mod tests {
         .unwrap();
         assert_eq!(fresh_generation(&s, 3, mine).unwrap(), HeadPut::Created);
         assert!(s.get(&index_store::head_key(3)).unwrap().is_some());
+    }
+
+    /// Step 10 F1: a backup's index write runs the pack-age term again at
+    /// its head step. A record that is not continuous passes it at the fence
+    /// with time to spare; a suspend past the limit between the fence and
+    /// the head step refuses the head (`StaleChunksDuringCommit`, the
+    /// fence's refusal) before any request of `index.h/`, on both head
+    /// writes (single-writer EXISTS + PUT, multi-writer put-if-absent). No
+    /// suspend there: the head is created.
+    #[test]
+    fn the_head_step_runs_the_pack_age_term_again() {
+        use crate::repo::ages::PACK_AGE_LIMIT;
+        use crate::repo::{OpenOptions, Repo};
+        use crate::sim::{Sim, SimConfig, SourceTree, StoreKind};
+        use std::time::Duration;
+
+        let edge = PACK_AGE_LIMIT - HEAD_LANDING_ALLOWANCE;
+        let minute = Duration::from_secs(60);
+        for kind in [StoreKind::Plain, StoreKind::Conditional] {
+            for (suspend, refused) in [(Duration::ZERO, false), (10 * minute, true)] {
+                let mut sim = Sim::with_config(SimConfig {
+                    kind,
+                    ..SimConfig::default()
+                });
+                let a = sim.client("a");
+                sim.backup(a, "a0", &SourceTree::seeded("a0", 2, 16 * 1024))
+                    .expect_ok();
+                let env = sim.host_env(a);
+                let mut repo = Repo::open(
+                    Box::new(sim.store().handle(a)),
+                    sim.store().passphrase(),
+                    Some(sim.client_dir(a).join("repo-cache")),
+                    OpenOptions::new().with_index().host_env(env.clone()),
+                )
+                .unwrap();
+                let registration =
+                    sessions::register_session(repo.storage().as_ref(), "s1", &env).unwrap();
+                let check = HeadCheck {
+                    session_id: "s1".into(),
+                    marker: Arc::new(SessionMarker::new(&registration)),
+                };
+                let prev = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())
+                    .unwrap();
+                let mut m = PublishMachine::publish(&mut repo, Some(prev.clone()), None, true)
+                    .force_head()
+                    .with_head_check(Some(check));
+                let fence = super::super::writer::Fence::unchecked();
+                let events = |_: super::super::control::CommitEvent| {};
+                let step = |repo: &mut super::super::Repo, m: &mut PublishMachine| {
+                    m.step(
+                        &mut StepCx {
+                            repo,
+                            fence: &fence,
+                            events: &events,
+                        },
+                        0,
+                    )
+                };
+                while m.enabled() != [StepKind::Fence] {
+                    assert!(!m.enabled().is_empty(), "{kind:?}: no fence");
+                    step(&mut repo, &mut m).unwrap();
+                }
+                // No marker write since the registration: a gap, so the
+                // record is not continuous; the fence passes 5 min short of
+                // the limit.
+                sim.advance(edge - 5 * minute);
+                step(&mut repo, &mut m).unwrap();
+                assert_eq!(m.enabled(), [StepKind::PutHead], "{kind:?}");
+                sim.advance(suspend);
+                let from = sim.store().step();
+                let result = step(&mut repo, &mut m);
+                let head_ops: Vec<_> = sim
+                    .store()
+                    .log()
+                    .into_iter()
+                    .filter(|r| r.client == a && r.step > from && r.key.starts_with("index.h/"))
+                    .collect();
+                if !refused {
+                    result.unwrap();
+                    assert!(m.wrote_head(), "{kind:?}");
+                    continue;
+                }
+                assert!(
+                    matches!(result, Err(VykarError::StaleChunksDuringCommit)),
+                    "{kind:?}: {result:?}"
+                );
+                assert!(head_ops.is_empty(), "{kind:?}: {head_ops:?}");
+                assert!(m.enabled().is_empty() && !m.wrote_head(), "{kind:?}");
+                assert_eq!(
+                    index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())
+                        .unwrap(),
+                    prev,
+                    "{kind:?}"
+                );
+            }
+        }
     }
 }

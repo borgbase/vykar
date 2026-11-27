@@ -134,14 +134,13 @@ pub struct RunRecord {
     /// Store step when the run returned.
     pub last_step: u64,
     pub outcome: RunOutcome,
-    /// The run committed without a lock (04 step 9): its protected writes
-    /// need no lock, and invariant 7 does not judge them. Since
-    /// 10-single-protocol step 7 every backup that marked its session and
-    /// every maintenance session run, on either mode.
-    pub lock_free: bool,
+    /// The run held a shared session for its protected writes: a backup
+    /// that marked its session committing, a compact, prune, delete or
+    /// shared custom run that registered its marker. Invariant 13's
+    /// `WriteWithoutSession` reads it. Never true together with `exclusive`.
+    pub shared: bool,
     /// The run registered an exclusive session (10-single-protocol step 8):
-    /// invariant 7 judges it against its `x-` marker as a hold. Never
-    /// `lock_free`.
+    /// judged by invariant 13 against its `x-` marker.
     pub exclusive: bool,
 }
 

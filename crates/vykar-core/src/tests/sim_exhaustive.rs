@@ -62,7 +62,6 @@ fn base(hosts: HostPlan, clients: Vec<Vec<Command>>) -> Case {
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
         template: TemplateKind::Encrypted,
-        lock_clients: vec![],
     }
 }
 
@@ -79,15 +78,6 @@ pub(super) fn stepped(c: Case) -> Case {
 pub(super) fn conditional(c: Case) -> Case {
     Case {
         storage: StoreKind::Conditional,
-        ..c
-    }
-}
-
-/// `c` on the encrypted template (phase F part 10b), where the lock-free
-/// path of 04 step 9 exists.
-pub(super) fn encrypted(c: Case) -> Case {
-    Case {
-        template: TemplateKind::Encrypted,
         ..c
     }
 }
@@ -242,44 +232,31 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         c.faults = vec![f];
         out.push((label, c, 1));
     }
-    // Phase F part 10d's lock-free maintenance bases, on the lock-free
-    // family only (every client lock-free; in the other families they add
-    // nothing the compact bases above do not): a delete during a stepped
-    // compact, and two compacts, each at K = 1 with time jumps (inside the
-    // stepped compact too: it holds no lock) and at K = 2.
-    let mut lock_free_only: Vec<(String, Case, u32)> = Vec::new();
+    // Phase F part 10d's maintenance bases, on the multi family only (in
+    // the single family they add nothing the compact bases above do not): a
+    // delete during a stepped compact, and two compacts, each at K = 1 with
+    // time jumps (inside the stepped compact too) and at K = 2.
+    let mut multi_only: Vec<(String, Case, u32)> = Vec::new();
     for (name, c) in [
         ("delete-during-compact", delete_during_compact()),
         ("two-compacts", two_compacts()),
     ] {
-        let c = encrypted(conditional(stepped(c)));
+        let c = conditional(stepped(c));
         let mut jumps = c.clone();
         jumps.advances = true;
-        lock_free_only.push((format!("{name}-stepped-advances-k1-lockfree"), jumps, 1));
-        lock_free_only.push((format!("{name}-stepped-k2-lockfree"), c, 2));
+        multi_only.push((format!("{name}-stepped-advances-k1-multi"), jumps, 1));
+        multi_only.push((format!("{name}-stepped-k2-multi"), c, 2));
     }
-    // Every scenario lock-free too (phase F part 10c: the encrypted
-    // template on the conditional store; local, OpenSSH SFTP, AWS S3 and
-    // vykar-server all offer put-if-absent, 04 step 8, N6). Families: 0
-    // plain (the fallback store: the single-writer protocol since
-    // 10-single-protocol step 7), 1 lock-free. The plaintext template's
-    // conditional family went with step 2, and the mixed family (client b
-    // in lock mode on the store whose plain PUT replaces heads) with step 7:
-    // no binary commits in lock mode.
+    // Every scenario on a multi-writer repository too (the conditional
+    // store; local, OpenSSH SFTP, AWS S3 and vykar-server all offer
+    // put-if-absent, 04 step 8, N6). Families: 0 single (the fallback store:
+    // a single-writer repository, 10-single-protocol step 7), 1 multi.
     let mut all: Vec<(u32, usize, (String, Case, u32))> = Vec::new();
     for (name, c, k) in out {
-        all.push((
-            k,
-            1,
-            (
-                format!("{name}-lockfree"),
-                encrypted(conditional(c.clone())),
-                k,
-            ),
-        ));
+        all.push((k, 1, (format!("{name}-multi"), conditional(c.clone()), k)));
         all.push((k, 0, (name, c, k)));
     }
-    for (name, c, k) in lock_free_only {
+    for (name, c, k) in multi_only {
         all.push((k, 1, (name, c, k)));
     }
     // Within one (K, family) the cheapest first; stable, so the build order
@@ -391,7 +368,7 @@ fn search(t: &Template, c: &Case, stop_on_damage: bool) -> Exploration {
 
 /// Every schedule of `c` within the bound is clean.
 fn assert_clean(name: &str, c: &Case) {
-    let t = Template::of_kind(c.template);
+    let t = Template::new();
     let e = search(&t, c, true);
     print_search(name, &e);
     if let Some((sig, (_, case))) = e.signatures.iter().next() {
@@ -409,10 +386,11 @@ fn lock_pair_on_distinct_hosts_is_clean() {
     assert_clean("pair-distinct", &lock_pair(HostPlan::Distinct));
 }
 
-/// [`assert_clean`], and some schedule has a run that committed lock-free
-/// (the case reaches the path it is about).
+/// [`assert_clean`], and some schedule has a run that committed in a
+/// shared session (`RunRecord::shared`: the case reaches the path it is
+/// about).
 fn assert_clean_lock_free(name: &str, c: &Case) {
-    assert_clean_lock_free_on(&Template::of_kind(c.template), name, c);
+    assert_clean_lock_free_on(&Template::new(), name, c);
 }
 
 /// [`assert_clean_lock_free`] on template `t`.
@@ -426,7 +404,7 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
             max_runs: PRECOMMIT_MAX_RUNS,
         },
         |o| {
-            if o.sim.history().runs.iter().any(|r| r.lock_free) {
+            if o.sim.history().runs.iter().any(|r| r.shared) {
                 lock_free += 1;
             }
             if o.signatures.is_empty() {
@@ -445,7 +423,7 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
     }
     assert!(e.search.complete, "{name}: the search did not complete");
     assert_eq!(e.clean, e.search.runs);
-    assert!(lock_free > 0, "{name}: no schedule committed lock-free");
+    assert!(lock_free > 0, "{name}: no schedule committed in a session");
 }
 
 /// Two lock-free backups (phase F part 10c: the encrypted template on the
@@ -457,11 +435,11 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
 fn lock_free_pair_is_clean() {
     assert_clean_lock_free(
         "lock-free-pair-distinct",
-        &encrypted(conditional(lock_pair(HostPlan::Distinct))),
+        &conditional(lock_pair(HostPlan::Distinct)),
     );
     assert_clean_lock_free(
         "lock-free-pair-hostname",
-        &encrypted(conditional(lock_pair(HostPlan::SameHostname))),
+        &conditional(lock_pair(HostPlan::SameHostname)),
     );
 }
 
@@ -475,7 +453,7 @@ fn lock_free_pair_is_clean() {
 /// reuse re-check fails it `StaleChunksDuringCommit` when it read the sweep.
 #[test]
 fn lock_free_backup_against_lock_free_compact_is_clean() {
-    let cvc = || encrypted(conditional(commit_vs_compact(HostPlan::Distinct)));
+    let cvc = || conditional(commit_vs_compact(HostPlan::Distinct));
     assert_clean_lock_free("lock-free-compact-distinct", &cvc());
     assert_clean_lock_free("lock-free-compact-distinct-stepped", &stepped(cvc()));
 }
@@ -484,14 +462,10 @@ fn lock_free_backup_against_lock_free_compact_is_clean() {
 /// template (c0's segment younger than T_pack: its chunks stay unswept).
 #[test]
 fn lock_free_backup_against_lock_free_compact_young_is_clean() {
-    let cvc = || encrypted(conditional(commit_vs_compact(HostPlan::Distinct)));
+    let cvc = || conditional(commit_vs_compact(HostPlan::Distinct));
+    assert_clean_lock_free_on(&Template::young(), "lock-free-compact-young", &cvc());
     assert_clean_lock_free_on(
-        &Template::encrypted_young(),
-        "lock-free-compact-young",
-        &cvc(),
-    );
-    assert_clean_lock_free_on(
-        &Template::encrypted_young(),
+        &Template::young(),
         "lock-free-compact-young-stepped",
         &stepped(cvc()),
     );
@@ -503,9 +477,7 @@ fn lock_free_backup_against_lock_free_compact_young_is_clean() {
 /// inside the compact reaps nothing live: the driver's backups refresh).
 #[test]
 fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean() {
-    let mut c = stepped(encrypted(conditional(commit_vs_compact(
-        HostPlan::Distinct,
-    ))));
+    let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.advances = true;
     assert_clean_lock_free("lock-free-compact-stepped-advances", &c);
 }
@@ -514,12 +486,10 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean() {
 /// on the young template.
 #[test]
 fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clean() {
-    let mut c = stepped(encrypted(conditional(commit_vs_compact(
-        HostPlan::Distinct,
-    ))));
+    let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.advances = true;
     assert_clean_lock_free_on(
-        &Template::encrypted_young(),
+        &Template::young(),
         "lock-free-compact-young-stepped-advances",
         &c,
     );
@@ -529,13 +499,11 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clea
 /// any decision), aged and young templates: every schedule is clean.
 #[test]
 fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() {
-    let mut c = stepped(encrypted(conditional(commit_vs_compact(
-        HostPlan::Distinct,
-    ))));
+    let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.crash = true;
     assert_clean_lock_free("lock-free-compact-stepped-crash", &c);
     assert_clean_lock_free_on(
-        &Template::encrypted_young(),
+        &Template::young(),
         "lock-free-compact-young-stepped-crash",
         &c,
     );
@@ -549,7 +517,7 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() 
 fn lock_free_delete_during_compact_is_clean() {
     assert_clean_lock_free(
         "lock-free-delete-during-compact",
-        &stepped(encrypted(conditional(delete_during_compact()))),
+        &stepped(conditional(delete_during_compact())),
     );
 }
 
@@ -561,7 +529,7 @@ fn lock_free_delete_during_compact_is_clean() {
 fn two_lock_free_compacts_are_clean() {
     assert_clean_lock_free(
         "two-lock-free-compacts",
-        &stepped(encrypted(conditional(two_compacts()))),
+        &stepped(conditional(two_compacts())),
     );
 }
 
@@ -604,7 +572,7 @@ fn backup_against_compact_is_clean() {
 /// completes.
 #[test]
 fn backup_against_compact_over_a_young_control_never_goes_stale() {
-    let t = Template::encrypted_young();
+    let t = Template::young();
     for (name, c) in [
         (
             "compact-young-distinct",
@@ -686,7 +654,7 @@ struct Contender {
 }
 
 impl Contender {
-    /// Wait for the client's next `locks/` op (held) or its end.
+    /// Wait for the client's next gated op (held) or its end.
     fn wait(&mut self, sim: &Sim) {
         assert!(
             self.next < self.max,
@@ -858,7 +826,7 @@ fn exclusive_registrations_race() {
     };
     for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
         let start = Instant::now();
-        let (s, t) = exclusive_registrations(&Template::encrypted(), hosts, bound);
+        let (s, t) = exclusive_registrations(&Template::new(), hosts, bound);
         eprintln!(
             "exclusive registrations, {hosts:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
             start.elapsed()
@@ -919,7 +887,9 @@ fn exclusive_backup_gated(op: OpKind, key: &str) -> bool {
 /// DELETE of its marker, except the backup's own marker keys
 /// (`sessions/<id>[.<n>].json`: a registration PUT and its refusal's
 /// DELETE, the residual of two registrations racing); `Invariant::STEP1`
-/// holds.
+/// and invariant 13 hold. The hand rule is the judge of the hold: invariant
+/// 13 sees the backup's head, index and snapshot writes and protected
+/// deletes under it, not its pack, pack-map or journal writes.
 fn exclusive_against_backup_search(
     template: &Template,
     kind: StoreKind,
@@ -1089,7 +1059,9 @@ fn exclusive_against_backup_search(
                 ));
             }
         }
-        let report = sim.check_invariants(Invariant::STEP1);
+        let mut judged = Invariant::STEP1.to_vec();
+        judged.push(Invariant::ExclusiveSessions);
+        let report = sim.check_invariants(&judged);
         if !report.violations.is_empty() && violation.is_none() {
             violation = Some(format!("{report}"));
         }
@@ -1110,16 +1082,15 @@ fn exclusive_against_backup_search(
 /// `ActiveSessions`, or the backup refuses `Locked` (or ran after it):
 /// no shared write lands under a live exclusive hold but the backup's own
 /// marker keys (the residual of racing registrations, see
-/// [`exclusive_against_backup_search`]). The cover of invariant 7's blind
-/// spot (shared runs are exempt from it, `sim::checker`). One test per
-/// kind, so the two run in parallel (about 20 s and 60 s, debug build).
+/// [`exclusive_against_backup_search`]); invariant 13 holds as well. One
+/// test per kind, so the two run in parallel (about 20 s and 60 s, debug build).
 fn assert_exclusive_against_backup(kind: StoreKind) {
     let bound = Bound {
         preemptions: GATE_K,
         max_runs: PRECOMMIT_MAX_RUNS,
     };
     let start = Instant::now();
-    let (s, t) = exclusive_against_backup_search(&Template::encrypted(), kind, bound);
+    let (s, t) = exclusive_against_backup_search(&Template::new(), kind, bound);
     eprintln!(
         "exclusive against backup, {kind:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
         start.elapsed()
@@ -1356,7 +1327,7 @@ const SINGLE_WRITER_K: u32 = 2;
 fn assert_single_writer_race(name: &str, rival: SingleWriterRival) {
     let start = Instant::now();
     let (s, t) = single_writer_search(
-        &Template::encrypted(),
+        &Template::new(),
         rival,
         Bound {
             preemptions: SINGLE_WRITER_K,
@@ -1440,8 +1411,7 @@ const GAPPED_INVARIANTS: &[Invariant] = &[
 /// The ops [`gapped_backup_search`] holds: every listing of `sessions/`,
 /// every marker PUT, the EXISTS and DELETE of an exclusive session's marker
 /// (its write check and its deregistration, 10-single-protocol step 8),
-/// every op on `config`, lock keys' writes and deletes, and the head
-/// writes (EXISTS, PUT, put-if-absent).
+/// every op on `config`, and the head writes (EXISTS, PUT, put-if-absent).
 fn gapped_gated(op: OpKind, key: &str) -> bool {
     (OpMatch::AnyList.matches(op) && key == "sessions/")
         || (op == OpKind::Put && key.starts_with("sessions/") && key.ends_with(".json"))
@@ -1449,7 +1419,6 @@ fn gapped_gated(op: OpKind, key: &str) -> bool {
             && key.starts_with("sessions/x-")
             && key.ends_with(".json"))
         || key == "config"
-        || (KeyMatch::LockKey.matches(key) && key != "locks/" && (op.is_write() || op.is_delete()))
         || (matches!(op, OpKind::Exists | OpKind::Put | OpKind::PutIfAbsent)
             && key.starts_with("index.h/"))
 }
@@ -1631,7 +1600,7 @@ const GAPPED_K: u32 = 2;
 fn assert_gapped_clean(name: &str, rival: GappedRival) {
     let start = Instant::now();
     let (s, t) = gapped_backup_search(
-        &Template::encrypted(),
+        &Template::new(),
         rival,
         Bound {
             preemptions: GAPPED_K,
@@ -1683,7 +1652,7 @@ fn measure_bounds() {
     if std::env::var("VYKAR_SIM_MEASURE").ok().as_deref() != Some("1") {
         return;
     }
-    let t = Template::encrypted();
+    let t = Template::new();
     for k in [1, 2] {
         let mut total = Duration::ZERO;
         let bases = [
@@ -1722,7 +1691,7 @@ fn measure_bounds() {
         for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
             let start = Instant::now();
             let (s, tally) = exclusive_registrations(
-                &Template::encrypted(),
+                &Template::new(),
                 hosts,
                 Bound {
                     preemptions: k,
@@ -1748,10 +1717,10 @@ fn measure_part_10_searches() {
         return;
     }
     let start = Instant::now();
-    let enc = Template::encrypted();
+    let enc = Template::new();
     eprintln!("encrypted template built in {:?}", start.elapsed());
     let start = Instant::now();
-    let young = Template::encrypted_young();
+    let young = Template::young();
     eprintln!("encrypted young template built in {:?}", start.elapsed());
     let delete_during_compact = delete_during_compact();
     let two_compacts = two_compacts();
@@ -1772,68 +1741,68 @@ fn measure_part_10_searches() {
         k1(
             "lock_free_pair_is_clean: pair-distinct",
             &enc,
-            encrypted(conditional(lock_pair(HostPlan::Distinct))),
+            conditional(lock_pair(HostPlan::Distinct)),
         ),
         k1(
             "lock_free_pair_is_clean: pair-hostname",
             &enc,
-            encrypted(conditional(lock_pair(HostPlan::SameHostname))),
+            conditional(lock_pair(HostPlan::SameHostname)),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: whole",
             &enc,
-            encrypted(conditional(cvc())),
+            conditional(cvc()),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: stepped",
             &enc,
-            encrypted(conditional(stepped(cvc()))),
+            conditional(stepped(cvc())),
         ),
         // 10d.
         k1(
             "lock_free_backup_against_lock_free_compact: stepped advances",
             &enc,
-            encrypted(conditional(advances(stepped(cvc())))),
+            conditional(advances(stepped(cvc()))),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: stepped crash",
             &enc,
-            encrypted(conditional(crash(stepped(cvc())))),
+            conditional(crash(stepped(cvc()))),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: young whole",
             &young,
-            encrypted(conditional(cvc())),
+            conditional(cvc()),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: young stepped",
             &young,
-            encrypted(conditional(stepped(cvc()))),
+            conditional(stepped(cvc())),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: young stepped advances",
             &young,
-            encrypted(conditional(advances(stepped(cvc())))),
+            conditional(advances(stepped(cvc()))),
         ),
         k1(
             "lock_free_backup_against_lock_free_compact: young stepped crash",
             &young,
-            encrypted(conditional(crash(stepped(cvc())))),
+            conditional(crash(stepped(cvc()))),
         ),
         k1(
             "lock_free_delete_during_compact: stepped",
             &enc,
-            encrypted(conditional(stepped(delete_during_compact))),
+            conditional(stepped(delete_during_compact)),
         ),
         k1(
             "two_lock_free_compacts: stepped",
             &enc,
-            encrypted(conditional(stepped(two_compacts))),
+            conditional(stepped(two_compacts)),
         ),
         (
             "three-clients-lockfree (campaign) K = 2".to_string(),
             &enc,
-            encrypted(conditional(three_clients())),
+            conditional(three_clients()),
             2,
         ),
     ];

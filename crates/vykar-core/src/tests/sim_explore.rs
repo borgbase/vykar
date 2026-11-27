@@ -72,7 +72,6 @@ fn key_class() -> impl Strategy<Value = KeyClass> {
         Just(KeyClass::IndexHead),
         Just(KeyClass::IndexObject),
         Just(KeyClass::Snapshot),
-        Just(KeyClass::Lock),
         Just(KeyClass::Session),
     ]
 }
@@ -126,10 +125,9 @@ fn storage() -> impl Strategy<Value = StoreKind> {
 
 /// 2-3 clients, 1-2 commands each, at most one `DeleteControl`, 0-2
 /// faults of any class and kind, a crash or not, any hosts, time jumps;
-/// compact whole or gate-stepped (no jump inside a stepped compact under
-/// the lock, see `Maintenance`; a lock-free one, on the encrypted
-/// template of [`campaign_cases`], is offered jumps; shrinking prefers
-/// whole); the fallback or the conditional store.
+/// compact whole or gate-stepped (offered jumps inside it, see
+/// `Maintenance`; shrinking prefers whole); the fallback or the
+/// conditional store.
 pub(super) fn general() -> impl Strategy<Value = Case> {
     (2usize..=3)
         .prop_flat_map(|n| {
@@ -158,17 +156,14 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
                     Maintenance::Whole
                 },
                 storage,
-                template: TemplateKind::Plain,
-                lock_clients: vec![],
+                template: TemplateKind::Encrypted,
             },
         )
 }
 
 /// The campaign's random cases: [`general`], and as often [`general`] on
-/// the encrypted template (phase F part 10c: backups commit lock-free
-/// there) on the conditional store or on the store whose plain PUT
-/// overwrites. The family with client b in lock mode (the mixed verdict)
-/// was dropped by 10-single-protocol step 7: no binary is such a client.
+/// a multi-writer repository: the conditional store or the store whose
+/// plain PUT overwrites.
 pub(super) fn campaign_cases() -> impl Strategy<Value = Case> {
     prop_oneof![
         general(),
@@ -195,8 +190,8 @@ fn two_backups() -> Vec<Vec<Command>> {
 }
 
 /// The one-hostname family (H1's before 04 step 1): two backups on cloned
-/// machines, no faults, no crash, no time jumps (an aged lock is reaped by
-/// design).
+/// machines, no faults, no crash, no time jumps (an aged marker is reaped
+/// by design).
 fn one_hostname_family() -> impl Strategy<Value = Case> {
     choices().prop_map(|choices| Case {
         hosts: HostPlan::SameHostname,
@@ -209,8 +204,7 @@ fn one_hostname_family() -> impl Strategy<Value = Case> {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
-        template: TemplateKind::Plain,
-        lock_clients: vec![],
+        template: TemplateKind::Encrypted,
     })
 }
 
@@ -238,8 +232,7 @@ fn h3_family() -> impl Strategy<Value = Case> {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
-        template: TemplateKind::Plain,
-        lock_clients: vec![],
+        template: TemplateKind::Encrypted,
     })
 }
 

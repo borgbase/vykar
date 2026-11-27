@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-beside-orphan-lock",
-  "note": "Third campaign of phase F part 2 (random-2227770492348456710): a backup's snapshot PUT is delayed and its commit fails, the same client's compact removes the snapshot's packs, the snapshot PUT then lands; independently another backup's delayed lock PUT leaves an orphan key its next run writes beside. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; OrphanLockKey remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): its late-snapshot half only, no signature (was OrphanLockKey): no backup writes a lock key, so the Lock fault on client 1 no longer fires and was dropped with the decisions of its failed lock; the late snapshot was already harmless.",
+  "note": "Third campaign of phase F part 2 (random-2227770492348456710): a backup's snapshot PUT is delayed and its commit fails, the same client's compact removes the snapshot's packs, the snapshot PUT then lands; independently another backup's delayed lock PUT leaves an orphan key its next run writes beside. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; OrphanLockKey remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): its late-snapshot half only, no signature (was OrphanLockKey): no backup writes a lock key, so the Lock fault on client 1 no longer fires and was dropped with the decisions of its failed lock; the late snapshot was already harmless. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -173,6 +173,15 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Ok",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "Distinct",

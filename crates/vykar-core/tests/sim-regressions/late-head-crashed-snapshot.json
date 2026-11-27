@@ -1,6 +1,6 @@
 {
   "name": "late-head-crashed-snapshot",
-  "note": "Shape C of the phase F part 2 campaign (random-2227767780591396598): compact's head PUT is delayed, a backup on the same client commits through put-snapshot and crashes before finish, the late head lands over its head and the snapshot loses index coverage (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads). Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-crashed-snapshot-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature (H3).",
+  "note": "Shape C of the phase F part 2 campaign (random-2227767780591396598): compact's head PUT is delayed, a backup on the same client commits through put-snapshot and crashes before finish, the late head lands over its head and the snapshot loses index coverage (H3 over a committed, unacknowledged snapshot). Fixed by 04 step 8 (create-if-absent heads). Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-crashed-snapshot-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature (H3). Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [
     "LateHeadWrite"
   ],
@@ -57,7 +57,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -198,6 +198,13 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Some(Allowed(Injected))",
+    "Some(Allowed(Locked))"
   ],
   "case": {
     "hosts": "SameHostname",

@@ -1,6 +1,6 @@
 {
   "name": "h1-bounded",
-  "note": "First TwoLockHolders schedule of tests::sim_exhaustive::lock_pair_on_one_hostname_shows_only_h1 (K = 1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): b no longer reaps a's live lock and ends Locked at its lock step, so the choices after it were trimmed; kept as a regression (now tests::sim_exhaustive::lock_pair_on_one_hostname_is_clean): this schedule must stay clean. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before): two backups on one hostname, the second waits at its single-writer listing while the first commits.",
+  "note": "First TwoLockHolders schedule of tests::sim_exhaustive::lock_pair_on_one_hostname_shows_only_h1 (K = 1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): b no longer reaps a's live lock and ends Locked at its lock step, so the choices after it were trimmed; kept as a regression (now tests::sim_exhaustive::lock_pair_on_one_hostname_is_clean): this schedule must stay clean. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before): two backups on one hostname, the second waits at its single-writer listing while the first commits. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -199,7 +199,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -313,6 +313,12 @@
       "Stop",
       "stop"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "SameHostname",

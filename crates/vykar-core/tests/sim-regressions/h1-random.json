@@ -1,6 +1,6 @@
 {
   "name": "h1-random",
-  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h1 (default seed): two backups on one hostname; the second one's registration reaps the first one's live lock. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5); kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before).",
+  "note": "Minimal case of tests::sim_explore::random_exploration_finds_h1 (default seed): two backups on one hostname; the second one's registration reaps the first one's live lock. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5); kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before). Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -57,6 +57,12 @@
       },
       "upload"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "SameHostname",

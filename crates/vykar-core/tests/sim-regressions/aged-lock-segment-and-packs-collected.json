@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-and-packs-collected",
-  "note": "Third campaign of phase F part 2 (random-2299828320597253367): aged lock; compact takes the holder's unpublished segment and its orphan packs; the holder's head names the segment, a backup fails on it, then the holder's next fold publishes a base from its cache naming the absent packs. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the holder's packs are about 6 h old at the compact, younger than T_pack, and stay; the segment (older than T_idx) is still collected. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-and-packs-collected-conditional is the same case on a conditional store with the schedule of before 10b2 (see its note). Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): after the jumps of 61 s, 61 s and 6 h 1 min the segment is younger than the object grace, compact keeps it and only AgedLockReaped is left, so the case now takes two 6 h 1 min jumps after the fence (the 61 s jumps dropped). The segment and the holder's packs are 12 h 2 min old at the compact, which reaps the aged lock and collects them; the holder's head create then refuses (AllowedError::SlowIndexWrite), so no head names the collected segment, no fold carries the absent packs, and the case is clean. AgedLockSegmentCollected is closed on every store by 10b2 for head writes that are not released late. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before). No lock key is written; the victim still refuses its slow index write.",
+  "note": "Third campaign of phase F part 2 (random-2299828320597253367): aged lock; compact takes the holder's unpublished segment and its orphan packs; the holder's head names the segment, a backup fails on it, then the holder's next fold publishes a base from its cache naming the absent packs. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the holder's packs are about 6 h old at the compact, younger than T_pack, and stay; the segment (older than T_idx) is still collected. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-and-packs-collected-conditional is the same case on a conditional store with the schedule of before 10b2 (see its note). Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): after the jumps of 61 s, 61 s and 6 h 1 min the segment is younger than the object grace, compact keeps it and only AgedLockReaped is left, so the case now takes two 6 h 1 min jumps after the fence (the 61 s jumps dropped). The segment and the holder's packs are 12 h 2 min old at the compact, which reaps the aged lock and collects them; the holder's head create then refuses (AllowedError::SlowIndexWrite), so no head names the collected segment, no fold carries the absent packs, and the case is clean. AgedLockSegmentCollected is closed on every store by 10b2 for head writes that are not released late. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before). No lock key is written; the victim still refuses its slow index write. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -164,6 +164,14 @@
       "upload"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(SlowIndexWrite))",
+    "Ok",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -210,8 +218,8 @@
       0,
       0,
       0,
-      7,
-      7,
+      6,
+      6,
       1,
       0,
       1

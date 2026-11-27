@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-and-late-head",
-  "note": "Second campaign of phase F part 2 (random-2011597334903818936): a backup's snapshot PUT is delayed and its commit fails; the same client's compact runs without that snapshot and its own delayed head lands later under another backup's lock; the snapshot PUT then lands over chunks the index no longer covers. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; LateIndexWrite remains. Fixed by 04 step 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-snapshot-and-late-head-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. LateIndexWrite's evidence was invariant 7 (a late index write without the lock); single-writer runs take no lock and invariant 7 exempts them, and the late writes damage nothing the other invariants judge.",
+  "note": "Second campaign of phase F part 2 (random-2011597334903818936): a backup's snapshot PUT is delayed and its commit fails; the same client's compact runs without that snapshot and its own delayed head lands later under another backup's lock; the snapshot PUT then lands over chunks the index no longer covers. Fixed by 04 step 8 (the commit point is the head). Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; LateIndexWrite remains. Fixed by 04 step 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-snapshot-and-late-head-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. LateIndexWrite's evidence was invariant 7 (a late index write without the lock); single-writer runs take no lock and invariant 7 exempts them, and the late writes damage nothing the other invariants judge. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -208,7 +208,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -253,6 +253,15 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Some(Allowed(Injected))",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "Distinct",

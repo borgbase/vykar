@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-write-lockfree",
-  "note": "Lock-free twin of late-snapshot-write (phase F part 10c): the same case on the encrypted template and the conditional store, each lock decision replaced by the commit mark and the probe of locks/. As in its twin the compact runs less than T_pack after the late snapshot's head, so nothing is lost: no signature.",
+  "note": "Lock-free twin of late-snapshot-write (phase F part 10c): the same case on the encrypted template and the conditional store, each lock decision replaced by the commit mark and the probe of locks/. As in its twin the compact runs less than T_pack after the late snapshot's head, so nothing is lost: no signature. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -28,7 +28,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -163,7 +163,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -299,6 +299,14 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "Distinct",

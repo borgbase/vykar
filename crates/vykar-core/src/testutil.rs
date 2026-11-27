@@ -1062,9 +1062,11 @@ mod tests {
     #[test]
     fn memory_backend_append_only_follows_the_table() {
         let store = MemoryBackend::append_only();
+        // The legacy lock directory keeps a class of its own in the table.
+        let legacy = format!("{}x", crate::repo::sessions::LEGACY_LOCKS_PREFIX);
         for key in [
             "index",
-            "locks/x",
+            legacy.as_str(),
             "config",
             "index.h/1",
             "snapshots/s",
@@ -1074,7 +1076,7 @@ mod tests {
             store.put(key, b"one").unwrap();
         }
         store.put("index", b"two").unwrap();
-        store.put("locks/x", b"two").unwrap();
+        store.put(&legacy, b"two").unwrap();
         for key in ["config", "index.h/1"] {
             let err = store.put(key, b"two").unwrap_err().to_string();
             assert!(err.contains("append-only"), "{key}: {err}");

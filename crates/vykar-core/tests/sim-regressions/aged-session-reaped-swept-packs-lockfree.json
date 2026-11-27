@@ -1,6 +1,6 @@
 {
   "name": "aged-session-reaped-swept-packs-lockfree",
-  "note": "Lock-free twin of aged-session-reaped-swept-packs (phase F part 10c): encrypted template, conditional store, the lock decision replaced by the commit mark and the probe. a's segment is younger than T_pack at b's compact, as in its twin: no signature. a's snapshot fence refuses (MarkerLostDuringCommit, StaleChunksDuringCommit before 10c fix round 2) before b's compact reaps the marker: the 3 h jump left a gap over MARKER_GAP_LIMIT in its marker record, and a lock-free commit writes its snapshot only on a continuous record (10c fix round 1; before it, the snapshot was written and the compact then reaped the marker). The jump falls after the commit mark: a gap before it would make a commit under the lock (10c fix round 2).",
+  "note": "Lock-free twin of aged-session-reaped-swept-packs (phase F part 10c): encrypted template, conditional store, the lock decision replaced by the commit mark and the probe. a's segment is younger than T_pack at b's compact, as in its twin: no signature. a's snapshot fence refuses (MarkerLostDuringCommit, StaleChunksDuringCommit before 10c fix round 2) before b's compact reaps the marker: the 3 h jump left a gap over MARKER_GAP_LIMIT in its marker record, and a lock-free commit writes its snapshot only on a continuous record (10c fix round 1; before it, the snapshot was written and the compact then reaped the marker). The jump falls after the commit mark: a gap before it would make a commit under the lock (10c fix round 2). Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min; its 3 h 1 min jump replaced by 46 min, the same operations): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -28,12 +28,12 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
         "Advance": {
-          "secs": 10860
+          "secs": 2760
         }
       },
       "advance"
@@ -195,6 +195,13 @@
       "stop"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "SameHostname",
     "clients": [
@@ -225,21 +232,21 @@
       0,
       0,
       0,
+      4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
       5,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      6,
       1,
       0,
       0,

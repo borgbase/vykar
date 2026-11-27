@@ -50,8 +50,7 @@ fn case(hosts: HostPlan, clients: Vec<Vec<Command>>, faults: Vec<FaultSpec>) -> 
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
-        template: TemplateKind::Plain,
-        lock_clients: vec![],
+        template: TemplateKind::Encrypted,
     }
 }
 
@@ -108,12 +107,12 @@ fn driven_backups(o: &Outcome) -> Vec<RunRecord> {
         .collect()
 }
 
-/// Every op of a driven backup's commit window (after its lock step,
+/// Every op of a driven backup's commit window (after its protection,
 /// through its snapshot PUT) is issued inside a machine step and is one
 /// that step declares; `Local` steps issue none; each head and snapshot
 /// PUT step issues exactly one write. Protection steps touch only
-/// `locks/`, `sessions/` and (the suspend rule's re-read) `config`;
-/// finish steps only `sessions/` and `locks/`.
+/// `sessions/` and (the suspend rule's re-read) `config`; finish steps
+/// only `sessions/`.
 fn check_guard(name: &str, o: &Outcome) {
     let log = o.sim.store().log();
     let entry_of = |rec: &OpRecord| {
@@ -145,26 +144,17 @@ fn check_guard(name: &str, o: &Outcome) {
                 .unwrap_or_else(|| panic!("unlabelled op {r:?}: {}", context()));
             match label {
                 "upload" | "crash" => {}
-                "lock" => assert!(
-                    r.key.starts_with("locks/") || r.key.starts_with("sessions/"),
-                    "lock step touched {}: {}",
-                    r.key,
-                    context()
-                ),
                 // The commit protection (10-single-protocol step 7): the
                 // single-writer listings, the mark, the pre-head listing of
-                // `sessions/` (the probe of `locks/` before step 8), and
-                // the suspend rule's re-read of `config`.
-                "list-writers" | "mark-committing" | "probe-locks" => assert!(
-                    r.key.starts_with("locks/")
-                        || r.key.starts_with("sessions/")
-                        || r.key == "config",
+                // `sessions/`, and the suspend rule's re-read of `config`.
+                LABEL_LIST_WRITERS | LABEL_MARK_COMMITTING | LABEL_LIST_EXCLUSIVE => assert!(
+                    r.key.starts_with("sessions/") || r.key == "config",
                     "protection step {label} touched {}: {}",
                     r.key,
                     context()
                 ),
                 "finish" => assert!(
-                    r.key.starts_with("sessions/") || r.key.starts_with("locks/"),
+                    r.key.starts_with("sessions/"),
                     "finish touched {}: {}",
                     r.key,
                     context()
@@ -480,7 +470,7 @@ fn assert_victim_fails_typed(o: &Outcome, sig: Signature) -> Report {
         step: None,
     });
     assert_eq!(
-        classify(&o.sim, &claimed, &o.trace.entries),
+        classify(&o.sim, &claimed),
         BTreeSet::from([sig]),
         "{}",
         render()
@@ -525,7 +515,7 @@ fn jumps_then_compact(t: &Template, c: &Case, jumps: usize) -> Case {
 /// A marker reaped by age (`AgedSessionReaped`): compact runs after two
 /// jumps past both stale ages at A's "fetch-head" (12 h 2 min, so A's
 /// packs are older than T_pack: 04 step 5 keeps younger orphans), reaps
-/// A's aged lock and marker and deletes its packs, and A's commit fails
+/// A's aged marker and deletes its packs, and A's commit fails
 /// typed (D9 of 04 step 2). The signature claims an injected disallowed
 /// error of A's run and nothing else: an unrelated violation, or a skipped
 /// evaluation, added to the report is left to `Unknown`.
@@ -557,7 +547,7 @@ fn aged_reap_fails_typed_and_claims_only_its_victim() {
         step: None,
     });
     assert_eq!(
-        classify(&o.sim, &unrelated, &o.trace.entries),
+        classify(&o.sim, &unrelated),
         BTreeSet::from([Signature::AgedSessionReaped, Signature::Unknown])
     );
 
@@ -568,7 +558,7 @@ fn aged_reap_fails_typed_and_claims_only_its_victim() {
         reason: "injected by the test".into(),
     });
     assert_eq!(
-        classify(&o.sim, &skipped, &o.trace.entries),
+        classify(&o.sim, &skipped),
         BTreeSet::from([Signature::Unknown])
     );
 }
@@ -761,7 +751,7 @@ fn stepped(c: &Case) -> Case {
 /// and restores (the checker opens it with the passphrase).
 #[test]
 fn the_encrypted_template_is_encrypted_with_a_cheap_key() {
-    let t = Template::encrypted();
+    let t = Template::new();
     assert_eq!(t.kind(), TemplateKind::Encrypted);
     let sim = t.fork();
     let tmp = tempfile::tempdir().unwrap();
@@ -798,7 +788,7 @@ fn on(kind: TemplateKind, c: &Case) -> Case {
 /// random nonces, so pack and index object names differ between runs; a
 /// driver decision that read one would show.
 fn templates() -> [(TemplateKind, Template); 1] {
-    [(TemplateKind::Encrypted, Template::encrypted())]
+    [(TemplateKind::Encrypted, Template::new())]
 }
 
 /// The compact cases of the op-order and determinism tests, no time jumps:
@@ -961,7 +951,7 @@ fn stepped_compact_replays_identically() {
     // deregisters, so it makes more step ops.
     most = most.max(stepped_compact_replays_identically_on(
         TemplateKind::Encrypted,
-        &Template::encrypted(),
+        &Template::new(),
         StoreKind::Conditional,
     ));
     if std::env::var_os("VYKAR_SIM_MEASURE").is_some() {
@@ -1118,7 +1108,7 @@ fn stepped_compact_with_jumps_and_crashes_is_deterministic_on(kind: TemplateKind
 /// end state is clean.
 #[test]
 fn crash_inside_a_stepped_compact() {
-    let t = Template::encrypted();
+    let t = Template::new();
     let base = Case {
         crash: true,
         ..stepped(&Case {
@@ -1159,9 +1149,9 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact List index.h/",
     "compact Get index.h/",
     // the registration (flagged `writes_heads`) and its listing of
-    // `sessions/` for a live exclusive session (10-single-protocol step 8;
-    // a probe of `locks/`, no step, before), the re-read of `config` (no
-    // step), then the single-writer check (step 7)
+    // `sessions/` for a live exclusive session (10-single-protocol step 8),
+    // the re-read of `config` (no step), then the single-writer check
+    // (step 7)
     "compact Put sessions/",
     "compact ListMeta sessions/",
     "compact ListMeta sessions/",
@@ -1220,14 +1210,11 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
 ];
 
 /// `AgedSessionReaped`'s claim of a backup's packs deleted by a run that
-/// found the backup's session stale by age at its listing, in both modes:
-/// seed `aged-session-reaped-mark-after-listing-lockfree` (the lock-free
-/// compact listed c's 12 h old key, c's commit mark wrote the next one,
-/// the compact deleted the key it listed and c's packs) and seed
-/// `mixed-aged-session-reaped-before-listing` (a lock client's backup
-/// reaped c's key, its locked compact then listed no key of c, c's commit
-/// mark wrote the next one, the compact deleted c's packs). Each condition
-/// of the claim has a negative that leaves the deletes `Unknown`.
+/// found the backup's session stale by age at its listing: seed
+/// `aged-session-reaped-mark-after-listing-lockfree` (the compact listed
+/// c's 12 h old key, c's commit mark wrote the next one, the compact
+/// deleted the key it listed and c's packs). Each condition of the claim
+/// has a negative that leaves the deletes `Unknown`.
 #[test]
 fn a_delete_after_a_stale_listing_is_claimed_narrowly() {
     stale_listing_claim_is_narrow("aged-session-reaped-mark-after-listing-lockfree");
@@ -1252,7 +1239,7 @@ fn stale_listing_claim_is_narrow(name: &str) {
         .collect();
     assert_eq!(deletes.len(), 2, "{name}: {}", o.report);
     let ev = Evidence::of(&o.sim);
-    let judge = |ev: &Evidence| classify_evidence(ev, &o.report, &o.trace.entries);
+    let judge = |ev: &Evidence| classify_evidence(ev, &o.report);
     assert_eq!(judge(&ev), aged, "{name}");
     let first = ev
         .log
@@ -1360,4 +1347,215 @@ fn stale_listing_claim_is_narrow(name: &str) {
         }
     }
     assert_eq!(judge(&e), unknown, "{name}: the packs were young");
+}
+
+/// `SingleWriterHeadRace` claims the residual's damage and nothing else
+/// (H-late-head-single's route A): with a's EXISTS finding the head, with
+/// the compact's head write gone from the evidence, with the reap of a's
+/// marker gone, or with that reap made young, the damage is `Unknown`; an
+/// unrelated violation stays `Unknown`.
+#[test]
+fn single_writer_head_race_is_claimed_narrowly() {
+    let (sim, _, _, ra, _) = crate::sim::hazards::h_late_head_single_runs(StoreKind::Plain)
+        .unwrap_or_else(|o| panic!("{o:?}"));
+    let (report, sigs) = classify_end_state(&sim);
+    let race = BTreeSet::from([Signature::SingleWriterHeadRace]);
+    let unknown = BTreeSet::from([Signature::Unknown]);
+    assert_eq!(sigs, race, "{report}");
+    let ev = Evidence::of(&sim);
+    let judge = |ev: &Evidence| classify_evidence(ev, &report);
+    assert_eq!(judge(&ev), race, "{report}");
+    let put = ev
+        .log
+        .iter()
+        .find(|r| {
+            r.run == Some(ra.index)
+                && r.op == OpKind::Put
+                && r.key.starts_with("index.h/")
+                && r.outcome == OpOutcome::Ok
+        })
+        .expect("a's head PUT")
+        .clone();
+    let exists = ev
+        .log
+        .iter()
+        .rfind(|r| {
+            r.step < put.step
+                && r.run == Some(ra.index)
+                && r.op == OpKind::Exists
+                && r.key == put.key
+        })
+        .expect("a's head EXISTS")
+        .clone();
+    assert_eq!(exists.outcome, OpOutcome::NotFound);
+
+    let mut e = ev.clone();
+    for r in &mut e.log {
+        if r.step == exists.step {
+            r.outcome = OpOutcome::Ok;
+        }
+    }
+    assert_eq!(judge(&e), unknown, "a's EXISTS found the head");
+
+    let mut e = ev.clone();
+    e.log.retain(|r| {
+        !(r.step > exists.step
+            && r.step < put.step
+            && r.key == put.key
+            && r.op.is_write()
+            && r.run != Some(ra.index))
+    });
+    assert_eq!(judge(&e), unknown, "the compact's head write removed");
+
+    let a_markers: BTreeSet<String> = ev
+        .log
+        .iter()
+        .filter(|r| {
+            r.run == Some(ra.index)
+                && r.op.is_write()
+                && r.key.starts_with("sessions/")
+                && r.key.ends_with(".json")
+        })
+        .map(|r| r.key.clone())
+        .collect();
+    let reaps: Vec<u64> = ev
+        .log
+        .iter()
+        .filter(|d| {
+            d.step > exists.step
+                && d.step < put.step
+                && d.client != put.client
+                && d.deleted_keys().iter().any(|k| a_markers.contains(*k))
+        })
+        .map(|d| d.step)
+        .collect();
+    assert!(!reaps.is_empty(), "the compact reaped a's marker");
+    let mut e = ev.clone();
+    e.log.retain(|r| !reaps.contains(&r.step));
+    assert_eq!(judge(&e), unknown, "the reap removed");
+
+    let mut e = ev.clone();
+    let last_mark = ev
+        .log
+        .iter()
+        .filter(|r| r.run == Some(ra.index) && r.op.is_write() && a_markers.contains(&r.key))
+        .map(|r| r.at)
+        .max()
+        .expect("a's marker write");
+    for r in &mut e.log {
+        if reaps.contains(&r.step) {
+            r.at = last_mark;
+        }
+    }
+    assert_eq!(judge(&e), unknown, "the reap made young");
+
+    let mut unrelated = report.clone();
+    unrelated.violations.push(Violation {
+        invariant: Invariant::CommittedSnapshotsRestore,
+        kind: ViolationKind::RestoreDiffers,
+        subject: "unrelated".into(),
+        detail: "injected by the test".into(),
+        step: None,
+    });
+    assert_eq!(
+        classify_evidence(&ev, &unrelated),
+        BTreeSet::from([Signature::SingleWriterHeadRace, Signature::Unknown]),
+        "an unrelated violation"
+    );
+}
+
+/// `ExclusiveSessionReaped` claims H1-late-clone's invariant-13 violations
+/// only with the delete of the holder's live marker: without it they are
+/// `Unknown`.
+#[test]
+fn exclusive_session_reaped_is_claimed_narrowly() {
+    let (sim, ra, rb, _) =
+        crate::sim::interleavings::h1_late_clone_runs().unwrap_or_else(|o| panic!("{o:?}"));
+    let (report, sigs) = classify_end_state(&sim);
+    assert_eq!(
+        sigs,
+        BTreeSet::from([Signature::ExclusiveSessionReaped]),
+        "{report}"
+    );
+    let ev = Evidence::of(&sim);
+    let a_markers: BTreeSet<String> = ev
+        .log
+        .iter()
+        .filter(|r| r.run == Some(ra.index) && r.op.is_write() && r.key.starts_with("sessions/x-"))
+        .map(|r| r.key.clone())
+        .collect();
+    let reaps = |d: &OpRecord| {
+        d.client == rb.client && d.deleted_keys().iter().any(|k| a_markers.contains(*k))
+    };
+    let mut e = ev.clone();
+    let before = e.log.len();
+    e.log.retain(|d| !reaps(d));
+    assert!(e.log.len() < before, "b deleted a's marker");
+    assert_eq!(
+        classify_evidence(&e, &report),
+        BTreeSet::from([Signature::Unknown]),
+        "the reaping delete removed"
+    );
+    // The delete after a's first violation: whatever came after it, that
+    // violation is not the reap's.
+    let first_reap = ev
+        .log
+        .iter()
+        .filter(|d| reaps(d))
+        .map(|d| d.step)
+        .min()
+        .expect("the reaping delete");
+    let mut early = report.clone();
+    early
+        .violations
+        .iter_mut()
+        .filter(|v| v.invariant == Invariant::ExclusiveSessions)
+        .min_by_key(|v| v.step)
+        .expect("an invariant-13 violation")
+        .step = Some(first_reap);
+    assert_eq!(
+        classify_evidence(&ev, &early),
+        BTreeSet::from([Signature::Unknown]),
+        "the delete after the first violation"
+    );
+}
+
+/// A cascading signature claims no invariant-13 violation (only
+/// `ExclusiveSessionReaped` does): a `WriteWithoutSession` after H3's late
+/// head stays `Unknown`.
+#[test]
+fn a_late_head_does_not_claim_an_exclusive_session_violation() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/sim-regressions/h3-random.json");
+    let seed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the seed")).expect("json");
+    let c: Case = serde_json::from_value(seed["case"].clone()).expect("the seed's case");
+    let o = Templates::new().run(&c);
+    assert_eq!(
+        o.signatures,
+        BTreeSet::from([Signature::LateHeadWrite]),
+        "{}",
+        o.trace.render()
+    );
+    let late = o
+        .sim
+        .store()
+        .log()
+        .iter()
+        .filter(|r| matches!(r.outcome, OpOutcome::Released(_)) && r.key.starts_with("index.h/"))
+        .map(|r| r.step)
+        .min()
+        .expect("a released head write");
+    let mut report = o.report.clone();
+    report.violations.push(Violation {
+        invariant: Invariant::ExclusiveSessions,
+        kind: ViolationKind::WriteWithoutSession,
+        subject: "no run".into(),
+        detail: "injected by the test".into(),
+        step: Some(late + 1),
+    });
+    assert_eq!(
+        classify(&o.sim, &report),
+        BTreeSet::from([Signature::LateHeadWrite, Signature::Unknown])
+    );
 }

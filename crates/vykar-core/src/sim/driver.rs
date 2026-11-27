@@ -15,25 +15,22 @@
 //!
 //! A backup is upload (registration, open, phase 1 and the commit mode's
 //! decision), then its commit protection one step per decision, with up to
-//! [`LOCK_ATTEMPTS`] contended steps: on a single-writer repository the
-//! listing of `sessions/` before the mark, the commit mark, the listing
-//! after it and the probe of `locks/` (10-single-protocol step 7); on a
-//! multi-writer one the mark and the probe (04 step 9); the suspend rule
-//! runs in the probe's decision. Then one decision per step of its
-//! `BackupCommit` machine (`Local` steps run right after the step before
-//! them), then its finish.
+//! [`PROTECTION_ATTEMPTS`] contended steps: on a single-writer repository
+//! the listing of `sessions/` before the mark, the commit mark, the listing
+//! after it and the pre-head listing of `sessions/` for a live exclusive
+//! session (10-single-protocol steps 7 and 8); on a multi-writer one the
+//! mark and the pre-head listing; the suspend rule runs in the pre-head
+//! listing's decision. Then one decision per step of its `BackupCommit`
+//! machine (`Local` steps run right after the step before them), then its
+//! finish.
 //! Compact is one decision (`Maintenance::Whole`, every seed recorded
 //! before 04 step 7) or one decision per protocol-key operation
 //! (`Stepped`: gate-stepped on its own thread; the commit machines are
-//! steppable, compact is not a machine; see [`is_maintenance_step`]). No
-//! time jump is offered while a stepped compact under the lock is in
-//! flight: it would hold the maintenance lock for its whole run, and a
-//! jump inside it would make it the victim of an aged-lock reap (H4's
-//! family), which no signature describes. A stepped compact in a session
-//! (phase F part 10d; every driver compact since 10-single-protocol step 7:
-//! it registers a session marker, its heartbeat running beside its gated
-//! main thread) is offered jumps inside it too. Jumps before and after it,
-//! and crashes, are offered.
+//! steppable, compact is not a machine; see [`is_maintenance_step`]). A
+//! stepped compact runs in a session (it registers a session marker, its
+//! heartbeat running beside its gated main thread), so jumps of time are
+//! offered inside it as well as before and after it; crashes are offered
+//! too.
 //! Delete is one decision. Both run their index writes through the same
 //! publish machine, driven to the end inside the command.
 //!
@@ -67,28 +64,32 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::VykarError;
 
 /// Contended attempts of a backup's commit protection (a single-writer
-/// listing that found another head writer, a probe that found a live
-/// lock) before it gives up with `Locked` (production waits up to 2 hours
-/// of real time instead).
-pub const LOCK_ATTEMPTS: u32 = 3;
+/// listing that found another head writer, a pre-head listing that found a
+/// live exclusive session) before it gives up with `Locked` (production
+/// waits up to 2 hours of real time instead).
+pub const PROTECTION_ATTEMPTS: u32 = 3;
 
 /// More decisions than this in one case is a harness bug.
 pub const MAX_DECISIONS: usize = 400;
 
 /// Jumps of virtual time a decision can offer (1 min, 16 min, 46 min,
-/// 3 h 1 min, 6 h 1 min): past the heartbeat poll, the session refresh,
-/// the session staleness, the lock refresh and the lock staleness.
-pub const ADVANCES: [u64; 5] = [61, 960, 2760, 10860, 21660];
+/// 6 h 1 min): past the heartbeat poll, the session refresh, the marker-gap
+/// limit and the session staleness, and (two of them) T_pack,
+/// INDEX_OBJECT_GRACE, PACK_AGE_LIMIT and INDEX_WRITE_LIMIT; nothing shorter
+/// reaches 12 h within [`MAX_ADVANCES`]. Between 46 min and 6 h 1 min lie
+/// HEAD_FRESHNESS_LIMIT (50 min), T_IDX (1 h), CLOCK_PROBE_DEBRIS_AGE (1 h)
+/// and COMMIT_MAX_WAIT (2 h): crossing 50 min or 1 h without crossing 6 h
+/// costs two jumps, and a case past T_IDX, under 6 h and past T_pack is out
+/// of one case's reach (scripted tests cover those thresholds). The
+/// 3 h 1 min jump of the lock's refresh went with the lock
+/// (10-single-protocol step 10).
+pub const ADVANCES: [u64; 4] = [61, 960, 2760, 21660];
 
 /// At most this many jumps of time per case.
 pub const MAX_ADVANCES: usize = 3;
 
 /// Real time to wait for the heartbeats to settle after a step.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Lock staleness of the removed lock protocol (6 h), on the store's clock;
-/// recorded seeds still replay its advances (10-single-protocol step 10).
-const STALE_LOCK_SECS: i64 = 6 * 3600;
 
 /// Session staleness of today's protocol (`SESSION_STALE_SECS`), on the
 /// store's clock since 04 step 5.
@@ -136,13 +137,12 @@ pub enum Command {
 }
 
 /// The keys a fault matches: `index.h/`, `index.d/`, `snapshots/`,
-/// `locks/`, `sessions/`.
+/// `sessions/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyClass {
     IndexHead,
     IndexObject,
     Snapshot,
-    Lock,
     Session,
 }
 
@@ -152,7 +152,6 @@ impl KeyClass {
             KeyClass::IndexHead => "index.h/",
             KeyClass::IndexObject => "index.d/",
             KeyClass::Snapshot => "snapshots/",
-            KeyClass::Lock => "locks/",
             KeyClass::Session => "sessions/",
         }
     }
@@ -192,6 +191,7 @@ fn yes() -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Case {
     pub hosts: HostPlan,
     /// One script per client (1..=3 clients, named a, b, c), run in order.
@@ -220,61 +220,30 @@ pub struct Case {
     /// the checker also judges invariant 12 and every retained head.
     #[serde(default, skip_serializing_if = "StoreKind::is_plain")]
     pub storage: StoreKind,
-    /// The template a case forks (phase F part 10): Plain (every seed before
-    /// part 10b) or Encrypted, where the lock-free path exists (O1). Since
-    /// 10-single-protocol step 2 both build the same encrypted repository;
-    /// Plain is only the label of cases recorded before then.
-    #[serde(default, skip_serializing_if = "TemplateKind::is_plain")]
+    /// The template a case forks. Required since 10-single-protocol step
+    /// 10: a seed or trace without it, or with "Plain", does not parse.
     pub template: TemplateKind,
-    /// Clients (indices into clients) whose storage handle offers no
-    /// put-if-absent: they run the lock protocol beside the others.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lock_clients: Vec<u8>,
 }
 
-/// The repository a [`Template`] holds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The repository a [`Template`] holds. `Plain` (the label of cases
+/// recorded before 10-single-protocol step 2, which ran encrypted since)
+/// went in step 10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TemplateKind {
-    /// Recorded before 10-single-protocol step 2, when it was plaintext
-    /// (every seed recorded before phase F part 10b). It now runs encrypted,
-    /// the same repository as `Encrypted`. Step 10 removes it.
-    #[default]
-    Plain,
     /// AES-256-GCM with a cheap KDF: object names are random per run
     /// (nonces), so nothing the driver decides may depend on them.
     Encrypted,
 }
 
-impl TemplateKind {
-    // serde's `skip_serializing_if` passes a reference.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub fn is_plain(&self) -> bool {
-        *self == TemplateKind::Plain
-    }
-}
-
 /// How the driver runs a Compact command.
 ///
 /// Since 04 step 7 (phase F part 8b) `Stepped` is drawn in cases with time
-/// jumps and with crashes, but the driver offers no jump while a stepped
-/// compact is in flight: one held between its fence check and its head
-/// PUT, or between the head PUT and its pack deletes, across a 6 h jump
-/// would become the aged-lock victim itself (H4's family, a known hazard
-/// with its own scripted scenario), and the signatures describe backups as
-/// victims. 8b's mechanisms need no jump inside compact: the horizon is
-/// read at the session listing, the age at the pack listing, I8 at the
-/// commit. That a jump between compact's listings only makes its "now"
-/// (the lock key's mtime) older, which errs young, is argued, not searched.
-/// A crash of the compact's client stays as before
-/// (`crash_inside_a_stepped_compact`). 04 step 8 (phase F part 9) makes
-/// maintenance heads put-if-absent; jumps inside a stepped compact on a
-/// conditional store are its separable step 3.12, not built (part 9's
-/// report). Phase F part 10d: a lock-free stepped compact (encrypted
-/// template, a handle whose put-if-absent check passed) holds no lock, so
-/// jumps are offered inside it (`MaintRun::session`); its marker's
-/// heartbeat keeps it live across them, and a jump inside it only makes
-/// its "now" (its marker key's mtime, read at its session listing) older,
-/// which errs young.
+/// jumps and with crashes. A stepped compact runs in a session (every
+/// driver compact since 10-single-protocol step 7), so jumps are offered
+/// inside it; its marker's heartbeat keeps it live across them, and a jump
+/// inside it only makes its "now" (its marker key's mtime, read at its
+/// session listing) older, which errs young. A crash of the compact's
+/// client is offered too (`crash_inside_a_stepped_compact`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Maintenance {
     /// One decision for the whole command (every seed recorded before 04
@@ -294,9 +263,8 @@ impl Maintenance {
     }
 }
 
-/// The name of a session's heartbeat thread: a lock-free stepped compact's
-/// heartbeat runs beside its gated main thread, its operations are not
-/// steps.
+/// The name of a session's heartbeat thread: a stepped compact's heartbeat
+/// runs beside its gated main thread, its operations are not steps.
 const HEARTBEAT_THREAD: &str = crate::repo::sessions::HEARTBEAT_THREAD_NAME;
 
 /// Most step operations one stepped compact makes; one more is a harness
@@ -314,36 +282,17 @@ const FIRST_PACK_SHARD: &str = "packs/00/";
 
 /// Whether `op` on `key` is a step boundary of a stepped compact: every
 /// operation under `sessions/`, `index.h/`, `index.d/`, `snapshots/` and
-/// `packmaps/`, the lock fence (an EXISTS of the lock key), every delete
-/// under `packs/`, and the listing of the first pack shard. Pack PUTs
-/// (repack outputs) and pack reads are not steps: they are not where
-/// clients interact, and the listing of the other shards runs inside the
-/// decision of the first.
-///
-/// No compact touches `locks/` since 10-single-protocol step 8 (its
-/// registration lists `sessions/`); the rule is kept for the lock until
-/// step 9 deletes it.
-///
-/// The other operations under `locks/` (the acquisition with its pre-check
-/// listing, clock probe, PUT and listing, a reap, the release) run inside a
-/// decision, as a backup's lock attempt is one decision: the checker counts
-/// a lock key as held from its PUT (`sim::checker`, invariant 7), so a
-/// contender's tentative key must not outlive a decision. Held between its
-/// pre-check and its PUT, compact would publish a key after another client
-/// acquired the lock compact had found free, and back off only at its next
-/// step. The raw lock protocol op by op is `tests::sim_exhaustive`'s
-/// gate-stepped search.
+/// `packmaps/`, every delete under `packs/`, and the listing of the first
+/// pack shard. Pack PUTs (repack outputs) and pack reads are not steps:
+/// they are not where clients interact, and the listing of the other shards
+/// runs inside the decision of the first.
 ///
 /// A probe (`crate::repo::ages::is_probe_key`: the put-if-absent check's
-/// `sessions/vykar-probe-*`, the clock probes) is never a step, wherever it
-/// lives: the check runs inside the step that needs it, as it did when its
-/// probe lived under `locks/`.
+/// `sessions/vykar-probe-*`, the clock probes) is never a step: the check
+/// runs inside the step that needs it.
 pub fn is_maintenance_step(op: OpKind, key: &str) -> bool {
     if crate::repo::ages::is_probe_key(key) {
         return false;
-    }
-    if key.starts_with("locks/") {
-        return op == OpKind::Exists;
     }
     const PROTOCOL: [&str; 5] = [
         "sessions/",
@@ -369,19 +318,19 @@ pub enum Policy {
     #[default]
     First,
     /// The first action [`free_actions`] marks free: the client that stepped
-    /// last continues; when it has no step, or its last step found the lock
-    /// taken or ended its command, the lowest client with a step; when no
-    /// client has work, `Stop`. The bounded search (`sim::explore`) runs
-    /// cases with it.
+    /// last continues; when it has no step, or its last step found
+    /// contention ([`LABEL_LOCKED`]) or ended its command, the lowest client
+    /// with a step; when no client has work, `Stop`. The bounded search
+    /// (`sim::explore`) runs cases with it.
     Continue,
 }
 
 /// The label of a backup's protection step that found contention: a
 /// single-writer listing that found another head writer (the backup
 /// waits, unmarked), or a pre-head listing of `sessions/` that found a live
-/// exclusive session (10-single-protocol step 8; a probe of `locks/` that
-/// found a live lock before).
-pub const LABEL_LOCKED: &str = "lock (locked)";
+/// exclusive session (10-single-protocol step 8). "lock (locked)" until
+/// step 10.
+pub const LABEL_LOCKED: &str = "wait (locked)";
 
 /// The label of a backup's commit mark (04 step 9; both modes since
 /// 10-single-protocol step 7).
@@ -394,10 +343,9 @@ pub const LABEL_LIST_WRITERS: &str = "list-writers";
 
 /// The label of a backup's pre-head listing of `sessions/` that found no
 /// live exclusive session (one that did is [`LABEL_LOCKED`]); the suspend
-/// rule runs in the same decision. Named for the probe of `locks/` it
-/// replaced in 10-single-protocol step 8; the label is historical, recorded
-/// in the seeds, and renamed with them in step 10.
-pub const LABEL_PROBE_LOCKS: &str = "probe-locks";
+/// rule runs in the same decision. "probe-locks" until 10-single-protocol
+/// step 10.
+pub const LABEL_LIST_EXCLUSIVE: &str = "list-exclusive";
 
 /// Which of `actions` are free under preemption bounding, given the
 /// decisions before it (`previous`): the pick-0 step of the client that
@@ -434,7 +382,8 @@ impl Case {
 }
 
 /// A store with init and the control backup `c0` (client "ctl", with the
-/// shared file), forked per case.
+/// shared file), forked per case: an encrypted repository on the fallback
+/// store (`StoreKind::Plain`), whatever `runner::with_store_kind` says.
 pub struct Template {
     sim: Sim,
     kind: TemplateKind,
@@ -448,23 +397,7 @@ impl Default for Template {
 
 impl Template {
     pub fn new() -> Self {
-        Self::build(true, TemplateKind::Plain)
-    }
-
-    /// [`Self::new`] on an encrypted repository (`TemplateKind::Encrypted`).
-    pub fn encrypted() -> Self {
-        Self::build(true, TemplateKind::Encrypted)
-    }
-
-    /// [`Self::young`] on an encrypted repository.
-    pub fn encrypted_young() -> Self {
-        Self::build(false, TemplateKind::Encrypted)
-    }
-
-    /// The template for cases of `kind`, aged ([`Self::new`] or
-    /// [`Self::encrypted`]).
-    pub fn of_kind(kind: TemplateKind) -> Self {
-        Self::build(true, kind)
+        Self::build(true)
     }
 
     pub fn kind(&self) -> TemplateKind {
@@ -476,14 +409,11 @@ impl Template {
     /// keeps it as a segment (the young-entries rule of 04 step 7 under
     /// search, `tests::sim_exhaustive`).
     pub fn young() -> Self {
-        Self::build(false, TemplateKind::Plain)
+        Self::build(false)
     }
 
-    fn build(aged: bool, kind: TemplateKind) -> Self {
-        let mut sim = match kind {
-            TemplateKind::Plain => Sim::new(),
-            TemplateKind::Encrypted => Sim::with_config(super::store::SimConfig::default()),
-        };
+    fn build(aged: bool) -> Self {
+        let mut sim = Sim::with_config(super::store::SimConfig::default());
         let ctl = sim.client("ctl");
         sim.backup(ctl, "c0", &backup_tree("c0", true)).expect_ok();
         if aged {
@@ -493,7 +423,10 @@ impl Template {
             // reuse of a swept chunk stay reachable without jumps.
             sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
         }
-        Self { sim, kind }
+        Self {
+            sim,
+            kind: TemplateKind::Encrypted,
+        }
     }
 
     /// A fork of the template, as each case starts from.
@@ -508,12 +441,10 @@ impl Template {
     }
 }
 
-/// One aged template of each kind, each built on first use: what a caller
-/// that runs cases of either kind holds (the campaign, the seed runner,
-/// replays).
+/// The aged template, built on first use: what a caller that runs cases
+/// holds (the campaign, the seed runner, replays).
 #[derive(Default)]
 pub struct Templates {
-    plain: std::cell::OnceCell<Template>,
     encrypted: std::cell::OnceCell<Template>,
 }
 
@@ -525,8 +456,7 @@ impl Templates {
     /// The template of `kind`, built on first use.
     pub fn get(&self, kind: TemplateKind) -> &Template {
         match kind {
-            TemplateKind::Plain => self.plain.get_or_init(Template::new),
-            TemplateKind::Encrypted => self.encrypted.get_or_init(Template::encrypted),
+            TemplateKind::Encrypted => self.encrypted.get_or_init(Template::new),
         }
     }
 
@@ -575,32 +505,27 @@ pub enum Action {
 /// Each signature claims the violations it explains, and is inserted only
 /// when it claims one; a violation no signature claims, or a skipped
 /// evaluation without a cascading signature, adds `Unknown` next to the
-/// named ones. Most signatures claim narrowly: the lock-exclusion violation
-/// they are derived from, or the violations of one run and its snapshot.
-/// `TwoLockHolders`, `LateHeadWrite`, `LateHeadThenCompact` and
-/// `LateHeadSegmentCollected` cascade:
-/// they leave real damage that later commands fail on, so each claims every
-/// violation not known to come before its hazard event (the reap, the
-/// released head write), and every skipped evaluation. A violation with a
-/// known store step earlier than the hazard is not theirs. Only
-/// lock-exclusion violations carry a store step today, so a cascading
-/// signature excuses every other violation of its case: "no `Unknown`" is a
-/// weak guard for such cases until the hazards are gone. Part 5 of
-/// clean-design phase F (04 step 1) removed `TwoLockHolders`' source;
-/// part 7 (04 step 5: ages on the store's clock, young orphan packs kept)
-/// narrowed `AgedSessionReaped`, `AgedLockPacksCollected` and
-/// `LateHeadThenCompact`; part 8c (04 step 7: young backup segments keep
-/// their entries from a sweep and stay out of folds; packs a sweep empties
-/// are kept while young) narrowed `AgedSessionReaped` and
-/// `LateSnapshotWrite` and put `AgedLockPacksCollected` out of the
-/// driver's reach; part 9 (04 step 8: heads created with put-if-absent)
-/// closes `LateHeadWrite`, `LateHeadThenCompact`,
-/// `LateHeadSegmentCollected`, `AgedLockSegmentCollected` and
-/// `AgedLockPacksCollected` on conditional stores (`Case::storage`) and
-/// narrows `LateIndexWrite` there; the fallback store (`StoreKind::Plain`)
-/// keeps them all. Part 10c (lock-free backups) adds the mixed-mode
-/// residual `LateHeadCreateReplaced`, which claims one overwrite and
-/// never cascades.
+/// named ones. Most signatures claim narrowly: the violations of one run
+/// and its snapshot, or the ones their evidence names. `LateHeadWrite`,
+/// `LateHeadThenCompact` and `LateHeadSegmentCollected` cascade: they
+/// leave real damage that later commands fail on, so each claims every
+/// violation not known to come before its hazard event (the released head
+/// write), and every skipped evaluation, but never an invariant-13 one
+/// (`ExclusiveSessionReaped` alone claims those). Violations of
+/// invariants 10, 11, 12 and 13 carry a store step; a cascading signature
+/// claims those at or after its hazard step and every step-less one, so
+/// "no `Unknown`" is a weak guard for such cases. Part 7 of clean-design
+/// phase F (04 step 5: ages on the store's clock, young orphan packs kept)
+/// narrowed `AgedSessionReaped` and `LateHeadThenCompact`; part 8c (04
+/// step 7: young backup segments keep their entries from a sweep and stay
+/// out of folds; packs a sweep empties are kept while young) narrowed
+/// `AgedSessionReaped` and `LateSnapshotWrite`; part 9 (04 step 8: heads
+/// created with put-if-absent) closes `LateHeadWrite`,
+/// `LateHeadThenCompact` and `LateHeadSegmentCollected` on multi-writer
+/// repositories; single-writer ones (`StoreKind::Plain`) keep them.
+/// 10-single-protocol step 10 removed the lock's signatures with the lock
+/// and named the single-writer residual (`SingleWriterHeadRace`) and the
+/// reaped exclusive session (`ExclusiveSessionReaped`).
 ///
 /// The driver's time jumps move the store and every client clock together,
 /// so a jump is a genuine stall of every client, and ages on the store's
@@ -608,18 +533,6 @@ pub enum Action {
 /// client wall clocks, which no protocol decision reads since 04 step 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Signature {
-    /// H1: a protected write by a client whose live lock another client on
-    /// the same hostname (another boot ID) reaped while it was younger than
-    /// the stale age. Also derived, without a checker violation, when the
-    /// victim's run makes an ordinary (not released) write to `index.d/`,
-    /// `index.h/` or `snapshots/` after a young reap: a delayed or
-    /// duplicated lock PUT of the victim's can recreate the reaped key, so
-    /// the checker sees a holder (seed `h1-duplicated-lock`). A young reap
-    /// of a live lock by another client: H1 before 04 step 1 (installation
-    /// ID); since then only [`HostPlan::LateClone`] produces it (the known
-    /// hazard H1-late-clone), so a case on another host plan that shows it
-    /// is a regression.
-    TwoLockHolders,
     /// H1-session: a live backup's session marker deleted by another client
     /// (same hostname, other boot ID) while younger than the session
     /// staleness; compact then deletes the backup's uploads and its commit
@@ -668,15 +581,9 @@ pub enum Signature {
     /// uploads inside their marker's horizon as well as by age; a reaped
     /// marker leaves only the age guard, and a victim whose marker record
     /// is broken commits only while its packs are younger than T_pack − M
-    /// − 30 min (I8). Since phase F part 10c also R5, the mixed-mode case:
-    /// a lock-free writer's `committing` marker reaped by age while it still
-    /// creates heads, so a lock holder no longer yields to it, and the
-    /// holder's plain head PUT replaces the lock-free head (also when that
-    /// PUT timed out and landed late, seed
-    /// `mixed-aged-marker-late-compact-head`); claims that
-    /// `HeadOverwritten` and the damage from it on. A lock-free commit
-    /// probes its marker before its snapshot PUT, so a reap before that
-    /// probe ends it `MarkerLostDuringCommit`. Since 04 step 7's young segments (phase F part 8c) a
+    /// − 30 min (I8). A commit probes its marker before its snapshot PUT,
+    /// so a reap before that probe ends it `MarkerLostDuringCommit`. Since
+    /// 04 step 7's young segments (phase F part 8c) a
     /// victim's own segment stays a segment until T_pack old and the sweep
     /// leaves its additions, and packs a sweep empties are kept while
     /// young: the swept-packs route needs a stall of T_pack in all between
@@ -684,63 +591,38 @@ pub enum Signature {
     /// `aged-session-reaped-swept-packs-old-segment`). Left by part 9 (04
     /// step 8): the sweep cannot mark a snapshot not yet written; part 10
     /// (04 step 9 and 05's `reused` section). Since phase F part 10d's fix
-    /// round also a lock-free compact's residual: it checks its marker
+    /// round also a compact's residual: it checks its marker
     /// before every head create and batch of deletes, so what remains is a
     /// reap by age while a head create is in flight after that check. The
     /// signature claims the compact's repack outputs another client deleted
     /// after the reap (`IndexNamesAbsentPack`) and the restores that need
-    /// them, and the violations of a snapshot a lock-path run committed
-    /// between the reap and that create (with a later compact's refusal to
-    /// mark it); nothing else. That claim cannot tell a reap after the
+    /// them; nothing else. That claim cannot tell a reap after the
     /// compact's marker check from a compact that never checked: with the
     /// fence in place the two look alike, so the scripted tests in which the
     /// compact stops at its marker check guard the fence, not campaigns.
     /// Since part 10d's fix rounds 2 and 3 also a backup whose session a
-    /// compact (in either mode) found stale by age at its listing, judged as
+    /// compact found stale by age at its listing, judged as
     /// production judges it (the newest key against the compact's own "now"),
     /// whichever run deleted the stale keys: the victim then wrote its next
     /// key (its commit mark) and the compact deleted its old uploads as
-    /// orphans while that key was present (invariant 10; seeds
-    /// `aged-session-reaped-mark-after-listing-lockfree`,
-    /// `mixed-aged-session-reaped-before-listing`). The victim's record has
+    /// orphans while that key was present (invariant 10; seed
+    /// `aged-session-reaped-mark-after-listing-lockfree`). The victim's record has
     /// a gap and its packs are past `PACK_AGE_LIMIT`, so its commit refuses
     /// before a head. Claims those pack deletes, of packs past
     /// `PACK_AGE_LIMIT` at the compact's "now", by the listing run, while
     /// the victim wrote no snapshot and every key of it present was written
     /// after the listing; nothing else.
     AgedSessionReaped,
-    /// A protected write by a client whose lock another client reaped by
-    /// age (not written for more than the 6 h stale age: the driver's time
-    /// jumps, a genuine stall of the holder). The fallback protocol's
-    /// documented limit; since 04 step 5 the age is the lock key's mtime on
-    /// the store's clock, which only a stall (or a store clock step) moves
-    /// past the stale age. Left by part 9 (04 step 8): the lock stays on
-    /// the commit path; on conditional stores fewer of its writes remain (a
-    /// taken create writes nothing). Part 10 (04 step 9) takes the lock off
-    /// it. Claims the lock-exclusion violation it is derived from.
-    /// Since phase F part 10c (lock-free backups) also R4, the mixed-mode
-    /// case: a lock-mode run whose lock was reaped by age goes on and
-    /// plain-PUTs a head over one a lock-free writer created meanwhile
-    /// (`StoreKind::ConditionalOverwrite`: local, SFTP, S3). Claims that
-    /// `HeadOverwritten` and, from it on, the damage it cascades to (the
-    /// replaced head's snapshot loses its index coverage); it was known
-    /// hazard `H-mixed-aged-lock` until 10-single-protocol step 7 retired
-    /// it with lock-mode commits.
-    AgedLockReaped,
-    /// A protected write while the store held a lock key that a delayed or
-    /// duplicated lock PUT left behind after its writer had deleted it (a
-    /// key with no holder). The fallback protocol's limit; left by part 9,
-    /// part 10 (04 step 9) takes the lock off the commit path. Claims the
-    /// lock-exclusion violation it is derived from.
-    OrphanLockKey,
     /// H3: a released write of `index.h/` (a head PUT that timed out and
-    /// landed after the lock was released), and a committed snapshot lost
+    /// landed after the next commit), and a committed snapshot lost
     /// its index coverage: one whose backup returned Ok, whose
     /// `snapshots/` PUT applied before the release, or whose backup's own
     /// head the release overwrote before its (not delayed) snapshot PUT.
     /// Closed on conditional stores by 04 step 8 (phase F part 9): a
     /// released create finds its generation taken; the fallback (`Plain`)
-    /// keeps it.
+    /// keeps it. Also the racy store's route (`StoreKind::RacyRelease`, known
+    /// hazard H-racy): a released put-if-absent create lands late and
+    /// overwrites whatever head is there.
     LateHeadWrite,
     /// H3-compact: a released write of `index.h/`, and the index names an
     /// absent pack. Since 04 step 5 compact deletes only orphan packs older
@@ -748,7 +630,7 @@ pub enum Signature {
     /// past the object grace too (T_idx until phase F part 10b2, T_pack
     /// since: `index_store::INDEX_OBJECT_GRACE`), so the compact's index GC
     /// takes it and the case shows `LateHeadSegmentCollected` instead; the packs must age before the
-    /// segment is written (jumps between the uploads and the commit lock,
+    /// segment is written (jumps between the uploads and the commit protection,
     /// seed `late-head-then-compact-old-packs`). Since 04 step 7 (phase F
     /// part 8b) I8 narrows it further: a backup whose marker went
     /// unrefreshed commits only while its packs are younger than T_pack − M
@@ -782,132 +664,42 @@ pub enum Signature {
     /// only right after it created the latest head, so the late create
     /// finds its generation taken; the fallback (`Plain`) keeps it.
     LateHeadSegmentCollected,
-    /// 04 "Current issues" 3 with the second holder coming from the 6 h
-    /// lock staleness: victim V wrote an `index.d/` segment S under its
-    /// lock; jumps of time age the lock past the stale age (and S past
-    /// `INDEX_OBJECT_GRACE`); another client reaps the lock and its index GC
-    /// deletes S, which no head names yet (the limit
-    /// `collect_index_garbage`'s doc names); V's head PUT, outside any
-    /// lock, then names S. Requires all of: an aged reap of V's lock at
-    /// step r, an applied PUT of S by V, an applied delete of S by another
-    /// client after r, a later non-released `index.h/` PUT by V that
-    /// violates lock exclusion, and S named absent (`HeadObjectAbsent`,
-    /// or a run's `DisallowedError` when a later fold of V's published a
-    /// head without S). Claims that
-    /// `HeadObjectAbsent`, the `ChainUnloadable` naming S, the
-    /// `DisallowedError` naming S of runs that end after V's head PUT, and
-    /// the skipped evaluations; the head PUT's own lock violation stays
-    /// `AgedLockReaped`'s. Left by 04 step 5 (the lock is reaped by genuine
-    /// age, the segment collected at T_idx = 1 h). Closed on conditional
-    /// stores by 04 step 8 (phase F part 9): the reaper's compact created
-    /// the generation before collecting, so the victim's create finds it
-    /// taken (its retry's writes after the reap stay `AgedLockReaped`'s).
-    /// Closed on every store by phase F part 10b2: S is collected only once
-    /// 12 h old (`INDEX_OBJECT_GRACE`), and V's head create refuses when its
-    /// first object PUT started more than 11 h 20 min before
-    /// (`ages::INDEX_WRITE_LIMIT`; seed `aged-lock-segment-collected`).
-    /// A head PUT issued before that and released late is
-    /// `LateHeadSegmentCollected`'s.
-    AgedLockSegmentCollected,
-    /// The same aged reap with packs instead of a segment: victim V's lock
-    /// and session marker age past their staleness in one jump of time;
-    /// another client's compact reaps both and deletes V's uploaded packs
-    /// as orphans; V's head PUT, outside any lock, then publishes entries
-    /// naming them (directly, or through a later fold of V's that carries
-    /// them). Requires an aged reap of V's lock at step r, an applied
-    /// delete after r by another client of a pack V PUT, and a later
-    /// non-released `index.h/` PUT by V that violates lock exclusion;
-    /// claims the `IndexNamesAbsentPack` of those packs. Since 04 step 5
-    /// V's packs must be at least T_pack (12 h) old on the store's clock at
-    /// the compact: a jump between V's uploads and its commit lock, one
-    /// before its fence (which refreshes the lock) and one after (seed
-    /// `aged-lock-packs-collected-old-packs`). Since 04 step 7 (phase F
-    /// part 8b) I8 narrows it: V's head must pass its fence before its
-    /// packs are T_pack − M − 30 min old (11 h 20 min), so the last jump
-    /// must come after the fence (a stall after it, the lost-lock hazard).
-    /// From phase F part 8c to 10b2 no driver case reached it: V writes
-    /// every index object before its fence, so the jump that aged its lock
-    /// aged them past T_idx too, and the compact's index GC collected them
-    /// (no head names them yet); V's head then named an absent segment, and
-    /// a later eligible fold of V's kept that segment named (a segment its
-    /// listing lacks reads young): `AgedLockSegmentCollected`. Since 10b2
-    /// unreferenced index objects are kept 12 h (`INDEX_OBJECT_GRACE`), so a
-    /// segment about 6 h old at the compact stays and the case shows this
-    /// signature again (seed `aged-lock-packs-collected-old-packs`). The scripted test
-    /// `an_aged_lock_head_names_packs_compact_deleted` (tests/sim.rs)
-    /// shows it with the compact's `index.d/` deletes failing. In production
-    /// it is reached whenever the compact's index GC does not take V's
-    /// segment after its packs went: a failed best-effort delete, a GC
-    /// stopped by an unreadable retained head, a compact that ends between
-    /// its pack deletes and its index maintenance, or a later full fold of
-    /// V's from its warm index. Closed on conditional stores by 04 step 8
-    /// (phase F part 9), as `AgedLockSegmentCollected`; the fallback
-    /// (`Plain`) keeps it.
-    AgedLockPacksCollected,
     /// A delayed `snapshots/` write released after a compact swept its
-    /// chunks: invariant 1 fails with no lock violation other than late
-    /// index writes (`LateIndexWrite`), writes beside an orphan lock key
-    /// (`OrphanLockKey`), and `index.d/` writes of another run than the
-    /// late snapshot's after an aged reap of that run's lock
-    /// (`AgedLockReaped`; seed `late-snapshot-beside-aged-lock-reap`): a
-    /// segment no head names leaves the late snapshot's index coverage
-    /// alone, while the reaped run's `index.h/` or `snapshots/` writes, or a
-    /// reap of the late snapshot's own run, do not qualify. Claims the
-    /// violations of the snapshot whose PUT was the released write.
-    /// Narrowed by 04 step 7 (phase F part 8c): the late snapshot's own new
-    /// chunks survive while its backup segment is younger than T_pack;
-    /// what remains needs a stall of T_pack between its head and the
+    /// chunks: invariant 1 fails with no invariant-13 violation in the case.
+    /// Claims the violations of the snapshot whose PUT was the released
+    /// write. Narrowed by 04 step 7 (phase F part 8c): the late snapshot's
+    /// own new chunks survive while its backup segment is younger than
+    /// T_pack; what remains needs a stall of T_pack between its head and the
     /// compact (seed `late-snapshot-write-old-segment`), or a chunk it
     /// reused from a snapshot whose segment is old and that nothing else
     /// visible references. Left by part 9: a head visible before its
     /// snapshot needs 05's `reused` section or snapshot-before-head (part 10,
     /// 04 step 9).
     LateSnapshotWrite,
-    /// A released write of `index.h/` or `index.d/` that landed outside
-    /// the lock and damaged nothing else (invariant 7 only): the late-write
-    /// mechanism of H3 without its damage. Claims the lock-exclusion
-    /// violations at released index writes that nothing else claims.
-    /// Narrowed on conditional stores by 04 step 8 (phase F part 9): a
-    /// released head lands only at a generation nobody created, extending
-    /// the head it was built on; released `index.d/` writes remain. Retires
-    /// with invariant 7 when part 10 takes the lock off the commit path.
-    /// Since phase F part 10c also, on `StoreKind::ConditionalOverwrite`, the
-    /// invariant-12 trace of a lock client's released plain head PUT that
-    /// nothing else claimed (no lost coverage, no absent pack): the
-    /// `HeadOverwritten` at the release and the `HeadSkipsPredecessor` of
-    /// the generation after the one it replaced (seed
-    /// `mixed-late-lock-head-replaces-compact-head`: a compact had built
-    /// on the head the late PUT replaced and published the next one), the
-    /// skip only beside that overwrite and only when the next head was
-    /// built on the replaced one before the release (phase F part 10d).
-    /// Also (phase F part 10d) the `HeadOverwritten` of a lock client's
-    /// plain head PUT over such a late head, when the late write's run
-    /// failed without a snapshot (seed `mixed-late-lock-head-replaced`):
-    /// a lock holder that read the head before the late one landed.
-    LateIndexWrite,
-    /// Mixed modes (phase F part 10c) on the store whose plain PUT replaces
-    /// heads (`StoreKind::ConditionalOverwrite`: local, SFTP, S3): a
-    /// lock-free run's head create times out, its GET finds the key absent,
-    /// and the run fails with the error and deregisters, writing no
-    /// snapshot; the abandoned request then lands late, after a lock client
-    /// (no put-if-absent) took the lock, listed sessions (nothing to yield
-    /// to) and read the head before it; the lock client's plain PUT of the
-    /// same generation replaces the late head (`HeadOverwritten`). The
-    /// replaced head named only the failed run's objects, which stay debris;
-    /// no committed snapshot loses coverage. Requires all of: the replaced
-    /// write is a released put-if-absent of `index.h/`, applied after its
-    /// run returned; that run did not succeed and has no applied
-    /// `snapshots/` write; the overwrite is a plain PUT by a lock client
-    /// on `ConditionalOverwrite`. Claims that `HeadOverwritten` only:
-    /// any other violation of the case stays `Unknown`. While the creating
-    /// run is alive (its request in flight) its `committing` marker is
-    /// listed and the lock holder yields, so only a run that gave up on its
-    /// create gets here (known hazard `H-mixed-late-create` and seed
-    /// `mixed-late-create-replaced` until 10-single-protocol step 7 retired
-    /// both: no binary is a lock client). Closed (a campaign failure) without
-    /// lock clients and on `StoreKind::Conditional`, where no plain PUT
-    /// replaces a head.
-    LateHeadCreateReplaced,
+    /// The single-writer residual (10-single-protocol step 7's defeated
+    /// check, named by step 10): a run's plain PUT of `index.h/<g>`, issued
+    /// and applied at once (a released late write is `LateHeadWrite`'s
+    /// mechanism), after its own EXISTS of that key found it absent, while
+    /// another run wrote the key between the EXISTS and the PUT: two writers
+    /// of one generation, the second replacing the first. Requires the stall
+    /// and reap that make it the residual: between the EXISTS and the PUT,
+    /// another client's applied delete of a marker key the PUT's run wrote,
+    /// over the session staleness after that run's last marker write. Routes:
+    /// a stall over the session staleness between the EXISTS and the PUT
+    /// whose marker another writer reaped (a compact; a backup; a
+    /// multi-writer backup after `upgrade --commit-mode multi`): known hazard
+    /// H-late-head-single. Not planned to close; closed where a plain PUT
+    /// cannot replace a head (vykar-server answers 409, read as Taken).
+    /// Claims the replacement (`HeadOverwritten` at the PUT), the replaced
+    /// head's snapshot's lost index coverage, the absent packs the replaced
+    /// head's run deleted before the PUT, and a compact's refusal to mark
+    /// that snapshot; never cascades.
+    SingleWriterHeadRace,
+    /// An exclusive run writes after another client deleted its live
+    /// exclusive marker: young (a late clone misjudging the holder, known
+    /// hazard H1-late-clone) or aged (a stall over 45 min past its write
+    /// check). Claims that run's invariant-13 violations after the delete.
+    ExclusiveSessionReaped,
     /// A violation no signature above claims, or anything not evaluated
     /// with no cascading signature.
     Unknown,
@@ -918,8 +710,7 @@ impl Signature {
     pub fn cascades(self) -> bool {
         matches!(
             self,
-            Signature::TwoLockHolders
-                | Signature::LateHeadWrite
+            Signature::LateHeadWrite
                 | Signature::LateHeadThenCompact
                 | Signature::LateHeadSegmentCollected
         )
@@ -938,8 +729,9 @@ pub struct TraceEntry {
     pub choice: u16,
     pub options: usize,
     pub action: Action,
-    /// What ran: the step's name, "upload", "lock", "finish", "whole", or
-    /// the action's name; steps run at once after it follow with `+`.
+    /// What ran: the step's name, "upload", a protection step's label,
+    /// "finish", "whole", or the action's name; steps run at once after it
+    /// follow with `+`.
     pub label: String,
     /// Each op as "client op key-class outcome", in issue order.
     pub ops: Vec<String>,
@@ -948,7 +740,7 @@ pub struct TraceEntry {
     /// The actions offered at this decision, in the driver's order.
     pub actions: Vec<Action>,
     /// A `Step` that ended its client's command (a finish, a whole
-    /// command, a failed upload, a lock attempt that gave up).
+    /// command, a failed upload, a protection that gave up).
     pub ended: bool,
     /// The store clock after the decision.
     pub clock: DateTime<Utc>,
@@ -1093,9 +885,8 @@ struct MaintRun {
     spawned: Spawned,
     gates: Vec<GateId>,
     next: usize,
-    /// A lock-free compact's session (04 step 9), from its registration
-    /// key's PUT (its first step op): such a compact holds no lock, so time
-    /// jumps are offered inside it.
+    /// The compact's session (04 step 9), from its registration key's PUT
+    /// (its first step op).
     session: Option<String>,
     /// Its heartbeat thread runs: registered and adopted, not yet ended.
     /// Adopted is known from the first step op after the registration's
@@ -1156,9 +947,10 @@ impl MaintRun {
 
 /// A backup between its upload and its commit machine: the steps of
 /// `PendingCommit::protect_commit`, one decision each, with up to
-/// [`LOCK_ATTEMPTS`] contended ones. Single-writer: the listing before the
-/// mark, the mark, the listing after it, the probe; multi-writer: the mark,
-/// the probe. The suspend rule runs in the probe's decision.
+/// [`PROTECTION_ATTEMPTS`] contended ones. Single-writer: the listing
+/// before the mark, the mark, the listing after it, the pre-head listing;
+/// multi-writer: the mark, the pre-head listing. The suspend rule runs in
+/// the pre-head listing's decision.
 struct ProbeWait {
     run: RunCtx,
     pending: PendingCommit,
@@ -1188,9 +980,8 @@ impl Actor {
         !matches!(self.phase, Phase::Idle) || !self.script.is_empty()
     }
 
-    /// Its session is registered and its heartbeat runs. A stepped compact
-    /// under the lock registers no session; a lock-free one does
-    /// (`MaintRun::heartbeat`).
+    /// Its session is registered and its heartbeat runs: a stepped compact's
+    /// once adopted (`MaintRun::heartbeat`).
     fn heartbeat(&self) -> bool {
         match &self.phase {
             Phase::Idle => false,
@@ -1260,12 +1051,6 @@ impl<'c> Driver<'c> {
                 }
             })
             .collect();
-        for &c in &case.lock_clients {
-            let actor = actors
-                .get(usize::from(c))
-                .unwrap_or_else(|| panic!("lock client {c} is not a client of the case"));
-            sim.set_lock_client(actor.client);
-        }
         for (actor, &skew) in actors.iter().zip(&case.skews) {
             if skew != 0 {
                 sim.set_skew(actor.client, chrono::Duration::seconds(skew));
@@ -1275,14 +1060,10 @@ impl<'c> Driver<'c> {
             let Some(actor) = actors.get(usize::from(f.client)) else {
                 continue;
             };
-            // Lock faults land on lock keys only, never on a clock probe
-            // (`locks/vykar-clock-*`), so the count of a class's writes
-            // is the same with and without contention. Session faults
-            // likewise never land on a probe (`sessions/vykar-probe-*`,
+            // Session faults never land on a probe (`sessions/vykar-probe-*`,
             // `sessions/vykar-clock-*`), so a seed's nth session write is
             // the same marker write as before the probes moved there.
             let key = match f.class {
-                KeyClass::Lock => KeyMatch::LockKey,
                 KeyClass::Session => KeyMatch::SessionKey,
                 class => KeyMatch::Prefix(class.prefix().into()),
             };
@@ -1334,13 +1115,7 @@ impl<'c> Driver<'c> {
             }
         }
         out.extend(parked);
-        // No jump inside a stepped compact under the lock (see
-        // `Maintenance`); a lock-free one holds no lock.
-        let in_maint = self
-            .actors
-            .iter()
-            .any(|a| matches!(&a.phase, Phase::Maint(m) if m.session.is_none()));
-        if self.case.advances && self.advances < MAX_ADVANCES && !in_maint {
+        if self.case.advances && self.advances < MAX_ADVANCES {
             out.extend(ADVANCES.iter().map(|&secs| Action::Advance { secs }));
         }
         if self.case.crash && !self.crashed {
@@ -1691,9 +1466,9 @@ impl<'c> Driver<'c> {
     /// One step of a backup's commit protection, mirroring
     /// `PendingCommit::protect_commit`: the listing before the mark
     /// (single-writer), the mark, the listing after it (single-writer), or
-    /// the probe of `locks/` with the suspend rule; a probe that finds no
-    /// live lock and a rule that proceeds start the commit machine in the
-    /// same decision.
+    /// the pre-head listing of `sessions/` with the suspend rule; a listing
+    /// that finds no live exclusive session and a rule that proceeds start
+    /// the commit machine in the same decision.
     fn probe_step(&mut self, i: usize, mut w: Box<ProbeWait>) -> String {
         let single = w.pending.protection_mode() == Some(WriterMode::Single);
         let marked = w.pending.is_marked();
@@ -1737,7 +1512,7 @@ impl<'c> Driver<'c> {
                 Err(e) => self.contended(i, w, e, LABEL_LIST_WRITERS),
             };
         }
-        self.label(i, LABEL_PROBE_LOCKS);
+        self.label(i, LABEL_LIST_EXCLUSIVE);
         let probed = w
             .pending
             .try_probe()
@@ -1754,7 +1529,7 @@ impl<'c> Driver<'c> {
                     pending.repo_mut().request_index_fold();
                 }
                 let commit = pending.begin_commit();
-                let mut label = String::from(LABEL_PROBE_LOCKS);
+                let mut label = String::from(LABEL_LIST_EXCLUSIVE);
                 self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
                 label
             }
@@ -1763,9 +1538,9 @@ impl<'c> Driver<'c> {
                 w.listed_before = false;
                 w.listed_after = false;
                 self.actors[i].phase = Phase::Probe(w);
-                format!("{LABEL_PROBE_LOCKS} (mode changed)")
+                format!("{LABEL_LIST_EXCLUSIVE} (mode changed)")
             }
-            Err(e) => self.contended(i, w, e, LABEL_PROBE_LOCKS),
+            Err(e) => self.contended(i, w, e, LABEL_LIST_EXCLUSIVE),
         }
     }
 
@@ -1776,7 +1551,7 @@ impl<'c> Driver<'c> {
     /// other error, or the last attempt, abandons the commit.
     fn contended(&mut self, i: usize, mut w: Box<ProbeWait>, e: VykarError, label: &str) -> String {
         match e {
-            VykarError::Locked(_) if w.attempts + 1 < LOCK_ATTEMPTS => {
+            VykarError::Locked(_) if w.attempts + 1 < PROTECTION_ATTEMPTS => {
                 w.attempts += 1;
                 w.listed_before = false;
                 w.listed_after = false;
@@ -1921,24 +1696,12 @@ impl<'c> Driver<'c> {
     }
 
     fn verdict(self) -> Outcome {
-        let mut set = vec![
-            Invariant::CommittedSnapshotsRestore,
-            Invariant::AcknowledgedCommitsDurable,
-            Invariant::NoSilentRemoval,
-            Invariant::IndexIntegrity,
-            Invariant::AllowedErrors,
-            Invariant::LockExclusion,
-            Invariant::OrphanGrace,
-            Invariant::MarkerGapCommit,
-        ];
         // Invariant 12 is asked for by the repository's mode: heads are
         // put-if-absent on a multi-writer repository (10-single-protocol
         // step 7; before it, by the store's honouring of creates).
-        if self.case.storage.records_multi_writer() {
-            set.push(Invariant::HeadsImmutable);
-        }
+        let set = Invariant::judged(self.case.storage.records_multi_writer());
         let report = self.sim.check_invariants(&set);
-        let signatures = classify(&self.sim, &report, &self.entries);
+        let signatures = classify(&self.sim, &report);
         let trace = self.trace(&report, &signatures);
         Outcome {
             report,
@@ -1958,33 +1721,6 @@ fn op_line(r: &OpRecord, names: &BTreeMap<ClientId, String>) -> String {
         key_class(&r.key),
         r.outcome.name()
     )
-}
-
-fn is_lock_key(key: &str) -> bool {
-    key.starts_with("locks/") && key.ends_with(".json")
-}
-
-/// A lock key deleted by a client other than its writer.
-struct Reap {
-    /// The store step of the delete.
-    step: u64,
-    /// The key's writer.
-    victim: ClientId,
-    /// The writer's run.
-    run: Option<usize>,
-    /// The lock's age in seconds at the delete: since the key's last
-    /// applied write, on the trace clock.
-    age: Option<i64>,
-}
-
-impl Reap {
-    fn young(&self) -> bool {
-        self.age.is_some_and(|a| a <= STALE_LOCK_SECS)
-    }
-
-    fn aged(&self) -> bool {
-        self.age.is_some_and(|a| a > STALE_LOCK_SECS)
-    }
 }
 
 /// Which violations a case's signatures explain. A signature is inserted
@@ -2030,9 +1766,12 @@ impl<'r> Claims<'r> {
     }
 
     /// A cascading signature (see [`Signature`]) found at store step
-    /// `hazard` claims every violation not known to come before it.
+    /// `hazard` claims every violation not known to come before it, but no
+    /// invariant-13 violation (`ExclusiveSessionReaped` alone claims those).
     fn cascade(&mut self, sig: Signature, hazard: u64) {
-        self.claim(sig, |v| v.step.is_none_or(|s| s >= hazard));
+        self.claim(sig, |v| {
+            v.invariant != Invariant::ExclusiveSessions && v.step.is_none_or(|s| s >= hazard)
+        });
     }
 
     fn finish(mut self) -> BTreeSet<Signature> {
@@ -2046,86 +1785,12 @@ impl<'r> Claims<'r> {
     }
 }
 
-/// [`Signature::LateHeadCreateReplaced`]: `over`, a lock client's plain
-/// head PUT on the store whose plain PUT replaces heads, replaced
-/// `created`, a head create released after its run had returned, by a run
-/// that did not succeed and wrote no snapshot.
-fn late_create_replaced(ev: &Evidence, created: &OpRecord, over: &OpRecord) -> bool {
-    let failed_without_snapshot = created
-        .run
-        .and_then(|i| ev.runs.iter().find(|x| x.index == i))
-        .is_some_and(|run| {
-            run.last_step < created.step
-                && !run.is_ok()
-                && !ev.log.iter().any(|r| {
-                    r.run == Some(run.index)
-                        && r.op.is_write()
-                        && r.applied()
-                        && r.key.starts_with("snapshots/")
-                })
-        });
-    ev.kind == StoreKind::ConditionalOverwrite
-        && over.op == OpKind::Put
-        && ev.lock_clients.contains(&over.client)
-        && created.op == OpKind::PutIfAbsent
-        && matches!(created.outcome, OpOutcome::Released(_))
-        && failed_without_snapshot
-}
-
-/// Whether `over`, a plain head PUT, replaced `late`, a lock client's plain
-/// head PUT released after its run returned, on the store whose plain PUT
-/// replaces heads: `late`'s run did not succeed and wrote no snapshot (so
-/// no committed snapshot depended on that head), and `over` is a lock
-/// client's plain PUT by a lock holder whose last read of `index.h/`
-/// before it came before the late one landed (seed
-/// `mixed-late-lock-head-replaced`): it chose the generation without
-/// seeing the late head.
-fn late_lock_head_replaced(ev: &Evidence, late: &OpRecord, over: &OpRecord) -> bool {
-    let read_before_landing = ev
-        .log
-        .iter()
-        .filter(|r| {
-            r.client == over.client
-                && r.run == over.run
-                && r.step < over.step
-                && !r.op.is_mutation()
-                && r.key.starts_with("index.h/")
-        })
-        .map(|r| r.step)
-        .max()
-        .is_some_and(|read| read < late.step);
-    let failed_without_snapshot = late
-        .run
-        .and_then(|i| ev.runs.iter().find(|x| x.index == i))
-        .is_some_and(|run| {
-            run.last_step < late.step
-                && !run.is_ok()
-                && !ev.log.iter().any(|r| {
-                    r.run == Some(run.index)
-                        && r.op.is_write()
-                        && r.applied()
-                        && r.key.starts_with("snapshots/")
-                })
-        });
-    ev.kind == StoreKind::ConditionalOverwrite
-        && over.op == OpKind::Put
-        && ev.lock_clients.contains(&over.client)
-        && late.op == OpKind::Put
-        && ev.lock_clients.contains(&late.client)
-        && matches!(late.outcome, OpOutcome::Released(_))
-        && failed_without_snapshot
-        && read_before_landing
-}
-
-/// What [`classify_evidence`] reads of a simulation: its store log, its
-/// runs, and the store facts a signature depends on.
+/// What [`classify_evidence`] reads of a simulation: its store log and its
+/// runs.
 #[derive(Clone, Debug)]
 pub(crate) struct Evidence {
     pub log: Vec<OpRecord>,
     pub runs: Vec<RunRecord>,
-    /// Clients whose handles offer no put-if-absent (`Sim::set_lock_client`).
-    pub lock_clients: BTreeSet<ClientId>,
-    pub kind: StoreKind,
 }
 
 impl Evidence {
@@ -2133,8 +1798,6 @@ impl Evidence {
         Self {
             log: sim.store().log(),
             runs: sim.history().runs.clone(),
-            lock_clients: sim.store().lock_clients(),
-            kind: sim.store().config().kind,
         }
     }
 }
@@ -2142,17 +1805,36 @@ impl Evidence {
 /// What the case's damage looks like: the hazard signatures that claim its
 /// violations, and `Unknown` when any violation (or skipped evaluation) is
 /// left unclaimed.
-pub(crate) fn classify(sim: &Sim, report: &Report, entries: &[TraceEntry]) -> BTreeSet<Signature> {
-    classify_evidence(&Evidence::of(sim), report, entries)
+pub(crate) fn classify(sim: &Sim, report: &Report) -> BTreeSet<Signature> {
+    classify_evidence(&Evidence::of(sim), report)
+}
+
+/// The end state judged as the driver judges a case (`Invariant::judged`
+/// by the repository's recorded mode) and classified: what a known
+/// hazard's `Reproduced` carries.
+pub(crate) fn classify_end_state(sim: &Sim) -> (Report, BTreeSet<Signature>) {
+    let multi = sim.store().writer_mode() == Some(WriterMode::Multi);
+    let report = sim.check_invariants(&Invariant::judged(multi));
+    let signatures = classify(sim, &report);
+    (report, signatures)
+}
+
+/// The run's snapshot, when it is a backup.
+fn snapshot_of(runs: &[RunRecord], run: Option<usize>) -> Option<&str> {
+    match run
+        .and_then(|i| runs.iter().find(|x| x.index == i))
+        .map(|x| &x.op)
+    {
+        Some(ClientOp::Backup { snapshot }) => Some(snapshot.as_str()),
+        _ => None,
+    }
 }
 
 /// [`classify`] on evidence a test may have edited (to show that a
-/// signature's claim needs each of its conditions).
-pub(crate) fn classify_evidence(
-    ev: &Evidence,
-    report: &Report,
-    entries: &[TraceEntry],
-) -> BTreeSet<Signature> {
+/// signature's claim needs each of its conditions). Every age is read from
+/// the records' store clock (`OpRecord::at`), which a scripted run has as
+/// a driver run does.
+pub(crate) fn classify_evidence(ev: &Evidence, report: &Report) -> BTreeSet<Signature> {
     let log = ev.log.as_slice();
     let runs = &ev.runs;
     let released = |r: &OpRecord| matches!(r.outcome, OpOutcome::Released(_));
@@ -2162,317 +1844,16 @@ pub(crate) fn classify_evidence(
             .map(|r| r.step)
             .min()
     };
-    let clock_at = |step: u64| {
-        entries
-            .iter()
-            .find(|e| step > e.steps.0 && step <= e.steps.1)
-            .map(|e| e.clock)
-    };
+    let is_marker = |k: &str| k.starts_with("sessions/") && k.ends_with(".json");
     let mut claims = Claims::new(report);
 
-    // Lock keys deleted by a client other than their writer, with the
-    // lock's age then. Since 04 step 5 production ages a lock by its mtime
-    // on the store's clock, which every applied write renews (the fence
-    // refresh rewrites the key), so the age is taken from the key's last
-    // applied write, on the trace clock. Driver jumps move the store and
-    // every client together, so the two agree.
-    let mut writers: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
-    let mut reaps: Vec<Reap> = Vec::new();
-    for r in log {
-        if r.op.is_write() && r.applied() && is_lock_key(&r.key) {
-            writers.insert(&r.key, (r.client, r.run, r.step));
-        }
-        for k in r.deleted_keys() {
-            if let Some((w, run, written)) = writers.get(k).copied()
-                && w != r.client
-            {
-                let age = clock_at(written)
-                    .zip(clock_at(r.step))
-                    .map(|(t, now)| (now - t).num_seconds());
-                reaps.push(Reap {
-                    step: r.step,
-                    victim: w,
-                    run,
-                    age,
-                });
-            }
-        }
-    }
-    let lock_violation_at = |step: u64| {
-        report
-            .violations
-            .iter()
-            .any(|v| v.invariant == Invariant::LockExclusion && v.step == Some(step))
-    };
-
-    // Lock-exclusion violations at a write that was not a release: each is
-    // claimed by the lock hazard it follows from. `TwoLockHolders` then
-    // cascades from its earliest reap.
-    let mut two_holders: Option<u64> = None;
-    let mut orphan_key_violations: BTreeSet<usize> = BTreeSet::new();
-    // The violations `AgedLockReaped` claims, with the violating write's
-    // run and key.
-    let mut aged_reap_violations: BTreeMap<usize, (Option<usize>, &str)> = BTreeMap::new();
-    for (i, v) in report.violations.iter().enumerate() {
-        if v.invariant != Invariant::LockExclusion {
-            continue;
-        }
-        let Some(rec) = v.step.and_then(|s| log.iter().find(|r| r.step == s)) else {
-            continue;
-        };
-        if released(rec) {
-            // A late index write: judged below.
-            continue;
-        }
-        let reaped: Vec<&Reap> = reaps
-            .iter()
-            .filter(|x| x.step < rec.step && x.victim == rec.client)
-            .collect();
-        let young_reap = reaped.iter().filter(|x| x.young()).map(|x| x.step).min();
-        if let Some(s) = young_reap {
-            claims.claim_index(Signature::TwoLockHolders, i);
-            two_holders = Some(two_holders.map_or(s, |h| h.min(s)));
-        } else if reaped.iter().any(|x| x.aged()) {
-            claims.claim_index(Signature::AgedLockReaped, i);
-            aged_reap_violations.insert(i, (rec.run, rec.key.as_str()));
-        } else if log
-            .iter()
-            .any(|r| r.step < rec.step && r.op.is_write() && released(r) && is_lock_key(&r.key))
-        {
-            claims.claim_index(Signature::OrphanLockKey, i);
-            orphan_key_violations.insert(i);
-        }
-    }
-
-    // A young reap whose victim's run goes on to make a protected write
-    // (an ordinary write, so the run was live at the reap; a released one
-    // is a late write and judged as such)
-    // is H1 even when the checker saw the victim as a holder: a delayed or
-    // duplicated lock PUT of the victim's, released after the reap,
-    // recreated the reaped key, so the victim's writes are not lock
-    // violations while the reaper's are under two locks. Cascades from the
-    // reap like the violations above.
-    for reap in reaps.iter().filter(|x| x.young()) {
-        let writes_on = log.iter().any(|r| {
-            r.step > reap.step
-                && r.client == reap.victim
-                && r.run == reap.run
-                && r.op.is_write()
-                && r.applied()
-                && !released(r)
-                && ["index.d/", "index.h/", "snapshots/"]
-                    .iter()
-                    .any(|p| r.key.starts_with(p))
-        });
-        if writes_on {
-            two_holders = Some(two_holders.map_or(reap.step, |h| h.min(reap.step)));
-        }
-    }
-
-    // An aged reap of V's lock, another client's index GC deleting V's
-    // segment S after it, and V's head PUT outside the lock naming S.
-    for reap in reaps.iter().filter(|x| x.aged()) {
-        for seg in log.iter().filter(|r| {
-            r.client == reap.victim
-                && r.op.is_write()
-                && r.applied()
-                && r.key.starts_with("index.d/")
-        }) {
-            let s = seg.key.as_str();
-            let collected = log.iter().any(|r| {
-                r.step > reap.step && r.client != reap.victim && r.deleted_keys().contains(&s)
-            });
-            let head = log
-                .iter()
-                .filter(|r| {
-                    r.step > reap.step
-                        && r.step > seg.step
-                        && r.client == reap.victim
-                        && r.op.is_write()
-                        && r.applied()
-                        && !released(r)
-                        && r.key.starts_with("index.h/")
-                        && lock_violation_at(r.step)
-                })
-                .map(|r| r.step)
-                .min();
-            // S named absent: by the end state's head, or by a run that
-            // failed on it before a later fold of V's published a head
-            // without it.
-            let absent = report.violations.iter().any(|v| match v.kind {
-                ViolationKind::HeadObjectAbsent => v.subject == s,
-                ViolationKind::DisallowedError => v.detail.contains(s),
-                _ => false,
-            });
-            let Some(head) = head.filter(|_| collected && absent) else {
-                continue;
-            };
-            // Runs that read the chain after the head PUT and failed on S.
-            let later: BTreeSet<String> = runs
-                .iter()
-                .filter(|x| x.last_step > head)
-                .map(run_subject)
-                .collect();
-            if claims.claim(Signature::AgedLockSegmentCollected, |v| match v.kind {
-                ViolationKind::HeadObjectAbsent => v.subject == s,
-                ViolationKind::ChainUnloadable => v.detail.contains(s),
-                ViolationKind::DisallowedError => {
-                    later.contains(&v.subject) && v.detail.contains(s)
-                }
-                _ => false,
-            }) {
-                claims.skipped = true;
-            }
-        }
-    }
-
-    // An aged reap of V's lock, another client's compact deleting V's packs
-    // after it (V's session marker aged too, so they were orphans), and V's
-    // head PUT outside the lock publishing entries that name them.
-    for reap in reaps.iter().filter(|x| x.aged()) {
-        let collected: Vec<(&str, u64)> = log
-            .iter()
-            .filter(|r| {
-                r.client == reap.victim
-                    && r.op.is_write()
-                    && r.applied()
-                    && r.key.starts_with("packs/")
-            })
-            .filter_map(|p| {
-                log.iter()
-                    .find(|r| {
-                        r.step > reap.step
-                            && r.client != reap.victim
-                            && r.deleted_keys().contains(&p.key.as_str())
-                    })
-                    .map(|r| (p.key.as_str(), r.step))
-            })
-            .collect();
-        let named = |pack: &str| {
-            collected.iter().any(|(k, deleted)| {
-                *k == pack
-                    && log.iter().any(|r| {
-                        r.step > *deleted
-                            && r.client == reap.victim
-                            && r.op.is_write()
-                            && r.applied()
-                            && !released(r)
-                            && r.key.starts_with("index.h/")
-                            && lock_violation_at(r.step)
-                    })
-            })
-        };
-        claims.claim(Signature::AgedLockPacksCollected, |v| {
-            v.kind == ViolationKind::IndexNamesAbsentPack && named(&v.subject)
-        });
-    }
-
-    // R4 (phase F part 10c, mixed modes): a lock-mode run whose lock was
-    // reaped by age goes on and plain-PUTs a head over one a lock-free
-    // writer created meanwhile (local, SFTP, S3 replace it). The overwrite
-    // and the damage after it (the replaced head's snapshot loses its index
-    // coverage) are `AgedLockReaped`'s, from the overwrite on.
-    // R5: the same overwrite after the lock-free writer's marker was reaped
-    // by age (a stall over the session staleness while it still creates
-    // heads), so the lock holder did not yield to it: `AgedSessionReaped`'s.
-    // Otherwise the replaced head may be a late create of a lock-free run
-    // that had already failed without a snapshot (its request abandoned
-    // after a timeout, landing after the run deregistered): the lock
-    // holder saw no session to yield to. `LateHeadCreateReplaced`'s, the
-    // overwrite only.
-    let mut marker_reaps: Vec<(u64, ClientId, Option<usize>, bool)> = Vec::new();
-    {
-        let mut written: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
-        for r in log {
-            if r.op.is_write()
-                && r.applied()
-                && r.key.starts_with("sessions/")
-                && r.key.ends_with(".json")
-            {
-                written.insert(&r.key, (r.client, r.run, r.step));
-            }
-            for k in r.deleted_keys() {
-                if let Some((w, run, at)) = written.get(k).copied()
-                    && w != r.client
-                {
-                    let aged = clock_at(at)
-                        .zip(clock_at(r.step))
-                        .is_some_and(|(t, now)| (now - t).num_seconds() > STALE_SESSION_SECS);
-                    marker_reaps.push((r.step, w, run, aged));
-                }
-            }
-        }
-    }
-    for (i, v) in report
-        .violations
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.kind == ViolationKind::HeadOverwritten)
-    {
-        let Some(step) = v.step else { continue };
-        let Some(rec) = log.iter().find(|r| r.step == step) else {
-            continue;
-        };
-        // A late head write is judged with `LateHeadWrite` below, unless the
-        // replaced head's writer had its marker reaped by age (R5 with the
-        // lock holder's PUT landing late, seed
-        // `mixed-aged-marker-late-compact-head`).
-        let late = released(rec);
-        let aged_lock = !late
-            && reaps
-                .iter()
-                .any(|x| x.step < step && x.victim == rec.client && x.run == rec.run && x.aged());
-        // The run whose head was replaced: the last applied write of the
-        // key before the overwrite.
-        let replaced_write = log
-            .iter()
-            .rfind(|r| r.step < step && r.key == rec.key && r.op.is_write() && r.applied());
-        let replaced = replaced_write.map(|r| (r.client, r.run));
-        // A late overwrite is R5's only as a lock client's plain PUT on the
-        // store whose plain PUT replaces heads (the only writer that lands
-        // over a lock-free head without a create).
-        let lock_client_put = ev.kind == StoreKind::ConditionalOverwrite
-            && rec.op == OpKind::Put
-            && ev.lock_clients.contains(&rec.client);
-        let aged_marker = (!late || lock_client_put)
-            && replaced.is_some_and(|(c, run)| {
-                marker_reaps
-                    .iter()
-                    .any(|&(s, w, r, aged)| aged && s < step && w == c && r == run)
-            });
-        let sig = if aged_lock {
-            Signature::AgedLockReaped
-        } else if aged_marker {
-            Signature::AgedSessionReaped
-        } else {
-            // A failed lock-free run's late create, replaced: nothing
-            // else is damaged, so it claims the overwrite alone.
-            if !late && replaced_write.is_some_and(|w| late_create_replaced(ev, w, rec)) {
-                claims.claim_index(Signature::LateHeadCreateReplaced, i);
-            }
-            // A failed lock-mode run's late plain head PUT, replaced by a
-            // lock holder that read the head before it landed (H3's
-            // mechanism on the mixed store, its damage none): the late
-            // write's trace, `LateIndexWrite`'s.
-            if !late && replaced_write.is_some_and(|w| late_lock_head_replaced(ev, w, rec)) {
-                claims.claim_index(Signature::LateIndexWrite, i);
-            }
-            continue;
-        };
-        claims.cascade(sig, step);
-        claims.skipped = true;
-    }
-
-    // F1's residual (phase F part 10d): a lock-free compact checks its marker
-    // before each head create and each batch of deletes, so what is left is
-    // a stall over the session staleness between that check and the head
-    // create it guards, the marker reaped meanwhile. The late create lands
-    // and names (a) the compact's own repack outputs another client deleted
-    // as old orphans after the reap, or (b) a sweep planned before a
-    // lock-path run (which did not yield to the reaped marker) committed a
-    // snapshot without a head. Claimed: absent outputs and the restores that
-    // need them, and that snapshot's violations (and the later compact that
-    // cannot mark it); nothing else.
+    // F1's residual (phase F part 10d): a compact checks its marker before
+    // each head create and each batch of deletes, so what is left is a stall
+    // over the session staleness between that check and the head create it
+    // guards, the marker reaped meanwhile. The late create lands and names
+    // the compact's own repack outputs another client deleted as old orphans
+    // after the reap. Claimed: absent outputs and the restores that need
+    // them; nothing else.
     // Ages on the store's clock of each record (`OpRecord::at`), which the
     // trace clock equals in a driver run and which a scripted run has too.
     let mut aged_marker_reaps: Vec<(u64, ClientId, Option<usize>)> = Vec::new();
@@ -2499,7 +1880,7 @@ pub(crate) fn classify_evidence(
     for &(reap_step, w, run) in &aged_marker_reaps {
         let Some(victim) = run
             .and_then(|i| runs.iter().find(|x| x.index == i))
-            .filter(|x| x.lock_free && matches!(x.op, ClientOp::Compact))
+            .filter(|x| x.shared && matches!(x.op, ClientOp::Compact))
         else {
             continue;
         };
@@ -2528,31 +1909,10 @@ pub(crate) fn classify_evidence(
             .flat_map(|r| r.deleted_keys())
             .filter(|k| outputs.contains(k))
             .collect();
-        let snaps: BTreeSet<&str> = runs
-            .iter()
-            .filter(|x| !x.lock_free && x.client != w)
-            .filter(|x| {
-                log.iter().any(|r| {
-                    r.run == Some(x.index)
-                        && r.step > reap_step
-                        && r.step < h
-                        && r.op.is_write()
-                        && r.applied()
-                        && r.key.starts_with("snapshots/")
-                })
-            })
-            .filter_map(|x| match &x.op {
-                ClientOp::Backup { snapshot } => Some(snapshot.as_str()),
-                _ => None,
-            })
-            .collect();
         claims.claim(Signature::AgedSessionReaped, |v| match v.kind {
             ViolationKind::IndexNamesAbsentPack => deleted.contains(v.subject.as_str()),
-            ViolationKind::WedgedCompact => snaps
-                .iter()
-                .any(|s| v.detail.contains(&format!("snapshot '{s} ("))),
             _ if v.invariant == Invariant::CommittedSnapshotsRestore => {
-                snaps.contains(v.subject.as_str()) || deleted.iter().any(|p| v.detail.contains(p))
+                deleted.iter().any(|p| v.detail.contains(p))
             }
             _ => false,
         });
@@ -2561,14 +1921,16 @@ pub(crate) fn classify_evidence(
     // Session markers deleted by another client while their writer's run
     // was still in progress: the victim run's disallowed error and the
     // violations of its snapshot.
-    let mut marker_writes: BTreeMap<&str, (ClientId, Option<usize>, u64)> = BTreeMap::new();
+    // Young or aged by the store clock of each record (`OpRecord::at`).
+    let mut marker_writes: BTreeMap<&str, (ClientId, Option<usize>, DateTime<Utc>)> =
+        BTreeMap::new();
     for r in log {
         if r.op.is_write()
             && r.applied()
             && r.key.starts_with("sessions/")
             && r.key.ends_with(".json")
         {
-            marker_writes.insert(&r.key, (r.client, r.run, r.step));
+            marker_writes.insert(&r.key, (r.client, r.run, r.at));
         }
         for k in r.deleted_keys() {
             let Some((writer, run, written)) = marker_writes.get(k).copied() else {
@@ -2583,9 +1945,7 @@ pub(crate) fn classify_evidence(
             if writer == r.client {
                 continue;
             }
-            let young = clock_at(written)
-                .zip(clock_at(r.step))
-                .is_some_and(|(w, now)| (now - w).num_seconds() <= STALE_SESSION_SECS);
+            let young = (r.at - written).num_seconds() <= STALE_SESSION_SECS;
             let sig = if young {
                 Signature::SessionReaped
             } else {
@@ -2610,20 +1970,18 @@ pub(crate) fn classify_evidence(
     // look for committing sessions, judges no age), the victim's newest
     // marker key was older than the session staleness at R's "now"
     // (`sessions::reap_sessions` judges a session by its newest key, against
-    // the mtime of R's own newest marker key lock-free or of its lock key
-    // under the lock, both written before L), so no horizon held the
+    // the mtime of R's own newest marker key, written before L), so no
+    // horizon held the
     // victim's packs, and they were orphans past `PACK_AGE_LIMIT`. Who deleted the victim's stale keys does not matter:
     // R itself (seed `aged-session-reaped-mark-after-listing-lockfree`), or
-    // an earlier run, such as a lock-mode backup's commit-lock yield (seed
-    // `mixed-aged-session-reaped-before-listing`). The victim then wrote a
+    // an earlier run. The victim then wrote a
     // key after L (its commit mark, or a refresh after a stall), present at
     // the delete: invariant 10's `LiveSessionPackDeleted`. Its record has a
     // gap over `MARKER_GAP_LIMIT` and its elapsed time is past
     // `PACK_AGE_LIMIT`, so every commit check refuses it (I8) before a head.
-    // Claimed: those deletes, by a run in either mode, of a backup run that
+    // Claimed: those deletes, by any run, of a backup run that
     // wrote no snapshot, while every marker key of the victim present at the
     // delete was written after L; nothing else.
-    let is_marker = |k: &str| k.starts_with("sessions/") && k.ends_with(".json");
     let pack_age_limit = chrono::Duration::from_std(crate::repo::ages::PACK_AGE_LIMIT)
         .expect("PACK_AGE_LIMIT fits a chrono duration");
     let stale_at_listing = |v: &Violation| -> bool {
@@ -2669,17 +2027,11 @@ pub(crate) fn classify_evidence(
             return false;
         };
         let before = |r: &&OpRecord| r.step < listing.step;
-        // The deleter's "now": its newest marker key lock-free, else the
-        // lock key it acquired.
+        // The deleter's "now": its newest marker key.
         let now = log
             .iter()
             .filter(before)
             .rfind(|r| mine(r, deleter) && is_marker(&r.key))
-            .or_else(|| {
-                log.iter().filter(before).find(|r| {
-                    mine(r, deleter) && r.key.starts_with("locks/") && r.key.ends_with(".json")
-                })
-            })
             .map(|r| r.at);
         let Some(now) = now else { return false };
         // The victim's newest marker key before the listing, stale there.
@@ -2718,6 +2070,89 @@ pub(crate) fn classify_evidence(
     };
     claims.claim(Signature::AgedSessionReaped, stale_at_listing);
 
+    // The single-writer residual: run r's plain head PUT p, issued and
+    // applied at once, after r's own EXISTS e of that key found it absent,
+    // while another run wrote the key between e and p. Only with the stall
+    // and reap that make it the residual: between e and p another client
+    // deleted a marker key r wrote, over the session staleness after r's
+    // last marker write before that delete. Claims p's `HeadOverwritten`,
+    // the replaced head's snapshot's lost coverage, the absent packs the
+    // replaced head's run deleted before p, and a compact's refusal to mark
+    // that snapshot.
+    for p in log.iter().filter(|p| {
+        p.op == OpKind::Put && p.key.starts_with("index.h/") && p.outcome == OpOutcome::Ok
+    }) {
+        let Some(r) = p.run else { continue };
+        let Some(e) = log.iter().rfind(|x| {
+            x.step < p.step
+                && x.run == Some(r)
+                && x.op == OpKind::Exists
+                && x.key == p.key
+                && x.outcome == OpOutcome::NotFound
+        }) else {
+            continue;
+        };
+        let Some(w) = log.iter().rfind(|x| {
+            x.step > e.step
+                && x.step < p.step
+                && x.op.is_write()
+                && x.applied()
+                && x.key == p.key
+                && x.run != p.run
+        }) else {
+            continue;
+        };
+        let reaped = log
+            .iter()
+            .filter(|d| d.step > e.step && d.step < p.step && d.client != p.client)
+            .any(|d| {
+                d.deleted_keys().iter().any(|k| {
+                    let own = log.iter().any(|m| {
+                        m.step < d.step
+                            && m.run == Some(r)
+                            && m.op.is_write()
+                            && m.applied()
+                            && m.key == *k
+                    });
+                    let last = log
+                        .iter()
+                        .filter(|m| {
+                            m.step < d.step
+                                && m.run == Some(r)
+                                && m.op.is_write()
+                                && m.applied()
+                                && is_marker(&m.key)
+                        })
+                        .map(|m| m.at)
+                        .max();
+                    is_marker(k)
+                        && own
+                        && last.is_some_and(|l| (d.at - l).num_seconds() > STALE_SESSION_SECS)
+                })
+            });
+        if !reaped {
+            continue;
+        }
+        let snapshot = snapshot_of(runs, w.run);
+        let deleted: BTreeSet<&str> = log
+            .iter()
+            .filter(|d| d.step < p.step && w.run.is_some() && d.run == w.run)
+            .flat_map(|d| d.deleted_keys())
+            .filter(|k| k.starts_with("packs/"))
+            .collect();
+        claims.claim(Signature::SingleWriterHeadRace, |v| match v.kind {
+            ViolationKind::HeadOverwritten => v.step == Some(p.step),
+            ViolationKind::TreeChunkNotInIndex | ViolationKind::FileChunkNotInIndex => {
+                snapshot == Some(v.subject.as_str())
+            }
+            ViolationKind::IndexNamesAbsentPack => deleted.contains(v.subject.as_str()),
+            ViolationKind::WedgedCompact => {
+                snapshot.is_some_and(|s| v.detail.contains(&format!("snapshot '{s} (")))
+            }
+            _ => false,
+        });
+    }
+
     // A released head write cascades from its step when it left a
     // committed snapshot without index coverage, or the index naming an
     // absent pack. Committed: its backup returned Ok, or its `snapshots/`
@@ -2726,13 +2161,6 @@ pub(crate) fn classify_evidence(
     // that crashed or failed after its snapshot PUT).
     let late_head = first_released_write("index.h/");
     if let Some(hazard) = late_head {
-        let snapshot_of = |run: Option<usize>| match run
-            .and_then(|i| runs.iter().find(|x| x.index == i))
-            .map(|x| &x.op)
-        {
-            Some(ClientOp::Backup { snapshot }) => Some(snapshot.as_str()),
-            _ => None,
-        };
         let late_key = log
             .iter()
             .find(|r| r.step == hazard)
@@ -2761,7 +2189,7 @@ pub(crate) fn classify_evidence(
                             && r.key.starts_with("snapshots/")
                             && (r.step < hazard || (!released(r) && head_before(r.run)))
                     })
-                    .filter_map(|r| snapshot_of(r.run)),
+                    .filter_map(|r| snapshot_of(runs, r.run)),
             )
             .collect();
         let after = |v: &Violation| v.step.is_none_or(|s| s >= hazard);
@@ -2830,123 +2258,82 @@ pub(crate) fn classify_evidence(
     {
         claims.cascade(Signature::LateHeadSegmentCollected, hazard);
     }
-    if let Some(hazard) = two_holders {
-        claims.cascade(Signature::TwoLockHolders, hazard);
-    }
-
     // A released snapshot PUT of run `late`: the violations of the snapshot
-    // it wrote, when no lock violation is one of two holders: each is a
-    // late index write (judged below), a write beside an orphan lock key,
-    // or an `index.d/` write of another run after an aged reap of its lock
-    // (a segment no head names cannot change the late snapshot's index
-    // coverage; the reaped run's `index.h/` or `snapshots/` writes can, and
-    // a reap of the late snapshot's own run is the cause itself).
-    let no_second_holder = |late: Option<usize>| {
-        report.violations.iter().enumerate().all(|(i, v)| {
-            v.invariant != Invariant::LockExclusion
-                || orphan_key_violations.contains(&i)
-                || aged_reap_violations
-                    .get(&i)
-                    .is_some_and(|(run, key)| key.starts_with("index.d/") && *run != late)
-                || v.step
-                    .and_then(|s| log.iter().find(|r| r.step == s))
-                    .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
-        })
-    };
+    // it wrote, when the case has no invariant-13 violation.
+    let no_exclusive_violation = !report.violated(Invariant::ExclusiveSessions);
     for r in log
         .iter()
         .filter(|r| r.op.is_write() && released(r) && r.key.starts_with("snapshots/"))
     {
-        let Some(ClientOp::Backup { snapshot }) = r
-            .run
-            .and_then(|i| runs.iter().find(|x| x.index == i))
-            .map(|x| &x.op)
-        else {
+        let Some(snapshot) = snapshot_of(runs, r.run) else {
             continue;
         };
-        if no_second_holder(r.run)
+        if no_exclusive_violation
             && report.violated_for(Invariant::CommittedSnapshotsRestore, snapshot)
         {
             claims.claim(Signature::LateSnapshotWrite, |v| v.subject == *snapshot);
         }
     }
 
-    // On the store whose plain PUT replaces heads, a lock client's head PUT
-    // released late (H3's mechanism, the fallback's) that nothing above
-    // took for damage still shows in invariant 12: the head it replaced
-    // (`HeadOverwritten` at the release) and the next generation not naming
-    // the replaced head's objects (`HeadSkipsPredecessor`). Both are the
-    // late write itself, claimed with its lock violation (seed
-    // `mixed-late-lock-head-replaces-compact-head`).
-    if ev.kind == StoreKind::ConditionalOverwrite {
-        let late_lock_heads: Vec<(u64, Option<u64>)> = log
-            .iter()
-            .filter(|r| {
-                released(r)
-                    && r.op == OpKind::Put
-                    && r.key.starts_with("index.h/")
-                    && ev.lock_clients.contains(&r.client)
-            })
-            .map(|r| (r.step, vykar_protocol::head_generation(&r.key)))
-            .collect();
-        let head_gen = |r: &OpRecord| vykar_protocol::head_generation(&r.key);
-        for &(s, g) in &late_lock_heads {
-            // The overwrite at the release itself; the next generation's
-            // skip only beside it, and only when that head was built on
-            // the replaced one: written, or its writer's GET of generation g
-            // made, before the release.
-            let Some(over) = report.violations.iter().enumerate().position(|(i, v)| {
-                !claims.claimed[i] && v.kind == ViolationKind::HeadOverwritten && v.step == Some(s)
-            }) else {
-                continue;
-            };
-            claims.claim_index(Signature::LateIndexWrite, over);
-            let Some(g) = g else { continue };
-            let next = log
-                .iter()
-                .find(|r| r.op.is_write() && r.applied() && head_gen(r) == Some(g + 1));
-            let built_before = next.is_some_and(|w| {
-                w.step < s
-                    || log.iter().any(|r| {
-                        r.step < s
-                            && r.client == w.client
-                            && r.run == w.run
-                            && r.op == OpKind::Get
-                            && head_gen(r) == Some(g)
+    // An exclusive run's write after another client deleted its live
+    // exclusive marker: the run's invariant-13 violations, when the delete
+    // precedes the first of them.
+    let exclusive_violation = |v: &Violation| {
+        let run = v
+            .subject
+            .strip_prefix("run ")
+            .and_then(|n| n.parse::<usize>().ok());
+        match (v.kind, v.step, run) {
+            (
+                ViolationKind::ExclusiveWriteWithoutHold
+                | ViolationKind::ExclusiveWriteUnderOtherHold
+                | ViolationKind::ExclusiveWriteUnderSeveralHolds,
+                Some(s),
+                Some(run),
+            ) => Some((s, run)),
+            _ => None,
+        }
+    };
+    let mut first_violation: BTreeMap<usize, u64> = BTreeMap::new();
+    for (s, run) in report.violations.iter().filter_map(exclusive_violation) {
+        first_violation
+            .entry(run)
+            .and_modify(|f| *f = (*f).min(s))
+            .or_insert(s);
+    }
+    for (i, v) in report.violations.iter().enumerate() {
+        let Some((_, run)) = exclusive_violation(v) else {
+            continue;
+        };
+        let s = first_violation[&run];
+        let in_progress = |at: u64| {
+            runs.iter()
+                .find(|x| x.index == run)
+                .is_none_or(|x| x.last_step > at)
+        };
+        let reaped = log.iter().filter(|d| d.step < s).any(|d| {
+            d.deleted_keys().iter().any(|k| {
+                is_exclusive_marker(k)
+                    && log.iter().any(|w| {
+                        w.step < d.step
+                            && w.run == Some(run)
+                            && w.client != d.client
+                            && w.op.is_write()
+                            && w.applied()
+                            && w.key == *k
                     })
-            });
-            if !built_before {
-                continue;
-            }
-            let skip = report.violations.iter().enumerate().position(|(i, v)| {
-                !claims.claimed[i]
-                    && v.kind == ViolationKind::HeadSkipsPredecessor
-                    && vykar_protocol::head_generation(&v.subject) == Some(g + 1)
-            });
-            if let Some(i) = skip {
-                claims.claim_index(Signature::LateIndexWrite, i);
-            }
+            }) && in_progress(d.step)
+        });
+        if reaped {
+            claims.claim_index(Signature::ExclusiveSessionReaped, i);
         }
     }
 
-    // Lock-exclusion violations at a released index write that nothing
-    // above explains.
-    let unclaimed_late_index: Vec<usize> = report
-        .violations
-        .iter()
-        .enumerate()
-        .filter(|(i, v)| {
-            !claims.claimed[*i]
-                && v.invariant == Invariant::LockExclusion
-                && v.step
-                    .and_then(|s| log.iter().find(|r| r.step == s))
-                    .is_some_and(|r| released(r) && r.op.is_write() && r.key.starts_with("index."))
-        })
-        .map(|(i, _)| i)
-        .collect();
-    for i in unclaimed_late_index {
-        claims.claim_index(Signature::LateIndexWrite, i);
-    }
-
     claims.finish()
+}
+
+/// An exclusive session's marker key (`sessions/x-*.json`).
+fn is_exclusive_marker(key: &str) -> bool {
+    crate::repo::sessions::parse_session_marker_key(key)
+        .is_some_and(|(id, _)| crate::repo::sessions::is_exclusive_session(id))
 }

@@ -621,10 +621,7 @@ mod tests {
             .expect("offered like the inner backend");
         assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
         assert_eq!(cond.verify_at_init().unwrap(), ConditionalSupport::Verified);
-        assert_eq!(
-            cond.put_if_absent("locks/k", &[0u8; 100]).unwrap(),
-            Created::Yes
-        );
+        assert_eq!(cond.put_if_absent("k", &[0u8; 100]).unwrap(), Created::Yes);
         assert_eq!(limiter.state.lock().unwrap().bytes_consumed, 100);
 
         let wrapped = ThrottledStorageBackend {
@@ -642,7 +639,7 @@ mod tests {
             ConditionalWrite::verify(&wrapped).unwrap(),
             ConditionalSupport::Unsupported { .. }
         ));
-        let refused = ConditionalWrite::put_if_absent(&wrapped, "locks/k", &[0u8; 10]).unwrap_err();
+        let refused = ConditionalWrite::put_if_absent(&wrapped, "k", &[0u8; 10]).unwrap_err();
         assert!(
             matches!(&refused, vykar_types::error::VykarError::UnsupportedBackend(m) if m.contains("put-if-absent unavailable")),
             "{refused:?}"

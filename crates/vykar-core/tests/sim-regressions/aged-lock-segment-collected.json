@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-segment-collected",
-  "note": "Shape A of the phase F part 2 campaign (random-2155709920513612321): a backup puts its index.d segment, a time jump past the 6 h lock staleness and INDEX_GC_GRACE, compact reaps the aged lock and its index GC deletes the unpublished segment, then the backup's head names it (04 Current issues 3). Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-conditional is the same case on a conditional store with the schedule of before 10b2 (see its note). Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): after one 6 h 1 min jump the segment is younger than the object grace, compact keeps it and only AgedLockReaped is left, so the case now takes two 6 h 1 min jumps after the fence. The segment and the backup's packs are 12 h 2 min old at the compact, which reaps the aged lock and collects them as before; the backup's head create then refuses (AllowedError::SlowIndexWrite), so no head names the collected segment and the case is clean. AgedLockSegmentCollected is closed on every store by 10b2 for head writes that are not released late (a released one is LateHeadSegmentCollected). Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before). No lock key is written; the victim still refuses its slow index write.",
+  "note": "Shape A of the phase F part 2 campaign (random-2155709920513612321): a backup puts its index.d segment, a time jump past the 6 h lock staleness and INDEX_GC_GRACE, compact reaps the aged lock and its index GC deletes the unpublished segment, then the backup's head names it (04 Current issues 3). Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; aged-lock-segment-collected-conditional is the same case on a conditional store with the schedule of before 10b2 (see its note). Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): after one 6 h 1 min jump the segment is younger than the object grace, compact keeps it and only AgedLockReaped is left, so the case now takes two 6 h 1 min jumps after the fence. The segment and the backup's packs are 12 h 2 min old at the compact, which reaps the aged lock and collects them as before; the backup's head create then refuses (AllowedError::SlowIndexWrite), so no head names the collected segment and the case is clean. AgedLockSegmentCollected is closed on every store by 10b2 for head writes that are not released late (a released one is LateHeadSegmentCollected). Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before). No lock key is written; the victim still refuses its slow index write. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -146,6 +146,12 @@
       "whole compact"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(SlowIndexWrite))",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -178,8 +184,8 @@
       0,
       0,
       0,
-      6,
-      6,
+      5,
+      5,
       1
     ],
     "policy": "First",

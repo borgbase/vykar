@@ -12,12 +12,13 @@
 //! |---|---|
 //! | I1 (no pack deleted while referenced, young or in a marker's horizon) | 1 (a committed snapshot's packs exist), plus 10: no pack deleted younger than T_pack or while its own session's marker was live, repack sources excepted |
 //! | I2 (every retained head names only objects that exist) | 4, for every retained head (latest − 16 and newer) on stores that honour put-if-absent; the latest head elsewhere |
-//! | I3 (heads immutable, one per generation) | 12 on stores that honour put-if-absent; 7 (lock exclusion) stands in on the fallback |
+//! | I3 (heads immutable, one per generation) | 12 on a multi-writer repository; a single-writer one replaces heads by design (10-single-protocol: I3 is multi-writer only) |
 //! | I4 (every listed snapshot covered by some retained head) | 1, against the latest head |
 //! | I5 (no removal without a completed mark) | not yet (the H5 regression is scripted) |
 //! | I6 (no snapshot references a chunk missing from its commit head) | 1 approximates it against the latest head |
 //! | I7 (a reader returns correct data or a typed error) | 1 (restore against the source), 8 |
 //! | I8 (a marker gap with an old pack does not commit) | 11 |
+//! | exclusive sessions keep every other writer out (10-single-protocol step 8) | 13 |
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -25,7 +26,9 @@ use std::fmt;
 use vykar_types::chunk_id::ChunkId;
 
 use super::fault::{ClientId, OpKind};
-use super::history::{ClientOp, ErrorClass, History, ObservationCause, RunOutcome, RunRecord};
+use super::history::{
+    AllowedError, ClientOp, ErrorClass, History, ObservationCause, RunOutcome, RunRecord,
+};
 use super::log::{OpOutcome, OpRecord};
 use super::runner::SourceTree;
 use super::store::SimStore;
@@ -43,12 +46,10 @@ pub enum Invariant {
     NoSilentRemoval = 3,
     IndexIntegrity = 4,
     // 5 (no reference-count deflation) is retired: no counts are stored
-    // since 05 step 8. The numbers of the others stay.
-    /// Every protected write lands while the store holds exactly one lock
-    /// key, written by the same run.
-    LockExclusion = 7,
+    // since 05 step 8; 7 (lock exclusion) is retired with the lock,
+    // 10-single-protocol step 10. The numbers of the others stay.
     AllowedErrors = 8,
-    /// Once every lock and marker has aged out, a new client can back up
+    /// Once every marker has aged out, a new client can back up
     /// and compact. Needs [`Sim::check_invariants`](super::runner::Sim::check_invariants).
     NoPermanentWedge = 9,
     /// I1's age and horizon parts, from the op log: a pack (never
@@ -59,14 +60,16 @@ pub enum Invariant {
     /// I8: a backup whose marker key was deleted by another client, or not
     /// written for more than MARKER_GAP_LIMIT, before its head PUT, and
     /// whose oldest own pack was older than PACK_AGE_LIMIT −
-    /// HEAD_LANDING_ALLOWANCE at the last op it issued before that PUT,
-    /// publishes no head.
+    /// HEAD_LANDING_ALLOWANCE when it issued that PUT, publishes no head.
     MarkerGapCommit = 11,
     /// I3 (04 step 8): no stored head is replaced by other bytes, and each
     /// retained head names every live object of its predecessor (it was
     /// written over it). Asked for (`STEP8`) on stores that honour
     /// put-if-absent; with it, invariant 4 judges every retained head.
     HeadsImmutable = 12,
+    /// Exclusive sessions keep every other writer out (10-single-protocol
+    /// steps 8 and 10; in place of invariant 7). See `exclusive_sessions`.
+    ExclusiveSessions = 13,
 }
 
 impl Invariant {
@@ -79,14 +82,14 @@ impl Invariant {
         Invariant::AllowedErrors,
     ];
 
-    /// STEP1 plus invariants 7 and 9 (08 step 3).
+    /// STEP1 plus invariants 13 and 9.
     pub const STEP3: &'static [Invariant] = &[
         Invariant::CommittedSnapshotsRestore,
         Invariant::AcknowledgedCommitsDurable,
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
         Invariant::AllowedErrors,
-        Invariant::LockExclusion,
+        Invariant::ExclusiveSessions,
         Invariant::NoPermanentWedge,
     ];
 
@@ -97,7 +100,7 @@ impl Invariant {
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
         Invariant::AllowedErrors,
-        Invariant::LockExclusion,
+        Invariant::ExclusiveSessions,
         Invariant::NoPermanentWedge,
         Invariant::OrphanGrace,
         Invariant::MarkerGapCommit,
@@ -111,12 +114,32 @@ impl Invariant {
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
         Invariant::AllowedErrors,
-        Invariant::LockExclusion,
+        Invariant::ExclusiveSessions,
         Invariant::NoPermanentWedge,
         Invariant::OrphanGrace,
         Invariant::MarkerGapCommit,
         Invariant::HeadsImmutable,
     ];
+
+    /// What the driver judges a case by, and what a known hazard's end state
+    /// is classified with: STEP7 without 9 (it needs `Sim::check_invariants`
+    /// and ages a fork), plus 12 on a multi-writer repository.
+    pub fn judged(multi_writer: bool) -> Vec<Invariant> {
+        let mut out = vec![
+            Invariant::CommittedSnapshotsRestore,
+            Invariant::AcknowledgedCommitsDurable,
+            Invariant::NoSilentRemoval,
+            Invariant::IndexIntegrity,
+            Invariant::AllowedErrors,
+            Invariant::ExclusiveSessions,
+            Invariant::OrphanGrace,
+            Invariant::MarkerGapCommit,
+        ];
+        if multi_writer {
+            out.push(Invariant::HeadsImmutable);
+        }
+        out
+    }
 }
 
 /// What exactly was wrong; each kind belongs to one invariant.
@@ -148,13 +171,6 @@ pub enum ViolationKind {
     SilentRemoval,
     // 8
     DisallowedError,
-    // 7
-    /// A protected write while the store held no lock key.
-    WriteWithoutLock,
-    /// A protected write while the one lock key was another run's.
-    WriteUnderOtherLock,
-    /// A protected write while the store held more than one lock key.
-    WriteUnderSeveralLocks,
     // 9
     WedgedBackup,
     WedgedCompact,
@@ -173,6 +189,22 @@ pub enum ViolationKind {
     HeadOverwritten,
     /// A retained head does not name a live object of its predecessor.
     HeadSkipsPredecessor,
+    // 13
+    /// A protected op of an exclusive run while no entered exclusive hold was
+    /// present (its own marker reaped or gone).
+    ExclusiveWriteWithoutHold,
+    /// A protected op of an exclusive run while the one entered hold present
+    /// was another run's.
+    ExclusiveWriteUnderOtherHold,
+    /// A protected op of an exclusive run while entered holds of two or more
+    /// runs were present.
+    ExclusiveWriteUnderSeveralHolds,
+    /// A protected op of a non-exclusive run while another run's entered
+    /// exclusive hold was present.
+    SharedWriteUnderExclusive,
+    /// A protected op of a run that is neither exclusive nor shared
+    /// (`RunRecord::shared` false), or of no run, with no hold present.
+    WriteWithoutSession,
 }
 
 impl ViolationKind {
@@ -196,13 +228,15 @@ impl ViolationKind {
             K::AcknowledgedCommitMissing => Invariant::AcknowledgedCommitsDurable,
             K::SilentRemoval => Invariant::NoSilentRemoval,
             K::DisallowedError => Invariant::AllowedErrors,
-            K::WriteWithoutLock | K::WriteUnderOtherLock | K::WriteUnderSeveralLocks => {
-                Invariant::LockExclusion
-            }
             K::WedgedBackup | K::WedgedCompact => Invariant::NoPermanentWedge,
             K::YoungOrphanDeleted | K::LiveSessionPackDeleted => Invariant::OrphanGrace,
             K::OldPackCommittedAfterMarkerGap => Invariant::MarkerGapCommit,
             K::HeadOverwritten | K::HeadSkipsPredecessor => Invariant::HeadsImmutable,
+            K::ExclusiveWriteWithoutHold
+            | K::ExclusiveWriteUnderOtherHold
+            | K::ExclusiveWriteUnderSeveralHolds
+            | K::SharedWriteUnderExclusive
+            | K::WriteWithoutSession => Invariant::ExclusiveSessions,
         }
     }
 }
@@ -806,116 +840,182 @@ pub(crate) fn run_subject(run: &RunRecord) -> String {
     format!("run {} {:?}", run.index, run.op)
 }
 
-/// Prefixes of keys whose deletion only a lock holder may do.
+/// Prefixes of keys whose deletion only a session holder may do.
 const PROTECTED_DELETE_PREFIXES: &[&str] =
     &["snapshots/", "packs/", "index.d/", "index.h/", "packmaps/"];
 
-/// A write only a lock holder may do: a head, or an index object.
-fn protected_write(key: &str) -> bool {
-    key.starts_with("index.h/") || key.starts_with("index.d/")
-}
-
-fn is_lock_key(key: &str) -> bool {
-    key.starts_with("locks/") && key.ends_with(".json")
-}
-
 /// An exclusive session's marker key (`sessions/x-*.json`, 10-single-protocol
-/// step 8): a hold for invariant 7, as a lock key is.
+/// step 8): a hold for invariant 13.
 fn is_exclusive_marker_key(key: &str) -> bool {
     crate::repo::sessions::parse_session_marker_key(key)
         .is_some_and(|(id, _)| crate::repo::sessions::is_exclusive_session(id))
 }
 
-/// Invariant 7, as the store sees it: replay the op log, tracking which
-/// holds exist (lock keys and, since 10-single-protocol step 8, exclusive
-/// session marker keys) and which (client, run) last wrote each, and judge
-/// every applied protected write against the distinct holders of the keys
-/// present just before it: none is `WriteWithoutLock`, one other than the
-/// writer `WriteUnderOtherLock`, two or more `WriteUnderSeveralLocks`. One
-/// run's overlapping marker keys (a refresh), or its legacy lock key and its
-/// `x-` marker (a v2/v3 upgrade), count once. Late effects count at the
-/// step they land. The tamper client, the Init run
-/// (`Repo::init` writes `index.h/1` with no lock) and lock-free runs
-/// (`RunRecord::lock_free`, 04 step 9: they write heads with put-if-absent
-/// and no lock) are exempt; every lock-mode run is judged, beside lock-free
-/// ones too.
+/// A write or delete no run may make under another run's exclusive session:
+/// an applied write of a head, an index object or a snapshot, or an applied
+/// delete naming a key under one of `PROTECTED_DELETE_PREFIXES`.
+fn protected_shared(rec: &OpRecord) -> bool {
+    if rec.op.is_write() {
+        ["index.h/", "index.d/", "snapshots/"]
+            .iter()
+            .any(|p| rec.key.starts_with(p))
+    } else if rec.op.is_delete() {
+        rec.all_keys()
+            .iter()
+            .any(|k| PROTECTED_DELETE_PREFIXES.iter().any(|p| k.starts_with(p)))
+    } else {
+        false
+    }
+}
+
+/// Invariant 13 over the applied op log: exclusive sessions keep every other
+/// writer out.
 ///
-/// What it does not see: shared runs (backups, compacts, prunes, deletes:
-/// `lock_free`) are exempt, so a shared write under an exclusive hold is
-/// visible only to scripted assertions (`tests::sim_exclusion` case (d),
-/// `exclusive_against_backup_race`) until step 10 replaces this invariant.
+/// An exclusive marker key is `sessions/x-*.json`. Run R is exclusive when
+/// the log has an applied write of an exclusive marker key by R;
+/// `first_put(R)` is that write's step and `listed(R)` the step of R's first
+/// `ListMeta` of exactly `sessions/` with outcome `Ok` after it (its
+/// registration listing). R entered unless its `RunRecord` ends
+/// `Allowed(ActiveSessions)` (its registration refused); a run not in `runs`
+/// (in flight) and a key written outside any run (tamper) count as entered.
+/// The holds present before op p are the distinct (client, run) owners of the
+/// exclusive marker keys present just before p (written and not deleted
+/// since, batch deletes included), keeping only entered owners and, for an
+/// owner with a run, only once `listed(owner)` is before p.
 ///
-/// Limit: a key counts as held from its PUT. A lock acquisition (vykar
-/// 0.24's, or this binary's before 10-single-protocol step 9) publishes a
-/// tentative key that can coexist with the holder's until the loser deletes
-/// it, and so does a refused exclusive registration (its marker, from its
-/// PUT to its delete), so a protected write by the rightful holder in that
-/// window reads as `WriteUnderSeveralLocks`. No scripted scenario holds a
-/// contender there, and in the driver (`sim::driver`) an exclusive
-/// registration is one step (and a lock acquisition was), so a contender's tentative
-/// key never coexists with the holder's across a decision. A delayed or duplicated lock PUT that lands later is a key
-/// with no holder; the driver names that shape (`OrphanLockKey`).
-fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
-    let exempt_runs: BTreeSet<usize> = history
-        .runs
+/// Then for every applied op p whose client is not the tamper client and
+/// whose run is not Init:
+/// - If p's run R is exclusive, p is protected when [`protected_shared`], or
+///   when p is a mutation landing after `first_put(R)` with a key outside
+///   `sessions/` and the legacy lock directory. A protected p is judged
+///   against the holds: none, `ExclusiveWriteWithoutHold`; exactly one that
+///   is not R's, `ExclusiveWriteUnderOtherHold`; exactly R's own, nothing;
+///   two or more, `ExclusiveWriteUnderSeveralHolds`.
+/// - Otherwise (a shared run, a run without a session, an op outside any run)
+///   only [`protected_shared`] ops are judged: any hold present,
+///   `SharedWriteUnderExclusive`; none, and R's `RunRecord` not `shared`
+///   (or p has no run), `WriteWithoutSession`; else nothing.
+///
+/// A late effect is judged at the step it lands.
+///
+/// What it exempts: the tamper client's ops; Init; holds whose keys were
+/// deleted (reaped or deregistered), judged by presence; tentative holds (a
+/// refused registration's key, and any exclusive key before its owner's
+/// registration listing); `sessions/` and the legacy lock directory for
+/// exclusive runs; pack uploads and pack-map writes of shared runs.
+///
+/// What it does not see: shared pack, pack-map and journal writes under an
+/// exclusive hold. They are legitimate where a backup misjudged no live
+/// exclusive session and stops at its pre-head listing
+/// (`tests::sim_exclusion` case (d)), and forbidden by the exclusive search's
+/// hand rule (`tests::sim_exhaustive::exclusive_against_backup_search`),
+/// which stays the judge of those.
+pub(crate) fn exclusive_sessions(
+    log: &[OpRecord],
+    runs: &[RunRecord],
+    tamper: ClientId,
+) -> Vec<Violation> {
+    use crate::repo::sessions::LEGACY_LOCKS_PREFIX;
+    let record = |i: usize| runs.iter().find(|r| r.index == i);
+    let mut first_put: BTreeMap<usize, u64> = BTreeMap::new();
+    for r in log {
+        if applied_write(r)
+            && is_exclusive_marker_key(&r.key)
+            && let Some(run) = r.run
+        {
+            first_put.entry(run).or_insert(r.step);
+        }
+    }
+    let mut listed: BTreeMap<usize, u64> = BTreeMap::new();
+    for r in log {
+        if r.op == OpKind::ListMeta
+            && r.key == "sessions/"
+            && r.outcome == OpOutcome::Ok
+            && let Some(run) = r.run
+            && first_put.get(&run).is_some_and(|&fp| fp < r.step)
+        {
+            listed.entry(run).or_insert(r.step);
+        }
+    }
+    let entered = |run: Option<usize>| {
+        run.and_then(record).is_none_or(|r| {
+            r.error_class() != Some(&ErrorClass::Allowed(AllowedError::ActiveSessions))
+        })
+    };
+    let init: BTreeSet<usize> = runs
         .iter()
-        .filter(|r| matches!(r.op, ClientOp::Init) || r.lock_free)
+        .filter(|r| matches!(r.op, ClientOp::Init))
         .map(|r| r.index)
         .collect();
-    let mut held: BTreeMap<String, (ClientId, Option<usize>)> = BTreeMap::new();
-    for rec in store.log() {
+    let mut present: BTreeMap<String, (ClientId, Option<usize>)> = BTreeMap::new();
+    let mut out = Vec::new();
+    for rec in log {
         if !rec.applied() {
             continue;
         }
-        let protected = if rec.op.is_write() {
-            protected_write(&rec.key)
-        } else if rec.op.is_delete() {
-            rec.all_keys()
-                .iter()
-                .any(|k| PROTECTED_DELETE_PREFIXES.iter().any(|p| k.starts_with(p)))
-        } else {
-            false
-        };
-        let exempt =
-            rec.client == store.tamper_id() || rec.run.is_some_and(|r| exempt_runs.contains(&r));
-        if protected && !exempt {
-            let mine = (rec.client, rec.run);
-            let holders: BTreeSet<(ClientId, Option<usize>)> = held.values().copied().collect();
-            let kind = match holders.len() {
-                0 => Some(ViolationKind::WriteWithoutLock),
-                1 if !holders.contains(&mine) => Some(ViolationKind::WriteUnderOtherLock),
-                1 => None,
-                _ => Some(ViolationKind::WriteUnderSeveralLocks),
+        if rec.client != tamper && !rec.run.is_some_and(|r| init.contains(&r)) {
+            let holds: BTreeSet<(ClientId, Option<usize>)> = present
+                .values()
+                .copied()
+                .filter(|&(_, run)| {
+                    entered(run)
+                        && run.is_none_or(|i| listed.get(&i).is_some_and(|&l| l < rec.step))
+                })
+                .collect();
+            let exclusive = rec.run.and_then(|r| first_put.get(&r).map(|&fp| (r, fp)));
+            let kind = if let Some((r, fp)) = exclusive {
+                let own_data = rec.op.is_mutation()
+                    && rec.step > fp
+                    && rec.all_keys().iter().any(|k| {
+                        !k.starts_with("sessions/") && !k.starts_with(LEGACY_LOCKS_PREFIX)
+                    });
+                if !(protected_shared(rec) || own_data) {
+                    None
+                } else {
+                    match holds.len() {
+                        0 => Some(ViolationKind::ExclusiveWriteWithoutHold),
+                        1 if holds.contains(&(rec.client, Some(r))) => None,
+                        1 => Some(ViolationKind::ExclusiveWriteUnderOtherHold),
+                        _ => Some(ViolationKind::ExclusiveWriteUnderSeveralHolds),
+                    }
+                }
+            } else if !protected_shared(rec) {
+                None
+            } else if !holds.is_empty() {
+                Some(ViolationKind::SharedWriteUnderExclusive)
+            } else if rec.run.and_then(record).is_none_or(|r| !r.shared) {
+                Some(ViolationKind::WriteWithoutSession)
+            } else {
+                None
             };
             if let Some(kind) = kind {
                 let subject = rec
                     .run
                     .map_or_else(|| "no run".to_string(), |r| format!("run {r}"));
-                let holders: Vec<String> = held
+                let held: Vec<String> = present
                     .iter()
-                    .map(|(k, (c, r))| format!("{k} by {} run {r:?}", store.client_name(*c)))
+                    .filter(|(_, owner)| holds.contains(owner))
+                    .map(|(k, (c, r))| format!("{k} by client {} run {r:?}", c.0))
                     .collect();
-                report.add_at(
+                out.push(violation(
                     kind,
                     subject,
-                    Some(rec.step),
+                    rec.step,
                     format!(
-                        "step {} {:?} {} by {}; locks held: {holders:?}",
-                        rec.step,
-                        rec.op,
-                        rec.key,
-                        store.client_name(rec.client)
+                        "step {} {:?} {} by client {}; exclusive holds: {held:?}",
+                        rec.step, rec.op, rec.key, rec.client.0
                     ),
-                );
+                ));
             }
         }
-        if rec.op.is_write() && (is_lock_key(&rec.key) || is_exclusive_marker_key(&rec.key)) {
-            held.insert(rec.key.clone(), (rec.client, rec.run));
+        if rec.op.is_write() && is_exclusive_marker_key(&rec.key) {
+            present.insert(rec.key.clone(), (rec.client, rec.run));
         }
         for k in rec.deleted_keys() {
-            held.remove(k);
+            present.remove(k);
         }
     }
+    out
 }
 
 fn is_marker_key(key: &str) -> bool {
@@ -928,14 +1028,6 @@ fn is_head_key(key: &str) -> bool {
 
 fn applied_write(r: &OpRecord) -> bool {
     r.applied() && r.op.is_write()
-}
-
-/// A record of an operation issued, not of a parked effect landing.
-fn issued(r: &OpRecord) -> bool {
-    !matches!(
-        r.outcome,
-        OpOutcome::Released(_) | OpOutcome::ReleasedRefused(_)
-    )
 }
 
 fn violation(kind: ViolationKind, subject: String, step: u64, detail: String) -> Violation {
@@ -1052,9 +1144,14 @@ pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violatio
 /// `index.h/` write `h` of a backup run, the marker was bad (an applied
 /// delete of one of its marker keys by another client before `h`, or `h`
 /// more than `MARKER_GAP_LIMIT` after its latest applied marker write)
-/// and its packs were too old (the `at` of the last op it issued before
-/// `h` was issued, minus the earliest of its applied pack PUTs, plus
-/// `HEAD_LANDING_ALLOWANCE`, exceeds `PACK_AGE_LIMIT`).
+/// and its packs were too old (the clock at `h`'s own issue — its
+/// record's `issued`, which is before `at` when a gate held the request;
+/// the parked record's for a released write — minus the earliest of its applied pack
+/// PUTs, plus `HEAD_LANDING_ALLOWANCE`, exceeds `PACK_AGE_LIMIT`). The
+/// product runs the pack-age term at its head step, just before this
+/// request; a clock read any earlier (the last op the run issued before
+/// `h`) misses a suspend between its fence and its head write when nothing
+/// is issued between them, as on a multi-writer head write.
 pub(crate) fn marker_gap_commit(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violation> {
     use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
     use crate::repo::sessions::MARKER_GAP_LIMIT;
@@ -1095,14 +1192,7 @@ pub(crate) fn marker_gap_commit(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Vio
                     .unwrap_or(h_pos),
                 _ => h_pos,
             };
-            let Some(t_last) = log[..issue_pos]
-                .iter()
-                .rev()
-                .find(|r| mine(r) && issued(r))
-                .map(|r| r.at)
-            else {
-                continue;
-            };
+            let t_issue = log[issue_pos].issued;
             let Some(oldest) = before
                 .iter()
                 .filter(mine)
@@ -1112,14 +1202,14 @@ pub(crate) fn marker_gap_commit(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Vio
             else {
                 continue;
             };
-            let age = between(oldest, t_last);
+            let age = between(oldest, t_issue);
             if age + HEAD_LANDING_ALLOWANCE > PACK_AGE_LIMIT {
                 out.push(violation(
                     ViolationKind::OldPackCommittedAfterMarkerGap,
                     run_subject(run),
                     h.step,
                     format!(
-                        "step {} wrote {} with a {} marker; its oldest pack was {} s old at its last op",
+                        "step {} wrote {} with a {} marker; its oldest pack was {} s old at its issue",
                         h.step,
                         h.key,
                         if reaped { "reaped" } else { "gapped" },
@@ -1150,8 +1240,8 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
     let mut index_report = Report::default();
     let index_ok = check_index(store, &mut repo, &mut index_report);
     // Invariant 12 and the retained heads' part of 4 are asked for
-    // together (`STEP8`): on the fallback (`StoreKind::Plain`) a lost lock
-    // or a late head replaces heads by design (07 stands in for I3 there).
+    // together (`STEP8`): a single-writer repository replaces heads by
+    // design (a late or stalled head; I3 is multi-writer only).
     if want(Invariant::IndexIntegrity) {
         report.violations.extend(index_report.violations);
         if want(Invariant::HeadsImmutable) {
@@ -1202,8 +1292,12 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
     if want(Invariant::AllowedErrors) {
         check_errors(history, &mut report);
     }
-    if want(Invariant::LockExclusion) {
-        check_lock_exclusion(store, history, &mut report);
+    if want(Invariant::ExclusiveSessions) {
+        report.violations.extend(exclusive_sessions(
+            &store.log(),
+            &history.runs,
+            store.tamper_id(),
+        ));
     }
     if want(Invariant::OrphanGrace) || want(Invariant::MarkerGapCommit) {
         let log = store.log();
@@ -1264,6 +1358,7 @@ mod tests {
                 outcome: OpOutcome::Ok,
                 label: None,
                 at,
+                issued: at,
             });
         }
     }
@@ -1279,7 +1374,7 @@ mod tests {
                 removed: Vec::new(),
                 detail: String::new(),
             },
-            lock_free: false,
+            shared: false,
             exclusive: false,
         }
     }
@@ -1301,33 +1396,279 @@ mod tests {
 
     const PACK: &str = "packs/aa/aa00";
 
-    /// Invariant 7 judges a lock-mode run's head write without a lock and
-    /// exempts the same write by a lock-free run (phase F part 10b).
-    #[test]
-    fn lock_exclusion_exempts_lock_free_runs() {
-        use crate::sim::store::{SimConfig, SimStore};
-        use vykar_storage::StorageBackend;
-        for lock_free in [false, true] {
-            let store = SimStore::new(SimConfig::default());
-            let a = store.register_client("a");
-            store.set_current_run(a, Some(0));
-            store.handle(a).put("index.h/2", b"head").unwrap();
-            let history = History {
-                runs: vec![RunRecord {
-                    lock_free,
-                    ..run(0, a, ClientOp::Compact, store.step())
-                }],
-                ..History::default()
-            };
-            let mut report = Report::default();
-            check_lock_exclusion(&store, &history, &mut report);
-            let want = if lock_free {
-                vec![]
-            } else {
-                vec![ViolationKind::WriteWithoutLock]
-            };
-            assert_eq!(kinds(&report.violations), want, "lock_free {lock_free}");
+    const TAMPER: ClientId = ClientId(1);
+    const XA: &str = "sessions/x-a.json";
+    const XB: &str = "sessions/x-b.json";
+
+    impl Log {
+        fn tamper(&mut self, op: OpKind, key: &str) {
+            self.op(TAMPER, 0, op, key, mins(0));
+            self.0.last_mut().unwrap().run = None;
         }
+
+        /// An exclusive run's registration: its marker PUT and its listing.
+        fn register(&mut self, client: ClientId, run: usize, key: &str) {
+            self.op(client, run, OpKind::Put, key, mins(0));
+            self.op(client, run, OpKind::ListMeta, "sessions/", mins(0));
+        }
+    }
+
+    fn exclusive_kinds(log: &Log, runs: &[RunRecord]) -> Vec<ViolationKind> {
+        kinds(&exclusive_sessions(&log.0, runs, TAMPER))
+    }
+
+    fn refused(index: usize, client: ClientId) -> RunRecord {
+        RunRecord {
+            outcome: RunOutcome::Err(crate::sim::history::ErrorRecord {
+                display: "active sessions".into(),
+                class: ErrorClass::Allowed(AllowedError::ActiveSessions),
+            }),
+            ..run(index, client, ClientOp::CheckRepair, 100)
+        }
+    }
+
+    fn shared(index: usize, client: ClientId, op: ClientOp) -> RunRecord {
+        RunRecord {
+            shared: true,
+            ..run(index, client, op, 100)
+        }
+    }
+
+    #[test]
+    fn exclusive_write_after_its_marker_is_reaped() {
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.op(OTHER, 1, OpKind::Delete, XA, mins(50));
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(50));
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            shared(1, OTHER, ClientOp::Compact),
+        ];
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::ExclusiveWriteWithoutHold]
+        );
+    }
+
+    #[test]
+    fn two_entered_exclusive_holds() {
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            run(1, OTHER, ClientOp::CheckRepair, 100),
+        ];
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.register(OTHER, 1, XB);
+        log.op(OTHER, 1, OpKind::Put, "index.h/2", mins(1));
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::ExclusiveWriteUnderSeveralHolds]
+        );
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.register(OTHER, 1, XB);
+        log.op(BACKUP, 0, OpKind::Delete, XB, mins(1));
+        log.op(OTHER, 1, OpKind::Put, "index.h/2", mins(1));
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::ExclusiveWriteUnderOtherHold]
+        );
+    }
+
+    /// Invariant 7 read this as `WriteUnderSeveralLocks` (its documented
+    /// limit: a key counted as held from its PUT).
+    #[test]
+    fn a_refused_registration_is_no_hold() {
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.register(OTHER, 1, XB);
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            refused(1, OTHER),
+        ];
+        assert_eq!(exclusive_kinds(&log, &runs), []);
+    }
+
+    /// A run whose registration was refused holds nothing, so a write it
+    /// made anyway is judged without a hold.
+    #[test]
+    fn a_refused_run_that_wrote_is_judged() {
+        let mut log = Log::default();
+        log.register(OTHER, 1, XB);
+        log.op(OTHER, 1, OpKind::Put, "snapshots/s", mins(1));
+        assert_eq!(
+            exclusive_kinds(&log, &[refused(1, OTHER)]),
+            [ViolationKind::ExclusiveWriteWithoutHold]
+        );
+    }
+
+    #[test]
+    fn a_hold_starts_at_the_registration_listing() {
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            shared(
+                1,
+                OTHER,
+                ClientOp::Backup {
+                    snapshot: "b".into(),
+                },
+            ),
+        ];
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, XA, mins(0));
+        log.op(OTHER, 1, OpKind::Put, "snapshots/s", mins(0));
+        log.op(BACKUP, 0, OpKind::ListMeta, "sessions/", mins(0));
+        assert_eq!(exclusive_kinds(&log, &runs), []);
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.op(OTHER, 1, OpKind::Put, "snapshots/s", mins(0));
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::SharedWriteUnderExclusive]
+        );
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.op(BACKUP, 0, OpKind::Delete, XA, mins(0));
+        log.op(OTHER, 1, OpKind::Put, "snapshots/s", mins(0));
+        assert_eq!(exclusive_kinds(&log, &runs), []);
+    }
+
+    /// An exclusive run's own protected write between its marker PUT and its
+    /// registration listing is not yet under its hold.
+    #[test]
+    fn an_exclusive_write_before_its_listing_has_no_hold() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, XA, mins(0));
+        log.op(BACKUP, 0, OpKind::Put, "index.d/x", mins(0));
+        log.op(BACKUP, 0, OpKind::ListMeta, "sessions/", mins(0));
+        assert_eq!(
+            exclusive_kinds(&log, &[run(0, BACKUP, ClientOp::CheckRepair, 100)]),
+            [ViolationKind::ExclusiveWriteWithoutHold]
+        );
+    }
+
+    #[test]
+    fn an_exclusive_runs_data_write_is_protected() {
+        let runs = [run(0, BACKUP, ClientOp::CheckRepair, 100)];
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.op(BACKUP, 0, OpKind::Delete, XA, mins(0));
+        log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::ExclusiveWriteWithoutHold]
+        );
+        // The open's key backfill, before its first exclusive marker PUT.
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "keys/repokey", mins(0));
+        log.register(BACKUP, 0, XA);
+        assert_eq!(exclusive_kinds(&log, &runs), []);
+    }
+
+    #[test]
+    fn a_sessionless_write() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "index.d/x", mins(0));
+        assert_eq!(
+            exclusive_kinds(&log, &[run(0, BACKUP, ClientOp::Compact, 100)]),
+            [ViolationKind::WriteWithoutSession]
+        );
+        assert_eq!(
+            exclusive_kinds(&log, &[shared(0, BACKUP, ClientOp::Compact)]),
+            []
+        );
+    }
+
+    #[test]
+    fn a_legacy_lock_key_is_no_hold() {
+        let legacy = format!(
+            "{}{:020}-{:032x}.json",
+            crate::repo::sessions::LEGACY_LOCKS_PREFIX,
+            0,
+            1u128
+        );
+        let mut log = Log::default();
+        log.tamper(OpKind::Put, &legacy);
+        log.register(BACKUP, 0, XA);
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(1));
+        assert_eq!(
+            exclusive_kinds(&log, &[run(0, BACKUP, ClientOp::CheckRepair, 100)]),
+            []
+        );
+    }
+
+    /// An exclusive run's own writes under `sessions/` and the legacy lock
+    /// directory are not judged, hold or none: its marker key is gone here,
+    /// yet its journal PUT, its delete of another session's marker and its
+    /// delete of a legacy lock key pass; a data write after them does not.
+    #[test]
+    fn an_exclusive_runs_session_and_legacy_writes_are_exempt() {
+        let legacy = format!(
+            "{}{:020}-{:032x}.json",
+            crate::repo::sessions::LEGACY_LOCKS_PREFIX,
+            0,
+            1u128
+        );
+        let mut log = Log::default();
+        log.register(BACKUP, 0, XA);
+        log.op(OTHER, 1, OpKind::Delete, XA, mins(50));
+        log.op(BACKUP, 0, OpKind::Put, "sessions/x-a.index", mins(50));
+        log.op(BACKUP, 0, OpKind::Delete, "sessions/s.json", mins(50));
+        log.op(BACKUP, 0, OpKind::Delete, &legacy, mins(50));
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            shared(1, OTHER, ClientOp::Compact),
+        ];
+        assert_eq!(exclusive_kinds(&log, &runs), []);
+        log.op(BACKUP, 0, OpKind::Put, "index.d/x", mins(50));
+        assert_eq!(
+            exclusive_kinds(&log, &runs),
+            [ViolationKind::ExclusiveWriteWithoutHold]
+        );
+    }
+
+    /// A batch delete that names an exclusive marker key removes its hold,
+    /// as a single delete does; one naming only other keys does not.
+    #[test]
+    fn a_batch_delete_removes_a_hold() {
+        let runs = [
+            run(0, BACKUP, ClientOp::CheckRepair, 100),
+            shared(1, OTHER, ClientOp::Compact),
+        ];
+        let batch = |keys: &[&str]| {
+            let mut log = Log::default();
+            log.register(BACKUP, 0, XA);
+            log.op(OTHER, 1, OpKind::BatchDelete, keys[0], mins(50));
+            log.0.last_mut().unwrap().keys = keys.iter().map(|k| k.to_string()).collect();
+            log.op(OTHER, 1, OpKind::Put, "snapshots/s", mins(50));
+            log
+        };
+        assert_eq!(exclusive_kinds(&batch(&["sessions/s.json", XA]), &runs), []);
+        assert_eq!(
+            exclusive_kinds(&batch(&["sessions/s.json", "sessions/t.json"]), &runs),
+            [ViolationKind::SharedWriteUnderExclusive]
+        );
+    }
+
+    #[test]
+    fn init_and_tamper_are_exempt() {
+        let mut log = Log::default();
+        log.op(BACKUP, 0, OpKind::Put, "index.h/1", mins(0));
+        log.tamper(OpKind::Put, "index.h/2");
+        log.tamper(OpKind::Delete, "snapshots/s");
+        assert_eq!(
+            exclusive_kinds(&log, &[run(0, BACKUP, ClientOp::Init, 1)]),
+            []
+        );
+        // A tamper-planted exclusive key is a hold from its PUT.
+        let mut log = Log::default();
+        log.tamper(OpKind::Put, XB);
+        log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(0));
+        assert_eq!(
+            exclusive_kinds(&log, &[shared(0, BACKUP, ClientOp::Compact)]),
+            [ViolationKind::SharedWriteUnderExclusive]
+        );
     }
 
     #[test]
@@ -1442,7 +1783,7 @@ mod tests {
             BACKUP,
             0,
             OpKind::Exists,
-            "locks/l.json",
+            "sessions/s.json",
             mins(11 * 60 + 30),
         );
         log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 30));
@@ -1455,7 +1796,7 @@ mod tests {
         let mut log = Log::default();
         log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
         log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
-        log.op(BACKUP, 0, OpKind::Exists, "locks/l.json", mins(60));
+        log.op(BACKUP, 0, OpKind::Exists, "sessions/s.json", mins(60));
         log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(60));
         assert!(marker_gap_commit(&log.0, &runs).is_empty());
         // A reap by another client counts like a gap.
@@ -1499,10 +1840,86 @@ mod tests {
             BACKUP,
             0,
             OpKind::Exists,
-            "locks/l.json",
+            "sessions/s.json",
             mins(11 * 60 + 30),
         );
         log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 30));
         assert!(marker_gap_commit(&log.0, &[backup_run(5)]).is_empty());
+    }
+
+    /// Invariant 11 reads the clock at the head write's own issue: a
+    /// multi-writer head write issues nothing between its segment PUT and
+    /// its put-if-absent, so a suspend there is seen only at the create
+    /// itself (step 10 F1). The last op before it would be the segment PUT,
+    /// 6 h 1 min in, and the commit would pass.
+    #[test]
+    fn checker_flags_an_old_pack_commit_suspended_before_its_head_create() {
+        let suspended = |head_at| {
+            let mut log = Log::default();
+            log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+            log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+            log.op(BACKUP, 0, OpKind::Put, "index.d/aa", mins(6 * 60 + 1));
+            log.op(BACKUP, 0, OpKind::PutIfAbsent, "index.h/2", head_at);
+            log
+        };
+        let runs = [backup_run(4)];
+        assert_eq!(
+            kinds(&marker_gap_commit(&suspended(mins(12 * 60 + 2)).0, &runs)),
+            [ViolationKind::OldPackCommittedAfterMarkerGap]
+        );
+        // No suspend before the create: the packs are young enough.
+        assert!(marker_gap_commit(&suspended(mins(6 * 60 + 1)).0, &runs).is_empty());
+    }
+
+    /// A released head write is judged at its parked record's issue, not
+    /// at its release: issued past the limit it is flagged; issued in time
+    /// and released late it is not (a late head is invariant 11's only
+    /// through its issue).
+    #[test]
+    fn checker_judges_a_released_head_write_at_its_issue() {
+        use crate::sim::fault::{FaultAction, ParkedId};
+        let released = |issued_at, released_at| {
+            let mut log = Log::default();
+            log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+            log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+            log.op(BACKUP, 0, OpKind::Put, "index.d/aa", mins(60));
+            log.op(BACKUP, 0, OpKind::PutIfAbsent, "index.h/2", issued_at);
+            log.0.last_mut().unwrap().outcome = OpOutcome::Parked(ParkedId(7), FaultAction::Delay);
+            log.op(BACKUP, 0, OpKind::PutIfAbsent, "index.h/2", released_at);
+            log.0.last_mut().unwrap().outcome = OpOutcome::Released(ParkedId(7));
+            log
+        };
+        let runs = [backup_run(5)];
+        assert_eq!(
+            kinds(&marker_gap_commit(
+                &released(mins(11 * 60 + 30), mins(11 * 60 + 31)).0,
+                &runs
+            )),
+            [ViolationKind::OldPackCommittedAfterMarkerGap]
+        );
+        assert!(marker_gap_commit(&released(mins(6 * 60), mins(12 * 60)).0, &runs).is_empty());
+    }
+
+    /// A head write a gate held is judged at the clock when the gate
+    /// caught it (`issued`), not when it was logged (`at`): a request in
+    /// flight for 45 minutes was issued in time, and the check after the
+    /// head returned is what answers its late landing. Issued that late, it
+    /// is flagged.
+    #[test]
+    fn checker_judges_a_gated_head_write_at_its_issue() {
+        let gated = |issued_at| {
+            let mut log = Log::default();
+            log.op(BACKUP, 0, OpKind::Put, "sessions/s.json", mins(0));
+            log.op(BACKUP, 0, OpKind::PutPack, PACK, mins(0));
+            log.op(BACKUP, 0, OpKind::Put, "index.h/2", mins(11 * 60 + 55));
+            log.0.last_mut().unwrap().issued = issued_at;
+            log
+        };
+        let runs = [backup_run(3)];
+        assert!(marker_gap_commit(&gated(mins(11 * 60 + 10)).0, &runs).is_empty());
+        assert_eq!(
+            kinds(&marker_gap_commit(&gated(mins(11 * 60 + 55)).0, &runs)),
+            [ViolationKind::OldPackCommittedAfterMarkerGap]
+        );
     }
 }

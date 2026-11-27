@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-write-old-segment-lockfree",
-  "note": "Lock-free twin of late-snapshot-write-old-segment (phase F part 10d): the same case on the encrypted template and the conditional store, each lock decision replaced by the commit mark and the probe of locks/, and the delete and the compact lock-free (each one decision). a's snapshot PUT is delayed and a fails after its head; 12 h later the lock-free compact's second session listing finds no committing session (a deregistered), its mark does not see a's snapshot, and a's segment is past T_pack, so it sweeps a1's chunks and deletes their packs; the release then lands a1's snapshot (R3, LateSnapshotWrite: a snapshot PUT released after its writer ended). Not planned to close.",
+  "note": "Lock-free twin of late-snapshot-write-old-segment (phase F part 10d): the same case on the encrypted template and the conditional store, each lock decision replaced by the commit mark and the probe of locks/, and the delete and the compact lock-free (each one decision). a's snapshot PUT is delayed and a fails after its head; 12 h later the lock-free compact's second session listing finds no committing session (a deregistered), its mark does not see a's snapshot, and a's segment is past T_pack, so it sweeps a1's chunks and deletes their packs; the release then lands a1's snapshot (R3, LateSnapshotWrite: a snapshot PUT released after its writer ended). Not planned to close. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [
     "LateSnapshotWrite"
   ],
@@ -30,7 +30,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -165,7 +165,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -318,6 +318,14 @@
       "release"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Ok",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -383,8 +391,8 @@
       0,
       0,
       0,
-      6,
-      6,
+      5,
+      5,
       0,
       0,
       1

@@ -57,12 +57,11 @@ pub enum StoreKind {
     /// concurrent-create failure the check cannot see).
     RacyRelease,
     /// Local, OpenSSH SFTP, AWS S3: put-if-absent honoured; a plain PUT
-    /// replaces any object, heads included (phase F part 10b: what a
-    /// lock-mode client's plain head PUT does beside a lock-free one), and
-    /// an identical re-PUT of an `index.d/` or `index.h/` key renews its
-    /// mtime (and writer), as these backends do: a duplicated plain head
-    /// PUT of a lock client makes that head younger, which keeps it from
-    /// the index GC longer. With random nonces no client re-creates an
+    /// replaces any object, heads included (a single-writer head write after
+    /// `upgrade --commit-mode multi` is one), and an identical re-PUT of an
+    /// `index.d/` or `index.h/` key renews its mtime (and writer), as these
+    /// backends do: a duplicated plain head PUT makes that head younger,
+    /// which keeps it from the index GC longer. With random nonces no client re-creates an
     /// identical object name.
     ConditionalOverwrite,
 }
@@ -155,15 +154,17 @@ struct State {
     labels: BTreeMap<ClientId, &'static str>,
     gates: Vec<GateState>,
     next_gate: u32,
+    /// The clock when a gate caught the operation now being decided
+    /// (`pass_gates` sets it, the operation's record takes it): the
+    /// record's `issued`.
+    gate_issue: Option<chrono::DateTime<chrono::Utc>>,
     /// Every replacement of a stored head by other bytes: (key, step, writer).
     head_overwrites: Vec<(String, u64, ClientId)>,
-    /// Clients whose handles offer no put-if-absent ([`SimStore::set_lock_client`]).
-    lock_clients: BTreeSet<ClientId>,
     /// Clients whose handles offer no put-if-absent and read the real
     /// `config` ([`SimStore::set_client_without_conditional`]).
     unconditional_clients: BTreeSet<ClientId>,
     /// Runs that wrote (or attempted) a session marker key flagged
-    /// `committing` ([`SimStore::committed_lock_free_in_run`]).
+    /// `committing` ([`SimStore::marked_committing_in_run`]).
     committing_runs: BTreeSet<usize>,
     /// Runs that wrote (or attempted) any session marker key
     /// ([`SimStore::registered_in_run`]), but an exclusive session's.
@@ -287,6 +288,7 @@ impl State {
             outcome,
             label,
             at: self.clock,
+            issued: self.gate_issue.take().unwrap_or(self.clock),
         });
     }
 
@@ -509,8 +511,8 @@ impl SimStore {
                     labels: BTreeMap::new(),
                     gates: Vec::new(),
                     next_gate: 0,
+                    gate_issue: None,
                     head_overwrites: Vec::new(),
-                    lock_clients: BTreeSet::new(),
                     unconditional_clients: BTreeSet::new(),
                     committing_runs: BTreeSet::new(),
                     registered_runs: BTreeSet::new(),
@@ -523,7 +525,8 @@ impl SimStore {
 
     /// A deep copy for invariant 9: same objects, clock, step counter,
     /// client names and config; empty log; no rules, parked effects,
-    /// crashes, runs, gates or lock clients (faults have stopped).
+    /// crashes, runs, gates or clients without put-if-absent (faults have
+    /// stopped).
     pub fn fork(&self) -> SimStore {
         self.fork_as(self.shared.config.kind)
     }
@@ -613,41 +616,13 @@ impl SimStore {
             .unwrap_or_else(|| format!("client#{}", client.0))
     }
 
-    /// Storage handle for `client`: logged, faultable. A lock client's
-    /// ([`Self::set_lock_client`]) offers no put-if-absent and reads
-    /// `config` as single-writer; a client named by
+    /// Storage handle for `client`: logged, faultable. A client named by
     /// [`Self::set_client_without_conditional`] offers no put-if-absent and
     /// reads the real `config`. Every handle the harness builds comes from
     /// here, so this holds in every run.
     pub fn handle(&self, client: ClientId) -> SimClient {
-        let (lock_client, unconditional) = {
-            let st = self.state();
-            (
-                st.lock_clients.contains(&client),
-                st.unconditional_clients.contains(&client),
-            )
-        };
-        let mut handle = self.new_handle(client, lock_client || unconditional);
-        handle.stale_single = lock_client;
-        handle
-    }
-
-    /// A handle for `client` whose `conditional()` is None on every store
-    /// kind: a client whose backend does not offer put-if-absent, or whose
-    /// check concluded Unsupported, beside clients that have it (the
-    /// mixed-verdict case of phase F part 10).
-    pub fn handle_without_conditional(&self, client: ClientId) -> SimClient {
-        self.new_handle(client, true)
-    }
-
-    /// Every later [`Self::handle`] of `client` offers no put-if-absent and
-    /// reads `config` as single-writer: a client that read `config` before
-    /// a switch to multi-writer. Since 10-single-protocol step 7 a lock
-    /// client models no client (it once modelled a lock-mode commit beside
-    /// lock-free ones; the re-read of `config` closes the stale-config
-    /// route); kept until step 10 removes it.
-    pub fn set_lock_client(&self, client: ClientId) {
-        self.state().lock_clients.insert(client);
+        let unconditional = self.state().unconditional_clients.contains(&client);
+        self.new_handle(client, unconditional)
     }
 
     /// Every later [`Self::handle`] of `client` offers no put-if-absent but
@@ -655,11 +630,6 @@ impl SimStore {
     /// refuse (`MultiWriterUnsupported`).
     pub fn set_client_without_conditional(&self, client: ClientId) {
         self.state().unconditional_clients.insert(client);
-    }
-
-    /// The clients [`set_lock_client`](Self::set_lock_client) named.
-    pub fn lock_clients(&self) -> BTreeSet<ClientId> {
-        self.state().lock_clients.clone()
     }
 
     fn new_handle(&self, client: ClientId, no_conditional: bool) -> SimClient {
@@ -672,7 +642,6 @@ impl SimStore {
             client,
             observer: false,
             no_conditional,
-            stale_single: false,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -684,7 +653,6 @@ impl SimStore {
             client: OBSERVER,
             observer: true,
             no_conditional: false,
-            stale_single: false,
             cond: Arc::new(Verifier::new()),
         }
     }
@@ -884,19 +852,15 @@ impl SimStore {
     }
 
     /// Whether run `run` attempted a session marker PUT flagged
-    /// `committing`: the lock-free writer's commit mark, which a backup
-    /// writes only once it decided to commit lock-free
-    /// (`PendingCommit::commit_mode`: an encrypted repository, a passed
-    /// put-if-absent check and a continuous marker record) and a lock-mode
-    /// commit never writes. The simulator's record of a run's mode,
-    /// `RunRecord::lock_free`.
-    pub fn committed_lock_free_in_run(&self, run: usize) -> bool {
+    /// `committing`: the backup's commit mark, which it writes once it
+    /// decided to commit. A backup's `RunRecord::shared`.
+    pub fn marked_committing_in_run(&self, run: usize) -> bool {
         self.state().committing_runs.contains(&run)
     }
 
-    /// Whether run `run` wrote (or attempted) a session marker key: a
-    /// maintenance run that did ran lock-free (04 step 9: under the lock
-    /// maintenance registers no session); `RunRecord::lock_free`.
+    /// Whether run `run` wrote (or attempted) a shared session's marker
+    /// key: a maintenance run that did ran in a shared session;
+    /// `RunRecord::shared`.
     pub fn registered_in_run(&self, run: usize) -> bool {
         self.state().registered_runs.contains(&run)
     }
@@ -1113,11 +1077,16 @@ impl SimStore {
         let Some(id) = held else {
             return st;
         };
+        let issued = st.clock;
         self.shared.gate_cv.notify_all();
-        self.shared
+        let mut st = self
+            .shared
             .gate_cv
             .wait_while(st, |s| gate_paused_in(s, id).is_some())
-            .unwrap()
+            .unwrap();
+        // The caller records this operation under the same lock hold.
+        st.gate_issue = Some(issued);
+        st
     }
 
     /// One read-like op (no effect): `f` computes the result, its outcome
@@ -1257,11 +1226,8 @@ pub struct SimClient {
     client: ClientId,
     observer: bool,
     /// `conditional()` is None whatever the store's kind
-    /// ([`SimStore::handle_without_conditional`]).
+    /// ([`SimStore::set_client_without_conditional`]).
     no_conditional: bool,
-    /// Reads `config` as single-writer (a lock client,
-    /// [`SimStore::set_lock_client`]).
-    stale_single: bool,
     /// The put-if-absent check's cache, as a production backend instance
     /// has one: shared by this handle's clones (one per run).
     cond: Arc<Verifier>,
@@ -1324,20 +1290,6 @@ impl ConditionalWrite for SimClient {
     }
 }
 
-/// `config` bytes as a lock client reads them: a map without
-/// `multi_writer`; anything that does not decode as a map unchanged.
-fn as_single_writer(data: Vec<u8>) -> Vec<u8> {
-    match crate::repo::RepoConfig::decode(&data) {
-        Ok(crate::repo::DecodedConfig::Map(mut config))
-            if config.writer_mode() == WriterMode::Multi =>
-        {
-            config.set_writer_mode(WriterMode::Single);
-            config.encode().unwrap_or(data)
-        }
-        _ => data,
-    }
-}
-
 /// Whether a session marker body carries `"committing": true`.
 fn is_committing_marker(data: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(data)
@@ -1355,15 +1307,11 @@ fn found_or_not<T>(v: Option<T>, len: Option<u64>) -> (Result<Option<T>>, OpOutc
 
 impl vykar_storage::StorageBackend for SimClient {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let got = self.read(OpKind::Get, key, |m| {
+        self.read(OpKind::Get, key, |m| {
             let v = m.get(key).map(|o| o.data.clone());
             let len = v.as_ref().map(|d| d.len() as u64);
             found_or_not(v, len)
-        })?;
-        if self.stale_single && key == "config" {
-            return Ok(got.map(as_single_writer));
-        }
-        Ok(got)
+        })
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -1371,8 +1319,8 @@ impl vykar_storage::StorageBackend for SimClient {
             let committing = is_committing_marker(data);
             let mut st = self.store.state();
             if let Some(run) = st.runs.get(&self.client).copied() {
-                // An exclusive session's marker is a hold (invariant 7),
-                // not a lock-free registration (10-single-protocol step 8).
+                // An exclusive session's marker is a hold for invariant 13,
+                // not a shared registration (10-single-protocol step 8).
                 if crate::repo::sessions::parse_session_marker_key(key)
                     .is_some_and(|(id, _)| crate::repo::sessions::is_exclusive_session(id))
                 {
@@ -1705,12 +1653,12 @@ mod tests {
     }
 
     #[test]
-    fn lock_re_put_renews_mtime() {
+    fn a_re_put_renews_mtime() {
         let (store, a, _) = two_clients(SimConfig::default());
-        a.put("locks/x.json", b"l").unwrap();
+        a.put("sessions/x.json", b"l").unwrap();
         store.advance_clock(std::time::Duration::from_secs(60));
-        a.put("locks/x.json", b"l").unwrap();
-        assert_eq!(store.object("locks/x.json").unwrap().mtime, store.now());
+        a.put("sessions/x.json", b"l").unwrap();
+        assert_eq!(store.object("sessions/x.json").unwrap().mtime, store.now());
     }
 
     #[test]
@@ -1718,15 +1666,15 @@ mod tests {
         let (store, a, _) = two_clients(SimConfig::default());
         let start = store.now();
         store.step_clock(chrono::Duration::hours(3));
-        a.put("locks/x.json", b"l").unwrap();
+        a.put("sessions/x.json", b"l").unwrap();
         assert_eq!(
-            store.object("locks/x.json").unwrap().mtime,
+            store.object("sessions/x.json").unwrap().mtime,
             start + chrono::Duration::hours(3)
         );
         store.step_clock(chrono::Duration::hours(-5));
-        a.put("locks/y.json", b"l").unwrap();
+        a.put("sessions/y.json", b"l").unwrap();
         assert_eq!(
-            store.object("locks/y.json").unwrap().mtime,
+            store.object("sessions/y.json").unwrap().mtime,
             start - chrono::Duration::hours(2)
         );
     }
@@ -1902,9 +1850,12 @@ mod tests {
             ..SimConfig::default()
         };
         let (store, a, _) = two_clients(config);
+        // vykar-protocol's table keeps a class for the legacy lock directory
+        // (vykar 0.24's locks).
+        let legacy = format!("{}a", crate::repo::sessions::LEGACY_LOCKS_PREFIX);
         for key in [
             "index",
-            "locks/a",
+            legacy.as_str(),
             "config",
             "index.h/1",
             "snapshots/s",
@@ -1913,7 +1864,7 @@ mod tests {
             a.put(key, b"one").unwrap();
         }
         a.put("index", b"two").unwrap();
-        a.put("locks/a", b"two").unwrap();
+        a.put(&legacy, b"two").unwrap();
         for key in ["config", "index.h/1"] {
             let err = a.put(key, b"two").unwrap_err().to_string();
             assert!(err.contains("append-only"), "{key}: {err}");
@@ -1928,7 +1879,7 @@ mod tests {
         assert!(store.object("sessions/s").is_none());
 
         // A batch fails as a whole on its first refused key.
-        let keys = ["locks/a".to_string(), "snapshots/s".to_string()];
+        let keys = [legacy.clone(), "snapshots/s".to_string()];
         let err = a
             .batch_delete()
             .expect("batch delete offered")
@@ -1937,7 +1888,7 @@ mod tests {
             .to_string();
         assert!(err.contains("append-only"), "{err}");
         assert_eq!(last(&store).outcome, OpOutcome::Refused);
-        assert!(store.object("locks/a").is_some());
+        assert!(store.object(&legacy).is_some());
     }
 
     #[test]
@@ -2249,7 +2200,11 @@ mod tests {
         assert_eq!(store.object("index.h/2").unwrap().data, b"a");
         // Each handle ran the check once: its probe is gone.
         assert!(store.keys("sessions/").is_empty());
-        assert!(store.keys("locks/").is_empty());
+        assert!(
+            store
+                .keys(crate::repo::sessions::LEGACY_LOCKS_PREFIX)
+                .is_empty()
+        );
         let probes = store
             .log()
             .iter()
@@ -2379,18 +2334,16 @@ mod tests {
         assert_eq!(first, init_log());
     }
 
-    /// On a multi-writer repository a lock client reads `config` as
-    /// single-writer; the observer and a client without put-if-absent read
-    /// the real one.
+    /// On a multi-writer repository the observer and a client without
+    /// put-if-absent read the real `config`.
     #[test]
-    fn lock_client_reads_config_as_single_writer() {
+    fn a_client_without_conditional_reads_the_real_config() {
         let sim = crate::sim::Sim::with_config(SimConfig {
             kind: StoreKind::Conditional,
             ..SimConfig::default()
         });
         let store = sim.store();
-        let (l, u) = (store.register_client("l"), store.register_client("u"));
-        store.set_lock_client(l);
+        let u = store.register_client("u");
         store.set_client_without_conditional(u);
         let mode = |h: &SimClient| match crate::repo::RepoConfig::decode(
             &h.get("config").unwrap().unwrap(),
@@ -2400,10 +2353,6 @@ mod tests {
             crate::repo::DecodedConfig::Map(c) => c.writer_mode(),
             other => panic!("{other:?}"),
         };
-        let lock = store.handle(l);
-        assert_eq!(mode(&lock), WriterMode::Single);
-        assert!(lock.conditional().is_none());
-        assert_eq!(last(store).op, OpKind::Get, "logged as the same GET");
         assert_eq!(mode(&store.observer()), WriterMode::Multi);
         let without = store.handle(u);
         assert_eq!(mode(&without), WriterMode::Multi);
@@ -2502,7 +2451,11 @@ mod tests {
             ConditionalSupport::Unsupported { .. }
         ));
         assert!(a.conditional().is_none());
-        assert!(store.keys("locks/").is_empty());
+        assert!(
+            store
+                .keys(crate::repo::sessions::LEGACY_LOCKS_PREFIX)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2594,34 +2547,27 @@ mod tests {
         store.set_current_run(a.client(), Some(3));
         a.put("sessions/s.1.json", br#"{"committing":false}"#)
             .unwrap();
-        assert!(!store.committed_lock_free_in_run(3));
+        assert!(!store.marked_committing_in_run(3));
         a.put("sessions/s.2.json", br#"{"committing":true}"#)
             .unwrap();
-        assert!(store.committed_lock_free_in_run(3));
-        assert!(!store.committed_lock_free_in_run(4));
+        assert!(store.marked_committing_in_run(3));
+        assert!(!store.marked_committing_in_run(4));
     }
 
-    /// A handle without put-if-absent beside one with it, on one store;
-    /// a lock client's every handle has none.
+    /// A handle without put-if-absent beside one with it, on one store.
     #[test]
-    fn handle_without_conditional_offers_no_put_if_absent() {
+    fn a_client_without_conditional_offers_no_put_if_absent() {
         for kind in [
             StoreKind::Conditional,
             StoreKind::ConditionalOverwrite,
             StoreKind::RacyRelease,
         ] {
             let (store, a, b) = of_kind(kind);
-            assert!(
-                store
-                    .handle_without_conditional(a.client())
-                    .conditional()
-                    .is_none()
-            );
             assert!(a.conditional().is_some(), "{kind:?}");
-            store.set_lock_client(b.client());
+            store.set_client_without_conditional(b.client());
             assert!(store.handle(b.client()).conditional().is_none(), "{kind:?}");
             assert!(store.handle(a.client()).conditional().is_some(), "{kind:?}");
-            // A fork forgets its lock clients, as it forgets runs.
+            // A fork forgets the setting, as it forgets runs.
             assert!(store.fork().handle(b.client()).conditional().is_some());
         }
     }

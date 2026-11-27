@@ -279,9 +279,9 @@ fn a_live_shared_session_refuses_the_exclusive_ones() {
 /// backup finds that session live (`Locked`) and waits: while the exclusive
 /// marker exists it writes no index object, head or snapshot. Once the
 /// session ended the backup ends Ok (the suspend rule) or with an allowed
-/// error. Invariant 7 does not judge the backup (a shared run): this test's
-/// assertions are what sees a shared write under an exclusive hold until
-/// step 10.
+/// error. Invariant 13 judges the backup's index, head and snapshot writes
+/// under the hold (`SharedWriteUnderExclusive`) in the final check; the
+/// hand assertion checks the same mid-run.
 #[test]
 fn an_exclusive_after_a_backups_registration_stops_its_head_write() {
     for kind in BOTH_KINDS {
@@ -464,9 +464,11 @@ fn snapshot_names(sim: &mut Sim, c: ClientId) -> Vec<String> {
 
 /// What a rerun after case (e) on [`damaged`] is judged by: STEP1 except
 /// invariants 2 and 3, which flag t1, lost to the fixture's tamper and
-/// removed by the repair as asked. Not invariant 7 either: the aborted
+/// removed by the repair as asked. Not invariant 13 either: the aborted
 /// run's held write lands after its marker's removal (the write past its
-/// check, the residual by design), which it reads as `WriteWithoutLock`.
+/// check, the residual by design), which it reads as
+/// `ExclusiveWriteWithoutHold` (asserted per case in
+/// [`marker_lost_at_every_write`]).
 const AFTER_REPAIR: &[Invariant] = &[
     Invariant::CommittedSnapshotsRestore,
     Invariant::IndexIntegrity,
@@ -572,6 +574,19 @@ fn marker_lost_at_every_write(
         }
         sim.check_invariants(&[Invariant::AllowedErrors])
             .assert_clean();
+        // Invariant 13 sees the residual: the held write landed without a
+        // hold; nothing of another run is judged.
+        let exclusive = sim.check_invariants(&[Invariant::ExclusiveSessions]);
+        let subject = format!("run {}", r.index);
+        assert!(
+            exclusive.violations.iter().all(|v| v.subject == subject)
+                && exclusive
+                    .violations
+                    .iter()
+                    .any(|v| v.step == Some(landed.step)),
+            "{at}: invariant 13 at the landed write (step {}): {exclusive}",
+            landed.step
+        );
 
         // Finding (not converged, reported): the rewritten snapshot's PUT
         // landed and the old blob's DELETE was refused, so two blobs name

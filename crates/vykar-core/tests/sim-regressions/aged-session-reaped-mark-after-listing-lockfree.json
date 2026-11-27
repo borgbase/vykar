@@ -1,6 +1,6 @@
 {
   "name": "aged-session-reaped-mark-after-listing-lockfree",
-  "note": "AgedSessionReaped from a listing that could not see the victim's newest marker key (phase F part 10d fix round 2, from the default one-hour make sim-campaign, shrunk): backup c uploads two packs, two 6 h 1 min jumps follow, b's lock-free stepped compact lists sessions (c's generation-0 key 12 h old, stale), c's commit mark then writes generation 1, and b deletes the generation-0 key it listed, takes c for ended, skips its sweep beside c's committing key and deletes c's 12 h old packs as orphans while generation 1 is present (invariant 10, LiveSessionPackDeleted). Production intends the reap (reap_sessions deletes the keys it listed); c's record has a 12 h gap and its packs are older than PACK_AGE_LIMIT, so its commit marker check refuses it StaleChunksDuringCommit before any head or snapshot: no committed data is damaged. On 10c's locked compact the same case refused its mark (no snapshot listed) before any delete. Re-derived by 10-single-protocol step 8 (registration lists `sessions/`; the probe of `locks/` became the pre-head listing of `sessions/`): one step inserted, compact's registration listing before its pack listing; signature unchanged.",
+  "note": "AgedSessionReaped from a listing that could not see the victim's newest marker key (phase F part 10d fix round 2, from the default one-hour make sim-campaign, shrunk): backup c uploads two packs, two 6 h 1 min jumps follow, b's lock-free stepped compact lists sessions (c's generation-0 key 12 h old, stale), c's commit mark then writes generation 1, and b deletes the generation-0 key it listed, takes c for ended, skips its sweep beside c's committing key and deletes c's 12 h old packs as orphans while generation 1 is present (invariant 10, LiveSessionPackDeleted). Production intends the reap (reap_sessions deletes the keys it listed); c's record has a 12 h gap and its packs are older than PACK_AGE_LIMIT, so its commit marker check refuses it StaleChunksDuringCommit before any head or snapshot: no committed data is damaged. On 10c's locked compact the same case refused its mark (no snapshot listed) before any delete. Re-derived by 10-single-protocol step 8 (registration lists `sessions/`; the probe of `locks/` became the pre-head listing of `sessions/`): one step inserted, compact's registration listing before its pack listing; signature unchanged. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [
     "AgedSessionReaped"
   ],
@@ -39,7 +39,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -201,6 +201,14 @@
       "mark-committing"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Ok",
+    "Some(Allowed(StaleChunksDuringCommit))",
+    "Some(Allowed(StaleChunksDuringCommit))",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -235,10 +243,10 @@
       0,
       0,
       2,
-      7,
-      0,
-      0,
       6,
+      0,
+      0,
+      5,
       0,
       0,
       0,

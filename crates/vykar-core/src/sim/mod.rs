@@ -46,9 +46,9 @@ pub mod store;
 
 pub use checker::{Invariant, Report, Violation, ViolationKind, check_invariants};
 pub use driver::{
-    Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, LABEL_LOCKED, Outcome, Policy,
-    Signature, Template, TemplateKind, Templates, Trace, TraceEntry, case_from_trace, free_actions,
-    run_case,
+    Action, Case, Command, FaultKind, FaultSpec, HostPlan, KeyClass, LABEL_LIST_EXCLUSIVE,
+    LABEL_LOCKED, Outcome, Policy, Signature, Template, TemplateKind, Templates, Trace, TraceEntry,
+    case_from_trace, free_actions, run_case,
 };
 pub use env::{INIT_PID_NS, SimClock, SimHosts, SimMachine, SimTime, TimeMode, Waiter};
 pub use explore::{Bound, Control, Exploration, Point, Search, dfs, explore, explore_with};

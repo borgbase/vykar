@@ -1,6 +1,6 @@
 {
   "name": "h3-random-lockfree",
-  "note": "Lock-free twin of h3-random (phase F part 10c): encrypted template, conditional store, lock decisions replaced by the commit mark and the probe. The delayed head create lands at a generation b created: taken, no signature (as h3-random-conditional).",
+  "note": "Lock-free twin of h3-random (phase F part 10c): encrypted template, conditional store, lock decisions replaced by the commit mark and the probe. The delayed head create lands at a generation b created: taken, no signature (as h3-random-conditional). Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); its choices replay unchanged): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -28,7 +28,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -169,7 +169,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -260,6 +260,12 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Ok"
   ],
   "case": {
     "hosts": "Distinct",

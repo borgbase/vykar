@@ -87,18 +87,18 @@ struct CampaignReport {
     searches: Vec<(usize, String, usize, bool, Duration)>,
 }
 
-/// A scenario's family, for the report: which store it runs on (see
-/// `sim_exhaustive::campaign_scenarios`). Every template is encrypted
-/// (10-single-protocol step 2): on the fallback store its clients run the
-/// single-writer protocol (step 7), on the conditional store they commit
-/// lock-free; the store whose plain PUT replaces heads held the mixed
-/// family (a lock client beside lock-free ones) until step 7 dropped it,
-/// and runs random cases only since (`"overwrite"`).
+/// A scenario's family, for the report: the repository's mode, by the
+/// store it runs on (see `sim_exhaustive::campaign_scenarios`; every
+/// template is encrypted since 10-single-protocol step 2). "single": the
+/// fallback store, a single-writer repository (step 7); "multi": the
+/// conditional store and the store whose plain PUT replaces heads
+/// (multi-writer; scenarios run on the conditional store, random cases on
+/// both). 10-single-protocol step 10 named them (before: "plain",
+/// "lockfree", "overwrite").
 fn family(case: &Case) -> &'static str {
     match case.storage {
-        StoreKind::Plain => "plain",
-        StoreKind::Conditional => "lockfree",
-        StoreKind::ConditionalOverwrite => "overwrite",
+        StoreKind::Plain => "single",
+        StoreKind::Conditional | StoreKind::ConditionalOverwrite => "multi",
         _ => "other",
     }
 }
@@ -123,43 +123,21 @@ fn family_counts(cfg: &CampaignConfig, r: &CampaignReport) -> FamilyCounts {
     out
 }
 
-/// The signatures 04 step 8 closes on a store that honours put-if-absent.
-const CLOSED_ON_CONDITIONAL: [Signature; 4] = [
+/// Shapes closed on a multi-writer repository: every head is created
+/// put-if-absent, so no late or stalled head replaces another.
+const CLOSED_ON_MULTI: [Signature; 4] = [
     Signature::LateHeadWrite,
     Signature::LateHeadThenCompact,
     Signature::LateHeadSegmentCollected,
-    Signature::AgedLockPacksCollected,
+    Signature::SingleWriterHeadRace,
 ];
 
-/// The signatures closed on every store. `AgedLockSegmentCollected` (phase
-/// F part 10b2: the 12 h object grace and the slow-index-write refusal)
-/// needs no exemption for a head PUT released late: the signature requires
-/// a non-released head PUT, and a released-late one is
-/// `LateHeadSegmentCollected`'s, which stays closed on the conditional
-/// store only.
-const CLOSED_EVERYWHERE: [Signature; 1] = [Signature::AgedLockSegmentCollected];
-
-/// The campaign's rule: damage no signature explains, damage of a shape
-/// closed on every store, or, where every client creates heads with
-/// put-if-absent, damage of a shape 04 step 8 closed there. That is the
-/// conditional store (vykar-server) and, without lock clients, the store
-/// whose plain PUT overwrites (local, SFTP, S3: phase F part 10c decides it
-/// as the conditional store, V1); with a lock client there its plain head
-/// PUTs can replace heads again, so those shapes stay open.
-/// `LateHeadCreateReplaced` (a lock client's plain PUT over a failed
-/// lock-free run's late create) is open only there: without lock clients,
-/// or on the conditional store, it is a failure.
+/// The campaign's rule: damage no signature explains, or, on a
+/// multi-writer repository, damage of a shape closed there.
 fn unknown(o: &Outcome) -> bool {
-    let case = &o.trace.case;
     o.signatures.contains(&Signature::Unknown)
-        || CLOSED_EVERYWHERE.iter().any(|s| o.signatures.contains(s))
-        || (o.signatures.contains(&Signature::LateHeadCreateReplaced)
-            && (case.lock_clients.is_empty() || case.storage == StoreKind::Conditional))
-        || (case.storage.honours_creates()
-            && case.lock_clients.is_empty()
-            && CLOSED_ON_CONDITIONAL
-                .iter()
-                .any(|s| o.signatures.contains(s)))
+        || (family(&o.trace.case) == "multi"
+            && CLOSED_ON_MULTI.iter().any(|s| o.signatures.contains(s)))
 }
 
 fn lock(r: &Mutex<CampaignReport>) -> MutexGuard<'_, CampaignReport> {
@@ -401,7 +379,7 @@ fn campaign() {
             [SingleWriterRival::Backup, SingleWriterRival::Compact].map(|rival| {
                 let start = Instant::now();
                 let (search, tally) = single_writer_search(
-                    &Template::encrypted(),
+                    &Template::new(),
                     rival,
                     Bound {
                         preemptions: SINGLE_WRITER_CAMPAIGN_K,
@@ -470,10 +448,9 @@ fn campaign() {
 
 /// The campaign's random cases narrowed to the shape of its stale-session
 /// unknowns (phase F part 10d fix round 3): time jumps, a gate-stepped
-/// compact (one command made `Compact` when the case has none), the
-/// encrypted template on the conditional store or on the store whose plain
-/// PUT overwrites, any hosts. The family with client b in lock mode was
-/// dropped by 10-single-protocol step 7: no binary is such a client.
+/// compact (one command made `Compact` when the case has none), a
+/// multi-writer repository (the conditional store or the store whose plain
+/// PUT overwrites), any hosts.
 fn stale_session_cases() -> impl proptest::strategy::Strategy<Value = Case> {
     use proptest::prelude::*;
     (super::sim_explore::general(), 0u8..2).prop_map(|(mut c, kind)| {
@@ -584,7 +561,7 @@ fn stale_session_search() {
 /// What the campaign failed to cover: a family with no completed scenario,
 /// no completed K >= 2 search.
 fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts) -> Vec<String> {
-    let mut gaps: Vec<String> = ["plain", "lockfree"]
+    let mut gaps: Vec<String> = ["single", "multi"]
         .into_iter()
         .filter(|f| counts.get(f).is_none_or(|c| c.0 == 0))
         .map(|f| format!("no {f} scenario completed"))
@@ -607,7 +584,7 @@ fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts
 fn campaign_order_reaches_every_family_early() {
     let all = campaign_scenarios();
     let head = &all[..20];
-    for f in ["plain", "lockfree"] {
+    for f in ["single", "multi"] {
         assert!(
             head.iter().any(|(_, c, k)| *k == 1 && family(c) == f),
             "no K = 1 {f} scenario among the first 20: {:?}",
@@ -647,8 +624,7 @@ fn campaign_writes_failing_traces() {
         skews: vec![],
         maintenance: Maintenance::Whole,
         storage: StoreKind::Plain,
-        template: TemplateKind::Plain,
-        lock_clients: vec![],
+        template: TemplateKind::Encrypted,
     };
     let deadline = Instant::now() + Duration::from_secs(600);
     let cfg = CampaignConfig {

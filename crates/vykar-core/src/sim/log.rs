@@ -26,6 +26,11 @@ pub struct OpRecord {
     /// The store's clock when the record was logged (for a release: when
     /// it applied). Harness-only: not in canonical traces or seeds.
     pub at: chrono::DateTime<chrono::Utc>,
+    /// The store's clock when the client issued the request: `at`, unless
+    /// a gate held the operation before it was logged, then the clock when
+    /// the gate caught it. For a release: as `at` (the issue is the parked
+    /// record's). Harness-only, like `at`.
+    pub issued: chrono::DateTime<chrono::Utc>,
 }
 
 impl OpRecord {
@@ -112,14 +117,16 @@ const KEY_CLASSES: &[&str] = &[
     "index.d/",
     "snapshots/",
     "sessions/",
-    "locks/",
+    // vykar 0.24's lock directory: a stray legacy request shows as its own
+    // class in a trace, not as "other".
+    crate::repo::sessions::LEGACY_LOCKS_PREFIX,
     "packs/",
     "packmaps/",
     "keys/",
     "config",
 ];
 
-/// The first path segment of `key` with its slash (`index.h/`, `locks/`,
+/// The first path segment of `key` with its slash (`index.h/`, `sessions/`,
 /// ...), `config`, or "other": a key's class with no random name.
 pub fn key_class(key: &str) -> &'static str {
     KEY_CLASSES

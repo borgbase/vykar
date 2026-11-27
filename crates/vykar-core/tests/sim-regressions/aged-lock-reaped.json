@@ -1,6 +1,6 @@
 {
   "name": "aged-lock-reaped",
-  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) aged-lock-reaped-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. No lock key is written, so AgedLockReaped cannot occur; the marker reap left ends the victim with an allowed error before its snapshot.",
+  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) aged-lock-reaped-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. No lock key is written, so AgedLockReaped cannot occur; the marker reap left ends the victim with an allowed error before its snapshot. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -223,7 +223,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -346,6 +346,13 @@
       "stop"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Some(Allowed(Injected))",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -393,7 +400,7 @@
       0,
       0,
       0,
-      7,
+      6,
       2,
       0,
       0,

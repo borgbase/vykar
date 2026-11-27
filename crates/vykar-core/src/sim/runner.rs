@@ -31,6 +31,11 @@ thread_local! {
 /// Run `f` with `Sim::new` making stores of `kind` on this thread: how a
 /// hazard or regression scenario runs on both the fallback and the
 /// conditional store without a parameter of its own.
+/// The store kind `Sim::new` uses on this thread (`with_store_kind`).
+pub(crate) fn default_store_kind() -> StoreKind {
+    DEFAULT_KIND.with(std::cell::Cell::get)
+}
+
 pub fn with_store_kind<T>(kind: StoreKind, f: impl FnOnce() -> T) -> T {
     struct Restore(StoreKind);
     impl Drop for Restore {
@@ -143,7 +148,7 @@ pub(super) type RunResult = Result<(Vec<String>, String)>;
 /// A client body: store, config, client dir, run index, environment.
 type Body = Box<dyn FnOnce(&SimStore, VykarConfig, &Path, usize, HostEnv) -> RunResult + Send>;
 
-/// A body run under the repo lock by [`Call::Custom`].
+/// A body run in an exclusive session by [`Call::Custom`].
 pub type CustomFn = Box<dyn FnOnce(&mut RepoWriter<'_>) -> Result<()> + Send + 'static>;
 
 /// One client command, owned so it can run on its own thread.
@@ -178,8 +183,9 @@ pub enum Call {
     Restore {
         snapshot: String,
     },
-    /// `vykar break-lock` without its confirmation: everything under
-    /// `locks/` (`sessions::clear_legacy_locks`), then every session object
+    /// `vykar break-lock` without its confirmation: everything under the
+    /// legacy lock directory (`sessions::LEGACY_LOCKS_PREFIX`,
+    /// `sessions::clear_legacy_locks`), then every session object
     /// (`sessions::clear_all_sessions`).
     BreakLock,
     /// Opens like delete and runs `f` as an exclusive session
@@ -233,10 +239,10 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Real time `wait_paused` waits for a gate.
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Ageing before the probe of invariant 9: past the 45 min session
-/// staleness (and the 6 h staleness of a vykar 0.24 lock; step 10
-/// re-derives the seeds before lowering it).
-const WEDGE_AGE: Duration = Duration::from_secs(6 * 3600 + 60);
+/// Ageing before the probe of invariant 9: past the 45 min staleness of every
+/// marker, shared and exclusive; nothing on a v6 repository reads the legacy
+/// lock directory.
+const WEDGE_AGE: Duration = Duration::from_secs(46 * 60);
 
 /// A run started with [`Sim::spawn`]; [`Sim::join`] records it.
 #[must_use = "a spawned run must be joined"]
@@ -411,13 +417,6 @@ impl Sim {
 
     pub fn store(&self) -> &SimStore {
         &self.store
-    }
-
-    /// Every later handle of `c` offers no put-if-absent
-    /// ([`SimStore::set_lock_client`]): `c` runs the lock protocol beside
-    /// clients that have it.
-    pub fn set_lock_client(&self, c: ClientId) {
-        self.store.set_lock_client(c);
     }
 
     /// Every later handle of `c` offers no put-if-absent but reads the
@@ -635,11 +634,11 @@ impl Sim {
     /// [`Self::custom`] in a maintenance session
     /// (`util::with_maintenance_session` with `flags`) instead of an
     /// exclusive one:
-    /// what a lock-free maintenance writer may do, for scripted tests of
-    /// what the checker judges in lock-free runs. The run is
-    /// `RunRecord::lock_free`.
+    /// what a shared maintenance writer may do, for scripted tests of
+    /// what the checker judges in shared runs. The run is
+    /// `RunRecord::shared`.
     #[cfg(test)]
-    pub(crate) fn custom_lock_free(
+    pub(crate) fn custom_shared(
         &mut self,
         c: ClientId,
         label: &str,
@@ -865,7 +864,7 @@ impl Sim {
         report
     }
 
-    /// Invariant 9: once every lock and marker has aged past its limit, a
+    /// Invariant 9: once every marker has aged past its limit, a
     /// backup and a compact from a new client succeed. Runs on a fork, so the
     /// store and the history are not touched.
     ///
@@ -1447,15 +1446,13 @@ impl Sim {
 
     /// Insert the run in index order and its observation in step order.
     fn record(&mut self, index: usize, c: ClientId, op: ClientOp, f: Finished) -> RunRecord {
-        // A shared run counts as `lock_free` (no binary that opens a v6
-        // repository takes the lock since 10-single-protocol step 9): a
-        // backup once it marked its session `committing`, maintenance
-        // (compact, prune, delete, a shared custom run) by its registered
-        // session marker. An exclusive session's marker (`x-`, step 8:
-        // repair, a mode switch, a custom run) is not counted, so such a run
-        // is judged.
-        let lock_free = match op {
-            ClientOp::Backup { .. } => self.store.committed_lock_free_in_run(index),
+        // A shared run: a backup once it marked its session `committing`,
+        // maintenance (compact, prune, delete, a shared custom run) by its
+        // registered session marker. An exclusive session's marker (`x-`,
+        // step 8: repair, a mode switch, a custom run) is not counted;
+        // invariant 13 judges such a run against it.
+        let shared = match op {
+            ClientOp::Backup { .. } => self.store.marked_committing_in_run(index),
             ClientOp::Compact
             | ClientOp::Prune
             | ClientOp::Delete { .. }
@@ -1469,7 +1466,7 @@ impl Sim {
             first_step: f.first_step,
             last_step: f.last_step,
             outcome: f.outcome,
-            lock_free,
+            shared,
             exclusive: self.store.exclusive_in_run(index),
         };
         let at = self.history.runs.partition_point(|r| r.index < index);

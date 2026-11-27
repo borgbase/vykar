@@ -1,6 +1,6 @@
 {
   "name": "aged-session-reaped-late-marker-write",
-  "note": "AgedSessionReaped through the transport (phase F part 6, from a 300 s make sim-campaign): the registration PUT of backup c's marker (generation 0) is duplicated and the copy held; after a 6 h 1 min jump a's compact reaps the aged marker and deletes c's packs; the held copy then lands and recreates the reaped key. A reaped key never comes back through the client's own requests, but a late copy can: put-if-absent would not stop it (the key is absent when it lands). c's commit probe finds the marker present, the pack check fails, the marker is still present, so the commit keeps the untyped pack-missing error and writes no snapshot (fails safe). Bounded by 04 step 5 (server-clock ages). Since 04 step 5 (phase F part 7) young orphans are kept: c's packs are about an hour old at the compact and stay, so c's commit finds them and the case is clean. aged-session-reaped-swept-packs shows AgedSessionReaped through packs the compact's sweep emptied. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before); the victim now refuses at its snapshot fence (MarkerLostDuringCommit), so the old decisions after it (its snapshot PUT, finish and compact) have no stand-in.",
+  "note": "AgedSessionReaped through the transport (phase F part 6, from a 300 s make sim-campaign): the registration PUT of backup c's marker (generation 0) is duplicated and the copy held; after a 6 h 1 min jump a's compact reaps the aged marker and deletes c's packs; the held copy then lands and recreates the reaped key. A reaped key never comes back through the client's own requests, but a late copy can: put-if-absent would not stop it (the key is absent when it lands). c's commit probe finds the marker present, the pack check fails, the marker is still present, so the commit keeps the untyped pack-missing error and writes no snapshot (fails safe). Bounded by 04 step 5 (server-clock ages). Since 04 step 5 (phase F part 7) young orphans are kept: c's packs are about an hour old at the compact and stay, so c's commit finds them and the case is clean. aged-session-reaped-swept-packs shows AgedSessionReaped through packs the compact's sweep emptied. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before); the victim now refuses at its snapshot fence (MarkerLostDuringCommit), so the old decisions after it (its snapshot PUT, finish and compact) have no stand-in. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -63,7 +63,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -240,7 +240,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -384,7 +384,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -404,6 +404,14 @@
       },
       "refresh-snapshots"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Ok",
+    "Ok",
+    "Ok"
   ],
   "case": {
     "hosts": "SameHostname",
@@ -451,7 +459,7 @@
     "crash": false,
     "advances": true,
     "choices": [
-      7,
+      6,
       0,
       2,
       0,

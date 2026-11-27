@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-write-old-segment",
-  "note": "LateSnapshotWrite with the late snapshot's segment older than T_pack (phase F part 8c, built from late-snapshot-write for 04 step 7): advances on and two 6 h 1 min jumps before client 2's delete of c0, so at the compact a's backup segment is about 12 h 2 min old: the sweep takes a's own new chunks (a1 is not visible yet) and deletes the packs it emptied (old too); the release then lands a1 naming absent chunks. Since 04 step 7 the late snapshot's own chunks survive while its segment is younger than T_pack. Fixed by 04 step 8 (the commit point is the head). Since 04 step 8 (phase F part 9) late-snapshot-write-old-segment-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature (as its -lockfree twin).",
+  "note": "LateSnapshotWrite with the late snapshot's segment older than T_pack (phase F part 8c, built from late-snapshot-write for 04 step 7): advances on and two 6 h 1 min jumps before client 2's delete of c0, so at the compact a's backup segment is about 12 h 2 min old: the sweep takes a's own new chunks (a1 is not visible yet) and deletes the packs it emptied (old too); the release then lands a1 naming absent chunks. Since 04 step 7 the late snapshot's own chunks survive while its segment is younger than T_pack. Fixed by 04 step 8 (the commit point is the head). Since 04 step 8 (phase F part 9) late-snapshot-write-old-segment-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature (as its -lockfree twin). Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [
     "LateSnapshotWrite"
   ],
@@ -48,7 +48,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -201,7 +201,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -354,6 +354,14 @@
       "release"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Ok",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -423,8 +431,8 @@
       0,
       0,
       0,
-      6,
-      6,
+      5,
+      5,
       0,
       0,
       1

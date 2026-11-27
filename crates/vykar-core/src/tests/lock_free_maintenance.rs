@@ -65,10 +65,15 @@ fn head_creates(recs: &[OpRecord]) -> Vec<&OpRecord> {
         .collect()
 }
 
-/// Lock keys (`locks/*.json`, never a probe) written among `recs`.
+/// Writes under the legacy lock directory (`sessions::LEGACY_LOCKS_PREFIX`)
+/// among `recs`, which no v6 client makes.
 fn lock_writes(recs: &[OpRecord]) -> usize {
     recs.iter()
-        .filter(|r| r.op.is_write() && KeyMatch::LockKey.matches(&r.key))
+        .filter(|r| {
+            r.op.is_write()
+                && r.key
+                    .starts_with(crate::repo::sessions::LEGACY_LOCKS_PREFIX)
+        })
         .count()
 }
 
@@ -175,7 +180,7 @@ fn maintenance_runs_without_the_lock() {
         .iter()
         .map(|run| {
             let recs = records(&sim, a, run.index);
-            assert!(run.lock_free, "run {} is lock-free", run.index);
+            assert!(run.shared, "run {} is lock-free", run.index);
             assert_eq!(lock_writes(&recs), 0, "run {} wrote a lock key", run.index);
             let marker = sim
                 .store()
@@ -214,7 +219,7 @@ fn compact_skips_the_sweep_beside_a_committing_backup() {
     sim.expect_paused(b_snap, "b between its head create and its snapshot PUT");
     let rc = sim.compact(a);
     rc.expect_ok();
-    assert!(rc.lock_free);
+    assert!(rc.shared);
     assert!(
         rc.detail().contains("sweep-skipped Some(Committing)"),
         "{}",
@@ -253,7 +258,7 @@ fn compact_re_marks_when_a_backup_commits_during_its_mark() {
     sim.expect_paused(held, "compact before its second session listing");
     let rb = sim.backup(b, "b1", &tree("b1"));
     rb.expect_ok();
-    assert!(rb.lock_free);
+    assert!(rb.shared);
     sim.resume(held);
     let rc = sim.join(rc);
     rc.expect_ok();
@@ -420,7 +425,7 @@ fn delete_during_the_mark_is_skipped() {
         .expect("the held snapshot's backup");
     let rd = sim.delete(d, &[held_name.as_str()]);
     rd.expect_ok();
-    assert!(rd.lock_free);
+    assert!(rd.shared);
     sim.resume(first_get);
     let rc = sim.join(rc);
     rc.expect_ok();
@@ -473,7 +478,7 @@ fn a_reuse_only_lock_free_commit_creates_a_head() {
         },
     );
     r2.expect_ok();
-    assert!(r2.lock_free);
+    assert!(r2.shared);
     let recs = records(&sim, a, r2.index);
     assert!(
         !recs
@@ -569,7 +574,7 @@ fn a_reuse_only_commit_conflicts_with_a_concurrent_sweep() {
         },
     );
     rb.expect_ok();
-    assert!(rb.lock_free);
+    assert!(rb.shared);
     sim.resume(sweep);
     let rc = sim.join(rc);
     rc.expect_ok();
@@ -661,7 +666,7 @@ fn a_backup_starts_and_commits_during_a_lock_free_compact() {
     sim.expect_paused(held, "compact after its pack listing");
     let rb = sim.backup(b, "b1", &tree("b1"));
     rb.expect_ok();
-    assert!(rb.lock_free);
+    assert!(rb.shared);
     sim.resume(held);
     sim.join(rc).expect_ok();
     for name in ["keep", "b1"] {
@@ -773,7 +778,7 @@ fn a_compact_stalled_before_its_batch_head_stops_at_its_marker_check() {
     sim.advance(PAST_T_PACK);
     let rc = sim.compact(c);
     rc.expect_ok();
-    assert!(rc.lock_free);
+    assert!(rc.shared);
     for k in &outputs {
         assert!(
             sim.store().object(k).is_none(),
@@ -805,14 +810,15 @@ fn a_compact_stalled_before_its_batch_head_stops_at_its_marker_check() {
 }
 
 /// `AgedSessionReaped` claims the residual's violations and nothing else:
-/// with the victim not lock-free, or no reap aged (every record at one
-/// instant), they are `Unknown`; an unrelated violation stays `Unknown`.
+/// with the victim not in a session (`RunRecord::shared`), or no reap aged
+/// (every record at one instant), they are `Unknown`; an unrelated violation
+/// stays `Unknown`.
 fn assert_narrow_aged_session_claim(sim: &Sim, report: &crate::sim::Report, victim: usize) {
     use crate::sim::Signature;
     use crate::sim::driver::{Evidence, classify_evidence};
     use std::collections::BTreeSet;
     let ev = Evidence::of(sim);
-    let judge = |e: &Evidence, r: &crate::sim::Report| classify_evidence(e, r, &[]);
+    let judge = |e: &Evidence, r: &crate::sim::Report| classify_evidence(e, r);
     assert_eq!(
         judge(&ev, report),
         BTreeSet::from([Signature::AgedSessionReaped]),
@@ -821,13 +827,13 @@ fn assert_narrow_aged_session_claim(sim: &Sim, report: &crate::sim::Report, vict
     let mut e = ev.clone();
     for r in &mut e.runs {
         if r.index == victim {
-            r.lock_free = false;
+            r.shared = false;
         }
     }
     assert_eq!(
         judge(&e, report),
         BTreeSet::from([Signature::Unknown]),
-        "the victim not lock-free"
+        "the victim not in a session"
     );
     let mut e = ev.clone();
     let t0 = e.log[0].at;
@@ -981,7 +987,7 @@ fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
         },
     );
     rl.expect_ok();
-    assert!(rl.lock_free);
+    assert!(rl.shared);
     assert!(
         records(&sim, l, rl.index)
             .iter()
@@ -1242,10 +1248,10 @@ fn an_old_pack_inside_a_live_horizon_is_not_a_lock_free_repack_source() {
 
 // ── V3: what judges a lock-free run's deletes ───────────────────────────
 //
-// Invariant 7 exempts lock-free runs (`RunRecord::lock_free`). Each test
-// below makes a lock-free maintenance run (`Sim::custom_lock_free`, a
-// registered session, no lock) delete what it must not, and shows the
-// invariant that judges that delete now flags it.
+// Invariant 13 judges a shared run (`RunRecord::shared`) only under an
+// exclusive hold. Each test below makes a shared maintenance run
+// (`Sim::custom_shared`, a registered session) delete what it must not, and
+// shows the invariant that judges that delete flags it.
 
 /// A pack the latest head names, deleted: invariant 4 (the index names an
 /// absent pack) and invariant 1 (the snapshot no longer restores).
@@ -1260,11 +1266,11 @@ fn a_lock_free_delete_of_a_named_pack_is_flagged() {
         .find(|r| r.op.is_write() && r.key.starts_with("packs/"))
         .expect("a1 uploaded a pack")
         .key;
-    let run = sim.custom_lock_free(c, "delete a named pack", MarkerFlags::default(), |repo| {
+    let run = sim.custom_shared(c, "delete a named pack", MarkerFlags::default(), |repo| {
         repo.storage().delete(&pack)
     });
     run.expect_ok();
-    assert!(run.lock_free);
+    assert!(run.shared);
     let report = sim.check_invariants(Invariant::STEP8);
     let kinds: Vec<ViolationKind> = report.violations.iter().map(|v| v.kind).collect();
     assert!(
@@ -1282,8 +1288,8 @@ fn a_lock_free_delete_of_a_named_pack_is_flagged() {
         !report
             .violations
             .iter()
-            .any(|v| v.invariant == Invariant::LockExclusion),
-        "invariant 7 exempts the lock-free run: {report}"
+            .any(|v| v.invariant == Invariant::ExclusiveSessions),
+        "invariant 13 judges a shared run only under an exclusive hold: {report}"
     );
 }
 
@@ -1307,7 +1313,7 @@ fn a_lock_free_delete_of_a_young_orphan_is_flagged() {
         .find(|r| r.client == b && r.op.is_write() && r.key.starts_with("packs/"))
         .expect("b uploaded a pack")
         .key;
-    let run = sim.custom_lock_free(c, "delete a young orphan", MarkerFlags::default(), |repo| {
+    let run = sim.custom_shared(c, "delete a young orphan", MarkerFlags::default(), |repo| {
         repo.storage().delete(&pack)
     });
     run.expect_ok();
@@ -1331,7 +1337,7 @@ fn a_lock_free_silent_snapshot_delete_is_flagged() {
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(a, "a1", &tree("a1")).expect_ok();
     let key = sim.store().keys("snapshots/").pop().expect("a1's snapshot");
-    sim.custom_lock_free(c, "delete a snapshot", MarkerFlags::default(), |repo| {
+    sim.custom_shared(c, "delete a snapshot", MarkerFlags::default(), |repo| {
         repo.storage().delete(&key)
     })
     .expect_ok();
@@ -1357,7 +1363,7 @@ fn a_lock_free_delete_of_a_named_index_object_is_flagged() {
         .find(|r| r.op.is_write() && r.key.starts_with("index.d/"))
         .expect("a1 wrote its segment")
         .key;
-    sim.custom_lock_free(
+    sim.custom_shared(
         c,
         "delete a named index object",
         MarkerFlags::default(),
@@ -1387,7 +1393,7 @@ fn a_lock_free_head_overwrite_is_flagged() {
         heads[heads.len() - 2].clone(),
         heads[heads.len() - 1].clone(),
     );
-    sim.custom_lock_free(c, "overwrite a head", MarkerFlags::default(), |repo| {
+    sim.custom_shared(c, "overwrite a head", MarkerFlags::default(), |repo| {
         let bytes = repo.storage().get(&older)?.expect("the older head");
         repo.storage().put(&latest, &bytes)
     })

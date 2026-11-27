@@ -1,6 +1,6 @@
 {
   "name": "h1-duplicated-lock",
-  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): a's second backup no longer reaps b's young lock at its registration and ends Locked; kept as a regression: only the aged reap of a's first lock (AgedLockReaped) remains. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written, so the duplicated lock PUT this seed built on no longer exists; the aged victim refuses typed.",
+  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): a's second backup no longer reaps b's young lock at its registration and ends Locked; kept as a regression: only the aged reap of a's first lock (AgedLockReaped) remains. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written, so the duplicated lock PUT this seed built on no longer exists; the aged victim refuses typed. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min; its Lock fault, which no client fires, dropped): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -117,7 +117,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -262,6 +262,13 @@
       "probe-marker +local"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Ok",
+    "Some(Allowed(Locked))"
+  ],
   "case": {
     "hosts": "SameHostname",
     "clients": [
@@ -288,14 +295,7 @@
         }
       ]
     ],
-    "faults": [
-      {
-        "client": 1,
-        "class": "Lock",
-        "nth": 1,
-        "kind": "Duplicate"
-      }
-    ],
+    "faults": [],
     "crash": false,
     "advances": true,
     "choices": [
@@ -305,7 +305,7 @@
       0,
       0,
       0,
-      7,
+      6,
       2,
       0,
       2,

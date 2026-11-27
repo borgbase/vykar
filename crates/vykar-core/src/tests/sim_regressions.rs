@@ -15,13 +15,34 @@
 //! single-writer repository: until 10-single-protocol step 7 its clients
 //! took the lock with the marker handshake, since then they run the
 //! single-writer protocol (the lock decision became the single-writer
-//! listings, the commit mark and the probe of `locks/`; a stepped compact
+//! listings, the commit mark and the probe of the legacy lock directory; a stepped compact
 //! registers and makes its single-writer check). A `<name>-lockfree` seed is
 //! the same case on the conditional store, where its backups commit
 //! lock-free (phase F part 10c: each lock decision becomes the commit mark
-//! and the probe of `locks/`). Step 7 re-derived every fallback-store seed
+//! and the probe of the legacy lock directory). Step 7 re-derived every fallback-store seed
 //! from its decisions ([`rederive`]; each note says what it shows since);
 //! the `-lockfree` seeds replay unchanged.
+//!
+//! Format (10-single-protocol step 10): `Case` and `Seed` refuse unknown
+//! fields, and `case.template` is required. A seed recorded before step 10
+//! does not parse: without `template` ("missing field"), with "Plain", with
+//! a `Lock` fault or with `lock_clients` (unknown variant or field). `runs`
+//! is the class of each run (`Ok`, its allowed error, or disallowed) the
+//! seed must end with. Step 10 re-recorded every seed: the labels
+//! "probe-locks" and "lock (locked)" became [`LABEL_LIST_EXCLUSIVE`] and
+//! [`LABEL_LOCKED`] ("wait (locked)"), the 3 h 1 min jump went from the
+//! driver's advances (a seed's jump of 3 h 1 min became 46 min), the Lock
+//! faults that no client fired were dropped, and the choices were
+//! re-derived from their decisions ([`rederive`]); each note says so.
+//!
+//! Closed by 10-single-protocol step 10 (F1: the pack-age term re-run at
+//! the head step): `marker-gap-suspend-before-head` (single-writer, a
+//! gapped backup's head with packs past the limit) and
+//! `marker-gap-suspend-before-head-packs-swept-lockfree` (multi-writer: that
+//! head naming two packs a compact had deleted). Both were `Unknown` before
+//! the fix and now refuse the head with `StaleChunksDuringCommit`; the
+//! second is judged by invariant 11 only since it reads the clock at the
+//! head write's own issue.
 //!
 //! Retired by 10-single-protocol step 7: the seven `mixed-…` seeds
 //! (`mixed-aged-lock-overwrites-lock-free-head`,
@@ -45,6 +66,7 @@ use serde::{Deserialize, Serialize};
 use crate::sim::driver::*;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Seed {
     /// The file stem.
     name: String,
@@ -57,6 +79,9 @@ struct Seed {
     /// means the same (a machine gained or lost a step) fails as drifted
     /// instead of silently testing something else.
     at: Vec<(Action, String)>,
+    /// How each run ended ([`run_classes`]): which typed refusal, which
+    /// commit.
+    runs: Vec<String>,
     case: Case,
 }
 
@@ -77,10 +102,7 @@ fn taken(o: &Outcome, choices: usize) -> Vec<(Action, String)> {
 /// The plan that removes a signature's hazard, as its doc comment names it.
 fn fixed_by(s: Signature) -> &'static str {
     match s {
-        Signature::TwoLockHolders | Signature::SessionReaped => "04 step 1",
-        Signature::AgedLockReaped | Signature::OrphanLockKey => {
-            "part 10 (04 step 9: the lock leaves the commit path)"
-        }
+        Signature::SessionReaped => "04 step 1",
         Signature::AgedSessionReaped => {
             "part 10 (04 step 9 and the reused section; narrowed by step 7: horizon, I8, \
              young segments)"
@@ -89,23 +111,16 @@ fn fixed_by(s: Signature) -> &'static str {
             "part 10 (04 step 9 and the reused section; narrowed by step 7: needs a segment \
              older than T_pack)"
         }
-        Signature::AgedLockSegmentCollected => {
-            "04 step 8 on conditional backends (phase F part 9); on every store by the \
-             slow-index-write refusal (phase F part 10b2)"
-        }
         Signature::LateHeadWrite
         | Signature::LateHeadThenCompact
-        | Signature::LateHeadSegmentCollected
-        | Signature::AgedLockPacksCollected => {
-            "04 step 8 on conditional backends (phase F part 9); the fallback keeps it"
+        | Signature::LateHeadSegmentCollected => {
+            "04 step 8 on multi-writer repositories; single-writer ones keep it (H3)"
         }
-        Signature::LateIndexWrite => {
-            "head writes: 04 step 8 on conditional backends; index.d/ writes: with \
-             invariant 7, part 10"
+        Signature::SingleWriterHeadRace => {
+            "not planned: the single-writer check is best effort (H-late-head-single)"
         }
-        Signature::LateHeadCreateReplaced => {
-            "not planned: mixed modes' residual (a failed lock-free run's late create replaced \
-             by a lock client's plain PUT; nothing committed is damaged)"
+        Signature::ExclusiveSessionReaped => {
+            "not planned (H1-late-clone; a stall past the write check)"
         }
         Signature::Unknown => "nothing: Unknown is never expected",
     }
@@ -158,6 +173,15 @@ fn regression_seeds_hold() {
             ));
             continue;
         }
+        let runs = run_classes(&o);
+        if runs != seed.runs {
+            failures.push(format!(
+                "seed {stem}: runs ended {runs:?}, expected {:?}; update runs and the note \
+                 only with the reason\n{}",
+                seed.runs,
+                o.trace.render()
+            ));
+        }
         if o.signatures != seed.expect {
             let gone: Vec<String> = seed
                 .expect
@@ -181,6 +205,65 @@ fn regression_seeds_hold() {
         paths.len(),
         failures.join("\n\n")
     );
+}
+
+/// A case or seed in the format before 10-single-protocol step 10 does not
+/// parse, and the error names what is wrong: no `template`, the "Plain"
+/// template, a `Lock` fault, `lock_clients`; a seed with a field it does
+/// not know.
+#[test]
+fn an_old_format_case_or_seed_does_not_parse() {
+    let case = serde_json::json!({
+        "hosts": "Distinct",
+        "clients": [[{"Backup": {"shared": true, "fold": false}}]],
+        "faults": [],
+        "crash": false,
+        "choices": [],
+        "template": "Encrypted",
+    });
+    let parses = |v: &serde_json::Value| serde_json::from_value::<Case>(v.clone());
+    parses(&case).expect("today's format parses");
+    let mut no_template = case.clone();
+    no_template.as_object_mut().unwrap().remove("template");
+    let mut plain = case.clone();
+    plain["template"] = "Plain".into();
+    let mut lock_fault = case.clone();
+    lock_fault["faults"] =
+        serde_json::json!([{"client": 0, "class": "Lock", "nth": 1, "kind": "Fail"}]);
+    let mut lock_clients = case.clone();
+    lock_clients["lock_clients"] = serde_json::json!([1]);
+    for (v, named) in [
+        (no_template, "missing field `template`"),
+        (plain, "unknown variant `Plain`"),
+        (lock_fault, "unknown variant `Lock`"),
+        (lock_clients, "unknown field `lock_clients`"),
+    ] {
+        let text = v.to_string();
+        let err = serde_json::from_str::<Case>(&text)
+            .expect_err(named)
+            .to_string();
+        assert!(err.contains(named), "{named}: {err}");
+        let err = case_from_trace(&format!("case: {text}\n")).expect_err(named);
+        assert!(
+            err.starts_with("bad case: ") && err.contains(named),
+            "{named}: {err}"
+        );
+    }
+    let seed = serde_json::json!({
+        "name": "s",
+        "note": "n",
+        "expect": [],
+        "at": [],
+        "runs": [],
+        "case": case,
+    });
+    serde_json::from_value::<Seed>(seed.clone()).expect("today's seed parses");
+    let mut extra = seed;
+    extra["lock_clients"] = serde_json::json!([]);
+    let err = serde_json::from_value::<Seed>(extra)
+        .expect_err("an unknown field")
+        .to_string();
+    assert!(err.contains("unknown field `lock_clients`"), "{err}");
 }
 
 /// The outcome class of each run: Ok, the allowed error, or disallowed.
@@ -270,6 +353,7 @@ fn promote_from_env() {
         note: "TODO".into(),
         expect: o.signatures.clone(),
         at: taken(&o, case.choices.len()),
+        runs: run_classes(&o),
         case,
     };
     eprintln!(
@@ -280,24 +364,24 @@ fn promote_from_env() {
 
 /// Labels of a backup's commit protection (10-single-protocol step 7).
 fn is_protection(label: &str) -> bool {
-    label.starts_with("lock")
+    label.starts_with("wait")
         || label.starts_with(LABEL_LIST_WRITERS)
         || label.starts_with(LABEL_MARK_COMMITTING)
-        || label.starts_with(LABEL_PROBE_LOCKS)
+        || label.starts_with(LABEL_LIST_EXCLUSIVE)
 }
 
 /// Whether the new decision labelled `new` ends what the old decision
 /// labelled `old` did, for a step of the same client: the same label; a
-/// lock attempt that started the commit machine (`lock`, its local steps
-/// following) and a probe that did; a contended attempt and a contended
-/// one; a stepped compact's lock fence and its marker fence.
+/// pre-head listing that started the commit machine (its local steps
+/// following) and one that did; a contended attempt and a contended one; a
+/// protection that gave up and one that did; a protection and the commit
+/// step that follows one that ended otherwise.
 fn ends_intent(old: &str, new: &str) -> bool {
     if old == new {
         return true;
     }
-    let commit_started =
-        |l: &str| l == "lock" || l.starts_with("lock +") || l.starts_with(LABEL_PROBE_LOCKS);
-    if commit_started(old) && new.starts_with(LABEL_PROBE_LOCKS) && !new.contains('(') {
+    let commit_started = |l: &str| l.starts_with(LABEL_LIST_EXCLUSIVE) && !l.contains('(');
+    if commit_started(old) && commit_started(new) {
         return true;
     }
     if old == LABEL_LOCKED && new == LABEL_LOCKED {
@@ -306,22 +390,21 @@ fn ends_intent(old: &str, new: &str) -> bool {
     if old.ends_with("(gave up)") && new.ends_with("(gave up)") {
         return true;
     }
-    // A protection that ended otherwise than it did (no lock key left to
-    // give up on): the commit machine's first step.
-    if is_protection(old) && !is_protection(new) {
-        return true;
-    }
-    old == "compact Exists locks/" && new == "compact Exists sessions/"
+    // A protection that ended otherwise than it did: the commit machine's
+    // first step.
+    is_protection(old) && !is_protection(new)
 }
 
 /// Re-derive `seed`'s choices on today's protocol from what its decisions
-/// did (10-single-protocol step 7): each old decision's action is taken
-/// again where the driver offers it, and a step of a client is repeated
-/// (up to 12 inserted steps) until its label ends what the old step did
-/// ([`ends_intent`]): a lock attempt becomes the single-writer listings,
-/// the mark and the probe; a stepped compact's new steps (its registration,
-/// its single-writer check, the head's EXISTS and read-back) are taken on
-/// the way to the old one's next step. `Err` names the first old decision
+/// did (10-single-protocol steps 7 and 10): each old decision's action is
+/// taken again where the driver offers it, and a step of a client is
+/// repeated (up to 12 inserted steps) until its label ends what the old
+/// step did ([`ends_intent`]): a lock attempt became the single-writer
+/// listings, the mark and the pre-head listing; a stepped compact's new
+/// steps (its registration, its single-writer check, the head's EXISTS and
+/// read-back) are taken on the way to the old one's next step. A decision
+/// is mapped by its action, not its index, so a removed advance shifts no
+/// other choice. `Err` names the first old decision
 /// no new decision can stand for.
 fn rederive(templates: &Templates, seed: &Seed) -> Result<Case, String> {
     let mut case = seed.case.clone();
@@ -395,10 +478,12 @@ fn rederive(templates: &Templates, seed: &Seed) -> Result<Case, String> {
 }
 
 /// `VYKAR_SIM_REDERIVE=<dir>`: re-derive every seed ([`rederive`]) and
-/// write each as `<dir>/<name>.json` (its note kept, its choices, `at` and
-/// expect new) with its trace, printing per seed the old and new
+/// write each as `<dir>/<name>.json` (its note kept, its choices, `at`,
+/// expect and runs new) with its trace, printing per seed the old and new
 /// signatures and run outcomes, for review before a seed is replaced
-/// (10-single-protocol step 7 re-derived the corpus this way).
+/// (10-single-protocol steps 7 and 10 re-derived the corpus this way). A
+/// seed that replays is written unchanged, with its trace, so the out
+/// directory holds the whole corpus.
 /// `VYKAR_SIM_REDERIVE_ONLY=<a,b>` names the seeds, and
 /// `VYKAR_SIM_REDERIVE_FROM=<dir>` reads them from another directory (a
 /// seed edited by hand first). A no-op otherwise.
@@ -434,6 +519,12 @@ fn rederive_from_env() {
                 seed.expect,
                 run_classes(&replay)
             );
+            std::fs::write(
+                out.join(format!("{stem}.json")),
+                serde_json::to_string_pretty(&seed).unwrap() + "\n",
+            )
+            .unwrap();
+            std::fs::write(out.join(format!("{stem}.trace")), replay.trace.render()).unwrap();
             continue;
         }
         match rederive(&templates, &seed) {
@@ -450,6 +541,7 @@ fn rederive_from_env() {
                     note: seed.note.clone(),
                     expect: o.signatures.clone(),
                     at: taken(&o, case.choices.len()),
+                    runs: run_classes(&o),
                     case,
                 };
                 std::fs::write(

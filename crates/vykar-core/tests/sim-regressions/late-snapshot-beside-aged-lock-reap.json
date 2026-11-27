@@ -1,6 +1,6 @@
 {
   "name": "late-snapshot-beside-aged-lock-reap",
-  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; AgedLockReaped remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written; the late snapshot is harmless and the aged victim refuses typed.",
+  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; AgedLockReaped remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written; the late snapshot is harmless and the aged victim refuses typed. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -46,7 +46,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -199,7 +199,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -253,6 +253,13 @@
       },
       "release"
     ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(Injected))",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Ok"
   ],
   "case": {
     "hosts": "Distinct",
@@ -313,7 +320,7 @@
       0,
       0,
       0,
-      7,
+      6,
       1,
       1
     ],

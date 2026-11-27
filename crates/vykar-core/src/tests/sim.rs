@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
+use crate::sim::driver::{Signature, classify_end_state};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, RunOutcome, classify};
 use crate::sim::interleavings::{self, Hosts, MarkerReap};
@@ -187,7 +188,7 @@ fn classify_errors() {
     let allowed = |e: VykarError, a: AllowedError| assert_eq!(classify(&e), ErrorClass::Allowed(a));
     allowed(
         VykarError::Locked(LockHolder {
-            key: "locks/x".into(),
+            key: "sessions/x-1.json".into(),
             details: None,
         }),
         AllowedError::Locked,
@@ -318,7 +319,7 @@ fn allowed_and_disallowed_errors() {
 
     let r = sim.custom(c, "locked", |_| {
         Err(VykarError::Locked(LockHolder {
-            key: "locks/x".into(),
+            key: "sessions/x-1.json".into(),
             details: None,
         }))
     });
@@ -473,7 +474,7 @@ fn exclusive_keys(sim: &Sim) -> Vec<String> {
 /// 8: what `check --repair`, upgrade and pack maps run as) and crashes
 /// deregistering it, so its marker stays. Before step 8 `c` took the lock
 /// and crashed releasing it; the backups these tests block no longer look
-/// at `locks/`.
+/// at the legacy lock directory.
 fn hold_exclusive_and_crash(sim: &mut Sim, c: ClientId) {
     sim.fault(
         FaultRule::new(
@@ -614,7 +615,7 @@ fn containers_sharing_a_hostname_reap_by_age_only() {
 /// An exclusive marker in the format of a writer before installation IDs
 /// from c's own hostname and boot, with a dead PID, is judged by age only
 /// (a 0.24-format lock before 10-single-protocol step 8: a backup no longer
-/// looks at `locks/`).
+/// looks at the legacy lock directory).
 #[test]
 fn old_format_marker_from_same_hostname_waits_for_age() {
     let mut sim = Sim::new();
@@ -964,9 +965,7 @@ const TESTED_IDS: &[&str] = &[
     "H3-conditional",
     "H3-compact-conditional",
     "H-committing-reaped",
-    "H-committing-reaped-single",
     "H-late-head-single",
-    "H-switch-late-head",
 ];
 
 #[test]
@@ -996,37 +995,27 @@ fn known_hazard_h_racy() {
     hazards::assert_reproduces("H-racy");
 }
 
-/// H-committing-reaped (phase F part 10d, R1): a lock-free backup whose
-/// committing marker is reaped by age after its marker probe, before its
-/// snapshot PUT, commits a snapshot a lock-free compact swept meanwhile.
+/// H-committing-reaped (phase F part 10d, R1): a backup whose committing
+/// marker is reaped by age after its marker probe, before its snapshot PUT,
+/// commits a snapshot a compact swept meanwhile; on a single-writer
+/// repository (here) the compact's single-writer listing reaps it
+/// (H-committing-reaped-single until 10-single-protocol step 10), on a
+/// multi-writer one its second session listing
+/// (`known_hazards_on_a_conditional_store`).
 #[test]
 fn known_hazard_h_committing_reaped() {
     hazards::assert_reproduces("H-committing-reaped");
 }
 
-/// H-committing-reaped-single (10-single-protocol step 7): the same on a
-/// single-writer repository, where the compact's single-writer listing
-/// reaps the stale committing marker: the residual of a defeated check.
-#[test]
-fn known_hazard_h_committing_reaped_single() {
-    hazards::assert_reproduces("H-committing-reaped-single");
-}
-
-/// H-late-head-single (10-single-protocol step 7): a single-writer backup
-/// stalled between its head EXISTS and its plain PUT, its marker reaped by
-/// a compact's single-writer listing, replaces the compact's head with an
-/// index that names the packs the compact deleted.
+/// H-late-head-single (10-single-protocol step 7), the single-writer
+/// residual: a single-writer backup stalled between its head EXISTS and its
+/// plain PUT, its marker reaped, replaces the head another writer wrote at
+/// that generation: a compact's (route A), or a multi-writer backup's after
+/// a switch on `ConditionalOverwrite` (route B, H-switch-late-head until
+/// step 10).
 #[test]
 fn known_hazard_h_late_head_single() {
     hazards::assert_reproduces("H-late-head-single");
-}
-
-/// H-switch-late-head (10-single-protocol step 7): a single-writer backup
-/// stalled between its head EXISTS and its plain PUT across a switch to
-/// multi-writer replaces a put-if-absent head on `ConditionalOverwrite`.
-#[test]
-fn known_hazard_h_switch_late_head() {
-    hazards::assert_reproduces("H-switch-late-head");
 }
 
 /// After a late head: `check --repair` leaves the repository clean (every
@@ -1051,13 +1040,18 @@ fn repaired_clean(sim: &mut Sim, c: ClientId, survivors: &[&str], set: &[Invaria
 /// are clean afterwards. Conditional (vykar-server, switched to
 /// single-writer): the late plain PUT is refused 409, which reads as
 /// `Taken` (D14), so a rebases, finds its marker gone and refuses:
-/// clean. The classifier has no signature for this shape yet (`Unknown`;
-/// 10-single-protocol step 10 names it), so the test asserts invariants.
+/// clean. Before the repair the end state classifies as
+/// `SingleWriterHeadRace`.
 #[test]
 fn a_late_single_writer_head_over_a_compact_is_repaired() {
     for kind in [StoreKind::Plain, StoreKind::ConditionalOverwrite] {
         let (mut sim, a, c, ra, report) =
             hazards::h_late_head_single_runs(kind).unwrap_or_else(|o| panic!("{kind:?}: {o:?}"));
+        assert_eq!(
+            classify_end_state(&sim).1,
+            BTreeSet::from([Signature::SingleWriterHeadRace]),
+            "{kind:?}: {report}"
+        );
         assert_eq!(
             ra.error_class(),
             Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
@@ -1090,7 +1084,8 @@ fn a_late_single_writer_head_over_a_compact_is_repaired() {
     report.assert_clean();
 }
 
-/// H-switch-late-head on each store kind. ConditionalOverwrite: a refuses
+/// H-late-head-single's route B (H-switch-late-head until 10-single-protocol
+/// step 10) on each store kind. ConditionalOverwrite: a refuses
 /// (`MarkerLostDuringCommit`), its plain PUT replaced b1's put-if-absent
 /// head (invariant 12) and b1's entries are unindexed (invariant 1; a
 /// compact refuses its mark, so invariant 9 too); `check --repair`
@@ -1098,12 +1093,18 @@ fn a_late_single_writer_head_over_a_compact_is_repaired() {
 /// are clean afterwards (invariant 12 aside: the replaced head stays
 /// replaced). Conditional: the plain PUT is refused 409 (`Taken`), a
 /// finds its marker gone and refuses: clean. Plain offers no
-/// put-if-absent, so the switch to multi-writer refuses there.
+/// put-if-absent, so the switch to multi-writer refuses there. Before the
+/// repair the end state classifies as `SingleWriterHeadRace`.
 #[test]
 fn a_late_head_across_a_switch_to_multi_writer_is_repaired() {
     let (mut sim, _, c, ra, report) =
         hazards::h_switch_late_head_runs(StoreKind::ConditionalOverwrite)
             .unwrap_or_else(|o| panic!("{o:?}"));
+    assert_eq!(
+        classify_end_state(&sim).1,
+        BTreeSet::from([Signature::SingleWriterHeadRace]),
+        "{report}"
+    );
     assert_eq!(
         ra.error_class(),
         Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
@@ -1138,8 +1139,8 @@ fn a_late_head_across_a_switch_to_multi_writer_is_repaired() {
 }
 
 /// What each known hazard does on a store that honours put-if-absent: H3
-/// and H3-compact are closed (their twins are regressions), the lock
-/// hazards remain.
+/// and H3-compact are closed (their twins are regressions), the others
+/// remain.
 #[test]
 fn known_hazards_on_a_conditional_store() {
     for h in KNOWN_HAZARDS {
@@ -1377,19 +1378,25 @@ fn held_delete() -> (
     (sim, a, run, gate, key)
 }
 
-const PLANTED_LOCK: &str = "locks/00000000000000000000-zz.json";
-const LOCK_BODY: &[u8] = br#"{"hostname":"elsewhere","pid":1,"time":"2026-01-01T00:00:00Z"}"#;
+/// Another exclusive session's marker, planted by the tamper client: a
+/// hold from its PUT (no run, so no registration listing to wait for).
+fn planted_exclusive() -> String {
+    format!("sessions/x-{:032x}.json", 1u128)
+}
+
+const MARKER_BODY: &[u8] =
+    br#"{"hostname":"elsewhere","pid":1,"registered_at":"2026-01-01T00:00:00Z","last_refresh":"2026-01-01T00:00:00Z"}"#;
 
 #[test]
-fn lock_exclusion_without_lock() {
+fn exclusive_sessions_without_hold() {
     let (mut sim, _, run, gate, key) = held_delete();
     assert!(sim.tamper_delete(&key));
     sim.resume(gate);
     let rec = sim.join(run);
-    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    let report = sim.check_invariants(&[Invariant::ExclusiveSessions]);
     assert!(
         report.has_kind(
-            ViolationKind::WriteWithoutLock,
+            ViolationKind::ExclusiveWriteWithoutHold,
             &format!("run {}", rec.index)
         ),
         "{report}"
@@ -1397,15 +1404,15 @@ fn lock_exclusion_without_lock() {
 }
 
 #[test]
-fn lock_exclusion_other_and_several() {
+fn exclusive_sessions_other_and_several() {
     let (mut sim, _, run, gate, _) = held_delete();
-    sim.tamper_put(PLANTED_LOCK, LOCK_BODY);
+    sim.tamper_put(&planted_exclusive(), MARKER_BODY);
     sim.resume(gate);
     let rec = sim.join(run);
-    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    let report = sim.check_invariants(&[Invariant::ExclusiveSessions]);
     assert!(
         report.has_kind(
-            ViolationKind::WriteUnderSeveralLocks,
+            ViolationKind::ExclusiveWriteUnderSeveralHolds,
             &format!("run {}", rec.index)
         ),
         "{report}"
@@ -1413,13 +1420,13 @@ fn lock_exclusion_other_and_several() {
 
     let (mut sim, _, run, gate, key) = held_delete();
     assert!(sim.tamper_delete(&key));
-    sim.tamper_put(PLANTED_LOCK, LOCK_BODY);
+    sim.tamper_put(&planted_exclusive(), MARKER_BODY);
     sim.resume(gate);
     let rec = sim.join(run);
-    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    let report = sim.check_invariants(&[Invariant::ExclusiveSessions]);
     assert!(
         report.has_kind(
-            ViolationKind::WriteUnderOtherLock,
+            ViolationKind::ExclusiveWriteUnderOtherHold,
             &format!("run {}", rec.index)
         ),
         "{report}"
@@ -2384,9 +2391,9 @@ fn a_segment_that_repeats_an_old_object_reads_old() {
     store.put(&key, &bytes).unwrap();
     sim.advance(Duration::from_secs(13 * 3600));
     store.put(&key, &bytes).unwrap();
-    store.put("locks/probe", b"now").unwrap();
-    let listing = store.list_meta("locks/").unwrap();
-    let now = vykar_storage::StoreNow::of_written(&listing, "locks/probe");
+    store.put("sessions/probe", b"now").unwrap();
+    let listing = store.list_meta("sessions/").unwrap();
+    let now = vykar_storage::StoreNow::of_written(&listing, "sessions/probe");
     assert!(now.is_some());
     let ages = SegmentAges::list(&store, now).unwrap();
     assert!(
@@ -2730,9 +2737,9 @@ fn marker_of(sim: &Sim, a: ClientId) -> String {
 /// `c`'s single-writer listing of `sessions/` before its commit mark
 /// (10-single-protocol step 7), after every pack is uploaded: its third
 /// listing, the first being its registration's (step 8), the second the
-/// open's. The scripted tests held a backup
-/// at its commit lock's stale-lock sweep (its second listing of `locks/`)
-/// before; both are the first op of its commit, unflagged, its marker live.
+/// open's. The scripted tests held a backup at its commit lock's stale-lock
+/// sweep (its second listing of the legacy lock directory) before; both are
+/// the first op of its commit, unflagged, its marker live.
 fn before_mark(c: ClientId) -> GateRule {
     GateRule::new(
         c,
@@ -2941,7 +2948,7 @@ fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
         Invariant::AllowedErrors,
-        Invariant::LockExclusion,
+        Invariant::ExclusiveSessions,
         Invariant::OrphanGrace,
         Invariant::MarkerGapCommit,
     ]);
@@ -2953,7 +2960,7 @@ fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
         "{report:?}"
     );
     assert_eq!(
-        classify_case(&sim, &report, &[]),
+        classify_case(&sim, &report),
         BTreeSet::from([Signature::LateHeadThenCompact]),
         "{report:?}"
     );

@@ -1,6 +1,6 @@
 {
   "name": "stall-before-head-create-lockfree",
-  "note": "Lock-free twin of stall-before-head-create-conditional (phase F part 10c): encrypted template, the lock decision replaced by the commit mark and the probe. a's fold commit stalls 6 h 1 min between its fence and its head create; the binding post-create checks refuse its snapshot, as under the lock: no signature.",
+  "note": "Lock-free twin of stall-before-head-create-conditional (phase F part 10c): encrypted template, the lock decision replaced by the commit mark and the probe. a's fold commit stalls 6 h 1 min between its fence and its head create; the binding post-create checks refuse its snapshot, as under the lock: no signature. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -36,7 +36,7 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
@@ -137,6 +137,12 @@
       "advance"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(StaleChunksDuringCommit))",
+    "Ok"
+  ],
   "case": {
     "hosts": "Distinct",
     "clients": [
@@ -162,7 +168,7 @@
     "advances": true,
     "choices": [
       0,
-      6,
+      5,
       0,
       0,
       0,
@@ -175,7 +181,7 @@
       0,
       0,
       0,
-      6
+      5
     ],
     "policy": "First",
     "storage": "Conditional",

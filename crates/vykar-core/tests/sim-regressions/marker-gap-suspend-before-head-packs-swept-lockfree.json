@@ -1,0 +1,204 @@
+{
+  "name": "marker-gap-suspend-before-head-packs-swept-lockfree",
+  "note": "Built by the diff review of 10-single-protocol step 10 (finding F1, the multi-writer replay) on the conditional store, three clients: backup a's marker record gaps (a 6 h 1 min jump before its probe) and a second 6 h 1 min jump lands after its fence; backup b marks committing; the compact reaps a's aged marker, skips its sweep because b is committing (it writes no head) and deletes a's two orphan packs, 12 h 2 min old. Before the fix a's put-if-absent of index.h/3 then succeeded: IndexIntegrity (IndexNamesAbsentPack) for both packs, Unknown, with invariant 11 silent (it read the clock at the last op a issued before its head write, its put-segment, before the second jump). Step 10 made invariant 11 read the clock at the head write's own issue, which flags the unfixed case (43322 s). Since the fix a's head step runs the pack-age term again and refuses (Allowed(StaleChunksDuringCommit)) with no request of index.h/; b commits, and the case shows no signature.",
+  "expect": [],
+  "at": [
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-exclusive"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "verify-packs +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Advance": {
+          "secs": 21660
+        }
+      },
+      "advance"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "upload"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "whole compact"
+    ]
+  ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(StaleChunksDuringCommit))",
+    "Ok",
+    "Ok"
+  ],
+  "case": {
+    "hosts": "Distinct",
+    "clients": [
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        {
+          "Backup": {
+            "shared": false,
+            "fold": false
+          }
+        }
+      ],
+      [
+        "Compact"
+      ]
+    ],
+    "faults": [],
+    "crash": false,
+    "advances": true,
+    "choices": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      7,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      6,
+      1,
+      1,
+      2
+    ],
+    "policy": "First",
+    "storage": "Conditional",
+    "template": "Encrypted"
+  }
+}

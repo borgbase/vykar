@@ -38,7 +38,8 @@ fn tree(name: &str) -> SourceTree {
 }
 
 /// Invariants 1 to 4 and 12 (and 8): what a conditional store keeps while a
-/// lock-exclusion violation (7) is expected.
+/// violation of the lock's exclusion (invariant 7, gone with the lock) was
+/// expected; the name is historical.
 const NOT_LOCK: &[Invariant] = &[
     Invariant::CommittedSnapshotsRestore,
     Invariant::AcknowledgedCommitsDurable,

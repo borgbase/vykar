@@ -1,6 +1,6 @@
 {
   "name": "aged-session-reaped-swept-packs-old-segment-lockfree",
-  "note": "Lock-free twin of aged-session-reaped-swept-packs-old-segment (phase F part 10d): encrypted template, conditional store, the lock decision replaced by the commit mark and the probe, the compact and the delete lock-free. The 3 h jump after a's commit mark leaves a gap over MARKER_GAP_LIMIT in its marker record, so a's fence before its snapshot PUT refuses (MarkerLostDuringCommit) and no snapshot is written; the compact 12 h later then sweeps nothing a committed snapshot needs: no signature. The hazard event of its twin (a snapshot written after the marker was reaped) does not exist lock-free; R1 (a reap after the marker probe) is the scripted known hazard H-committing-reaped.",
+  "note": "Lock-free twin of aged-session-reaped-swept-packs-old-segment (phase F part 10d): encrypted template, conditional store, the lock decision replaced by the commit mark and the probe, the compact and the delete lock-free. The 3 h jump after a's commit mark leaves a gap over MARKER_GAP_LIMIT in its marker record, so a's fence before its snapshot PUT refuses (MarkerLostDuringCommit) and no snapshot is written; the compact 12 h later then sweeps nothing a committed snapshot needs: no signature. The hazard event of its twin (a snapshot written after the marker was reaped) does not exist lock-free; R1 (a reap after the marker probe) is the scripted known hazard H-committing-reaped. Re-recorded by 10-single-protocol step 10 (labels list-exclusive and wait (locked); choices re-derived for the jumps of 1 min, 16 min, 46 min and 6 h 1 min; its 3 h 1 min jump replaced by 46 min, the same operations): the same signatures and run outcomes.",
   "expect": [],
   "at": [
     [
@@ -28,12 +28,12 @@
           "pick": 0
         }
       },
-      "probe-locks"
+      "list-exclusive"
     ],
     [
       {
         "Advance": {
-          "secs": 10860
+          "secs": 2760
         }
       },
       "advance"
@@ -203,6 +203,13 @@
       "stop"
     ]
   ],
+  "runs": [
+    "Ok",
+    "Ok",
+    "Some(Allowed(MarkerLostDuringCommit))",
+    "Ok",
+    "Ok"
+  ],
   "case": {
     "hosts": "SameHostname",
     "clients": [
@@ -233,22 +240,22 @@
       0,
       0,
       0,
+      4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
       5,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      6,
-      6,
+      5,
       1,
       0,
       0,

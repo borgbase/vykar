@@ -55,12 +55,15 @@ fn records(sim: &Sim, client: ClientId, run: usize) -> Vec<OpRecord> {
         .collect()
 }
 
-/// Writes of lock keys (`locks/*.json`, never a probe).
+/// Writes under the legacy lock directory (`sessions::LEGACY_LOCKS_PREFIX`),
+/// which no v6 client makes.
 fn lock_writes(records: &[OpRecord]) -> Vec<&OpRecord> {
     records
         .iter()
         .filter(|r| {
-            r.op.is_write() && r.key.starts_with("locks/") && KeyMatch::LockKey.matches(&r.key)
+            r.op.is_write()
+                && r.key
+                    .starts_with(crate::repo::sessions::LEGACY_LOCKS_PREFIX)
         })
         .collect()
 }
@@ -192,7 +195,7 @@ fn two_lock_free_backups_commit_without_a_lock() {
     sim.resume(gate);
     let ra = sim.join(ra);
     ra.expect_ok();
-    assert!(ra.lock_free && rb.lock_free, "both commit lock-free");
+    assert!(ra.shared && rb.shared, "both commit lock-free");
     let (ra_recs, rb_recs) = (records(&sim, a, ra.index), records(&sim, b, rb.index));
     for recs in [&ra_recs, &rb_recs] {
         assert!(lock_writes(recs).is_empty(), "{:?}", lock_writes(recs));
@@ -247,7 +250,7 @@ fn a_commit_waits_for_a_live_exclusive_session() {
         sim.resume(l_held);
         let rl = sim.join(rl);
         rl.expect_ok();
-        assert!(!rl.lock_free && rl.exclusive);
+        assert!(!rl.shared && rl.exclusive);
         sim.resume(f_retry);
         let rf = sim.join(rf);
         assert!(
@@ -290,13 +293,13 @@ fn an_exclusive_session_refuses_beside_a_committing_backup() {
         sim.resume(f_snap);
         let rf = sim.join(rf);
         rf.expect_ok();
-        assert!(rf.lock_free);
+        assert!(rf.shared);
         // The segments old enough to fold (04 step 7), so the fold writes a
         // head.
         sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
         let rl = sim.call(l, exclusive_fold());
         rl.expect_ok();
-        assert!(!rl.lock_free);
+        assert!(!rl.shared);
         assert!(
             records(&sim, l, rl.index)
                 .iter()
@@ -429,7 +432,7 @@ fn an_exclusive_session_lists_sessions_after_its_marker_put() {
         sim.resume(f_snap);
         let rf = sim.join(rf);
         rf.expect_ok();
-        assert!(rf.lock_free);
+        assert!(rf.shared);
         sim.call(l, exclusive_fold()).expect_ok();
         assert!(sim.store().head_overwrites().is_empty(), "{kind:?}");
         let set = if kind.records_multi_writer() {
@@ -555,7 +558,7 @@ fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
         "{}",
         rf.detail()
     );
-    assert!(rf.lock_free, "f decided lock-free before the gap");
+    assert!(rf.shared, "f decided lock-free before the gap");
     assert!(lock_writes(&records(&sim, f, rf.index)).is_empty());
     assert!(
         !records(&sim, f, rf.index)
@@ -586,15 +589,12 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
     );
     let run = sim.backup(a, "a1", &tree("a1"));
     assert!(!run.is_ok(), "the backup failed");
-    assert!(!run.lock_free);
+    assert!(!run.shared);
     let recs = records(&sim, a, run.index);
     let stray: Vec<&OpRecord> = recs
         .iter()
         .filter(|r| r.op.is_mutation())
-        .filter(|r| {
-            !(r.key.starts_with("sessions/")
-                || (r.key.starts_with("locks/") && !KeyMatch::LockKey.matches(&r.key)))
-        })
+        .filter(|r| !r.key.starts_with("sessions/"))
         .collect();
     assert!(stray.is_empty(), "{}: {stray:?}", run.detail());
     assert!(lock_writes(&recs).is_empty(), "no lock was taken");
@@ -607,7 +607,7 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
     );
     let again = sim.backup(a, "a2", &tree("a2"));
     again.expect_ok();
-    assert!(again.lock_free);
+    assert!(again.shared);
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
@@ -745,7 +745,7 @@ fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
     sim.resume(gate);
     let ra = sim.join(ra);
     ra.expect_ok();
-    assert!(ra.lock_free, "a commits lock-free");
+    assert!(ra.shared, "a commits lock-free");
     let recs = records(&sim, a, ra.index);
     assert!(lock_writes(&recs).is_empty(), "a lock was taken: {recs:?}");
     let mark = recs
@@ -770,7 +770,7 @@ fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
     sim.restore(a, "a1").expect_ok();
     let again = sim.backup(a, "a2", &tree("a2"));
     again.expect_ok();
-    assert!(again.lock_free);
+    assert!(again.shared);
     let recs = records(&sim, a, again.index);
     let mark = recs
         .iter()

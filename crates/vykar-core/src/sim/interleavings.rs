@@ -5,7 +5,7 @@
 //! other, and resumes the first. Only one client is runnable at a time, so
 //! virtual time stays in Auto mode. Gates select an operation by (client,
 //! nth matching operation), never by a key the run invents; the keys a
-//! verdict needs (lock keys, markers) are read back from the op log.
+//! verdict needs (markers) are read back from the op log.
 //!
 //! H4-segment is a regression since 05 step 8 (index garbage is collected
 //! by age): [`h4_segment_regression`]. H1 and H1-session are regressions
@@ -30,7 +30,9 @@ use super::checker::{Invariant, Report, ViolationKind};
 use super::env::{INIT_PID_NS, SimMachine};
 use super::fault::{ClientId, KeyMatch, OpKind, OpMatch};
 use super::gate::{GateId, GateRule, Paused};
-use super::hazards::{HazardOutcome, base_controls, broken, deleted_in_run, different_damage};
+use super::hazards::{
+    HazardOutcome, base_controls, broken, deleted_in_run, different_damage, reproduced,
+};
 use super::history::{AllowedError, ErrorClass, RunRecord};
 use super::log::OpRecord;
 use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree, seeded_bytes};
@@ -71,14 +73,14 @@ pub enum Hosts {
     LateNamesake,
 }
 
-/// The checked set for these scenarios: STEP1 and invariants 7, 10 and 11.
+/// The checked set for these scenarios: STEP1 and invariants 13, 10 and 11.
 pub const CHECKED: &[Invariant] = &[
     Invariant::CommittedSnapshotsRestore,
     Invariant::AcknowledgedCommitsDurable,
     Invariant::NoSilentRemoval,
     Invariant::IndexIntegrity,
     Invariant::AllowedErrors,
-    Invariant::LockExclusion,
+    Invariant::ExclusiveSessions,
     Invariant::OrphanGrace,
     Invariant::MarkerGapCommit,
 ];
@@ -254,19 +256,19 @@ fn took_no_exclusive(sim: &Sim, c: ClientId) -> bool {
         .any(|k| k.ends_with(".json"))
 }
 
-/// The outcome of a lock (or exclusive) scenario whose clients took no lock
-/// (registered no exclusive session).
-fn no_lock_taken(evidence: String) -> HazardOutcome {
+/// The outcome of an exclusive scenario whose clients registered no
+/// exclusive session.
+fn no_exclusive_taken(evidence: String) -> HazardOutcome {
     HazardOutcome::PrerequisiteNotReproduced {
-        prerequisite: "a lock held by a",
+        prerequisite: "an exclusive session held by a",
         evidence: format!(
-            "lock-free clients take no lock
+            "the clients registered no exclusive session
 {evidence}"
         ),
     }
 }
 
-fn lock_violation(report: &Report, run: usize, kind: ViolationKind) -> bool {
+fn run_violation(report: &Report, run: usize, kind: ViolationKind) -> bool {
     report.has_kind(kind, &format!("run {run}"))
 }
 
@@ -298,7 +300,7 @@ fn boots_late(hosts: Hosts) -> bool {
 
 /// H1 as a regression: on cloned machines, namesakes (also one booted
 /// after a's write) and containers that share a hostname, b keeps a's live
-/// lock (Locked) and a finishes.
+/// exclusive marker (ActiveSessions) and a finishes.
 pub fn h1_regression() -> Report {
     not_reproduced_on("H1", ONE_HOSTNAME, h1_with)
 }
@@ -310,12 +312,22 @@ pub fn h1_session_regression() -> Report {
 }
 
 /// H1-late-clone: a clone of a's installation that booted after a wrote
-/// its lock takes the live lock for one of its own earlier boot and reaps
-/// it; a then writes under b's lock. The residual of 04 step 1's uptime
-/// rule.
+/// its exclusive marker takes the live session for one of its own earlier
+/// boot and reaps it; a then writes under b's session. The residual of 04
+/// step 1's uptime rule.
 pub fn h1_late_clone() -> HazardOutcome {
     h1_with(Hosts::LateClone)
 }
+
+/// H1-late-clone's end state: the sim, a's and b's runs and the report
+/// (`CHECKED`); `Err` with the outcome of a scenario that ended early.
+#[cfg(test)]
+pub(crate) fn h1_late_clone_runs() -> Result<H1End, HazardOutcome> {
+    h1_runs(Hosts::LateClone)
+}
+
+/// The end state of an H1 scenario: the sim, a's run, b's run, the report.
+pub(crate) type H1End = (Sim, RunRecord, RunRecord, Report);
 
 /// A clean report if every placement gives `NotReproduced`; else one
 /// `DisallowedError` per other outcome, subject `"<id> on <hosts>"`.
@@ -352,6 +364,42 @@ pub fn h1_with(hosts: Hosts) -> HazardOutcome {
 }
 
 fn h1_scenario(hosts: Hosts) -> Scenario {
+    let (sim, ra, rb, report) = h1_runs(hosts)?;
+    controls(&report)?;
+    let key = exclusive_key_of(&sim, &ra);
+    let reaped: Vec<u64> = key
+        .as_deref()
+        .map(|k| steps_deleting(&sim, rb.client, rb.index, k))
+        .unwrap_or_default();
+    let inside = reaped
+        .iter()
+        .any(|s| (ra.first_step..ra.last_step).contains(s));
+    let evidence = format!(
+        "{}\na's exclusive marker {key:?} deleted by b at {reaped:?}\n{report}",
+        outcomes(&ra, &rb)
+    );
+    Ok(
+        if inside
+            && run_violation(
+                &report,
+                ra.index,
+                ViolationKind::ExclusiveWriteUnderOtherHold,
+            )
+        {
+            reproduced(&sim, evidence)
+        } else if allowed(&rb, AllowedError::ActiveSessions)
+            && ra.is_ok()
+            && !report.violated(Invariant::ExclusiveSessions)
+        {
+            HazardOutcome::NotReproduced { evidence }
+        } else {
+            different_damage(evidence)
+        },
+    )
+}
+
+/// The runs of [`h1_scenario`] up to its report.
+fn h1_runs(hosts: Hosts) -> Result<H1End, HazardOutcome> {
     let mut sim = Sim::new();
     let c = sim.client("c");
     ok(&sim.backup(c, "t0", &seeded("t0")), "control backup t0")?;
@@ -363,7 +411,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         KeyMatch::Prefix("snapshots/".into()),
     ));
     // b's write check (10-single-protocol step 8: the EXISTS of its
-    // exclusive marker; the lock fence's EXISTS of its lock key before).
+    // exclusive marker).
     let gb = sim.gate(GateRule::new(
         b,
         OpMatch::Kind(OpKind::Exists),
@@ -399,7 +447,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
                 if took_no_exclusive(&sim, a) && took_no_exclusive(&sim, b) {
                     sim.resume(ga);
                     let ra = sim.join(sa);
-                    return Ok(no_lock_taken(outcomes(&ra, &rb)));
+                    return Err(no_exclusive_taken(outcomes(&ra, &rb)));
                 }
                 return Err(broken(format!(
                     "b ended before its write check, not ActiveSessions: {:?}",
@@ -411,31 +459,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         }
     };
     let report = sim.check_invariants(CHECKED);
-    controls(&report)?;
-    let key = exclusive_key_of(&sim, &ra);
-    let reaped: Vec<u64> = key
-        .as_deref()
-        .map(|k| steps_deleting(&sim, b, rb.index, k))
-        .unwrap_or_default();
-    let inside = reaped
-        .iter()
-        .any(|s| (ra.first_step..ra.last_step).contains(s));
-    let evidence = format!(
-        "{}\na's exclusive marker {key:?} deleted by b at {reaped:?}\n{report}",
-        outcomes(&ra, &rb)
-    );
-    Ok(
-        if inside && lock_violation(&report, ra.index, ViolationKind::WriteUnderOtherLock) {
-            HazardOutcome::Reproduced { evidence }
-        } else if allowed(&rb, AllowedError::ActiveSessions)
-            && ra.is_ok()
-            && !report.violated(Invariant::LockExclusion)
-        {
-            HazardOutcome::NotReproduced { evidence }
-        } else {
-            different_damage(evidence)
-        },
-    )
+    Ok((sim, ra, rb, report))
 }
 
 /// H1-session: a live backup's session marker reaped by a compact that
@@ -444,8 +468,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
 /// placement reproduces it.
 ///
 /// A backs up a1 and is held at its single-writer listing before its
-/// commit mark (its commit lock's stale-lock sweep until 10-single-protocol
-/// step 7), after phase 1 uploaded its packs. B compacts beside A's live
+/// commit mark, after phase 1 uploaded its packs. B compacts beside A's live
 /// backup (since 04 step 7 it proceeds, keeping A's uploads). Then A
 /// resumes.
 pub fn h1_session_with(hosts: Hosts) -> HazardOutcome {
@@ -459,7 +482,7 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     let (a, b) = pair(&mut sim, hosts);
     // The 1st listing of sessions/ is the open's, the 2nd the single-writer
     // listing before the commit mark (on a multi-writer repository: the
-    // probe of `locks/` after it), after every pack is uploaded.
+    // pre-head listing after it), after every pack is uploaded.
     let ga = sim.gate(before_commit(a));
     let sa = sim.spawn(
         a,
@@ -493,7 +516,7 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     );
     Ok(
         if marker_reaped && packs_deleted && allowed(&ra, AllowedError::StaleChunksDuringCommit) {
-            HazardOutcome::Reproduced { evidence }
+            reproduced(&sim, evidence)
         } else if !marker_reaped
             && rb.is_ok()
             && ra.is_ok()
@@ -646,7 +669,7 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
         MarkerReap::AfterPut => reaped.is_empty() && rb.is_ok() && ra.is_ok() && restores,
     };
     Ok(if !reaped.is_empty() && !rewrites.is_empty() {
-        HazardOutcome::Reproduced { evidence }
+        reproduced(&sim, evidence)
     } else if held && rewrites.is_empty() && left.is_empty() {
         HazardOutcome::NotReproduced { evidence }
     } else if reap == MarkerReap::BeforeRefresh && reaped.is_empty() {

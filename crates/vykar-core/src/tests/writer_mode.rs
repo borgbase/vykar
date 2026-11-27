@@ -9,9 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::RetentionConfig;
 use crate::repo::{Repo, WriterMode, WriterModeReport};
-use crate::sim::{
-    ClientId, Invariant, KeyMatch, OpKind, OpRecord, Sim, SimConfig, SourceTree, StoreKind,
-};
+use crate::sim::{ClientId, Invariant, OpKind, OpRecord, Sim, SimConfig, SourceTree, StoreKind};
 use crate::testutil::MemoryBackend;
 use vykar_storage::{
     ConditionalSupport, ConditionalWrite, Created, InnerBackend, StorageBackend, Verifier,
@@ -53,7 +51,7 @@ const STEP8_WITH_REFUSALS: &[Invariant] = &[
     Invariant::AcknowledgedCommitsDurable,
     Invariant::NoSilentRemoval,
     Invariant::IndexIntegrity,
-    Invariant::LockExclusion,
+    Invariant::ExclusiveSessions,
     Invariant::NoPermanentWedge,
     Invariant::OrphanGrace,
     Invariant::MarkerGapCommit,
@@ -203,9 +201,9 @@ fn switch_to_single_and_back() {
     run.expect_ok();
     let recs = records(&sim, u, run.index);
     assert!(
-        !recs
-            .iter()
-            .any(|r| r.op.is_write() && KeyMatch::LockKey.matches(&r.key)),
+        !recs.iter().any(|r| r.op.is_write()
+            && r.key
+                .starts_with(crate::repo::sessions::LEGACY_LOCKS_PREFIX)),
         "a lock was taken: {recs:?}"
     );
     let heads: Vec<&OpRecord> = recs
@@ -242,7 +240,7 @@ fn switch_to_single_and_back() {
     assert_refused(&sim, u, &run, "u's backup after the switch back");
     let run = sim.backup(ctl, "c3", &tree("c3"));
     run.expect_ok();
-    assert!(run.lock_free);
+    assert!(run.shared);
     for name in ["c1", "c2", "u1", "c3"] {
         sim.restore(ctl, name).expect_ok();
     }

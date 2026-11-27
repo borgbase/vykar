@@ -89,10 +89,6 @@ pub enum KeyMatch {
     Any,
     Exact(String),
     Prefix(String),
-    /// A lock key (`locks/*.json`), or the `locks/` directory itself (the
-    /// key its listings are logged under); never a probe (a lock wait's
-    /// `locks/vykar-clock-*`, legacy `locks/vykar-probe-*`).
-    LockKey,
     /// A session key (marker or journal), or the `sessions/` directory
     /// itself; never a probe (`sessions/vykar-probe-*`,
     /// `sessions/vykar-clock-*`).
@@ -105,9 +101,6 @@ impl KeyMatch {
             KeyMatch::Any => true,
             KeyMatch::Exact(k) => k == key,
             KeyMatch::Prefix(p) => key.starts_with(p.as_str()),
-            KeyMatch::LockKey => {
-                key == "locks/" || (key.starts_with("locks/") && key.ends_with(".json"))
-            }
             KeyMatch::SessionKey => {
                 key == "sessions/"
                     || (key.starts_with("sessions/") && !crate::repo::ages::is_probe_key(key))

@@ -180,8 +180,8 @@ pub struct DamagedFile {
     pub reason: String,
 }
 
-/// Progress of a restore, delivered on the thread that called
-/// [`run_with_options`]. Counts are cumulative over the whole restore and
+/// Progress of a restore, delivered on the thread that called [`run`] or
+/// [`run_on_repo`]. Counts are cumulative over the whole restore and
 /// never decrease. [`RestoreStats`] stays the authoritative result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreEvent {
@@ -202,7 +202,7 @@ pub enum RestoreEvent {
     Finishing,
 }
 
-/// Knobs for [`run_with_options`].
+/// Knobs of a [`RestoreRequest`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RestoreOptions {
     pub xattrs_enabled: bool,
@@ -214,197 +214,155 @@ pub struct RestoreOptions {
     pub continue_on_error: bool,
 }
 
-/// Run `vykar restore`.
+/// What a restore takes from the snapshot.
+#[derive(Debug, Clone, Copy)]
+pub enum RestoreSelection<'a> {
+    /// Every item.
+    All,
+    /// Items whose path matches this glob (`vykar restore <snapshot> <dest> <pattern>`).
+    Pattern(&'a str),
+    /// These paths and everything under them (the GUI's selection).
+    ///
+    /// An item is included if its path exactly matches one of them, or if any
+    /// prefix of its path does (a parent directory was selected).
+    Paths(&'a HashSet<String>),
+}
+
+impl RestoreSelection<'_> {
+    /// Fail on an invalid glob, as the restore would, without opening
+    /// anything: callers that open first check the selection before the open.
+    pub fn validate(&self) -> Result<()> {
+        if let Self::Pattern(p) = self {
+            compile_pattern(p)?;
+        }
+        Ok(())
+    }
+}
+
+/// One restore.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreRequest<'a> {
+    /// Snapshot name, or `latest`.
+    pub snapshot: &'a str,
+    pub dest: &'a str,
+    pub selection: RestoreSelection<'a>,
+    pub options: RestoreOptions,
+}
+
+/// Run `vykar restore`. `events` receive [`RestoreEvent`]s on the calling
+/// thread; `None` costs nothing. An invalid glob fails before the open.
 ///
 /// Every restored chunk's plaintext is matched against its stored `chunk_id`
 /// via `ChunkId::compute` when `verify_chunks` is true. AEAD already
 /// authenticates the data, so `verify_chunks` only guards against writer-side
 /// bugs.
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    snapshot_name: &str,
-    dest: &str,
-    pattern: Option<&str>,
-    xattrs_enabled: bool,
-    verify_chunks: bool,
-    cancel: &CancelToken,
-) -> Result<RestoreStats> {
-    let opts = RestoreOptions {
-        xattrs_enabled,
-        verify_chunks,
-        continue_on_error: false,
-    };
-    run_with_options(
-        config,
-        passphrase,
-        snapshot_name,
-        dest,
-        pattern,
-        opts,
-        None,
-        cancel,
-    )
-}
-
-/// Run `vykar restore` with explicit [`RestoreOptions`].
-///
-/// `events` receives [`RestoreEvent`]s on the calling thread; `None` costs
-/// nothing.
-#[allow(clippy::too_many_arguments)]
-pub fn run_with_options(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-    dest: &str,
-    pattern: Option<&str>,
-    opts: RestoreOptions,
+    req: &RestoreRequest<'_>,
     events: Option<&dyn EventSink<RestoreEvent>>,
     cancel: &CancelToken,
 ) -> Result<RestoreStats> {
-    let filter = compile_pattern(pattern)?;
-
-    restore_with_filter(
-        config,
-        passphrase,
-        snapshot_name,
-        dest,
-        opts,
-        pattern_scope(pattern),
-        move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
-        events,
-        cancel,
-    )
+    req.selection.validate()?;
+    cancel.check()?;
+    let mut repo =
+        super::util::open_repo(config, passphrase, crate::repo::OpenOptions::new(), cancel)?;
+    run_on_repo(&mut repo, req, events, cancel)
 }
 
-/// The glob filter `run_with_options` builds from `pattern`.
-fn compile_pattern(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>> {
-    pattern
-        .map(|p| {
-            globset::GlobBuilder::new(p)
-                .literal_separator(false)
-                .build()
-                .map(|g| g.compile_matcher())
-        })
-        .transpose()
+/// [`run`] on a repository opened with `OpenOptions::new()`.
+pub fn run_on_repo(
+    repo: &mut Repo,
+    req: &RestoreRequest<'_>,
+    events: Option<&dyn EventSink<RestoreEvent>>,
+    cancel: &CancelToken,
+) -> Result<RestoreStats> {
+    cancel.check()?;
+    restore_selection(repo, req, false, events, cancel).map(|(stats, _)| stats)
+}
+
+/// The glob filter of a [`RestoreSelection::Pattern`].
+fn compile_pattern(pattern: &str) -> Result<globset::GlobMatcher> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+        .map(|g| g.compile_matcher())
         .map_err(|e| VykarError::Config(format!("invalid pattern: {e}")))
 }
 
-/// [`run_with_options`] on an already opened repository.
-#[cfg(any(test, feature = "sim"))]
-pub(crate) fn run_on_repo(
+/// Restore `req` on an open repository, reading the scope its selection
+/// implies (or the whole listing when `whole`). Also returns what the
+/// subtree reads cost (`None`: the lazy whole-listing read).
+fn restore_selection(
     repo: &mut Repo,
-    snapshot_name: &str,
-    dest: &str,
-    pattern: Option<&str>,
-    opts: RestoreOptions,
+    req: &RestoreRequest<'_>,
+    whole: bool,
+    events: Option<&dyn EventSink<RestoreEvent>>,
     cancel: &CancelToken,
-) -> Result<RestoreStats> {
-    let filter = compile_pattern(pattern)?;
-    restore_on_repo_with_filter(
-        repo,
-        snapshot_name,
+) -> Result<(RestoreStats, Option<ListingRead>)> {
+    let RestoreRequest {
+        snapshot,
         dest,
-        opts,
-        pattern_scope(pattern),
-        move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
-        None,
-        cancel,
-    )
-    .map(|(stats, _)| stats)
+        selection,
+        options,
+    } = *req;
+    let narrowed = |scope: ReadScope| if whole { ReadScope::Whole } else { scope };
+    match selection {
+        RestoreSelection::All => restore_on_repo_with_filter(
+            repo,
+            snapshot,
+            dest,
+            options,
+            ReadScope::Whole,
+            |_| true,
+            events,
+            cancel,
+        ),
+        RestoreSelection::Pattern(pattern) => {
+            let matcher = compile_pattern(pattern)?;
+            restore_on_repo_with_filter(
+                repo,
+                snapshot,
+                dest,
+                options,
+                narrowed(pattern_scope(Some(pattern))),
+                move |path| matcher.is_match(path),
+                events,
+                cancel,
+            )
+        }
+        RestoreSelection::Paths(selected) => restore_on_repo_with_filter(
+            repo,
+            snapshot,
+            dest,
+            options,
+            narrowed(selection_scope(selected)),
+            |path| path_matches_selection(path, selected),
+            events,
+            cancel,
+        ),
+    }
 }
 
-/// What a test restores: selected paths (as [`run_selected`]) or a glob
-/// (as [`run_with_options`]).
-#[cfg(test)]
-pub(crate) enum TestSelection<'s> {
-    Paths(&'s HashSet<String>),
-    Pattern(Option<&'s str>),
-}
-
-/// Restore `selection` on an open repository, reading the scope it implies
-/// (or the whole listing when `whole`). Also returns what the subtree reads
-/// cost (`None`: the lazy whole-listing read).
+/// Restore `selection` with default options on an open repository, reading
+/// the scope it implies (or the whole listing when `whole`). Also returns
+/// what the subtree reads cost (`None`: the lazy whole-listing read).
 #[cfg(test)]
 pub(crate) fn restore_on_repo_for_test(
     repo: &mut Repo,
     snapshot_name: &str,
     dest: &str,
-    selection: TestSelection<'_>,
+    selection: RestoreSelection<'_>,
     whole: bool,
     cancel: &CancelToken,
 ) -> Result<(RestoreStats, Option<ListingRead>)> {
-    let opts = RestoreOptions::default();
-    match selection {
-        TestSelection::Paths(selected) => {
-            let scope = if whole {
-                ReadScope::Whole
-            } else {
-                selection_scope(selected)
-            };
-            restore_on_repo_with_filter(
-                repo,
-                snapshot_name,
-                dest,
-                opts,
-                scope,
-                |path| path_matches_selection(path, selected),
-                None,
-                cancel,
-            )
-        }
-        TestSelection::Pattern(pattern) => {
-            let filter = compile_pattern(pattern)?;
-            let scope = if whole {
-                ReadScope::Whole
-            } else {
-                pattern_scope(pattern)
-            };
-            restore_on_repo_with_filter(
-                repo,
-                snapshot_name,
-                dest,
-                opts,
-                scope,
-                move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
-                None,
-                cancel,
-            )
-        }
-    }
-}
-
-/// Run `vykar restore` for a selected set of paths.
-///
-/// An item is included if its path exactly matches an entry in `selected_paths`,
-/// or if any prefix of its path matches (i.e. a parent directory was selected).
-#[allow(clippy::too_many_arguments)]
-pub fn run_selected(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-    dest: &str,
-    selected_paths: &HashSet<String>,
-    xattrs_enabled: bool,
-    verify_chunks: bool,
-    cancel: &CancelToken,
-) -> Result<RestoreStats> {
-    restore_with_filter(
-        config,
-        passphrase,
-        snapshot_name,
+    let req = RestoreRequest {
+        snapshot: snapshot_name,
         dest,
-        RestoreOptions {
-            xattrs_enabled,
-            verify_chunks,
-            continue_on_error: false,
-        },
-        selection_scope(selected_paths),
-        |path| path_matches_selection(path, selected_paths),
-        None,
-        cancel,
-    )
+        selection,
+        options: RestoreOptions::default(),
+    };
+    restore_selection(repo, &req, whole, None, cancel)
 }
 
 // ---------------------------------------------------------------------------
@@ -592,37 +550,6 @@ fn scan_subtrees(
 // ---------------------------------------------------------------------------
 // Core restore logic — phased approach
 // ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn restore_with_filter<F>(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-    dest: &str,
-    opts: RestoreOptions,
-    scope: ReadScope,
-    include_path: F,
-    events: Option<&dyn EventSink<RestoreEvent>>,
-    cancel: &CancelToken,
-) -> Result<RestoreStats>
-where
-    F: FnMut(&str) -> bool,
-{
-    cancel.check()?;
-    let mut repo =
-        super::util::open_repo(config, passphrase, crate::repo::OpenOptions::new(), cancel)?;
-    restore_on_repo_with_filter(
-        &mut repo,
-        snapshot_name,
-        dest,
-        opts,
-        scope,
-        include_path,
-        events,
-        cancel,
-    )
-    .map(|(stats, _)| stats)
-}
 
 /// The restore. Also returns what the subtree reads cost (`None` for the
 /// lazy whole-listing read).
@@ -1416,6 +1343,43 @@ mod tests {
     use super::*;
     use crate::tests::helpers::pass;
 
+    /// Open `config`'s repository and restore with the filter `include_path`
+    /// (the tests' injection point) over `scope`.
+    #[allow(clippy::too_many_arguments)]
+    fn restore_with_filter<F>(
+        config: &VykarConfig,
+        passphrase: Option<&str>,
+        snapshot_name: &str,
+        dest: &str,
+        opts: RestoreOptions,
+        scope: ReadScope,
+        include_path: F,
+        events: Option<&dyn EventSink<RestoreEvent>>,
+        cancel: &CancelToken,
+    ) -> Result<RestoreStats>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        cancel.check()?;
+        let mut repo = crate::commands::util::open_repo(
+            config,
+            passphrase,
+            crate::repo::OpenOptions::new(),
+            cancel,
+        )?;
+        restore_on_repo_with_filter(
+            &mut repo,
+            snapshot_name,
+            dest,
+            opts,
+            scope,
+            include_path,
+            events,
+            cancel,
+        )
+        .map(|(stats, _)| stats)
+    }
+
     #[test]
     fn restore_readers_follow_transfer_width() {
         let profile = |transfer_width| vykar_storage::BackendProfile {
@@ -1763,6 +1727,33 @@ mod tests {
         assert_dest_clean(&dest);
     }
 
+    /// An invalid glob fails as a config error before the repository is
+    /// opened, and the destination is never created.
+    #[test]
+    fn invalid_pattern_fails_before_the_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, dest) = restore_fixture(tmp.path(), 1);
+        let req = RestoreRequest {
+            snapshot: "snap-cancel",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::Pattern("[unclosed"),
+            options: RestoreOptions::default(),
+        };
+        assert!(matches!(
+            req.selection.validate(),
+            Err(VykarError::Config(m)) if m.starts_with("invalid pattern")
+        ));
+        let (res, opens) = crate::testing::count_repo_opens(|| {
+            run(&config, pass(&config), &req, None, &CancelToken::new())
+        });
+        assert!(
+            matches!(&res, Err(VykarError::Config(m)) if m.starts_with("invalid pattern")),
+            "{res:?}"
+        );
+        assert_eq!(opens, 0);
+        assert!(!dest.exists());
+    }
+
     #[test]
     fn restore_error_wraps_only_source_failures() {
         let src = restore_error(parallel::ReadError::Source(VykarError::InvalidFormat(
@@ -1912,13 +1903,15 @@ mod tests {
         let mut events = Vec::new();
         let stats = {
             let sink = crate::repo::control::FnMutSink::new(|e| events.push(e));
-            run_with_options(
+            run(
                 config,
                 pass(config),
-                "snap-progress",
-                dest.to_str().unwrap(),
-                None,
-                RestoreOptions::default(),
+                &RestoreRequest {
+                    snapshot: "snap-progress",
+                    dest: dest.to_str().unwrap(),
+                    selection: RestoreSelection::All,
+                    options: RestoreOptions::default(),
+                },
                 Some(&sink),
                 &CancelToken::new(),
             )
@@ -1977,13 +1970,15 @@ mod tests {
         assert_eq!(stats.files, files.len() as u64);
         assert_eq!(stats.total_bytes, sum);
 
-        let plain = run_with_options(
+        let plain = run(
             &config,
             pass(&config),
-            "snap-progress",
-            tmp.path().join("dest-plain").to_str().unwrap(),
-            None,
-            RestoreOptions::default(),
+            &RestoreRequest {
+                snapshot: "snap-progress",
+                dest: tmp.path().join("dest-plain").to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions::default(),
+            },
             None,
             &CancelToken::new(),
         )

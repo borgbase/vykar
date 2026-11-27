@@ -2,23 +2,22 @@ use comfy_table::{Cell, CellAlignment};
 
 use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
-use vykar_core::config::VykarConfig;
+use vykar_core::repo::OpenOptions;
+use vykar_core::repo::control::CancelToken;
 
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use crate::table::CliTableTheme;
 use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_list(
-    config: &VykarConfig,
     source_filter: &[String],
     last: Option<usize>,
+    cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let listing = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::list::list_snapshots_with_stats(
-            config, passphrase,
-        )?)
-    })?;
+    let repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let listing = commands::list::list_snapshots_with_stats_on_repo(&repo);
+    drop(repo);
     let mut snapshots = listing.snapshots;
 
     // Never present a truncated list as if it were complete. Reported before

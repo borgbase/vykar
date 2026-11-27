@@ -137,11 +137,20 @@ pub fn run(
     scope: &FindScope,
     filter: &FindFilter,
 ) -> Result<Vec<PathTimeline>> {
-    let mut repo =
-        super::util::open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
+    let cancel = CancelToken::new();
+    let mut repo = super::util::open_repo(config, passphrase, OpenOptions::new(), &cancel)?;
+    run_on_repo(&mut repo, scope, filter, &cancel)
+}
 
+/// [`run`] on a repository opened with `OpenOptions::new()`.
+pub fn run_on_repo(
+    repo: &mut Repo,
+    scope: &FindScope,
+    filter: &FindFilter,
+    cancel: &CancelToken,
+) -> Result<Vec<PathTimeline>> {
     let entries = select_snapshots(&repo.manifest().snapshots, scope);
-    let (timelines, _stats) = find_on_repo(&mut repo, &entries, filter, &CancelToken::new())?;
+    let (timelines, _stats) = find_on_repo(repo, &entries, filter, cancel)?;
     Ok(timelines)
 }
 

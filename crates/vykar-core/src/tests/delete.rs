@@ -1,4 +1,5 @@
 use crate::commands;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
@@ -219,11 +220,13 @@ fn delete_multiple_snapshots_in_single_call() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-3",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-3",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

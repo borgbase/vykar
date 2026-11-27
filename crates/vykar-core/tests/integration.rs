@@ -7,6 +7,7 @@
 mod common;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::ChunkerParams;
@@ -321,11 +322,16 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         commands::restore::run(
             &config,
             common::pass(&config),
-            "before",
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: "before",
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            false,
-            true,
             &CancelToken::new(),
         )
         .unwrap();
@@ -536,11 +542,16 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
     let extract_stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-dedup",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-dedup",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -793,11 +804,16 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-xattrs",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-xattrs",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: true,
+                ..Default::default()
+            },
+        },
         None,
-        true,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -929,11 +945,13 @@ fn backup_and_restore_preserves_hard_links() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-hl",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-hl",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -976,11 +994,13 @@ fn restore_pattern_excluding_representative_restores_link_from_own_chunks() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-hl-partial",
-        restore_dir.to_str().unwrap(),
-        Some("keep*"),
-        false,
-        false,
+        &RestoreRequest {
+            snapshot: "snap-hl-partial",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::Pattern("keep*"),
+            options: RestoreOptions::default(),
+        },
+        None,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1033,11 +1053,13 @@ fn restore_single_in_set_hardlink_is_standalone_file() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-hl-single",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-hl-single",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1085,11 +1107,13 @@ fn restore_relinks_cross_source_hard_link_group() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-hl-cross",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-hl-cross",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1146,11 +1170,13 @@ fn second_backup_cache_hit_preserves_hard_link() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-hl-2",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-hl-2",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1224,11 +1250,13 @@ fn backup_and_restore_preserves_directory_mtime() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-dirmtime",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-dirmtime",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1272,11 +1300,13 @@ fn backup_and_restore_preserves_symlink_mtime() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-symmtime",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-symmtime",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1326,11 +1356,16 @@ fn backup_and_restore_preserves_symlink_xattrs() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-symxattr",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-symxattr",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: true,
+                ..Default::default()
+            },
+        },
         None,
-        true,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1386,11 +1421,13 @@ fn restore_populates_readonly_directory() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-rodir",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-rodir",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1444,11 +1481,16 @@ fn restore_readonly_file_keeps_xattr_and_mode() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-rofile-xattr",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-rofile-xattr",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: true,
+                ..Default::default()
+            },
+        },
         None,
-        true,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1501,11 +1543,16 @@ fn restore_readonly_dir_keeps_xattr_and_mode() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-rodir-xattr",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-rodir-xattr",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: true,
+                ..Default::default()
+            },
+        },
         None,
-        true,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1941,11 +1988,13 @@ fn command_dump_backup_and_restore() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-dumps",
-        extract_dir.path().to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-dumps",
+            dest: extract_dir.path().to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2054,11 +2103,13 @@ fn command_dump_mixed_with_files() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-mixed",
-        extract_dir.path().to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-mixed",
+            dest: extract_dir.path().to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2158,11 +2209,13 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-small-1",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-small-1",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2240,11 +2293,13 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-small-2",
-        restore_dir2.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-small-2",
+            dest: restore_dir2.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2317,11 +2372,13 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-threshold",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-threshold",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2488,11 +2545,13 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-mixed-2",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-mixed-2",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

@@ -12,7 +12,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use vykar_core::commands;
-use vykar_core::commands::restore::{RestoreEvent, RestoreOptions, RestoreStats};
+use vykar_core::commands::restore::{
+    RestoreEvent, RestoreOptions, RestoreRequest, RestoreSelection, RestoreStats,
+};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::control::{CancelToken, EventSink, FnMutSink};
 use vykar_types::chunk_decode::ChunkDecodeStage;
@@ -102,15 +104,17 @@ impl Fixture {
         continue_on_error: bool,
         events: Option<&dyn EventSink<RestoreEvent>>,
     ) -> Result<RestoreStats> {
-        commands::restore::run_with_options(
+        commands::restore::run(
             &self.config,
             self.passphrase,
-            "snap",
-            self.dest.to_str().unwrap(),
-            None,
-            RestoreOptions {
-                continue_on_error,
-                ..Default::default()
+            &RestoreRequest {
+                snapshot: "snap",
+                dest: self.dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    continue_on_error,
+                    ..Default::default()
+                },
             },
             events,
             &CancelToken::new(),
@@ -293,11 +297,13 @@ fn damaged_hardlink_representative_drops_the_whole_group() {
     let intact = commands::restore::run(
         &fx.config,
         fx.passphrase,
-        "snap",
-        fx.dest.with_extension("intact").to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap",
+            dest: fx.dest.with_extension("intact").to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

@@ -12,6 +12,7 @@ mod common;
 use std::path::Path;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
@@ -67,11 +68,13 @@ fn backup_and_restore_single_file_source() {
     let stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-v1",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-v1",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -91,11 +94,13 @@ fn backup_and_restore_single_file_source() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-v2",
-        restore_dir2.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-v2",
+            dest: restore_dir2.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -129,11 +134,13 @@ fn backup_mixed_file_and_directory_sources() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

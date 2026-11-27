@@ -10,6 +10,7 @@ use super::helpers::{
     PAST_T_PACK, age_repo_objects, backup_single_source, make_test_config, pass, set_store_now,
 };
 use crate::commands;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
 use crate::index::head::IndexHead;
 use crate::repo::control::CancelToken;
@@ -292,11 +293,16 @@ fn v6_backup_sweep_fold_and_compact_through_the_server() {
     commands::restore::run(
         &c.config,
         pass(&c.config),
-        "s3",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s3",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1085,11 +1091,16 @@ fn trailer_packs_through_the_server() {
     commands::restore::run(
         &c.config,
         pass(&c.config),
-        "s3",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s3",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1183,11 +1194,16 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     commands::restore::run(
         &cold,
         pass(&cold),
-        "s2",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s2",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1247,11 +1263,16 @@ fn a_lost_pack_reply_on_an_append_only_server_is_recognised() {
     commands::restore::run(
         &c.config,
         pass(&c.config),
-        "s1",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s1",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();

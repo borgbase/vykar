@@ -2,9 +2,10 @@
 //!
 //! The fine-grained cases (mid-stream, and the window between staging and the
 //! rename) live in `commands::restore`'s own test module, where the private
-//! `restore_with_filter` and the pre-publish injection hook are reachable.
-//! What is pinned here is the public contract: `run` / `run_selected` honour
-//! the flag, report `Interrupted`, and leave nothing behind at the destination.
+//! restore core and the pre-publish injection hook are reachable. What is
+//! pinned here is the public contract: `run`, for the whole snapshot and for
+//! selected paths, honours the flag, reports `Interrupted`, and leaves nothing
+//! behind at the destination.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -12,6 +13,7 @@ use std::path::Path;
 use vykar_types::error::VykarError;
 
 use crate::commands;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 
@@ -57,11 +59,13 @@ fn pre_cancelled_restore_run_writes_nothing() {
     let err = commands::restore::run(
         &config,
         pass(&config),
-        "snap-1",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-1",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &flag,
     )
     .unwrap_err();
@@ -74,7 +78,7 @@ fn pre_cancelled_restore_run_writes_nothing() {
 }
 
 #[test]
-fn pre_cancelled_restore_run_selected_writes_nothing() {
+fn pre_cancelled_restore_of_selected_paths_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, dest) = fixture(tmp.path());
 
@@ -83,14 +87,16 @@ fn pre_cancelled_restore_run_selected_writes_nothing() {
 
     let flag = CancelToken::new();
     flag.cancel();
-    let err = commands::restore::run_selected(
+    let err = commands::restore::run(
         &config,
         pass(&config),
-        "snap-1",
-        dest.to_str().unwrap(),
-        &selected,
-        false,
-        false,
+        &RestoreRequest {
+            snapshot: "snap-1",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::Paths(&selected),
+            options: RestoreOptions::default(),
+        },
+        None,
         &flag,
     )
     .unwrap_err();
@@ -113,11 +119,13 @@ fn restore_with_unset_flag_completes_normally() {
     let stats = commands::restore::run(
         &config,
         pass(&config),
-        "snap-1",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-1",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &flag,
     )
     .unwrap();

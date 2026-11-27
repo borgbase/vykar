@@ -16,7 +16,7 @@ use vykar_types::pack_id::PackId;
 
 use crate::commands;
 use crate::commands::list::LazyItemStream;
-use crate::commands::restore::RestoreOptions;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::compress::Compression;
 use crate::config::{RetentionConfig, VykarConfig};
 use crate::repo::control::CancelToken;
@@ -824,10 +824,13 @@ fn restore_reads_the_listing_from_the_cache() {
         let dest = host.tmp.path().join(dest);
         commands::restore::run_on_repo(
             &mut repo,
-            "s1",
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: "s1",
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: opts(),
+            },
             None,
-            opts(),
             &CancelToken::new(),
         )
         .unwrap();

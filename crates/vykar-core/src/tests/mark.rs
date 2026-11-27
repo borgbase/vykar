@@ -21,6 +21,7 @@ use crate::commands::list::{
 use crate::commands::mark::{
     MarkOptions, MissingRefs, TreeChunkSet, load_snapshots_strict, mark_live,
 };
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::compress::Compression;
 use crate::config::{RetentionConfig, VykarConfig};
 use crate::repo::control::CancelToken;
@@ -1651,11 +1652,16 @@ fn compact_after_a_delete_sweeps_what_the_report_names() {
     commands::restore::run(
         &fx.config,
         fx.pass,
-        "s2",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s2",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1910,11 +1916,16 @@ fn compact_refuses_a_live_snapshot_whose_get_finds_nothing() {
     commands::restore::run(
         &fx.config,
         fx.pass,
-        "s2",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s2",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();

@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
@@ -277,11 +278,17 @@ pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, v
     commands::restore::run(
         &cold,
         fx.passphrase(),
-        fx.latest_snapshot(),
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: fx.latest_snapshot(),
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: cold.xattrs.enabled,
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        cold.xattrs.enabled,
-        true,
         &CancelToken::new(),
     )
     .unwrap();

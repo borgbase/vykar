@@ -47,7 +47,7 @@ pub fn with_store_kind<T>(kind: StoreKind, f: impl FnOnce() -> T) -> T {
     f()
 }
 use crate::commands::check::{self, RepairAction, RepairMode};
-use crate::commands::restore::{self, RestoreOptions};
+use crate::commands::restore::{self, RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::commands::{backup, compact, delete, prune, util};
 use crate::compress::Compression;
 use crate::config::{
@@ -1224,14 +1224,17 @@ impl Sim {
                         let dest = dir.join(format!("restore-{idx}"));
                         let stats = restore::run_on_repo(
                             &mut repo,
-                            &snapshot,
-                            &dest.to_string_lossy(),
-                            None,
-                            RestoreOptions {
-                                xattrs_enabled: false,
-                                verify_chunks: true,
-                                continue_on_error: false,
+                            &RestoreRequest {
+                                snapshot: &snapshot,
+                                dest: &dest.to_string_lossy(),
+                                selection: RestoreSelection::All,
+                                options: RestoreOptions {
+                                    xattrs_enabled: false,
+                                    verify_chunks: true,
+                                    continue_on_error: false,
+                                },
                             },
+                            None,
                             &CancelToken::new(),
                         )?;
                         Ok((Vec::new(), format!("{} files", stats.files)))

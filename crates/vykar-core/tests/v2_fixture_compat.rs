@@ -19,6 +19,7 @@
 mod common;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::index::ChunkIndex;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::file_cache::FileCache;
@@ -112,11 +113,18 @@ fn v2_fixtures_restore_byte_identical() {
         commands::restore::run(
             &config,
             fx.passphrase(),
-            fx.latest_snapshot(),
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: fx.latest_snapshot(),
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    xattrs_enabled: config.xattrs.enabled,
+                    // verify chunk IDs: the point of the exercise
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            config.xattrs.enabled,
-            true, // verify chunk IDs: the point of the exercise
             &CancelToken::new(),
         )
         .unwrap();
@@ -217,11 +225,17 @@ fn v2_fixtures_upgrade_to_v6_with_blake2b() {
         commands::restore::run(
             &config,
             fx.passphrase(),
-            fx.latest_snapshot(),
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: fx.latest_snapshot(),
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    xattrs_enabled: config.xattrs.enabled,
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            config.xattrs.enabled,
-            true,
             &CancelToken::new(),
         )
         .unwrap();
@@ -342,11 +356,17 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
         commands::restore::run(
             &config,
             fx.passphrase(),
-            "post-change-snap",
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: "post-change-snap",
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    xattrs_enabled: config.xattrs.enabled,
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            config.xattrs.enabled,
-            true,
             &CancelToken::new(),
         )
         .unwrap();
@@ -412,11 +432,16 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
         let err = commands::restore::run(
             &config,
             wrong,
-            fx.latest_snapshot(),
-            fx.root.join("bad-restore").to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: fx.latest_snapshot(),
+                dest: fx.root.join("bad-restore").to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    xattrs_enabled: config.xattrs.enabled,
+                    ..Default::default()
+                },
+            },
             None,
-            config.xattrs.enabled,
-            false,
             &CancelToken::new(),
         )
         .err()

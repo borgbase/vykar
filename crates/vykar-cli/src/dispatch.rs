@@ -81,10 +81,10 @@ pub(crate) fn dispatch_command(
             "'backup' is dispatched through the app service",
         )),
         Commands::List { source, last, .. } => {
-            cmd::list::run_list(cfg, source, *last, passphrase).map(|()| false)
+            cmd::list::run_list(source, *last, cancel, passphrase).map(|()| false)
         }
         Commands::Snapshot { command, .. } => {
-            cmd::snapshot::run_snapshot_command(command, cfg, cancel, passphrase).map(|()| false)
+            cmd::snapshot::run_snapshot_command(command, cancel, passphrase).map(|()| false)
         }
         Commands::Restore {
             snapshot,

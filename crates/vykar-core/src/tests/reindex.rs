@@ -10,6 +10,7 @@ use super::helpers::{backup_single_source, latest_head_key, make_test_config, pa
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode, RepairResult};
 use crate::commands::compact::CompactStats;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repo};
@@ -156,11 +157,16 @@ impl Fixture {
         commands::restore::run(
             config,
             pass(config),
-            snapshot,
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot,
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            false,
-            true,
             &CancelToken::new(),
         )
         .unwrap();

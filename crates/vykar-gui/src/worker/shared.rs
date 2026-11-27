@@ -13,7 +13,7 @@ use vykar_types::error::Result;
 use crate::cancel::CancelSlot;
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
-use crate::repo_helpers::{DialogPrompt, PassphraseRun, run_with_passphrase, send_log};
+use crate::repo_helpers::{DialogPrompt, send_log};
 
 use super::WorkerContext;
 
@@ -155,9 +155,13 @@ pub(super) fn select_repo_or_fail<'r>(
 /// constant so the four conventional handlers cannot drift apart.
 const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 
-/// Guard + repo-select + passphrase-retry scaffold shared by the conventional
-/// worker handlers (diff, find). Delete uses [`with_open_repo_op`] and prune
-/// [`with_hooked_repo_op`].
+/// Guard + repo-select + open scaffold shared by the conventional worker
+/// handlers (delete, diff, find); prune uses [`with_hooked_repo_op`]. The
+/// repository is opened with the passphrase (`OpenOptions::new()`, observing
+/// the operation's cancel token), a refused passphrase re-prompts and only
+/// the open runs again, and the passphrase is accepted right after the open;
+/// `run` gets the handle. A decryption failure inside `run` is the
+/// command's error, not a refused passphrase: it does not re-prompt.
 ///
 /// The guard lives for the duration of `run`, so a repo miss, a dismissed
 /// prompt, and a failed run are all reported here — exactly once each. On
@@ -172,47 +176,6 @@ const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 /// Mount deliberately does **not** use this: it interleaves
 /// `UiEvent::MountFailed` / `MountStopped` lifecycle events with every failure
 /// arm and hands the validated passphrase to a spawned thread.
-pub(super) fn with_repo_op<T>(
-    ctx: &mut WorkerContext,
-    repo_name: &str,
-    status: impl Into<String>,
-    label: &str,
-    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &CancelToken) -> Result<T>,
-) -> std::result::Result<T, String> {
-    let mut guard = OpGuard::ui(
-        &ctx.ui_tx,
-        &ctx.cancel_requested,
-        &ctx.operation_running,
-        status,
-    );
-
-    let Some(repo) = select_repo_or_fail(&mut guard, &ctx.runtime.repos, repo_name) else {
-        return Err("repository not found".to_string());
-    };
-
-    let cancel = ctx.cancel_requested.current();
-    let outcome = run_with_passphrase(&mut ctx.service, repo, |pass| run(repo, pass, &cancel));
-
-    match outcome {
-        Ok(PassphraseRun::Ran(value)) => Ok(value),
-        // A dismissed prompt is the user's choice, not a failure: log it and
-        // leave the status bar clean.
-        Ok(PassphraseRun::Canceled) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
-            Err("passphrase required".to_string())
-        }
-        Err(e) => {
-            guard.fail(format!("[{repo_name}] {label} failed: {e}"));
-            Err(e.to_string())
-        }
-    }
-}
-
-/// [`with_repo_op`] over an open repository: the repository is opened with
-/// the passphrase (`OpenOptions::new()`, observing the operation's cancel
-/// token), the passphrase is accepted right after the open, and `run` gets
-/// the handle. A decryption failure inside `run` is the command's error, not
-/// a refused passphrase: it does not re-prompt.
 pub(super) fn with_open_repo_op<T>(
     ctx: &mut WorkerContext,
     repo_name: &str,

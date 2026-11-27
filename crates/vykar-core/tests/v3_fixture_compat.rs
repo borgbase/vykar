@@ -18,6 +18,7 @@
 mod common;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::index::ChunkIndex;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::{OpenOptions, Repo, UpgradeOutcome};
@@ -89,11 +90,18 @@ fn assert_restores_source(fx: &Fixture, dest_name: &str, label: &str) {
     commands::restore::run(
         &config,
         fx.passphrase(),
-        fx.latest_snapshot(),
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: fx.latest_snapshot(),
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                // verify chunk IDs
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        true, // verify chunk IDs
         &CancelToken::new(),
     )
     .unwrap();

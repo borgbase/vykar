@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::commands;
 use crate::commands::check::{RepairAction, RepairMode, RepairResult};
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
 use crate::repo::control::CancelToken;
 use crate::snapshot::item::ItemType;
@@ -945,11 +946,13 @@ fn repair_reclaims_crash_orphan_index_entries() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-base",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-base",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

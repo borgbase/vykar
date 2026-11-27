@@ -91,40 +91,24 @@ fn for_each_listed_item_inner(
     snapshot_name: &str,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<Vec<String>> {
-    let (repo, meta, origin) = open_listing(config, passphrase, snapshot_name)?;
-    for_each_item_by_chunk(
-        &repo,
-        &meta.item_ptrs,
-        TreeChunkSource::CacheFirst,
-        LISTING_BATCH_CHUNKS,
-        LISTING_BATCH_STORED_BYTES,
-        &CancelToken::new(),
-        visit,
-    )
-    .map_err(|e| origin.explain(&repo, e))?;
-    Ok(meta.source_paths)
+    let cancel = CancelToken::new();
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), &cancel)?;
+    for_each_listed_item_on_repo(&mut repo, snapshot_name, None, &cancel, visit)
 }
 
-/// Open the repository, resolve `snapshot_name`, load its meta and the
-/// chunk index. Also returns where the read started, for
-/// [`ReadOrigin::explain`].
-fn open_listing(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-) -> Result<(Repo, SnapshotMeta, ReadOrigin)> {
-    let mut repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
-
+/// Resolve `snapshot_name`, load its meta and the chunk index. Also returns
+/// where the read started, for [`ReadOrigin::explain`].
+fn listing_on_repo(repo: &mut Repo, snapshot_name: &str) -> Result<(SnapshotMeta, ReadOrigin)> {
     let resolved_name = repo
         .manifest()
         .resolve_snapshot(snapshot_name)?
         .name
         .clone();
 
-    let origin = ReadOrigin::of(&repo, &resolved_name)?;
-    let meta = load_snapshot_meta(&repo, &resolved_name)?;
-    ItemStreamReader::new(&repo).ensure_index(&mut repo)?;
-    Ok((repo, meta, origin))
+    let origin = ReadOrigin::of(repo, &resolved_name)?;
+    let meta = load_snapshot_meta(repo, &resolved_name)?;
+    ItemStreamReader::new(repo).ensure_index(repo)?;
+    Ok((meta, origin))
 }
 
 /// Call `visit` for every item whose display path (`Item::path`) equals
@@ -141,13 +125,38 @@ pub fn for_each_listed_item_under(
     dir: &str,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<()> {
-    if dir.is_empty() {
-        return for_each_listed_item(config, passphrase, snapshot_name, visit);
+    let cancel = CancelToken::new();
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), &cancel)?;
+    for_each_listed_item_on_repo(&mut repo, snapshot_name, Some(dir), &cancel, visit).map(|_| ())
+}
+
+/// Call `visit` for each item of `snapshot_name` (under `dir` when given and
+/// non-empty), as [`for_each_listed_item`] / [`for_each_listed_item_under`],
+/// on a repository opened with `OpenOptions::new()`. Returns the snapshot's
+/// `source_paths`. Loads the index (`ensure_index`).
+pub fn for_each_listed_item_on_repo(
+    repo: &mut Repo,
+    snapshot_name: &str,
+    dir: Option<&str>,
+    cancel: &CancelToken,
+    visit: impl FnMut(Item) -> Result<()>,
+) -> Result<Vec<String>> {
+    let (meta, origin) = listing_on_repo(repo, snapshot_name)?;
+    match dir.filter(|d| !d.is_empty()) {
+        None => for_each_item_by_chunk(
+            repo,
+            &meta.item_ptrs,
+            TreeChunkSource::CacheFirst,
+            LISTING_BATCH_CHUNKS,
+            LISTING_BATCH_STORED_BYTES,
+            cancel,
+            visit,
+        )
+        .map(drop),
+        Some(dir) => list_under_on_repo(repo, &meta, dir, cancel, visit).map(drop),
     }
-    let (repo, meta, origin) = open_listing(config, passphrase, snapshot_name)?;
-    list_under_on_repo(&repo, &meta, dir, &CancelToken::new(), visit)
-        .map(|_| ())
-        .map_err(|e| origin.explain(&repo, e))
+    .map_err(|e| origin.explain(repo, e))?;
+    Ok(meta.source_paths)
 }
 
 /// Where a read of one snapshot started: the generation of the head it
@@ -397,18 +406,23 @@ pub fn list_snapshots_with_stats(
     passphrase: Option<&str>,
 ) -> Result<SnapshotListing> {
     let repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
+    Ok(list_snapshots_with_stats_on_repo(&repo))
+}
+
+/// [`list_snapshots_with_stats`] on an open repository.
+pub fn list_snapshots_with_stats_on_repo(repo: &Repo) -> SnapshotListing {
     let entries = repo.manifest().snapshots.clone();
     let mut snapshots = Vec::with_capacity(entries.len());
     for entry in entries {
-        let stats = load_snapshot_meta(&repo, &entry.name)
+        let stats = load_snapshot_meta(repo, &entry.name)
             .ok()
             .map(|meta| meta.stats);
         snapshots.push((entry, stats));
     }
-    Ok(SnapshotListing {
+    SnapshotListing {
         snapshots,
         hidden: repo.skipped_snapshots().to_vec(),
-    })
+    }
 }
 
 /// Get metadata for a specific snapshot.

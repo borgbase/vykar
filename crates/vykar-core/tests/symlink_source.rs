@@ -12,6 +12,7 @@
 mod common;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::repo::control::CancelToken;
 
@@ -61,11 +62,13 @@ fn backup_symlink_to_directory_descends_target() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

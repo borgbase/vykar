@@ -121,22 +121,32 @@ pub(crate) struct DiffStats {
     pub(crate) full: Option<FullDiffReason>,
 }
 
+/// Diff two snapshots: the older one is the base, the newer the target.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
     snapshot_a: &str,
     snapshot_b: &str,
 ) -> Result<DiffResult> {
-    let mut repo =
-        super::util::open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
+    let cancel = CancelToken::new();
+    let mut repo = super::util::open_repo(config, passphrase, OpenOptions::new(), &cancel)?;
+    run_on_repo(&mut repo, snapshot_a, snapshot_b, &cancel)
+}
 
+/// [`run`] on a repository opened with `OpenOptions::new()`.
+pub fn run_on_repo(
+    repo: &mut Repo,
+    snapshot_a: &str,
+    snapshot_b: &str,
+    cancel: &CancelToken,
+) -> Result<DiffResult> {
     let entry_a = repo.manifest().resolve_snapshot(snapshot_a)?.clone();
     let entry_b = repo.manifest().resolve_snapshot(snapshot_b)?.clone();
 
     ensure_distinct_snapshots(&entry_a, &entry_b)?;
 
     let (base, target) = order_snapshots(entry_a, entry_b);
-    let (entries, _stats) = diff_on_repo(&mut repo, &base, &target, &CancelToken::new())?;
+    let (entries, _stats) = diff_on_repo(repo, &base, &target, cancel)?;
 
     Ok(DiffResult {
         base_snapshot: base.name,

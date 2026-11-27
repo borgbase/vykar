@@ -6,6 +6,7 @@ use crate::commands::check::{
     CheckError, IntegrityIssue, RepairAction, RepairMode, ServerVerifyOutcome,
     process_verify_response, try_server_verify, verify_pack_full,
 };
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::index::ChunkIndexEntry;
 use crate::repo::control::CancelToken;
 use vykar_protocol::{VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse};
@@ -881,11 +882,13 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-drop",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-drop",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1101,11 +1104,13 @@ fn repair_drops_items_and_sweeps_the_index() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-b",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-b",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1454,11 +1459,13 @@ fn small_file_non_utf8_name_round_trips_at_one_thread() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-small",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-small",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1528,11 +1535,13 @@ fn non_utf8_names_round_trip_via_pipeline() {
     commands::restore::run(
         &config,
         pass(&config),
-        "snap-pipe",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-pipe",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -2224,11 +2233,13 @@ impl InterruptedRewrite {
             commands::restore::run(
                 &self.config,
                 pass(&self.config),
-                name,
-                dest.to_str().unwrap(),
+                &RestoreRequest {
+                    snapshot: name,
+                    dest: dest.to_str().unwrap(),
+                    selection: RestoreSelection::All,
+                    options: RestoreOptions::default(),
+                },
                 None,
-                false,
-                false,
                 &CancelToken::new(),
             )
             .unwrap_or_else(|e| panic!("restore {name}: {e}"));

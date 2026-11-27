@@ -462,6 +462,7 @@ mod backup_restore {
     use proptest::prelude::*;
 
     use crate::commands;
+    use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
     use crate::tests::helpers::{backup_single_source, init_repo, pass};
 
     fn arb_nested_file_tree() -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
@@ -514,11 +515,16 @@ mod backup_restore {
             commands::restore::run(
                 &config,
                 pass(&config),
-                "snap-1",
-                restore_dir.to_str().unwrap(),
+                &RestoreRequest {
+                    snapshot: "snap-1",
+                    dest: restore_dir.to_str().unwrap(),
+                    selection: RestoreSelection::All,
+                    options: RestoreOptions {
+                        xattrs_enabled: config.xattrs.enabled,
+                        ..Default::default()
+                    },
+                },
                 None,
-                config.xattrs.enabled,
-                false,
                 &CancelToken::new(),
             )
             .unwrap();

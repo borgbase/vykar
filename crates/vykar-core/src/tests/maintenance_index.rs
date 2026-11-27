@@ -14,6 +14,7 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::commands;
 use crate::commands::backup::{self, BackupProgressEvent};
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::commands::util::with_exclusive_session;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::ChunkIndexEntry;
@@ -871,11 +872,13 @@ fn compact_does_not_delete_packs_committed_after_open() {
         commands::restore::run(
             &env.config,
             pass(&env.config),
-            "s2",
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot: "s2",
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions::default(),
+            },
             None,
-            false,
-            false,
             &CancelToken::new(),
         )
         .unwrap();

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::commands;
 use crate::commands::listing::ListingRead;
 use crate::commands::restore::{
-    RestoreStats, TestSelection, force_subtree_reads, restore_on_repo_for_test,
+    RestoreSelection, RestoreStats, force_subtree_reads, restore_on_repo_for_test,
 };
 use crate::repo::control::CancelToken;
 use crate::snapshot::listing::{STRIDE, encode_ext};
@@ -71,7 +71,7 @@ impl Restorer<'_> {
 
     fn run(
         &self,
-        selection: TestSelection<'_>,
+        selection: RestoreSelection<'_>,
         whole: bool,
     ) -> (BTreeMap<PathBuf, Entry>, RestoreStats, Option<ListingRead>) {
         let dest = self.dest();
@@ -92,10 +92,10 @@ impl Restorer<'_> {
     /// read; returns the scoped read's cost.
     fn same_as_whole(&self, selected: &[&str]) -> Option<ListingRead> {
         let selected: HashSet<String> = selected.iter().map(|s| s.to_string()).collect();
-        let (want, want_stats, read) = self.run(TestSelection::Paths(&selected), true);
+        let (want, want_stats, read) = self.run(RestoreSelection::Paths(&selected), true);
         assert!(read.is_none());
         let _force = force_subtree_reads();
-        let (got, stats, read) = self.run(TestSelection::Paths(&selected), false);
+        let (got, stats, read) = self.run(RestoreSelection::Paths(&selected), false);
         assert_eq!(got, want, "{selected:?}");
         assert_eq!(counts(&stats), counts(&want_stats), "{selected:?}");
         read
@@ -221,16 +221,22 @@ fn glob_prefix_restore_like_the_whole_read() {
         ("*".to_string(), false),
     ] {
         // Unforced, this listing is too small for the subtree reads to pay.
-        let (want, want_stats, read) = r.run(TestSelection::Pattern(Some(&pattern)), false);
+        let (want, want_stats, read) = r.run(RestoreSelection::Pattern(&pattern), false);
         assert!(read.is_none(), "{pattern}");
         assert!(!want.is_empty(), "{pattern}");
         let _force = force_subtree_reads();
-        let (got, stats, read) = r.run(TestSelection::Pattern(Some(&pattern)), false);
+        let (got, stats, read) = r.run(RestoreSelection::Pattern(&pattern), false);
         assert_eq!(got, want, "{pattern}");
         assert_eq!(counts(&stats), counts(&want_stats), "{pattern}");
         assert_eq!(read.is_some(), narrowed, "{pattern}");
         assert!(read.is_none_or(|r| r.via_index), "{pattern}");
     }
+    // `All` restores what a glob matching every path does, by the whole read.
+    let (all, all_stats, read) = r.run(RestoreSelection::All, false);
+    assert!(read.is_none());
+    let (every, every_stats, _) = r.run(RestoreSelection::Pattern("*"), false);
+    assert_eq!(all, every);
+    assert_eq!(counts(&all_stats), counts(&every_stats));
 }
 
 #[test]
@@ -271,7 +277,7 @@ fn hard_link_across_two_selected_subtrees() {
         &mut repo,
         "snap",
         dest.to_str().unwrap(),
-        TestSelection::Paths(&selected),
+        RestoreSelection::Paths(&selected),
         false,
         &CancelToken::new(),
     )
@@ -339,7 +345,7 @@ fn a_dangling_pointer_fails_before_the_destination_is_created() {
         &mut repo,
         "snap",
         dest.to_str().unwrap(),
-        TestSelection::Paths(&selected),
+        RestoreSelection::Paths(&selected),
         false,
         &CancelToken::new(),
     )

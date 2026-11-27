@@ -5,7 +5,7 @@ use comfy_table::{Cell, CellAlignment};
 
 use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
-use vykar_core::config::VykarConfig;
+use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 
 use crate::cli::{SnapshotCommand, SortField};
@@ -22,7 +22,6 @@ fn normalize_path_filter(raw: &str) -> String {
 
 pub(crate) fn run_snapshot_command(
     command: &SnapshotCommand,
-    config: &VykarConfig,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
@@ -42,22 +41,18 @@ pub(crate) fn run_snapshot_command(
                 .map(normalize_path_filter)
                 .filter(|f| !f.is_empty());
             let mut items = Vec::new();
-            passphrase.with(|passphrase| -> CliResult<_> {
-                // A refused passphrase runs this again: start over.
-                items.clear();
-                let push = |item| {
+            let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+            commands::list::for_each_listed_item_on_repo(
+                &mut repo,
+                snapshot,
+                filter.as_deref(),
+                cancel,
+                |item| {
                     items.push(item);
                     Ok(())
-                };
-                Ok(match filter.as_deref() {
-                    Some(f) => commands::list::for_each_listed_item_under(
-                        config, passphrase, snapshot, f, push,
-                    )?,
-                    None => {
-                        commands::list::for_each_listed_item(config, passphrase, snapshot, push)?
-                    }
-                })
-            })?;
+                },
+            )?;
+            drop(repo);
 
             // Apply sort
             match sort {
@@ -104,7 +99,7 @@ pub(crate) fn run_snapshot_command(
         SnapshotCommand::Diff {
             snapshot_a,
             snapshot_b,
-        } => run_snapshot_diff(config, snapshot_a, snapshot_b, passphrase),
+        } => run_snapshot_diff(snapshot_a, snapshot_b, cancel, passphrase),
         SnapshotCommand::Find {
             path,
             source,
@@ -117,14 +112,13 @@ pub(crate) fn run_snapshot_command(
             smaller,
             ..
         } => run_snapshot_find(
-            config, path, source, last, name, iname, entry_type, since, larger, smaller, passphrase,
+            path, source, last, name, iname, entry_type, since, larger, smaller, cancel, passphrase,
         ),
         SnapshotCommand::Info { snapshot, .. } => {
-            let meta = passphrase.with(|passphrase| -> CliResult<_> {
-                Ok(commands::list::get_snapshot_meta(
-                    config, passphrase, snapshot,
-                )?)
-            })?;
+            let repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+            let name = repo.manifest().resolve_snapshot(snapshot)?.name.clone();
+            let meta = commands::list::load_snapshot_meta(&repo, &name)?;
+            drop(repo);
 
             let theme = CliTableTheme::detect();
 
@@ -192,16 +186,14 @@ pub(crate) fn run_snapshot_command(
 }
 
 fn run_snapshot_diff(
-    config: &VykarConfig,
     snapshot_a: &str,
     snapshot_b: &str,
+    cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let diff = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::diff::run(
-            config, passphrase, snapshot_a, snapshot_b,
-        )?)
-    })?;
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let diff = commands::diff::run_on_repo(&mut repo, snapshot_a, snapshot_b, cancel)?;
+    drop(repo);
 
     if diff.entries.is_empty() {
         println!("No file changes found.");
@@ -236,7 +228,6 @@ fn run_snapshot_diff(
 
 #[allow(clippy::too_many_arguments)]
 fn run_snapshot_find(
-    config: &VykarConfig,
     path: &Option<String>,
     source: &Option<String>,
     last: &Option<u64>,
@@ -246,6 +237,7 @@ fn run_snapshot_find(
     since: &Option<String>,
     larger: &Option<String>,
     smaller: &Option<String>,
+    cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     use commands::find::{FileStatus, FindFilter, FindScope};
@@ -302,9 +294,9 @@ fn run_snapshot_find(
         smaller_than,
     )?;
 
-    let timelines = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::find::run(config, passphrase, &scope, &filter)?)
-    })?;
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let timelines = commands::find::run_on_repo(&mut repo, &scope, &filter, cancel)?;
+    drop(repo);
 
     if timelines.is_empty() {
         println!("No matching files found.");

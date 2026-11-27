@@ -15,7 +15,7 @@ use super::mark::Fx;
 use crate::commands;
 use crate::commands::find::FindFilter;
 use crate::commands::list::{ItemStreamReader, LISTING_BATCH_CHUNKS, LISTING_BATCH_STORED_BYTES};
-use crate::commands::restore::RestoreOptions;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repo, TreeChunkSource};
 
@@ -131,14 +131,17 @@ fn readers_work_against_storage_that_refuses_writes() {
     let dest = fx.src("out");
     let stats = commands::restore::run_on_repo(
         &mut repo,
-        "s2",
-        dest.to_str().unwrap(),
-        None,
-        RestoreOptions {
-            xattrs_enabled: false,
-            verify_chunks: true,
-            continue_on_error: false,
+        &RestoreRequest {
+            snapshot: "s2",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: false,
+                verify_chunks: true,
+                continue_on_error: false,
+            },
         },
+        None,
         &CancelToken::new(),
     )
     .unwrap();

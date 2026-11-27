@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Once;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::{
     EncryptionConfig, EncryptionModeConfig, RepositoryConfig, SourceEntry, SourceHooksConfig,
@@ -316,11 +317,17 @@ pub fn exercise_pack_naming(
     commands::restore::run(
         config,
         passphrase,
-        "pn-b",
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "pn-b",
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: xattrs,
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        xattrs,
-        true,
         &CancelToken::new(),
     )
     .unwrap();

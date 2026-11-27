@@ -14,6 +14,7 @@ mod common;
 use std::path::Path;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::{CommandDump, VykarConfig};
 use vykar_core::repo::control::CancelToken;
@@ -290,11 +291,13 @@ fn dumps_list_in_name_order_and_run_in_config_order() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "s-dumps",
-        dest.path().to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "s-dumps",
+            dest: dest.path().to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

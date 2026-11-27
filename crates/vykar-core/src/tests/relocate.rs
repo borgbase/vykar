@@ -17,7 +17,7 @@ use vykar_types::pack_id::PackId;
 
 use super::mark::Fx;
 use crate::commands;
-use crate::commands::restore::RestoreOptions;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repo};
 
@@ -268,14 +268,17 @@ fn restore(
     let dest = fx.src(dest);
     commands::restore::run_on_repo(
         repo,
-        name,
-        dest.to_str().unwrap(),
-        None,
-        RestoreOptions {
-            xattrs_enabled: false,
-            verify_chunks: true,
-            continue_on_error,
+        &RestoreRequest {
+            snapshot: name,
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: false,
+                verify_chunks: true,
+                continue_on_error,
+            },
         },
+        None,
         &CancelToken::new(),
     )
     .map(|stats| (stats, dest))

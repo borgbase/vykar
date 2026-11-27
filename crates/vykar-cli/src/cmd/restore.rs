@@ -1,8 +1,11 @@
 use std::io::IsTerminal;
 
 use vykar_core::commands;
-use vykar_core::commands::restore::{RestoreEvent, RestoreOptions};
+use vykar_core::commands::restore::{
+    RestoreEvent, RestoreOptions, RestoreRequest, RestoreSelection,
+};
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::{CancelToken, EventSink, FnMutSink};
 use vykar_types::error::VykarError;
 
@@ -22,13 +25,25 @@ pub(crate) fn run_restore(
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<bool> {
-    let opts = RestoreOptions {
-        xattrs_enabled: config.xattrs.enabled,
-        verify_chunks: verify,
-        continue_on_error,
+    let req = RestoreRequest {
+        snapshot: &snapshot_name,
+        dest: &dest,
+        selection: pattern
+            .as_deref()
+            .map_or(RestoreSelection::All, RestoreSelection::Pattern),
+        options: RestoreOptions {
+            xattrs_enabled: config.xattrs.enabled,
+            verify_chunks: verify,
+            continue_on_error,
+        },
     };
+    // An invalid glob fails before the passphrase prompt and the open.
+    req.selection.validate()?;
+    // Before the open, as `restore::run` does.
+    cancel.check()?;
     let stats = passphrase
-        .with(|passphrase| -> CliResult<_> {
+        .open::<CliError>(OpenOptions::new(), cancel)
+        .and_then(|mut repo| -> CliResult<_> {
             // Built after any passphrase prompt; only a terminal gets progress.
             let mut renderer = std::io::stderr()
                 .is_terminal()
@@ -37,13 +52,9 @@ pub(crate) fn run_restore(
                 let sink = renderer
                     .as_mut()
                     .map(|r| FnMutSink::new(move |e| r.on_event(e)));
-                commands::restore::run_with_options(
-                    config,
-                    passphrase,
-                    &snapshot_name,
-                    &dest,
-                    pattern.as_deref(),
-                    opts,
+                commands::restore::run_on_repo(
+                    &mut repo,
+                    &req,
                     sink.as_ref().map(|s| s as &dyn EventSink<RestoreEvent>),
                     cancel,
                 )

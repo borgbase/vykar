@@ -4,6 +4,7 @@ use chrono::{DateTime, Local, Utc};
 use vykar_core::app::service::HookedCommand;
 use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
 use crate::repo_helpers::{PassphraseRun, find_repo_for_snapshot, send_log};
@@ -11,7 +12,7 @@ use vykar_common::display::format_bytes;
 use vykar_types::error::VykarError;
 
 use super::WorkerContext;
-use super::shared::{OpGuard, with_hooked_repo_op, with_open_repo_op, with_repo_op};
+use super::shared::{OpGuard, with_hooked_repo_op, with_open_repo_op};
 
 pub(super) fn handle_restore_selected(
     ctx: &mut WorkerContext,
@@ -30,16 +31,22 @@ pub(super) fn handle_restore_selected(
     match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, &snapshot, &mut ctx.service) {
         Ok(PassphraseRun::Ran((repo, passphrase))) => {
             let path_set: std::collections::HashSet<String> = paths.into_iter().collect();
-            match commands::restore::run_selected(
+            let req = RestoreRequest {
+                snapshot: &snapshot,
+                dest: &dest,
+                selection: RestoreSelection::Paths(&path_set),
+                options: RestoreOptions {
+                    xattrs_enabled: repo.config.xattrs.enabled,
+                    ..Default::default()
+                },
+            };
+            match commands::restore::run(
                 &repo.config,
                 passphrase.as_deref().map(|s| s.as_str()),
-                &snapshot,
-                &dest,
-                &path_set,
-                repo.config.xattrs.enabled,
-                false, // verify_chunks
+                &req,
+                None,
                 // Taken after `OpGuard::ui`, which installs a fresh token at
-                // operation start (see `with_repo_op`).
+                // operation start (see `with_open_repo_op`).
                 &ctx.cancel_requested.current(),
             ) {
                 Ok(stats) => {
@@ -236,13 +243,13 @@ pub(super) fn handle_diff_snapshots(
     snapshot_b: String,
 ) {
     // Diff is the one conventional handler that must also push a result event
-    // on failure, so it consumes `with_repo_op`'s reason string.
-    let result = match with_repo_op(
+    // on failure, so it consumes `with_open_repo_op`'s reason string.
+    let result = match with_open_repo_op(
         ctx,
         &repo_name,
         "Diffing snapshots...",
         "diff",
-        |repo, pass, _| commands::diff::run(&repo.config, pass, &snapshot_a, &snapshot_b),
+        |_, r, cancel| commands::diff::run_on_repo(r, &snapshot_a, &snapshot_b, cancel),
     ) {
         Ok(r) => r,
         Err(reason) => {
@@ -350,12 +357,12 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
         last_n: None,
     };
 
-    let Ok(timelines) = with_repo_op(
+    let Ok(timelines) = with_open_repo_op(
         ctx,
         &repo_name,
         "Searching files...",
         "find",
-        |repo, pass, _| commands::find::run(&repo.config, pass, &scope, &filter),
+        |_, r, cancel| commands::find::run_on_repo(r, &scope, &filter, cancel),
     ) else {
         return;
     };

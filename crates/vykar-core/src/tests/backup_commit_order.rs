@@ -17,6 +17,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::helpers::pass;
 use crate::commands::backup;
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::repo::control::CancelToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -938,11 +939,16 @@ fn assert_restores(config: &crate::config::VykarConfig, snapshot: &str, dest: &P
     crate::commands::restore::run(
         config,
         pass(config),
-        snapshot,
-        dest.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot,
+            dest: dest.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        false,
-        true,
         &CancelToken::new(),
     )
     .unwrap();

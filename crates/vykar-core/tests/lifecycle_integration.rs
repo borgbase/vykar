@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vykar_core::commands;
+use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::control::CancelToken;
@@ -118,11 +119,17 @@ fn lifecycle_delete_compact_check_and_restore() {
     let extract_stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-v2",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-v2",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                verify_chunks: true,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -258,11 +265,16 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-a2",
-        restore_a.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-a2",
+            dest: restore_a.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -275,11 +287,16 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     commands::restore::run(
         &config,
         common::pass(&config),
-        "snap-b1",
-        restore_b.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-b1",
+            dest: restore_b.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -333,11 +350,16 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     commands::restore::run(
         &config,
         Some(passphrase),
-        "snap-secret",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-secret",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -363,11 +385,16 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     let wrong_extract = commands::restore::run(
         &config,
         Some(wrong_passphrase),
-        "snap-secret",
-        tmp.path().join("bad-restore").to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap-secret",
+            dest: tmp.path().join("bad-restore").to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions {
+                xattrs_enabled: config.xattrs.enabled,
+                ..Default::default()
+            },
+        },
         None,
-        config.xattrs.enabled,
-        false,
         &CancelToken::new(),
     );
     let msg = wrong_extract.expect_err("restore must fail").to_string();
@@ -624,11 +651,13 @@ fn restore_downloads_the_index_when_the_local_table_is_gone() {
     let stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap1",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap1",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -708,11 +737,13 @@ fn restore_reads_the_local_table_without_index_downloads() {
     let stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap1",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap1",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -739,15 +770,17 @@ fn restore_reports_an_unreadable_data_chunk() {
         std::fs::remove_file(repo_dir.join(pack_id.storage_key())).unwrap();
 
         let restore_dir = tmp.path().join("restore");
-        let result = commands::restore::run_with_options(
+        let result = commands::restore::run(
             &config,
             common::pass(&config),
-            "snap1",
-            restore_dir.to_str().unwrap(),
-            None,
-            commands::restore::RestoreOptions {
-                continue_on_error,
-                ..Default::default()
+            &RestoreRequest {
+                snapshot: "snap1",
+                dest: restore_dir.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: commands::restore::RestoreOptions {
+                    continue_on_error,
+                    ..Default::default()
+                },
             },
             None,
             &CancelToken::new(),
@@ -806,11 +839,13 @@ fn restore_streams_a_multi_chunk_item_stream() {
     let stats = commands::restore::run(
         &config,
         common::pass(&config),
-        "snap1",
-        restore_dir.to_str().unwrap(),
+        &RestoreRequest {
+            snapshot: "snap1",
+            dest: restore_dir.to_str().unwrap(),
+            selection: RestoreSelection::All,
+            options: RestoreOptions::default(),
+        },
         None,
-        false,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

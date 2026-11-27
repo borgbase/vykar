@@ -33,7 +33,7 @@ use super::log::{OpOutcome, OpRecord};
 use super::runner::SourceTree;
 use super::store::SimStore;
 use crate::commands::list;
-use crate::commands::restore::{self, RestoreOptions};
+use crate::commands::restore::{self, RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repo, index_store};
 use crate::snapshot::item::ItemType;
@@ -713,14 +713,17 @@ fn check_snapshots(
         let dest = scratch.join(format!("restore-{i}"));
         let restored = restore::run_on_repo(
             repo,
-            name,
-            &dest.to_string_lossy(),
-            None,
-            RestoreOptions {
-                xattrs_enabled: false,
-                verify_chunks: true,
-                continue_on_error: false,
+            &RestoreRequest {
+                snapshot: name,
+                dest: &dest.to_string_lossy(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    xattrs_enabled: false,
+                    verify_chunks: true,
+                    continue_on_error: false,
+                },
             },
+            None,
             &CancelToken::new(),
         );
         if let Err(e) = restored {

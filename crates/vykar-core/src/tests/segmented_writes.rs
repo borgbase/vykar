@@ -11,6 +11,7 @@ use super::helpers::{
 };
 use crate::commands;
 use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
+use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
 use crate::index::head::{IndexHead, ObjectName, SegmentKind};
 use crate::index::table;
@@ -160,11 +161,16 @@ impl Fixture {
         commands::restore::run(
             config,
             pass(config),
-            snapshot,
-            dest.to_str().unwrap(),
+            &RestoreRequest {
+                snapshot,
+                dest: dest.to_str().unwrap(),
+                selection: RestoreSelection::All,
+                options: RestoreOptions {
+                    verify_chunks: true,
+                    ..Default::default()
+                },
+            },
             None,
-            false,
-            true,
             &CancelToken::new(),
         )
         .unwrap();

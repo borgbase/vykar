@@ -155,6 +155,7 @@ pub(crate) fn run_lifecycle<R>(
 }
 
 /// [`run_lifecycle`] with repo-level hooks around a fallible action.
+#[cfg(test)]
 pub(crate) fn run_with_hooks<T>(
     global: &HooksConfig,
     repo: &HooksConfig,
@@ -180,9 +181,14 @@ pub(crate) fn run_source_hooks<T>(
 }
 
 pub(crate) fn result_verdict<T>(r: &OpsResult<T>) -> Verdict {
+    error_verdict(r)
+}
+
+/// The lifecycle's verdict on an action with any [`HookError`].
+pub(crate) fn error_verdict<T, E: crate::app::HookError>(r: &Result<T, E>) -> Verdict {
     match r {
         Ok(_) => Verdict::Success,
-        Err(OpsError::Skipped(_)) => Verdict::Skipped,
+        Err(e) if e.is_skip() => Verdict::Skipped,
         Err(e) => Verdict::Failed(e.to_string()),
     }
 }

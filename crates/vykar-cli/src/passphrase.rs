@@ -28,7 +28,7 @@ pub(crate) fn with_repo_passphrase<T>(
 pub(crate) fn get_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
-) -> CliResult<Option<Zeroizing<String>>> {
+) -> vykar_types::error::Result<Option<Zeroizing<String>>> {
     let cache_key = config.repository.url.clone();
 
     // Check cache first (avoids double interactive prompt during probe+dispatch)

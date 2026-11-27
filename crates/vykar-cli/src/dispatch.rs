@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 
 use crate::progress::BackupProgressRenderer;
+use vykar_core::app::OpsError;
 use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
 use vykar_core::app::preflight::{self, Availability, UnavailableRepo};
 use vykar_core::config::{ResolvedRepo, VykarConfig};
@@ -15,7 +16,6 @@ use crate::error::{CliError, CliResult};
 use crate::format::print_backup_stats;
 use crate::passphrase::get_passphrase;
 use vykar_common::display::format_duration_seconds;
-use vykar_types::error::VykarError;
 
 pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) {
     let Ok(parsed) = parse_repo_url(&config.repository.url) else {
@@ -65,11 +65,7 @@ pub(crate) fn run_default_actions(
     };
     let mut resolve = || {
         if defer {
-            get_passphrase(&repo.config, label).map_err(|e| match e {
-                CliError::Vykar(e) => e.into(),
-                CliError::Ops(e) => e,
-                e => VykarError::Other(e.to_string()).into(),
-            })
+            get_passphrase(&repo.config, label).map_err(OpsError::from)
         } else {
             Ok(early.take())
         }

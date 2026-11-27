@@ -492,20 +492,15 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Run `action` inside the repo-level hooks for `command`. The CLI error is
-/// flattened to an engine `VykarError::Other` to fit the core signature; only
-/// its text is used downstream, so the lost downcast info is immaterial.
+/// Run `action` inside the repo-level hooks for `command`. The action's
+/// `CliError` passes through the hooks unchanged; a hook failure or skip
+/// arrives as `CliError::Ops`.
 fn run_hooked(
     repo: &ResolvedRepo,
     command: &str,
     action: impl FnOnce() -> CliResult<bool>,
 ) -> CliResult<bool> {
-    operations::run_command_with_hooks(repo, command, || {
-        action().map_err(|e| {
-            vykar_core::app::OpsError::from(vykar_types::error::VykarError::Other(e.to_string()))
-        })
-    })
-    .map_err(CliError::from)
+    operations::run_command_with_hooks(repo, command, action)
 }
 
 /// Execute the CLI command (or default actions) against one repo.
@@ -583,6 +578,52 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::log_filter;
+
+    /// A repository whose `failed_prune` hook appends `failed` to `log`.
+    #[cfg(unix)]
+    fn repo_with_failed_hook(log: &std::path::Path) -> super::ResolvedRepo {
+        use vykar_core::config::{HooksConfig, RepositoryConfig, VykarConfig};
+        let config = VykarConfig {
+            repository: RepositoryConfig {
+                url: "/nonexistent/repo".into(),
+                ..RepositoryConfig::default()
+            },
+            ..VykarConfig::default()
+        };
+        let cmd = format!("echo failed >> '{}'", log.display());
+        super::ResolvedRepo {
+            label: None,
+            config,
+            global_hooks: HooksConfig::default(),
+            repo_hooks: HooksConfig {
+                hooks: [("failed_prune".to_string(), vec![cmd])].into(),
+            },
+            sources: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hooked_keeps_the_cli_error() {
+        use super::{CliError, run_hooked};
+        use vykar_types::error::VykarError;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("log");
+        let repo = repo_with_failed_hook(&log);
+
+        let r = run_hooked(&repo, "prune", || Err(CliError::Msg("boom".into())));
+        assert!(matches!(&r, Err(CliError::Msg(m)) if m == "boom"), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "failed");
+
+        let r = run_hooked(&repo, "prune", || {
+            Err(CliError::Vykar(VykarError::Interrupted))
+        });
+        assert!(
+            matches!(r, Err(CliError::Vykar(VykarError::Interrupted))),
+            "{r:?}"
+        );
+    }
 
     #[test]
     fn log_filter_appends_non_empty_env() {

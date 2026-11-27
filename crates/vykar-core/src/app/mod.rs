@@ -10,7 +10,7 @@ pub mod preflight;
 pub mod scheduler;
 pub mod views;
 
-pub use error::{OpsError, OpsResult};
+pub use error::{HookError, OpsError, OpsResult, StepError, StepErrorKind};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

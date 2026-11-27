@@ -36,6 +36,8 @@ thread_local! {
     /// with Argon2id parameters cheap enough for the simulator. On by
     /// default in this crate's own unit-test binary, off everywhere else.
     static CHEAP_KDF: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
+    /// Opens on this thread, counted while [`count_repo_opens`] runs.
+    static REPO_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` with every `Repo::init` on this thread wrapping the
@@ -53,6 +55,26 @@ pub fn with_cheap_kdf<T>(f: impl FnOnce() -> T) -> T {
     }
     let _restore = Restore(CHEAP_KDF.with(|c| c.replace(true)));
     f()
+}
+
+/// Runs `f` and returns how many repositories it opened on this thread
+/// (`Repo::open` and `open_shared`, failed opens included). Nested calls
+/// count their own opens, and the outer total includes them.
+/// Not API: test support (features sim, testing).
+#[cfg(any(test, feature = "sim", feature = "testing"))]
+pub fn count_repo_opens<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    /// Restores the outer count plus this call's opens, also on unwind.
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REPO_OPENS.with(|c| c.set(self.0 + c.get()));
+        }
+    }
+    let restore = Restore(REPO_OPENS.with(|c| c.replace(0)));
+    let value = f();
+    let opens = REPO_OPENS.with(std::cell::Cell::get);
+    drop(restore);
+    (value, opens)
 }
 
 /// Wrap a new repository's master key with the passphrase: the product's
@@ -387,6 +409,8 @@ impl Repo {
         cache_dir: Option<PathBuf>,
         opts: &OpenOptions,
     ) -> Result<(Self, Option<FileCacheLoad>)> {
+        #[cfg(any(test, feature = "sim", feature = "testing"))]
+        REPO_OPENS.with(|c| c.set(c.get() + 1));
         // Read config
         let config_data = storage
             .get("config")?
@@ -575,6 +599,31 @@ mod tests {
         repo.request_index_fold();
         repo.unchecked_writer().save_state().unwrap();
         (inner, repo)
+    }
+
+    #[test]
+    fn count_repo_opens_counts_this_thread() {
+        let cache = tempfile::tempdir().unwrap();
+        let (inner, repo) = repo_with_caches(cache.path());
+        drop(repo);
+        let open = || {
+            Repo::open(
+                Box::new(Arc::clone(&inner)),
+                Some(crate::testing::TEST_PASSPHRASE),
+                Some(cache.path().to_path_buf()),
+                OpenOptions::new(),
+            )
+            .unwrap();
+        };
+
+        let (inner_opens, outer) = count_repo_opens(|| {
+            open();
+            let ((), nested) = count_repo_opens(open);
+            open();
+            nested
+        });
+        assert_eq!(inner_opens, 1);
+        assert_eq!(outer, 3);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use vykar_core::app::{OpsError, operations, passphrase};
+use vykar_core::app::{OpsError, OpsResult, operations, passphrase};
 use vykar_core::commands;
 use vykar_core::config::{self, ResolvedRepo};
 use vykar_types::error::VykarError;
@@ -40,6 +40,12 @@ fn resolve_passphrase_tracked(
         Ok(value.map(zeroize::Zeroizing::new))
     })
 }
+
+/// The error line of a re-prompt after a refused dialog entry.
+const INCORRECT_PASSPHRASE: &str = "Incorrect passphrase. Please try again.";
+
+/// The skip reason of a cycle whose passphrase prompt was dismissed.
+pub(crate) const PASSPHRASE_PROMPT_CANCELED: &str = "passphrase prompt canceled";
 
 /// Outcome of running an operation under [`with_passphrase_retry`].
 pub(crate) enum PassphraseRun<T> {
@@ -144,7 +150,7 @@ fn with_passphrase_retry_inner<T, E: PassphraseError>(
                 return Ok(PassphraseRun::Ran(v));
             }
             Err(e) if e.is_passphrase_failure() && from_dialog && attempt + 1 < attempts => {
-                error_line = "Incorrect passphrase. Please try again.".to_string();
+                error_line = INCORRECT_PASSPHRASE.to_string();
                 last_failure = Some(e);
             }
             Err(e) => return Err(e),
@@ -155,6 +161,120 @@ fn with_passphrase_retry_inner<T, E: PassphraseError>(
     // real failure so its diagnosis (which key copies were consulted, whether
     // they corroborated each other) is not flattened away.
     Err(last_failure.unwrap_or_else(|| E::from(VykarError::DecryptionFailed)))
+}
+
+/// The cycle's counterpart of [`with_passphrase_retry`]: the cached value or
+/// the configured source/dialog; a refused dialog entry is re-prompted (up to
+/// `attempts` entries), a refused cached value is evicted and prompted for,
+/// a refused configured value fails. The value is cached only when the
+/// cycle reports that a step opened the repository with it.
+pub(crate) struct CyclePassphraseRetry<'a, R> {
+    key: String,
+    cache: &'a mut HashMap<String, zeroize::Zeroizing<String>>,
+    attempts: usize,
+    resolve: R,
+    /// Prompts since the start (an evicted cached value made none).
+    prompts: usize,
+    current: Option<zeroize::Zeroizing<String>>,
+    from_dialog: bool,
+    from_cache: bool,
+}
+
+impl<'a, R> CyclePassphraseRetry<'a, R>
+where
+    R: FnMut(&str) -> Result<(Option<zeroize::Zeroizing<String>>, bool), VykarError>,
+{
+    /// `resolve` as in [`with_passphrase_retry_inner`]: gets the error line,
+    /// returns the value and whether it came from the dialog.
+    pub(crate) fn new(
+        key: String,
+        cache: &'a mut HashMap<String, zeroize::Zeroizing<String>>,
+        attempts: usize,
+        resolve: R,
+    ) -> Self {
+        Self {
+            key,
+            cache,
+            attempts,
+            resolve,
+            prompts: 0,
+            current: None,
+            from_dialog: false,
+            from_cache: false,
+        }
+    }
+
+    fn prompt(&mut self, error_line: &str) -> OpsResult<Option<zeroize::Zeroizing<String>>> {
+        self.prompts += 1;
+        let (pass, from_dialog) = (self.resolve)(error_line)?;
+        self.from_dialog = from_dialog;
+        self.from_cache = false;
+        match pass {
+            None => Err(OpsError::Skipped(PASSPHRASE_PROMPT_CANCELED.into())),
+            Some(p) => {
+                self.current = Some(p.clone());
+                Ok(Some(p))
+            }
+        }
+    }
+}
+
+impl<R> operations::CyclePassphrase for CyclePassphraseRetry<'_, R>
+where
+    R: FnMut(&str) -> Result<(Option<zeroize::Zeroizing<String>>, bool), VykarError>,
+{
+    fn resolve(&mut self) -> OpsResult<Option<zeroize::Zeroizing<String>>> {
+        if let Some(cached) = self.cache.get(&self.key) {
+            self.from_cache = true;
+            self.current = Some(cached.clone());
+            return Ok(Some(cached.clone()));
+        }
+        self.prompt("")
+    }
+
+    fn retry(&mut self, _failure: &OpsError) -> operations::PassphraseRetry {
+        let asked = if self.from_cache {
+            // Only an opened-with value is cached; self-heal if one is refused.
+            self.cache.remove(&self.key);
+            self.prompt("")
+        } else if self.from_dialog && self.prompts < self.attempts.max(1) {
+            self.prompt(INCORRECT_PASSPHRASE)
+        } else {
+            // A configured value, or the dialog tries are used up. The probe this
+            // replaces failed the whole cycle here, so later steps are skipped.
+            return operations::PassphraseRetry::GiveUp;
+        };
+        match asked {
+            Ok(pass) => operations::PassphraseRetry::Value(pass),
+            Err(e) => operations::PassphraseRetry::Stop(e),
+        }
+    }
+
+    fn accepted(&mut self) {
+        if !self.from_cache
+            && let Some(p) = &self.current
+        {
+            self.cache.insert(self.key.clone(), p.clone());
+        }
+    }
+}
+
+/// [`CyclePassphraseRetry`] over the configured source and the dialog.
+pub(crate) fn cycle_passphrase<'a>(
+    repo: &'a ResolvedRepo,
+    cache: &'a mut HashMap<String, zeroize::Zeroizing<String>>,
+    attempts: usize,
+) -> impl operations::CyclePassphrase + 'a {
+    CyclePassphraseRetry::new(
+        repo.config.repository.url.clone(),
+        cache,
+        attempts,
+        move |error_line| {
+            let mut from_dialog = false;
+            let pass = resolve_passphrase_tracked(repo, error_line, &mut from_dialog)?;
+            Ok((pass, from_dialog))
+        },
+    )
 }
 
 pub(crate) fn select_repos<'a>(
@@ -771,5 +891,143 @@ mod tests {
         assert!(matches!(result, Ok(PassphraseRun::Ran("ok"))));
         assert_eq!(calls.get(), 2);
         assert_eq!(cache.get(KEY).map(|z| z.as_str()), Some("right"));
+    }
+
+    mod cycle_retry {
+        use super::*;
+        use vykar_core::app::operations::{CyclePassphrase, PassphraseRetry};
+
+        type Lines = std::cell::RefCell<Vec<String>>;
+
+        /// A resolver returning `responses` in order, recording each error line.
+        fn recording<'a>(
+            responses: &'a [(Option<&'a str>, bool)],
+            lines: &'a Lines,
+        ) -> impl FnMut(&str) -> Result<(Option<zeroize::Zeroizing<String>>, bool), VykarError> + 'a
+        {
+            move |error_line| {
+                let mut seen = lines.borrow_mut();
+                let (pass, from_dialog) = *responses.get(seen.len()).expect("scripted response");
+                seen.push(error_line.to_string());
+                Ok((
+                    pass.map(|s| zeroize::Zeroizing::new(s.to_string())),
+                    from_dialog,
+                ))
+            }
+        }
+
+        fn refused() -> OpsError {
+            VykarError::DecryptionFailed.into()
+        }
+
+        fn value(r: PassphraseRetry) -> Option<String> {
+            match r {
+                PassphraseRetry::Value(p) => p.map(|p| p.to_string()),
+                _ => None,
+            }
+        }
+
+        fn cached(cache: &HashMap<String, zeroize::Zeroizing<String>>) -> Option<&str> {
+            cache.get(KEY).map(|z| z.as_str())
+        }
+
+        #[test]
+        fn wrong_then_right_dialog_entry_is_cached_on_accept() {
+            let mut cache = HashMap::new();
+            let lines = Lines::default();
+            let responses = [(Some("wrong"), true), (Some("right"), true)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            assert_eq!(p.resolve().unwrap().unwrap().as_str(), "wrong");
+            assert_eq!(value(p.retry(&refused())).as_deref(), Some("right"));
+            assert!(p.cache.is_empty());
+            p.accepted();
+            assert_eq!(cached(&cache), Some("right"));
+            assert_eq!(*lines.borrow(), ["", INCORRECT_PASSPHRASE]);
+        }
+
+        #[test]
+        fn configured_value_gives_up() {
+            let mut cache = HashMap::new();
+            let lines = Lines::default();
+            let responses = [(Some("cfg"), false)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            p.resolve().unwrap();
+            assert!(matches!(p.retry(&refused()), PassphraseRetry::GiveUp));
+            assert_eq!(lines.borrow().len(), 1);
+            assert!(cache.is_empty());
+        }
+
+        #[test]
+        fn refused_cached_value_is_evicted_and_prompted_for() {
+            let mut cache = HashMap::new();
+            cache.insert(
+                KEY.to_string(),
+                zeroize::Zeroizing::new("stale".to_string()),
+            );
+            let lines = Lines::default();
+            let responses = [(Some("fresh"), true)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            assert_eq!(p.resolve().unwrap().unwrap().as_str(), "stale");
+            assert_eq!(value(p.retry(&refused())).as_deref(), Some("fresh"));
+            assert!(p.cache.is_empty(), "evicted");
+            p.accepted();
+            assert_eq!(cached(&cache), Some("fresh"));
+            assert_eq!(*lines.borrow(), [""]);
+        }
+
+        #[test]
+        fn accepted_cached_value_needs_no_prompt() {
+            let mut cache = HashMap::new();
+            cache.insert(KEY.to_string(), zeroize::Zeroizing::new("good".to_string()));
+            let lines = Lines::default();
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&[], &lines));
+            assert_eq!(p.resolve().unwrap().unwrap().as_str(), "good");
+            p.accepted();
+            assert!(lines.borrow().is_empty());
+            assert_eq!(cached(&cache), Some("good"));
+        }
+
+        #[test]
+        fn dialog_tries_are_used_up() {
+            let mut cache = HashMap::new();
+            let lines = Lines::default();
+            let responses = [(Some("a"), true), (Some("b"), true), (Some("c"), true)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            p.resolve().unwrap();
+            assert_eq!(value(p.retry(&refused())).as_deref(), Some("b"));
+            assert_eq!(value(p.retry(&refused())).as_deref(), Some("c"));
+            assert!(matches!(p.retry(&refused()), PassphraseRetry::GiveUp));
+            assert_eq!(lines.borrow().len(), 3);
+            assert!(cache.is_empty());
+        }
+
+        #[test]
+        fn dismissed_prompt_is_a_skip() {
+            let mut cache = HashMap::new();
+            let lines = Lines::default();
+            let responses = [(None, true)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            assert!(matches!(
+                p.resolve(),
+                Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED
+            ));
+
+            let lines = Lines::default();
+            let responses = [(Some("wrong"), true), (None, true)];
+            let mut p =
+                CyclePassphraseRetry::new(KEY.into(), &mut cache, 3, recording(&responses, &lines));
+            p.resolve().unwrap();
+            assert!(matches!(
+                p.retry(&refused()),
+                PassphraseRetry::Stop(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED
+            ));
+            assert!(cache.is_empty());
+        }
     }
 }

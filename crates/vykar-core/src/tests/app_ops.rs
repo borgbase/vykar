@@ -3,12 +3,13 @@ use std::cell::Cell;
 use zeroize::Zeroizing;
 
 use crate::app::operations::{
-    BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepOutcome, run_backup_selection,
-    run_command_with_hook_warnings, run_command_with_hooks, run_full_cycle_for_repo,
-    run_full_cycle_with_passphrase_source, run_hooked_step,
+    BackupRunEvent, CycleEvent, CyclePassphrase, CycleStep, FullCycleResult, PassphraseRetry,
+    StepErrorKind, StepOutcome, run_backup_selection, run_command_with_hook_warnings,
+    run_command_with_hooks, run_full_cycle_for_repo, run_full_cycle_with_passphrase_source,
+    run_hooked_step,
 };
 use crate::app::preflight::UnavailableRepo;
-use crate::app::{OpsError, OpsResult};
+use crate::app::{HookError, OpsError, OpsResult, StepError};
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
 use crate::repo::control::CancelToken;
 use crate::testutil::{cmd_append, cmd_rename, env_word};
@@ -112,7 +113,12 @@ fn hooked_step_classified_failure_fires_failed_hooks() {
         &mut |e| events.push(e),
         &mut steps,
         |_| Ok(3usize),
-        |n| StepOutcome::Failed(format!("check found {n} error(s)")),
+        |n| {
+            StepOutcome::Failed(StepError::new(
+                StepErrorKind::Other,
+                format!("check found {n} error(s)"),
+            ))
+        },
     );
 
     assert_eq!(value, Some(3));
@@ -474,7 +480,8 @@ fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
     assert_eq!(calls.get(), 1);
     assert!(matches!(
         outcome(&result, CycleStep::Backup),
-        StepOutcome::Failed(e) if e.contains("no route to host")
+        StepOutcome::Failed(e)
+            if e.message.contains("no route to host") && e.kind == StepErrorKind::Other
     ));
     assert!(matches!(
         outcome(&result, CycleStep::Check),
@@ -932,7 +939,7 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
 
     assert!(matches!(
         outcome(&result, CycleStep::Backup),
-        StepOutcome::Failed(msg) if msg.contains("'gone'")
+        StepOutcome::Failed(e) if e.message.contains("'gone'")
     ));
     let report = result.backup_report.as_ref().expect("report kept");
     assert_eq!(report.created.len(), 1);
@@ -965,7 +972,9 @@ fn command_hooks_report_warnings() {
     repo.repo_hooks = hooks(&[("after_prune", "exit 1")]);
     let mut seen = Vec::new();
 
-    let result = run_command_with_hook_warnings(&repo, "prune", &mut |w| seen.push(w), || Ok(7));
+    let result = run_command_with_hook_warnings(&repo, "prune", &mut |w| seen.push(w), || {
+        Ok::<_, OpsError>(7)
+    });
 
     assert_eq!(result.unwrap(), 7);
     assert_eq!(seen.len(), 1, "{seen:?}");
@@ -977,7 +986,285 @@ fn command_hooks_wrapper_matches_reporting_variant() {
     let mut repo = make_test_repo("/tmp/repo", None);
     repo.repo_hooks = hooks(&[("before_prune", CMD_SKIP)]);
 
-    let result = run_command_with_hooks(&repo, "prune", || Ok(()));
+    let result = run_command_with_hooks(&repo, "prune", || Ok::<_, OpsError>(()));
 
     assert!(matches!(result, Err(OpsError::Skipped(_))), "{result:?}");
+}
+
+#[derive(Debug)]
+enum TestErr {
+    Ops(OpsError),
+    Mine(String),
+}
+
+impl std::fmt::Display for TestErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ops(e) => e.fmt(f),
+            Self::Mine(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<OpsError> for TestErr {
+    fn from(e: OpsError) -> Self {
+        Self::Ops(e)
+    }
+}
+
+impl HookError for TestErr {
+    fn is_skip(&self) -> bool {
+        matches!(self, Self::Ops(OpsError::Skipped(_)))
+    }
+}
+
+#[test]
+fn hooked_command_keeps_a_caller_error_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = make_test_repo("/tmp/repo", None);
+    let failed = cmd_append(&log, &env_word("failed:", "VYKAR_ERROR", ""));
+    repo.repo_hooks = hooks(&[("failed_prune", failed.as_str())]);
+
+    let result = run_command_with_hooks(&repo, "prune", || {
+        Err::<(), _>(TestErr::Mine("boom".into()))
+    });
+
+    assert!(
+        matches!(&result, Err(TestErr::Mine(m)) if m == "boom"),
+        "{result:?}"
+    );
+    assert_eq!(log_lines(&log), vec!["failed:boom"]);
+
+    repo.repo_hooks = hooks(&[("before_prune", CMD_SKIP)]);
+    let result = run_command_with_hooks(&repo, "prune", || Ok::<(), TestErr>(()));
+    assert!(
+        matches!(result, Err(TestErr::Ops(OpsError::Skipped(_)))),
+        "{result:?}"
+    );
+}
+
+// ── Passphrase retry inside a step ──────────────────────────────────────────
+
+/// A passphrase source with a scripted first value and retry values.
+struct Scripted {
+    first: &'static str,
+    retries: Vec<&'static str>,
+    /// What `retry` answers once `retries` is used up.
+    exhausted: fn() -> PassphraseRetry,
+    resolves: usize,
+    retried: usize,
+    accepted: Vec<String>,
+    current: String,
+}
+
+impl Scripted {
+    fn new(first: &'static str, retries: Vec<&'static str>) -> Self {
+        Self {
+            first,
+            retries,
+            exhausted: || PassphraseRetry::GiveUp,
+            resolves: 0,
+            retried: 0,
+            accepted: Vec::new(),
+            current: String::new(),
+        }
+    }
+}
+
+impl CyclePassphrase for Scripted {
+    fn resolve(&mut self) -> OpsResult<Option<Zeroizing<String>>> {
+        self.resolves += 1;
+        self.current = self.first.to_string();
+        Ok(Some(Zeroizing::new(self.current.clone())))
+    }
+
+    fn retry(&mut self, failure: &OpsError) -> PassphraseRetry {
+        assert!(failure.is_passphrase_failure(), "{failure}");
+        self.retried += 1;
+        if self.retries.is_empty() {
+            return (self.exhausted)();
+        }
+        self.current = self.retries.remove(0).to_string();
+        PassphraseRetry::Value(Some(Zeroizing::new(self.current.clone())))
+    }
+
+    fn accepted(&mut self) {
+        self.accepted.push(self.current.clone());
+    }
+}
+
+/// `local_repo` whose backup hooks append their own names to `log`.
+fn backup_hooked_repo(tmp: &tempfile::TempDir, log: &std::path::Path) -> ResolvedRepo {
+    let mut repo = local_repo(tmp, &["src"]);
+    let cmds: Vec<(&str, String)> = [
+        "before_backup",
+        "after_backup",
+        "failed_backup",
+        "finally_backup",
+    ]
+    .into_iter()
+    .map(|name| (name, cmd_append(log, name)))
+    .collect();
+    let pairs: Vec<(&str, &str)> = cmds.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    repo.repo_hooks = hooks(&pairs);
+    repo
+}
+
+fn run_with_source(repo: &ResolvedRepo, source: &mut dyn CyclePassphrase) -> FullCycleResult {
+    run_full_cycle_with_passphrase_source(
+        repo,
+        source,
+        &CancelToken::new(),
+        false,
+        &[],
+        UnavailableRepo::Skip,
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn refused_passphrase_is_retried_inside_the_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let repo = backup_hooked_repo(&tmp, &log);
+    let mut source = Scripted::new("wrong", vec![crate::testing::TEST_PASSPHRASE]);
+
+    let result = run_with_source(&repo, &mut source);
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Ok),
+        "{:?}",
+        result.steps
+    );
+    assert!(!result.has_failures(), "{:?}", result.steps);
+    assert_eq!(source.resolves, 1);
+    assert_eq!(source.retried, 1);
+    assert!(!source.accepted.is_empty());
+    assert!(
+        source
+            .accepted
+            .iter()
+            .all(|p| p == crate::testing::TEST_PASSPHRASE)
+    );
+    assert_eq!(
+        log_lines(&log),
+        vec!["before_backup", "after_backup", "finally_backup"]
+    );
+}
+
+#[test]
+fn refused_passphrase_without_retry_fails_as_passphrase_and_check_still_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.config.check.max_percent = 100;
+    let calls = Cell::new(0);
+
+    let result = run_full_cycle_with_passphrase_source(
+        &repo,
+        &mut || {
+            calls.set(calls.get() + 1);
+            Ok(Some(Zeroizing::new("wrong".to_string())))
+        },
+        &CancelToken::new(),
+        false,
+        &[],
+        UnavailableRepo::Skip,
+        &mut |_| {},
+    );
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Passphrase),
+        "{:?}",
+        result.steps
+    );
+    assert!(
+        matches!(outcome(&result, CycleStep::Check), StepOutcome::Failed(e) if e.kind == StepErrorKind::Passphrase),
+        "{:?}",
+        result.steps
+    );
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn source_that_gives_up_skips_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.config.check.max_percent = 100;
+    let mut source = Scripted::new("wrong", Vec::new());
+
+    let result = run_with_source(&repo, &mut source);
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Passphrase),
+        "{:?}",
+        result.steps
+    );
+    assert!(
+        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r == "backup failed"),
+        "{:?}",
+        result.steps
+    );
+    assert_eq!(source.retried, 1);
+    assert!(source.accepted.is_empty());
+}
+
+#[test]
+fn retry_cancel_skips_the_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let repo = backup_hooked_repo(&tmp, &log);
+    let mut source = Scripted::new("wrong", Vec::new());
+    source.exhausted =
+        || PassphraseRetry::Stop(OpsError::Skipped("passphrase prompt canceled".into()));
+
+    let result = run_with_source(&repo, &mut source);
+
+    assert!(!result.has_failures(), "{:?}", result.steps);
+    assert_eq!(result.backup_skipped(), Some("passphrase prompt canceled"));
+    assert_eq!(log_lines(&log), vec!["before_backup", "finally_backup"]);
+}
+
+#[test]
+fn passphrase_is_not_accepted_without_an_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.repo_hooks = hooks(&[("before_backup", "exit 3")]);
+    let mut source = Scripted::new(crate::testing::TEST_PASSPHRASE, Vec::new());
+
+    let result = run_with_source(&repo, &mut source);
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Hook),
+        "{:?}",
+        result.steps
+    );
+    assert!(
+        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r == "check not configured"),
+        "{:?}",
+        result.steps
+    );
+    assert!(source.accepted.is_empty(), "{:?}", source.accepted);
+}
+
+#[test]
+fn unknown_source_filter_is_a_config_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = local_repo(&tmp, &["src"]);
+
+    let result = run_full_cycle_for_repo(
+        &repo,
+        Some(crate::testing::TEST_PASSPHRASE),
+        &CancelToken::new(),
+        false,
+        &["nope".to_string()],
+        UnavailableRepo::Skip,
+        &mut |_| {},
+    );
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Config),
+        "{:?}",
+        result.steps
+    );
 }

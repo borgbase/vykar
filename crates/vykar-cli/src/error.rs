@@ -45,6 +45,13 @@ impl From<&str> for CliError {
 
 pub(crate) type CliResult<T> = Result<T, CliError>;
 
+/// A skip is the ops layer's; every other variant is a failure.
+impl vykar_core::app::HookError for CliError {
+    fn is_skip(&self) -> bool {
+        matches!(self, Self::Ops(OpsError::Skipped(_)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +66,14 @@ mod tests {
             CliError::from(OpsError::Skipped("r".into())),
             CliError::Ops(OpsError::Skipped(r)) if r == "r"
         ));
+    }
+
+    #[test]
+    fn only_an_ops_skip_is_a_hook_skip() {
+        use vykar_core::app::HookError;
+        assert!(CliError::Ops(OpsError::Skipped("r".into())).is_skip());
+        assert!(!CliError::Ops(OpsError::Hook("h".into())).is_skip());
+        assert!(!CliError::Vykar(VykarError::Interrupted).is_skip());
+        assert!(!CliError::Msg("m".into()).is_skip());
     }
 }

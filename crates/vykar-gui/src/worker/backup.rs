@@ -1,18 +1,12 @@
-use std::collections::HashMap;
-
-use crossbeam_channel::Sender;
 use vykar_core::app::preflight::UnavailableRepo;
-use vykar_core::app::{OpsError, OpsResult, operations};
+use vykar_core::app::{OpsError, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
-use vykar_types::error::VykarError;
-use zeroize::Zeroizing;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{BackupStatusTracker, format_check_status, format_step_outcome};
 use crate::repo_helpers::{
-    InitTarget, PassphraseRun, classify_init_target, log_backup_report, send_log,
-    with_passphrase_retry,
+    PassphraseRun, cycle_passphrase, log_backup_report, send_log, with_passphrase_retry,
 };
 
 use super::WorkerContext;
@@ -40,39 +34,6 @@ fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) 
             .map(|(idx, _)| idx)
             .collect(),
         None => (0..repos.len()).collect(),
-    }
-}
-
-/// Passphrase step of a cycle, run after the `before` hooks pass so a skip hook
-/// sees neither a dialog nor a connection. Validates and caches the passphrase
-/// (retrying a wrong dialog entry; a wrong value is never cached).
-/// The cycle buries decryption failures inside `steps` as a string, so it cannot
-/// drive `with_passphrase_retry` directly — the `info::run` probe does.
-fn resolve_cycle_passphrase(
-    repo: &config::ResolvedRepo,
-    passphrases: &mut HashMap<String, Zeroizing<String>>,
-    ui_tx: &Sender<UiEvent>,
-) -> OpsResult<Option<Zeroizing<String>>> {
-    let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
-        vykar_core::commands::info::run(&repo.config, pass)
-    });
-    match outcome {
-        Ok(PassphraseRun::Ran(_)) => Ok(passphrases.get(&repo.config.repository.url).cloned()),
-        Ok(PassphraseRun::Canceled) => Err(OpsError::Skipped("passphrase prompt canceled".into())),
-        Err(VykarError::RepoNotFound(_)) => {
-            let (log, reason) =
-                if classify_init_target(&repo.config.repository.url) == InitTarget::Unavailable {
-                    (
-                        "repository path not available (drive not connected?)",
-                        "repository not available",
-                    )
-                } else {
-                    ("repository not initialized", "repository not initialized")
-                };
-            send_log(ui_tx, format!("[{}] {log}", repo.label_or_url()));
-            Err(VykarError::Other(reason.to_string()).into())
-        }
-        Err(e) => Err(VykarError::Other(format!("failed to open repository: {e}")).into()),
     }
 }
 
@@ -136,11 +97,10 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
         let mut tracker = BackupStatusTracker::new(repo_name.clone());
         let ui_tx_progress = ctx.ui_tx.clone();
         let rn = repo_name.clone();
-        let passphrases = &mut ctx.passphrases;
-        let ui_tx = &ctx.ui_tx;
+        let mut passphrase = cycle_passphrase(repo, &mut ctx.passphrases, 3);
         let result = operations::run_full_cycle_with_passphrase_source(
             repo,
-            &mut || resolve_cycle_passphrase(repo, passphrases, ui_tx),
+            &mut passphrase,
             &ctx.cancel_requested.current(),
             false,
             &[],
@@ -627,6 +587,132 @@ mod tests {
             hook_log(&h).iter().any(|l| l == "after_backup"),
             "{:?}",
             hook_log(&h)
+        );
+    }
+
+    /// `nas` at `<tmp>/repo`, initialized, with one source and every backup
+    /// hook appending its name to `<tmp>/hooks.log`.
+    fn initialized_harness() -> Harness {
+        let h = test_support::harness(|tmp| {
+            let source = tmp.join("source");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("a.txt"), b"data").unwrap();
+            let log = tmp.join("hooks.log");
+            let hooks = FIXTURE_HOOKS
+                .iter()
+                .map(|name| {
+                    format!(
+                        "  {name}: {}\n",
+                        quoted(&test_support::cmd_append(&log, name))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            format!(
+                "repositories:\n  - url: {}\n    label: nas\n\
+                 encryption:\n  mode: aes256gcm\n  passphrase: {}\n\
+                 cache_dir: {}\n\
+                 hooks:\n{hooks}\
+                 sources:\n  - path: {}\n    label: src\n",
+                quoted(&tmp.join("repo").display().to_string()),
+                quoted(vykar_core::testing::TEST_PASSPHRASE),
+                quoted(&tmp.join("cache").display().to_string()),
+                quoted(&source.display().to_string()),
+            )
+        });
+        std::fs::create_dir_all(h.tmp.path().join("repo")).unwrap();
+        vykar_core::testing::with_cheap_kdf(|| {
+            vykar_core::commands::init::run(
+                &h.ctx.runtime.repos.first().unwrap().config,
+                Some(vykar_core::testing::TEST_PASSPHRASE),
+            )
+        })
+        .unwrap();
+        h
+    }
+
+    /// The GUI cycle opens the repository no more often than the core cycle:
+    /// no passphrase probe.
+    #[test]
+    fn cycle_opens_the_repository_as_often_as_the_core_cycle() {
+        use vykar_core::repo::control::CancelToken;
+        use vykar_core::testing::count_repo_opens;
+
+        let mut a = initialized_harness();
+        let b = initialized_harness();
+
+        let ((), gui) = count_repo_opens(|| handle_backup_all(&mut a.ctx, true));
+        let repo_b = b.ctx.runtime.repos.first().unwrap();
+        let (result, core) = count_repo_opens(|| {
+            operations::run_full_cycle_for_repo(
+                repo_b,
+                Some(vykar_core::testing::TEST_PASSPHRASE),
+                &CancelToken::new(),
+                false,
+                &[],
+                UnavailableRepo::Skip,
+                &mut |_| {},
+            )
+        });
+
+        let (logs, errors) = drain(&a.ui_rx);
+        assert!(errors.is_empty(), "{errors:?} {logs:?}");
+        assert!(!result.has_failures(), "{:?}", result.steps);
+        assert!(core > 0);
+        assert_eq!(gui, core);
+        let url = &a.ctx.runtime.repos.first().unwrap().config.repository.url;
+        assert_eq!(
+            a.ctx.passphrases.get(url).map(|p| p.as_str()),
+            Some(vykar_core::testing::TEST_PASSPHRASE)
+        );
+    }
+
+    #[test]
+    fn cycle_retries_a_wrong_dialog_entry_once_without_rerunning_hooks() {
+        use crate::repo_helpers::CyclePassphraseRetry;
+        use vykar_core::repo::control::CancelToken;
+
+        let h = initialized_harness();
+        let repo = h.ctx.runtime.repos.first().unwrap();
+        let url = repo.config.repository.url.clone();
+        let mut cache = std::collections::HashMap::new();
+        let mut lines: Vec<String> = Vec::new();
+        let mut responses = vec!["wrong", vykar_core::testing::TEST_PASSPHRASE];
+        let mut source = CyclePassphraseRetry::new(url.clone(), &mut cache, 3, |line: &str| {
+            lines.push(line.to_string());
+            Ok((
+                Some(zeroize::Zeroizing::new(responses.remove(0).to_string())),
+                true,
+            ))
+        });
+
+        let result = operations::run_full_cycle_with_passphrase_source(
+            repo,
+            &mut source,
+            &CancelToken::new(),
+            false,
+            &[],
+            UnavailableRepo::Skip,
+            &mut |_| {},
+        );
+        drop(source);
+
+        assert!(
+            matches!(
+                result.steps.first(),
+                Some((operations::CycleStep::Backup, operations::StepOutcome::Ok))
+            ),
+            "{:?}",
+            result.steps
+        );
+        assert_eq!(lines, ["", "Incorrect passphrase. Please try again."]);
+        assert_eq!(
+            cache.get(&url).map(|p| p.as_str()),
+            Some(vykar_core::testing::TEST_PASSPHRASE)
+        );
+        assert_eq!(
+            hook_log(&h),
+            vec!["before_backup", "after_backup", "finally_backup"]
         );
     }
 

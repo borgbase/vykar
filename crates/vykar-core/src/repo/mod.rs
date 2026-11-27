@@ -42,7 +42,7 @@ pub use index_rebuild::{RebuildCounts, UncoveredPack};
 pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "sim", feature = "testing"))]
-pub use open::with_cheap_kdf;
+pub use open::{count_repo_opens, with_cheap_kdf};
 mod read;
 pub(crate) use read::TreeChunkSource;
 pub(crate) mod relocate;

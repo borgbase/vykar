@@ -5,13 +5,16 @@ use vykar_core::config::VykarConfig;
 
 use crate::error::CliResult;
 use crate::format::{format_bytes, format_size_with_savings};
-use crate::passphrase::with_repo_passphrase;
 use crate::table::{CliTableTheme, add_kv_row};
+use vykar_core::app::passphrase::RepoPassphrase;
 
-pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<()> {
-    let stats = with_repo_passphrase(config, label, |passphrase| {
-        Ok(commands::info::run(config, passphrase)?)
-    })?;
+pub(crate) fn run_info(
+    config: &VykarConfig,
+    label: Option<&str>,
+    passphrase: &mut RepoPassphrase<'_>,
+) -> CliResult<()> {
+    let stats = passphrase
+        .with(|passphrase| -> CliResult<_> { Ok(commands::info::run(config, passphrase)?) })?;
 
     let theme = CliTableTheme::detect();
 

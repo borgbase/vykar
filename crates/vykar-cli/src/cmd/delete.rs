@@ -5,17 +5,17 @@ use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_delete(
     config: &VykarConfig,
-    label: Option<&str>,
     snapshot_names: &[String],
     dry_run: bool,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
-    let result = with_repo_passphrase(config, label, |passphrase| {
+    let result = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::delete::run(
             config, passphrase, &name_refs, dry_run, cancel,
         )?)

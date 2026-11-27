@@ -114,6 +114,24 @@ impl HookError for OpsError {
     }
 }
 
+/// Whether a wrong passphrase could explain an error, for the passphrase
+/// retry. Implemented by every error a passphrase-taking action returns.
+pub trait PassphraseFailure {
+    fn is_passphrase_failure(&self) -> bool;
+}
+
+impl PassphraseFailure for OpsError {
+    fn is_passphrase_failure(&self) -> bool {
+        OpsError::is_passphrase_failure(self)
+    }
+}
+
+impl PassphraseFailure for VykarError {
+    fn is_passphrase_failure(&self) -> bool {
+        VykarError::is_passphrase_failure(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

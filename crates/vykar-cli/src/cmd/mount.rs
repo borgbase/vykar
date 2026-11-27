@@ -3,17 +3,17 @@ use vykar_core::commands::mount::MountProgressEvent;
 use vykar_core::config::VykarConfig;
 
 use crate::error::CliResult;
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_mount(
     config: &VykarConfig,
-    label: Option<&str>,
     snapshot_name: Option<String>,
     address: String,
     cache_size: usize,
     source_filter: &[String],
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    with_repo_passphrase(config, label, |passphrase| {
+    passphrase.with(|passphrase| -> CliResult<_> {
         let mut on_progress = |event: MountProgressEvent| match event {
             MountProgressEvent::LoadingSnapshots => {
                 eprintln!("Loading snapshot data...");

@@ -126,7 +126,7 @@ Reload behavior:
 - `on_startup` is ignored on reload; every repository's next run is recalculated from its schedule relative to now
 - If the new config is **invalid** (parse error, empty repositories, no repository with `schedule.enabled: true`, passphrase validation failure), the daemon logs a warning and continues with the previous config
 - If the new config is **valid**, repos and schedules are replaced and the next run times are recalculated
-- Passphrases are resolved again from the new configuration on the next cycle. Without a reload the daemon keeps the passphrase it resolved first for each repository; after rotating a `passcommand` secret, send `SIGHUP`
+- The daemon keeps a passphrase only after a repository accepted it, and drops it when that repository's `encryption` passphrase settings change on reload. If the repository refuses a kept passphrase, the daemon resolves it again from the configuration, so a passphrase changed together with its `passcommand` secret is picked up on the next cycle without `SIGHUP`
 
 ## Ad-hoc backup via SIGUSR1
 

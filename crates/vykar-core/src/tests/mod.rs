@@ -1,4 +1,5 @@
 mod app_ops;
+mod app_service;
 mod backup_commit_order;
 mod backup_file_txn;
 mod backup_metrics;

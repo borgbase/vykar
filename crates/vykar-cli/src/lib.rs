@@ -12,6 +12,7 @@
 mod cli;
 mod cmd;
 mod config_gen;
+mod cycle;
 mod dispatch;
 mod error;
 mod format;
@@ -28,14 +29,15 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser;
 
-use vykar_core::app::operations;
-use vykar_core::app::preflight::UnavailableRepo;
+use vykar_core::app::AppService;
+use vykar_core::app::service::{CycleRequest, HookedCommand, RepoSelection};
 use vykar_core::config::{self, ResolvedRepo};
 
 use crate::cli::{Cli, Commands};
 use crate::config_gen::run_config_generate;
-use crate::dispatch::{dispatch_command, run_default_actions, warn_if_untrusted_rest};
+use crate::dispatch::{dispatch_backup, dispatch_command, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
+use crate::passphrase::TtyPrompt;
 use crate::resolve::{
     DiffDispatch, SnapshotDispatch, classify_diff_target, classify_snapshot_target, repo_name_at,
     repo_names_at,
@@ -75,11 +77,76 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
         None => all_repos.iter().collect(),
     };
 
-    if let Some(code) = dispatch_targeted(&cli, &repos) {
+    // One process, one command: values the probe validated are trusted.
+    let mut service = AppService::one_shot();
+
+    if let Some(code) = dispatch_targeted(&cli, &repos, &mut service) {
         return code;
     }
 
-    run_all_repos(&cli, &repos)
+    if cli.command.is_none() {
+        // An explicitly selected repository runs and fails if it is missing.
+        let selection = match repo_selector {
+            Some(_) => {
+                let index = repos
+                    .first()
+                    .and_then(|selected| all_repos.iter().position(|r| std::ptr::eq(r, *selected)));
+                // Never widen a named repository to all of them.
+                let Some(index) = index else {
+                    eprintln!("Error: the selected repository is not in the configuration");
+                    return ExitCode::from(EXIT_ERROR);
+                };
+                RepoSelection::Explicit(index)
+            }
+            None => RepoSelection::All,
+        };
+        let multi = matches!(selection, RepoSelection::All) && all_repos.len() > 1;
+        let request = CycleRequest {
+            selection,
+            source_filter: cli.source.clone(),
+            verbose: cli.verbose >= 1,
+        };
+        let report = cycle::run_bare_cycle(
+            &mut service,
+            &all_repos,
+            &request,
+            cli.verbose,
+            multi,
+            &mut TtyPrompt,
+        );
+        return cycle::exit_code(&report);
+    }
+
+    run_all_repos(&cli, &repos, &mut service)
+}
+
+/// Point the per-user config and cache directories at a per-process temp
+/// directory, so tests that open repositories in-process never write into
+/// the developer's real home (installation ID, identity pins). Idempotent;
+/// call before the test's first repository open.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(crate) fn init_test_environment() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let base = std::env::temp_dir().join(format!("vykar-cli-unit-{}", std::process::id()));
+        let (home, config, cache) = (base.join("home"), base.join("config"), base.join("cache"));
+        for dir in [&home, &config, &cache] {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once behind `Once`, before the first repository
+        // open of whichever test calls it first; other tests read the
+        // environment only through `std::env`, which takes the same lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+            std::env::set_var("APPDATA", &config);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+            std::env::set_var("LOCALAPPDATA", &cache);
+        }
+    });
 }
 
 /// `EnvFilter` directives appended to the `-v`-derived log filter
@@ -283,7 +350,11 @@ fn load_repos(cli: &Cli, source: &config::ConfigSource) -> Result<Vec<ResolvedRe
 /// Multi-repo dispatch for commands that name a specific snapshot: probe the
 /// repositories, pick the one that actually holds it, and run there. Returns
 /// `None` when the command should fall through to the run-everywhere path.
-fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
+fn dispatch_targeted(
+    cli: &Cli,
+    repos: &[&ResolvedRepo],
+    service: &mut AppService,
+) -> Option<ExitCode> {
     if repos.len() < 2 {
         return None;
     }
@@ -326,11 +397,11 @@ fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
             },
     }) = cli.command.as_ref()
     {
-        return Some(dispatch_diff(cli, repos, snapshot_a, snapshot_b));
+        return Some(dispatch_diff(cli, repos, service, snapshot_a, snapshot_b));
     }
 
     let snap = cli.command.as_ref().and_then(|c| c.snapshot_name())?;
-    Some(dispatch_snapshot(cli, repos, snap))
+    Some(dispatch_snapshot(cli, repos, service, snap))
 }
 
 /// Probe both snapshot names and run the diff in the single repository that
@@ -338,6 +409,7 @@ fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
 fn dispatch_diff(
     cli: &Cli,
     repos: &[&ResolvedRepo],
+    service: &mut AppService,
     snapshot_a: &str,
     snapshot_b: &str,
 ) -> ExitCode {
@@ -345,7 +417,7 @@ fn dispatch_diff(
     for repo in repos {
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
     }
-    match classify_diff_target(snapshot_a, snapshot_b, repos) {
+    match classify_diff_target(service, snapshot_a, snapshot_b, repos) {
         DiffDispatch::LatestRequiresRepo => {
             eprintln!(
                 "Error: \'latest\' is ambiguous in snapshot diff when multiple repositories \
@@ -387,20 +459,25 @@ fn dispatch_diff(
                 eprintln!("Internal error: diff target repo index out of range");
                 return ExitCode::from(EXIT_ERROR);
             };
-            finish(run_repo_command(cli, repo))
+            finish(run_repo_command(cli, repo, service))
         }
     }
 }
 
 /// Probe the repositories for `snap` and run the command in the one that holds
 /// it, or explain why that could not be determined.
-fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode {
+fn dispatch_snapshot(
+    cli: &Cli,
+    repos: &[&ResolvedRepo],
+    service: &mut AppService,
+    snap: &str,
+) -> ExitCode {
     // Emit REST warnings before probing backends.
     for repo in repos {
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
     }
 
-    match classify_snapshot_target(snap, repos) {
+    match classify_snapshot_target(service, snap, repos) {
         SnapshotDispatch::RequireRepo => {
             eprintln!(
                 "Error: \'latest\' requires -R / --repo when multiple repositories are configured"
@@ -417,7 +494,7 @@ fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode
                 eprintln!("Internal error: snapshot dispatch index out of range");
                 return ExitCode::from(EXIT_ERROR);
             };
-            finish(run_repo_command(cli, repo))
+            finish(run_repo_command(cli, repo, service))
         }
         SnapshotDispatch::Ambiguous(indices) => {
             eprintln!(
@@ -441,9 +518,9 @@ fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode
     }
 }
 
-/// Run the command against every selected repository, aggregating the outcome:
-/// any hard error wins over a partial, which wins over success.
-fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
+/// Run the subcommand against every selected repository, aggregating the
+/// outcome: any hard error wins over a partial, which wins over success.
+fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], service: &mut AppService) -> ExitCode {
     let multi = repos.len() > 1;
     let mut had_error = false;
     let mut had_partial = false;
@@ -457,7 +534,7 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
             eprintln!("--- Repository: {} ---", repo.label_or_url());
         }
 
-        let result = run_repo_command(cli, repo);
+        let result = run_repo_command(cli, repo, service);
         if signal::SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("Interrupted");
             return ExitCode::from(EXIT_INTERRUPTED);
@@ -492,78 +569,58 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Run `action` inside the repo-level hooks for `command`. The action's
-/// `CliError` passes through the hooks unchanged; a hook failure or skip
-/// arrives as `CliError::Ops`.
-fn run_hooked(
-    repo: &ResolvedRepo,
-    command: &str,
-    action: impl FnOnce() -> CliResult<bool>,
-) -> CliResult<bool> {
-    operations::run_command_with_hooks(repo, command, action)
-}
-
-/// Execute the CLI command (or default actions) against one repo.
-/// Returns `Ok(had_partial)` where `true` means backup had soft errors. A skip
-/// requested by a hook, or a bare cycle skipped because its local repository is
-/// unavailable, is reported here and counts as success.
-fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
+/// Execute a subcommand against one repo. Returns `Ok(had_partial)` where
+/// `true` means backup had soft errors. A skip requested by a hook, or a
+/// dismissed passphrase prompt, is reported here and counts as success.
+fn run_repo_command(cli: &Cli, repo: &ResolvedRepo, service: &mut AppService) -> CliResult<bool> {
     warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
     let shutdown = signal::shutdown_token();
-    let result = match &cli.command {
-        Some(cmd) => {
-            if matches!(cmd, Commands::Backup { .. }) {
-                // Backup: hooks handled by run_backup_selection in core
-                dispatch_command(cmd, repo, shutdown, cli.verbose)
-            } else {
-                let result = run_hooked(repo, cmd.name(), || {
-                    dispatch_command(cmd, repo, shutdown, cli.verbose)
-                });
-                match (result, cmd) {
-                    // Compact runs as its own hooked command once prune's lifecycle
-                    // has ended, as in the default cycle. A failed or skipped prune
-                    // does not compact, nor does one interrupted by a shutdown.
-                    (
-                        Ok(partial),
-                        Commands::Prune {
-                            compact: true,
-                            dry_run,
-                            ..
-                        },
-                    ) if !signal::SHUTDOWN.load(Ordering::SeqCst) => {
-                        run_hooked(repo, "compact", || {
-                            crate::cmd::compact::run_compact(
-                                &repo.config,
-                                repo.label.as_deref(),
-                                repo.config.compact.threshold,
-                                None,
-                                *dry_run,
-                                shutdown,
-                            )
-                            .map(|()| partial)
-                        })
-                    }
-                    (other, _) => other,
-                }
-            }
+    let Some(cmd) = &cli.command else {
+        return Err(CliError::from("the bare command runs through the cycle"));
+    };
+    let mut prompt = TtyPrompt;
+    let result = if matches!(cmd, Commands::Backup { .. }) {
+        // Repo and source hooks run inside the service's backup.
+        dispatch_backup(cmd, repo, service, shutdown, cli.verbose)
+    } else if let Some((hooked, dry_run)) = cmd.hooked() {
+        let result = service.run_hooked(repo, hooked, dry_run, &mut prompt, &mut |_| {}, |pass| {
+            dispatch_command(cmd, repo, pass, shutdown)
+        });
+        match (result, cmd) {
+            // Compact runs as its own hooked command once prune's lifecycle
+            // has ended, as in the default cycle. A failed or skipped prune
+            // does not compact, nor does one interrupted by a shutdown.
+            (
+                Ok(partial),
+                Commands::Prune {
+                    compact: true,
+                    dry_run,
+                    ..
+                },
+            ) if !signal::SHUTDOWN.load(Ordering::SeqCst) => service.run_hooked(
+                repo,
+                HookedCommand::Compact,
+                *dry_run,
+                &mut prompt,
+                &mut |_| {},
+                |pass| {
+                    crate::cmd::compact::run_compact(
+                        &repo.config,
+                        repo.config.compact.threshold,
+                        None,
+                        *dry_run,
+                        shutdown,
+                        pass,
+                    )
+                    .map(|()| partial)
+                },
+            ),
+            (other, _) => other,
         }
-        None => {
-            // An explicitly selected repository runs and fails if it is missing.
-            let unavailable = if effective_repo_selector(cli).is_some() {
-                UnavailableRepo::Attempt
-            } else {
-                UnavailableRepo::Skip
-            };
-            run_default_actions(repo, shutdown, cli.verbose, &cli.source, unavailable).map(|o| {
-                if o.unavailable
-                    && let Some(reason) = &o.skipped
-                {
-                    eprintln!("Warning: skipping '{}' — {reason}", repo.label_or_url());
-                }
-                o.partial
-            })
-        }
+    } else {
+        let mut pass = service.passphrase(&repo.config, repo.label.as_deref(), &mut prompt);
+        dispatch_command(cmd, repo, &mut pass, shutdown)
     };
 
     match result {
@@ -604,25 +661,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_hooked_keeps_the_cli_error() {
-        use super::{CliError, run_hooked};
+    fn service_run_hooked_keeps_the_cli_error() {
+        use super::{AppService, CliError, HookedCommand};
+        use vykar_core::app::passphrase::NoPrompt;
         use vykar_types::error::VykarError;
 
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("log");
         let repo = repo_with_failed_hook(&log);
+        let mut service = AppService::new();
+        let mut run = |dry_run: bool, err: CliError| {
+            service.run_hooked(
+                &repo,
+                HookedCommand::Prune,
+                dry_run,
+                &mut NoPrompt,
+                &mut |_| {},
+                |_| Err::<(), _>(err),
+            )
+        };
 
-        let r = run_hooked(&repo, "prune", || Err(CliError::Msg("boom".into())));
+        let r = run(false, CliError::Msg("boom".into()));
         assert!(matches!(&r, Err(CliError::Msg(m)) if m == "boom"), "{r:?}");
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "failed");
 
-        let r = run_hooked(&repo, "prune", || {
-            Err(CliError::Vykar(VykarError::Interrupted))
-        });
+        let r = run(false, CliError::Vykar(VykarError::Interrupted));
         assert!(
             matches!(r, Err(CliError::Vykar(VykarError::Interrupted))),
             "{r:?}"
         );
+
+        // A dry run runs no hooks: `failed_prune` does not fire.
+        std::fs::remove_file(&log).unwrap();
+        let r = run(true, CliError::Msg("boom".into()));
+        assert!(matches!(&r, Err(CliError::Msg(m)) if m == "boom"), "{r:?}");
+        assert!(!log.exists());
     }
 
     #[test]

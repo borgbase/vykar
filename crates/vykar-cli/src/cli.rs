@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
+use vykar_core::app::service::HookedCommand;
 
 #[derive(Parser)]
 #[command(
@@ -486,6 +487,18 @@ impl SnapshotCommand {
 }
 
 impl Commands {
+    /// The hooked command this is, and whether it is a dry run (no hooks).
+    /// `compact --report-unreferenced` conflicts with `--dry-run`, so it keeps
+    /// its hooks; so does `prune --list` without `--dry-run`.
+    pub(crate) fn hooked(&self) -> Option<(HookedCommand, bool)> {
+        match self {
+            Self::Prune { dry_run, .. } => Some((HookedCommand::Prune, *dry_run)),
+            Self::Compact { dry_run, .. } => Some((HookedCommand::Compact, *dry_run)),
+            Self::Check { dry_run, .. } => Some((HookedCommand::Check, *dry_run)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn repo(&self) -> Option<&str> {
         match self {
             Self::Init { repo, .. }
@@ -524,27 +537,6 @@ impl Commands {
             },
             Self::Mount { snapshot, .. } => snapshot.as_deref(),
             _ => None,
-        }
-    }
-
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::Init { .. } => "init",
-            Self::Backup { .. } => "backup",
-            Self::List { .. } => "list",
-            Self::Restore { .. } => "restore",
-            Self::Delete { .. } => "delete",
-            Self::Prune { .. } => "prune",
-            Self::Check { .. } => "check",
-            Self::Info { .. } => "info",
-            Self::Mount { .. } => "mount",
-            Self::ClearSessions { .. } => "clear-sessions",
-            Self::Compact { .. } => "compact",
-            Self::Upgrade { .. } => "upgrade",
-            Self::Snapshot { .. } => "snapshot",
-            Self::Key { .. } => "key",
-            Self::Config { .. } => "config",
-            Self::Daemon { .. } => "daemon",
         }
     }
 }

@@ -1,67 +1,38 @@
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::io::IsTerminal;
 
 use zeroize::Zeroizing;
 
 use crate::error::{CliError, CliResult};
 use crate::prompt::prompt_hidden;
 use vykar_core::app::passphrase::{
-    InitPassphrase, InitPromptStage, resolve_init_passphrase, resolve_passphrase,
+    InitPassphrase, InitPromptStage, PassphrasePrompt, PromptContext, PromptReply,
+    resolve_init_passphrase,
 };
 use vykar_core::config::VykarConfig;
 
-/// Process-level passphrase cache keyed by repository URL.
-/// Avoids double interactive prompts when probe-then-dispatch opens the same
-/// repo twice (once to check the manifest, once to run the command).
-static PASSPHRASE_CACHE: LazyLock<Mutex<HashMap<String, Option<Zeroizing<String>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The terminal prompt. A retry is asked only on a terminal: a passphrase
+/// piped on stdin is read once, so a wrong one fails instead of consuming
+/// further input.
+pub(crate) struct TtyPrompt;
 
-pub(crate) fn with_repo_passphrase<T>(
-    config: &VykarConfig,
-    label: Option<&str>,
-    action: impl FnOnce(Option<&str>) -> CliResult<T>,
-) -> CliResult<T> {
-    let passphrase = get_passphrase(config, label)?;
-    action(passphrase.as_deref().map(|s| s.as_str()))
-}
-
-pub(crate) fn get_passphrase(
-    config: &VykarConfig,
-    label: Option<&str>,
-) -> vykar_types::error::Result<Option<Zeroizing<String>>> {
-    let cache_key = config.repository.url.clone();
-
-    // Check cache first (avoids double interactive prompt during probe+dispatch)
-    if let Some(cached) = PASSPHRASE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&cache_key)
-    {
-        return Ok(cached.clone());
-    }
-
-    let pass = resolve_passphrase(config, label, |ctx| {
-        let prompt = match ctx.repository_label {
-            Some(ref l) => format!("Enter passphrase for '{l}': "),
+impl PassphrasePrompt for TtyPrompt {
+    fn ask(
+        &mut self,
+        ctx: &PromptContext,
+        retry_reason: Option<&str>,
+    ) -> vykar_types::error::Result<PromptReply> {
+        if let Some(reason) = retry_reason {
+            if !std::io::stdin().is_terminal() {
+                return Ok(PromptReply::Unavailable);
+            }
+            eprintln!("{reason}");
+        }
+        let text = match &ctx.repository_label {
+            Some(l) => format!("Enter passphrase for '{l}': "),
             None => "Enter passphrase: ".to_string(),
         };
-        Ok(Some(Zeroizing::new(prompt_hidden(&prompt)?)))
-    })?;
-
-    PASSPHRASE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(cache_key, pass.clone());
-    Ok(pass)
-}
-
-/// Forget every cached passphrase, so the next lookup resolves from the
-/// current config. The daemon calls this after a successful reload.
-pub(crate) fn clear_passphrase_cache() {
-    PASSPHRASE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+        Ok(PromptReply::Value(Zeroizing::new(prompt_hidden(&text)?)))
+    }
 }
 
 pub(crate) fn get_init_passphrase(
@@ -90,41 +61,5 @@ pub(crate) fn get_init_passphrase(
         // Unreachable from a terminal: `prompt_hidden` never reports a
         // cancellation (Ctrl-C terminates the process, EOF is an I/O error).
         InitPassphrase::Cancelled => Err(CliError::from("passphrase entry cancelled")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vykar_core::config::{EncryptionConfig, EncryptionModeConfig, RepositoryConfig};
-
-    fn config(passphrase: &str) -> VykarConfig {
-        VykarConfig {
-            repository: RepositoryConfig {
-                url: "/test/passphrase-cache-clear".to_string(),
-                ..Default::default()
-            },
-            encryption: EncryptionConfig {
-                mode: EncryptionModeConfig::Aes256Gcm,
-                passphrase: Some(passphrase.to_string()),
-                passcommand: None,
-            },
-            ..Default::default()
-        }
-    }
-
-    fn lookup(passphrase: &str) -> String {
-        get_passphrase(&config(passphrase), None)
-            .unwrap()
-            .unwrap()
-            .to_string()
-    }
-
-    #[test]
-    fn clear_forgets_a_cached_passphrase() {
-        assert_eq!(lookup("old"), "old");
-        assert_eq!(lookup("new"), "old");
-        clear_passphrase_cache();
-        assert_eq!(lookup("new"), "new");
     }
 }

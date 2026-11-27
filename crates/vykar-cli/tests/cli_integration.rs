@@ -3285,7 +3285,7 @@ fn cli_bare_mounted_encrypted_repo_resolves_passphrase_after_before_hooks() {
 
 #[test]
 #[cfg(unix)]
-fn cli_bare_present_encrypted_repo_resolves_passphrase_before_hooks() {
+fn cli_bare_present_encrypted_repo_resolves_passphrase_after_before_hooks() {
     let fx = CliFixture::new();
     let encryption = logging_passcommand(&fx);
     let log = write_unavailable_config(&fx, None, &encryption, "");
@@ -3300,7 +3300,7 @@ fn cli_bare_present_encrypted_repo_resolves_passphrase_before_hooks() {
     let lines = hook_log(&log);
     assert_eq!(
         lines.get(..2),
-        Some(&["pass", "before_backup"].map(String::from)[..]),
+        Some(&["before_backup", "pass"].map(String::from)[..]),
         "{lines:?}"
     );
 }
@@ -4083,4 +4083,155 @@ fn latest_head(repo_dir: &Path) -> std::path::PathBuf {
         .max_by_key(|(g, _)| *g)
         .map(|(_, p)| p)
         .expect("an index head")
+}
+
+// ── Dry runs run no hooks; the passphrase comes after the before hooks ─────
+
+/// The fixture's config with bare `before`/`finally` hooks appending
+/// `<phase>:$VYKAR_COMMAND` to the returned log, and one backup taken.
+#[cfg(unix)]
+fn dry_run_fixture(fx: &CliFixture) -> (String, PathBuf) {
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    std::fs::write(fx.source_a.join("a.txt"), b"a-v1").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+    fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
+    let log = fx.home_dir.join("hooks.log");
+    let append = |word: &str| format!("echo {word} >> '{}'", log.display());
+    write_hooked_sources_config(
+        fx,
+        &[
+            ("before", append("before:$VYKAR_COMMAND")),
+            ("finally", append("finally:$VYKAR_COMMAND")),
+        ],
+    );
+    (cfg, log)
+}
+
+#[cfg(unix)]
+fn assert_dry_run_runs_no_hooks(args: &[&str]) {
+    let fx = CliFixture::new();
+    let (cfg, log) = dry_run_fixture(&fx);
+    let mut full = vec!["--config", cfg.as_str()];
+    full.extend_from_slice(args);
+    fx.run_ok(&full);
+    assert!(!log.exists(), "{args:?}: {:?}", hook_log(&log));
+
+    // Control: the same command without the dry run runs its hooks.
+    fx.run_ok(&["--config", &cfg, "prune"]);
+    assert_eq!(hook_log(&log), ["before:prune", "finally:prune"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_prune_dry_run_runs_no_hooks() {
+    assert_dry_run_runs_no_hooks(&["prune", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_compact_dry_run_runs_no_hooks() {
+    assert_dry_run_runs_no_hooks(&["compact", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_check_repair_dry_run_runs_no_hooks() {
+    assert_dry_run_runs_no_hooks(&["check", "--repair", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_prune_compact_dry_run_runs_no_hooks() {
+    assert_dry_run_runs_no_hooks(&["prune", "--compact", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_backup_resolves_passphrase_after_before_hooks() {
+    let fx = CliFixture::new();
+    let encryption = logging_passcommand(&fx);
+    let log = write_unavailable_config(&fx, None, &encryption, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::create_dir_all(fx._tmp.path().join("volume").join("repo")).unwrap();
+    fx.init_repos(&cfg);
+    let _ = std::fs::remove_file(&log);
+
+    let output = fx.run(&["--config", &cfg, "backup"]);
+    let err = stderr(&output);
+    assert!(output.status.success(), "{err}");
+    let lines = hook_log(&log);
+    assert_eq!(
+        lines.get(..2),
+        Some(&["before_backup", "pass"].map(String::from)[..]),
+        "{lines:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_backup_passcommand_failure_fires_failed_hooks() {
+    let fx = CliFixture::new();
+    let tmp_log = fx._tmp.path().join("hooks.log");
+    let failing = format!(
+        "  mode: aes256gcm\n  passcommand: {}\n",
+        yaml_single(&format!("echo pass >> '{}' && exit 1", tmp_log.display()))
+    );
+    let log = write_unavailable_config(&fx, None, &failing, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::create_dir_all(fx._tmp.path().join("volume").join("repo")).unwrap();
+    // Initialized under the working passcommand.
+    write_unavailable_config(&fx, None, &logging_passcommand(&fx), "");
+    fx.init_repos(&cfg);
+    write_unavailable_config(&fx, None, &failing, "");
+    let _ = std::fs::remove_file(&log);
+
+    let output = fx.run(&["--config", &cfg, "backup"]);
+    let err = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    assert_eq!(
+        hook_log(&log),
+        ["before_backup", "pass", "failed_backup", "finally_backup"]
+    );
+}
+
+/// A passphrase piped on stdin is read once: a wrong one fails, and the next
+/// line is not taken as a second try.
+#[test]
+#[cfg(unix)]
+fn cli_wrong_piped_passphrase_is_read_once() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let fx = CliFixture::new();
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\nsources:\n  - path: {}\n    label: src-a\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&fx.source_a),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+
+    let mut child = Command::new(vykar_binary_path())
+        .args(["--config", &cfg, "list"])
+        .envs(fx.test_env())
+        .env_remove("VYKAR_PASSPHRASE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("wrong\n{TEST_PASS}\n").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let err = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    assert!(!err.contains("Incorrect passphrase"), "{err}");
+    // The failure is the refused passphrase, not the setup.
+    assert!(err.contains("passphrase"), "{err}");
 }

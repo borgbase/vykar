@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
-use vykar_core::app::{OpsError, OpsResult, operations};
+use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::app::service::HookedCommand;
+use vykar_core::app::{AppService, OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
 use vykar_core::repo::control::CancelToken;
@@ -10,7 +12,7 @@ use vykar_types::error::Result;
 use crate::cancel::CancelSlot;
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
-use crate::repo_helpers::{PassphraseRun, send_log, with_passphrase_retry};
+use crate::repo_helpers::{DialogPrompt, PassphraseRun, run_with_passphrase, send_log};
 
 use super::WorkerContext;
 
@@ -20,7 +22,7 @@ use super::WorkerContext;
 ///
 /// The guard borrows only the individual channel/flag fields it needs (not the
 /// whole [`WorkerContext`]), so handlers can still mutably borrow disjoint ctx
-/// fields (e.g. `ctx.passphrases`) while a guard is live.
+/// fields (e.g. `ctx.service`) while a guard is live.
 pub(super) struct OpGuard<'a> {
     ui_tx: &'a Sender<UiEvent>,
     /// Cleared on drop; set for every operation so the tray (and window) can
@@ -162,7 +164,7 @@ const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 /// drop it.
 ///
 /// `run` receives the cancel token rather than reading it off the context: the
-/// context is mutably borrowed here for the passphrase cache, so a closure
+/// context is mutably borrowed here for the app service, so a closure
 /// capturing `ctx` would not borrow-check.
 ///
 /// Mount deliberately does **not** use this: it interleaves
@@ -187,9 +189,7 @@ pub(super) fn with_repo_op<T>(
     };
 
     let cancel = ctx.cancel_requested.current();
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        run(repo, pass, &cancel)
-    });
+    let outcome = run_with_passphrase(&mut ctx.service, repo, |pass| run(repo, pass, &cancel));
 
     match outcome {
         Ok(PassphraseRun::Ran(value)) => Ok(value),
@@ -214,7 +214,7 @@ pub(super) fn with_hooked_repo_op<T>(
     ctx: &mut WorkerContext,
     repo_name: &str,
     status: impl Into<String>,
-    command: &'static str,
+    command: HookedCommand,
     mut run: impl FnMut(&ResolvedRepo, Option<&str>, &CancelToken) -> Result<T>,
 ) -> std::result::Result<T, String> {
     let mut guard = OpGuard::ui(
@@ -230,53 +230,53 @@ pub(super) fn with_hooked_repo_op<T>(
 
     let ui_tx = &ctx.ui_tx;
     let cancel = ctx.cancel_requested.current();
-    let passphrases = &mut ctx.passphrases;
-    let mut canceled = false;
-    let outcome = operations::run_command_with_hook_warnings(
+    let command_name = command.name();
+    // A dismissed prompt is a skip, so `finally` hooks run but `after` hooks do not.
+    let outcome = ctx.service.run_hooked(
         repo,
         command,
+        false,
+        &mut DialogPrompt,
         &mut |w| send_log(ui_tx, format!("[{repo_name}] hook warning: {w}")),
-        || match with_passphrase_retry(repo, passphrases, 3, |pass| run(repo, pass, &cancel))? {
-            PassphraseRun::Ran(value) => Ok(value),
-            // A skip, so `finally` hooks run but `after` hooks do not.
-            PassphraseRun::Canceled => {
-                canceled = true;
-                Err(OpsError::Skipped(PASSPHRASE_CANCELLED.to_string()))
-            }
-        },
+        |pass| pass.with(|p| run(repo, p, &cancel).map_err(OpsError::from)),
     );
 
     match outcome {
         Ok(value) => Ok(value),
-        Err(OpsError::Skipped(_)) if canceled => {
+        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
             send_log(ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
             Err("passphrase required".to_string())
         }
         Err(OpsError::Skipped(reason)) => {
-            send_log(ui_tx, format!("[{repo_name}] {command} skipped: {reason}"));
+            send_log(
+                ui_tx,
+                format!("[{repo_name}] {command_name} skipped: {reason}"),
+            );
             Err(reason)
         }
         Err(e) => {
-            guard.fail(format!("[{repo_name}] {command} failed: {e}"));
+            guard.fail(format!("[{repo_name}] {command_name} failed: {e}"));
             Err(e.to_string())
         }
     }
 }
 
+/// Backup of `sources` with progress in the status bar, through the app
+/// service: the dialog comes after the repo `before` hooks.
 pub(super) fn run_selection_with_progress(
+    service: &mut AppService,
     ui_tx: &Sender<UiEvent>,
     cancel: &CancelToken,
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
-    passphrase: Option<&str>,
 ) -> OpsResult<operations::BackupRunReport> {
     let repo_name = repo.label_or_url().to_string();
     let mut tracker = BackupStatusTracker::new(repo_name.clone());
     let ui_tx_progress = ui_tx.clone();
-    operations::run_backup_selection(
+    service.backup(
         repo,
         sources,
-        passphrase,
+        &mut DialogPrompt,
         cancel,
         false,
         Some(&mut |evt| match evt {

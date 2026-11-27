@@ -13,13 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
-use vykar_core::app::passphrase::configured_passphrase;
-use vykar_core::app::preflight::UnavailableRepo;
+use vykar_core::app::AppService;
+use vykar_core::app::passphrase::{NoPrompt, configured_passphrase};
 use vykar_core::app::scheduler::{SchedulePlan, SchedulerLock};
+use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::config::{self, ConfigSource, ResolvedRepo, ScheduleConfig};
 use vykar_types::error::VykarError;
 
-use crate::dispatch::{run_default_actions, warn_if_untrusted_rest};
+use crate::cycle::CycleRenderer;
+use crate::dispatch::warn_if_untrusted_rest;
 use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
@@ -155,6 +157,9 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
     })?;
 
     let mut repos = load_daemon_config(&source)?;
+    // Caches accepted passphrases across cycles; a reload drops those whose
+    // source changed.
+    let mut service = AppService::new();
 
     let started_at = Instant::now();
     let status = status::new_shared();
@@ -205,7 +210,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                         "configuration reloaded successfully"
                     );
                     repos = new_repos;
-                    crate::passphrase::clear_passphrase_cache();
+                    service.reload(&repos);
                     status::init(&status, &repos, started_at);
                     send_configure(&status_tx, &repos);
 
@@ -232,8 +237,14 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             TRIGGER.store(false, Ordering::SeqCst);
             tracing::info!("SIGUSR1 received, triggering immediate backup");
             // An ad-hoc trigger runs every repository regardless of cadence.
-            let all: Vec<&ResolvedRepo> = repos.iter().collect();
-            run_cycle(&all, &repos, &status, &status_tx, &cycle_running);
+            run_cycle(
+                &mut service,
+                RepoSelection::All,
+                &repos,
+                &status,
+                &status_tx,
+                &cycle_running,
+            );
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
@@ -252,9 +263,14 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
 
         let due = plan.due(SystemTime::now());
         if !due.is_empty() {
-            let due_repos: Vec<&ResolvedRepo> =
-                due.iter().filter_map(|&idx| repos.get(idx)).collect();
-            run_cycle(&due_repos, &repos, &status, &status_tx, &cycle_running);
+            run_cycle(
+                &mut service,
+                RepoSelection::Indices(due.clone()),
+                &repos,
+                &status,
+                &status_tx,
+                &cycle_running,
+            );
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
@@ -320,104 +336,127 @@ fn send_configure(tx: &Sender<worker::Msg>, repos: &[ResolvedRepo]) {
 /// and which were skipped. The message goes first so the worker applies the
 /// skip marks before it is allowed to do I/O again.
 fn run_cycle(
-    due: &[&ResolvedRepo],
+    service: &mut AppService,
+    selection: RepoSelection,
     all: &[ResolvedRepo],
     status: &SharedStatus,
     status_tx: &Sender<worker::Msg>,
     cycle_running: &AtomicBool,
 ) {
     cycle_running.store(true, Ordering::SeqCst);
-    let report = run_backup_cycle(due, all, status);
+    let names = run_backup_cycle(service, selection, all, status);
     let _ = status_tx.send(worker::Msg::CycleDone {
-        ran: report.ran,
-        skipped: report.skipped,
+        ran: names.ran,
+        skipped: names.skipped,
     });
     cycle_running.store(false, Ordering::SeqCst);
 }
 
 /// Repositories a cycle reached, by name. Repos not reached because of
 /// `SHUTDOWN` are in neither list.
-struct CycleReport {
+struct CycleNames {
     ran: Vec<String>,
     skipped: Vec<String>,
 }
 
-/// Run a backup cycle for the `due` repositories.
-///
-/// `all` is the full configured set: it decides whether the
-/// `=== Repo ===` headers print, which must not switch off just because
-/// a single repo came due.
+/// Run a backup cycle for the `selection` of `all`, the full configured set:
+/// it decides whether the `=== Repo ===` headers print, which must not switch
+/// off just because a single repo came due.
 fn run_backup_cycle(
-    due: &[&ResolvedRepo],
+    service: &mut AppService,
+    selection: RepoSelection,
     all: &[ResolvedRepo],
     status: &SharedStatus,
-) -> CycleReport {
+) -> CycleNames {
+    run_backup_cycle_report(service, selection, all, status).0
+}
+
+/// [`run_backup_cycle`], also returning the core report (tests).
+fn run_backup_cycle_report(
+    service: &mut AppService,
+    selection: RepoSelection,
+    all: &[ResolvedRepo],
+    status: &SharedStatus,
+) -> (CycleNames, CycleReport) {
     tracing::info!("backup cycle starting");
     status::record_cycle_start(status);
     let cycle_start = Instant::now();
-    let mut had_error = false;
-    let mut had_partial = false;
-    let mut attempted = 0usize;
-    let mut skipped = 0usize;
-    let mut report = CycleReport {
-        ran: Vec::new(),
-        skipped: Vec::new(),
-    };
 
     let multi = all.len() > 1;
-
-    for repo in due {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            tracing::info!("shutdown signal received, skipping remaining repos");
-            break;
-        }
-
-        let name = repo.label_or_url();
-
-        if multi {
-            eprintln!("=== Repository: {name} ===");
-            if repo.label.is_some() {
-                eprintln!("url: {}", repo.config.repository.url);
-            }
-        }
-
-        warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
-
-        attempted += 1;
-        match run_default_actions(
-            repo,
-            crate::signal::shutdown_token(),
-            0,
-            &[],
-            UnavailableRepo::Skip,
-        ) {
-            Ok(outcome) => {
-                if outcome.partial {
-                    tracing::warn!(repo = name, "backup cycle partial: some files were skipped");
-                    had_partial = true;
+    let mut renderer = CycleRenderer::new(0);
+    let request = CycleRequest {
+        selection,
+        ..Default::default()
+    };
+    let report = service.run_cycle(
+        all,
+        &request,
+        &mut NoPrompt,
+        crate::signal::shutdown_token(),
+        &mut |event| match event {
+            AppEvent::RepoStarted { repo, .. } => {
+                if multi {
+                    eprintln!("=== Repository: {} ===", repo.label_or_url());
+                    if repo.label.is_some() {
+                        eprintln!("url: {}", repo.config.repository.url);
+                    }
                 }
-                if let Some(reason) = outcome.skipped {
-                    if outcome.unavailable {
+                warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
+                renderer.repo_started();
+            }
+            AppEvent::Cycle { event, .. } => renderer.on_cycle_event(&event),
+            AppEvent::RepoFinished { repo, report } => {
+                renderer.repo_finished(&report.result);
+                let name = repo.label_or_url();
+                if report.result.has_failures() {
+                    tracing::error!(
+                        repo = name,
+                        error = "one or more steps failed",
+                        "backup cycle failed for repo"
+                    );
+                    return;
+                }
+                if report.result.had_partial() {
+                    tracing::warn!(repo = name, "backup cycle partial: some files were skipped");
+                }
+                if let Some(reason) = report.skipped() {
+                    if report.result.repo_unavailable {
                         tracing::warn!(repo = name, reason, "skipping unavailable repository");
                     } else {
                         tracing::info!(repo = name, reason, "backup cycle skipped");
                     }
-                    skipped += 1;
-                    report.skipped.push(name.to_string());
-                } else {
-                    report.ran.push(name.to_string());
                 }
             }
-            Err(e) => {
-                tracing::error!(repo = name, error = %e, "backup cycle failed for repo");
-                had_error = true;
-                report.ran.push(name.to_string());
-            }
+        },
+    );
+    if !report.not_reached.is_empty() {
+        tracing::info!("shutdown signal received, skipping remaining repos");
+    }
+
+    let mut names = CycleNames {
+        ran: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for r in &report.repos {
+        let name = all
+            .get(r.index)
+            .map_or("?", ResolvedRepo::label_or_url)
+            .to_string();
+        if r.skipped().is_some() {
+            names.skipped.push(name);
+        } else {
+            names.ran.push(name);
         }
     }
 
     let elapsed = cycle_start.elapsed();
-    let all_skipped = attempted > 0 && skipped == attempted;
+    let had_error = report.has_failures();
+    // Partial counts only for repositories that did not fail.
+    let had_partial = report
+        .repos
+        .iter()
+        .any(|r| !r.result.has_failures() && r.result.had_partial());
+    let all_skipped = report.all_skipped();
     if had_error {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with errors");
     } else if had_partial {
@@ -434,7 +473,7 @@ fn run_backup_cycle(
     if !SHUTDOWN.load(Ordering::SeqCst) {
         release_malloc_arenas();
     }
-    report
+    (names, report)
 }
 
 fn log_next_run(delay: Duration) {
@@ -444,4 +483,38 @@ fn log_next_run(delay: Duration) {
         delay = ?delay,
         "next backup scheduled"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vykar_core::testing::conformance;
+
+    /// The daemon's cycle over the conformance fixture reports what the core
+    /// cycle does.
+    #[test]
+    fn conformance_daemon_cycle() {
+        crate::init_test_environment();
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = conformance::fixture(tmp.path());
+        let mut service = AppService::new();
+
+        let (names, report) = run_backup_cycle_report(
+            &mut service,
+            RepoSelection::All,
+            &repos,
+            &status::new_shared(),
+        );
+
+        assert_eq!(
+            conformance::summary(&report, &repos),
+            conformance::EXPECTED_SUMMARY
+        );
+        assert_eq!(
+            conformance::hook_logs(tmp.path()),
+            conformance::EXPECTED_HOOKS
+        );
+        assert_eq!(names.ran, ["present"]);
+        assert_eq!(names.skipped, ["missing"]);
+    }
 }

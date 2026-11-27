@@ -1,7 +1,9 @@
+use vykar_core::app::AppService;
+use vykar_core::app::passphrase::RepoPassphrase;
 use vykar_core::config::ResolvedRepo;
 
 use crate::error::CliResult;
-use crate::passphrase::with_repo_passphrase;
+use crate::passphrase::TtyPrompt;
 
 /// Display name of the repo at a probe-result index. Every index handed here
 /// comes from a classifier in this module, so an out-of-range one is a bug.
@@ -38,7 +40,11 @@ pub(crate) enum SnapshotDispatch {
 
 /// Classify where a snapshot lives across multiple repos.
 /// Pure decision logic — no I/O side effects beyond the lightweight probes.
-pub(crate) fn classify_snapshot_target(snap: &str, repos: &[&ResolvedRepo]) -> SnapshotDispatch {
+pub(crate) fn classify_snapshot_target(
+    service: &mut AppService,
+    snap: &str,
+    repos: &[&ResolvedRepo],
+) -> SnapshotDispatch {
     if snap.eq_ignore_ascii_case("latest") {
         return SnapshotDispatch::RequireRepo;
     }
@@ -47,7 +53,9 @@ pub(crate) fn classify_snapshot_target(snap: &str, repos: &[&ResolvedRepo]) -> S
     let mut errors: Vec<(usize, String)> = Vec::new();
 
     for (i, repo) in repos.iter().enumerate() {
-        match probe_snapshot(&repo.config, repo.label.as_deref(), snap) {
+        let mut prompt = TtyPrompt;
+        let mut pass = service.passphrase(&repo.config, repo.label.as_deref(), &mut prompt);
+        match probe_snapshot(&mut pass, &repo.config, snap) {
             Ok(true) => matches.push(i),
             Ok(false) => {}
             Err(e) => errors.push((i, e.to_string())),
@@ -67,11 +75,11 @@ pub(crate) fn classify_snapshot_target(snap: &str, repos: &[&ResolvedRepo]) -> S
 
 /// Probe whether a repo's manifest contains a snapshot (lightweight open).
 fn probe_snapshot(
+    passphrase: &mut RepoPassphrase<'_>,
     config: &vykar_core::config::VykarConfig,
-    label: Option<&str>,
     snapshot_name: &str,
 ) -> CliResult<bool> {
-    with_repo_passphrase(config, label, |passphrase| {
+    passphrase.with(|passphrase| -> CliResult<_> {
         let repo = vykar_core::commands::util::open_repo(
             config,
             passphrase,
@@ -100,6 +108,7 @@ pub(crate) enum DiffDispatch {
 
 /// Classify where two snapshots live across multiple repos.
 pub(crate) fn classify_diff_target(
+    service: &mut AppService,
     snap_a: &str,
     snap_b: &str,
     repos: &[&ResolvedRepo],
@@ -113,8 +122,11 @@ pub(crate) fn classify_diff_target(
     let mut errors: Vec<(usize, String)> = Vec::new();
 
     for (i, repo) in repos.iter().enumerate() {
-        let a = probe_snapshot(&repo.config, repo.label.as_deref(), snap_a);
-        let b = probe_snapshot(&repo.config, repo.label.as_deref(), snap_b);
+        // One scope for both probes: one prompt per repository.
+        let mut prompt = TtyPrompt;
+        let mut pass = service.passphrase(&repo.config, repo.label.as_deref(), &mut prompt);
+        let a = probe_snapshot(&mut pass, &repo.config, snap_a);
+        let b = probe_snapshot(&mut pass, &repo.config, snap_b);
         match (a, b) {
             (Ok(found_a), Ok(found_b)) => {
                 if found_a {

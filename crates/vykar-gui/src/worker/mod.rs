@@ -22,7 +22,8 @@ mod shared;
 mod test_support;
 
 pub(super) struct WorkerContext {
-    pub(super) passphrases: HashMap<String, zeroize::Zeroizing<String>>,
+    /// Passphrase policy and the backup cycle; caches accepted passphrases.
+    pub(super) service: app::AppService,
     /// Last-known per-repo card data, keyed by repository URL. Lets a
     /// single-repo `FetchRepoInfo` re-emit a full, in-order `RepoModelData`.
     pub(super) repo_info: HashMap<String, RepoInfoData>,
@@ -156,7 +157,7 @@ pub(crate) fn run_worker(
         .unwrap_or_else(|_| runtime.source.path().to_path_buf());
 
     let mut ctx = WorkerContext {
-        passphrases: HashMap::new(),
+        service: app::AppService::new(),
         repo_info: HashMap::new(),
         config_display_path,
         runtime,

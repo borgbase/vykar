@@ -1,12 +1,12 @@
 use std::cell::Cell;
 
-use zeroize::Zeroizing;
-
 use crate::app::operations::{
-    BackupRunEvent, CycleEvent, CyclePassphrase, CycleStep, FullCycleResult, PassphraseRetry,
-    StepErrorKind, StepOutcome, run_backup_selection, run_command_with_hook_warnings,
-    run_command_with_hooks, run_full_cycle_for_repo, run_full_cycle_with_passphrase_source,
-    run_hooked_step,
+    BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepErrorKind, StepOutcome,
+    run_backup_selection, run_command_with_hook_warnings, run_command_with_hooks, run_full_cycle,
+    run_full_cycle_for_repo, run_hooked_step,
+};
+use crate::app::passphrase::{
+    INCORRECT_PASSPHRASE, PASSPHRASE_PROMPT_CANCELED, PassphraseCache, RepoPassphrase,
 };
 use crate::app::preflight::UnavailableRepo;
 use crate::app::{HookError, OpsError, OpsResult, StepError};
@@ -15,7 +15,10 @@ use crate::repo::control::CancelToken;
 use crate::testutil::{cmd_append, cmd_rename, env_word};
 use vykar_types::error::VykarError;
 
-use super::helpers::{init_repo, make_test_config, make_test_repo, resolved_repo, source_entry};
+use super::helpers::{
+    Reply, ScriptedPrompt, init_repo, make_test_config, make_test_repo, prompt_only, resolved_repo,
+    source_entry,
+};
 
 #[test]
 fn run_backup_selection_rejects_empty_sources() {
@@ -399,29 +402,36 @@ fn all_sources_skipped_is_a_repo_level_skip() {
     assert_eq!(log_lines(&log), vec!["finally"]);
 }
 
-#[test]
-fn resolver_not_called_when_backup_is_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut repo = local_repo(&tmp, &["src"]);
-    repo.repo_hooks = hooks(&[("before_backup", CMD_SKIP)]);
-    let calls = Cell::new(0);
-
-    let result = run_full_cycle_with_passphrase_source(
-        &repo,
-        &mut || {
-            calls.set(calls.get() + 1);
-            Ok(Some(Zeroizing::new(
-                crate::testing::TEST_PASSPHRASE.to_string(),
-            )))
-        },
+/// The full cycle over a prompt-only scope (`repo` must have no configured
+/// passphrase, see [`prompt_only`]).
+fn run_prompted(
+    repo: &ResolvedRepo,
+    prompt: &mut ScriptedPrompt,
+    cache: &mut PassphraseCache,
+) -> FullCycleResult {
+    let mut pass = RepoPassphrase::new(cache, prompt, &repo.config, None);
+    run_full_cycle(
+        repo,
+        &mut pass,
         &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
         &mut |_| {},
-    );
+    )
+}
 
-    assert_eq!(calls.get(), 0);
+#[test]
+fn resolver_not_called_when_backup_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
+    repo.repo_hooks = hooks(&[("before_backup", CMD_SKIP)]);
+    let mut prompt = ScriptedPrompt::new(&[]);
+
+    let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
+
+    assert_eq!(prompt.asks(), 0);
     assert!(result.backup_skipped().is_some());
 }
 
@@ -430,28 +440,23 @@ fn resolver_runs_once_after_before_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("before_ran");
     let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
     let before_cmd = crate::testutil::cmd_touch(&marker);
     repo.repo_hooks = hooks(&[("before_backup", before_cmd.as_str())]);
-    let calls = Cell::new(0);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value(crate::testing::TEST_PASSPHRASE)]);
+    let seen = marker.clone();
+    prompt.on_ask = Some(Box::new(move || {
+        assert!(seen.exists(), "before hooks run first");
+    }));
 
-    let result = run_full_cycle_with_passphrase_source(
-        &repo,
-        &mut || {
-            assert!(marker.exists(), "before hooks run first");
-            calls.set(calls.get() + 1);
-            Ok(Some(Zeroizing::new(
-                crate::testing::TEST_PASSPHRASE.to_string(),
-            )))
-        },
-        &CancelToken::new(),
-        false,
-        &[],
-        UnavailableRepo::Skip,
-        &mut |_| {},
-    );
+    let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
     assert!(!result.has_failures(), "{:?}", result.steps);
-    assert_eq!(calls.get(), 1, "memoized across backup, compact and check");
+    assert_eq!(
+        prompt.asks(),
+        1,
+        "memoized across backup, compact and check"
+    );
 }
 
 #[test]
@@ -459,25 +464,15 @@ fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("log");
     let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
     let failed = cmd_append(&log, "failed");
     let finally = cmd_append(&log, "finally");
     repo.repo_hooks = hooks(&[("failed", failed.as_str()), ("finally", finally.as_str())]);
-    let calls = Cell::new(0);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Fail("no route to host")]);
 
-    let result = run_full_cycle_with_passphrase_source(
-        &repo,
-        &mut || {
-            calls.set(calls.get() + 1);
-            Err(VykarError::Other("no route to host".into()).into())
-        },
-        &CancelToken::new(),
-        false,
-        &[],
-        UnavailableRepo::Skip,
-        &mut |_| {},
-    );
+    let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
-    assert_eq!(calls.get(), 1);
+    assert_eq!(prompt.asks(), 1);
     assert!(matches!(
         outcome(&result, CycleStep::Backup),
         StepOutcome::Failed(e)
@@ -496,6 +491,7 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("log");
     let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
     let after = cmd_append(&log, "after");
     let failed = cmd_append(&log, "failed");
     let finally = cmd_append(&log, "finally");
@@ -504,19 +500,12 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
         ("failed", failed.as_str()),
         ("finally", finally.as_str()),
     ]);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Cancel]);
 
-    let result = run_full_cycle_with_passphrase_source(
-        &repo,
-        &mut || Err(OpsError::Skipped("passphrase prompt canceled".into())),
-        &CancelToken::new(),
-        false,
-        &[],
-        UnavailableRepo::Skip,
-        &mut |_| {},
-    );
+    let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
     assert!(!result.has_failures());
-    assert_eq!(result.backup_skipped(), Some("passphrase prompt canceled"));
+    assert_eq!(result.backup_skipped(), Some(PASSPHRASE_PROMPT_CANCELED));
     assert_eq!(log_lines(&log), vec!["finally"]);
 }
 
@@ -544,25 +533,30 @@ fn unavailable_fixture(tmp: &tempfile::TempDir, log: &std::path::Path) -> Resolv
     repo
 }
 
+/// The cycle with the configured passphrase removed and a prompt that
+/// answers the test passphrase; `calls` counts the prompts.
 fn run_counting(
     repo: &ResolvedRepo,
     unavailable: UnavailableRepo,
     calls: &Cell<u32>,
 ) -> FullCycleResult {
-    run_full_cycle_with_passphrase_source(
-        repo,
-        &mut || {
-            calls.set(calls.get() + 1);
-            Ok(Some(Zeroizing::new(
-                crate::testing::TEST_PASSPHRASE.to_string(),
-            )))
-        },
+    let mut repo = repo.clone();
+    let _env = prompt_only(&mut repo.config);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value(crate::testing::TEST_PASSPHRASE)]);
+    let mut cache = PassphraseCache::default();
+    let mut pass = RepoPassphrase::new(&mut cache, &mut prompt, &repo.config, None);
+    let result = run_full_cycle(
+        &repo,
+        &mut pass,
         &CancelToken::new(),
         false,
         &[],
         unavailable,
         &mut |_| {},
-    )
+    );
+    drop(pass);
+    calls.set(prompt.asks() as u32);
+    result
 }
 
 #[test]
@@ -1046,54 +1040,6 @@ fn hooked_command_keeps_a_caller_error_type() {
 
 // ── Passphrase retry inside a step ──────────────────────────────────────────
 
-/// A passphrase source with a scripted first value and retry values.
-struct Scripted {
-    first: &'static str,
-    retries: Vec<&'static str>,
-    /// What `retry` answers once `retries` is used up.
-    exhausted: fn() -> PassphraseRetry,
-    resolves: usize,
-    retried: usize,
-    accepted: Vec<String>,
-    current: String,
-}
-
-impl Scripted {
-    fn new(first: &'static str, retries: Vec<&'static str>) -> Self {
-        Self {
-            first,
-            retries,
-            exhausted: || PassphraseRetry::GiveUp,
-            resolves: 0,
-            retried: 0,
-            accepted: Vec::new(),
-            current: String::new(),
-        }
-    }
-}
-
-impl CyclePassphrase for Scripted {
-    fn resolve(&mut self) -> OpsResult<Option<Zeroizing<String>>> {
-        self.resolves += 1;
-        self.current = self.first.to_string();
-        Ok(Some(Zeroizing::new(self.current.clone())))
-    }
-
-    fn retry(&mut self, failure: &OpsError) -> PassphraseRetry {
-        assert!(failure.is_passphrase_failure(), "{failure}");
-        self.retried += 1;
-        if self.retries.is_empty() {
-            return (self.exhausted)();
-        }
-        self.current = self.retries.remove(0).to_string();
-        PassphraseRetry::Value(Some(Zeroizing::new(self.current.clone())))
-    }
-
-    fn accepted(&mut self) {
-        self.accepted.push(self.current.clone());
-    }
-}
-
 /// `local_repo` whose backup hooks append their own names to `log`.
 fn backup_hooked_repo(tmp: &tempfile::TempDir, log: &std::path::Path) -> ResolvedRepo {
     let mut repo = local_repo(tmp, &["src"]);
@@ -1111,26 +1057,20 @@ fn backup_hooked_repo(tmp: &tempfile::TempDir, log: &std::path::Path) -> Resolve
     repo
 }
 
-fn run_with_source(repo: &ResolvedRepo, source: &mut dyn CyclePassphrase) -> FullCycleResult {
-    run_full_cycle_with_passphrase_source(
-        repo,
-        source,
-        &CancelToken::new(),
-        false,
-        &[],
-        UnavailableRepo::Skip,
-        &mut |_| {},
-    )
-}
-
+/// Also the GUI's former `cycle_retries_a_wrong_dialog_entry_once_without_rerunning_hooks`.
 #[test]
 fn refused_passphrase_is_retried_inside_the_step() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("log");
-    let repo = backup_hooked_repo(&tmp, &log);
-    let mut source = Scripted::new("wrong", vec![crate::testing::TEST_PASSPHRASE]);
+    let mut repo = backup_hooked_repo(&tmp, &log);
+    let _env = prompt_only(&mut repo.config);
+    let mut prompt = ScriptedPrompt::new(&[
+        Reply::Value("wrong"),
+        Reply::Value(crate::testing::TEST_PASSPHRASE),
+    ]);
+    let mut cache = PassphraseCache::default();
 
-    let result = run_with_source(&repo, &mut source);
+    let result = run_prompted(&repo, &mut prompt, &mut cache);
 
     assert!(
         matches!(outcome(&result, CycleStep::Backup), StepOutcome::Ok),
@@ -1138,14 +1078,13 @@ fn refused_passphrase_is_retried_inside_the_step() {
         result.steps
     );
     assert!(!result.has_failures(), "{:?}", result.steps);
-    assert_eq!(source.resolves, 1);
-    assert_eq!(source.retried, 1);
-    assert!(!source.accepted.is_empty());
-    assert!(
-        source
-            .accepted
-            .iter()
-            .all(|p| p == crate::testing::TEST_PASSPHRASE)
+    assert_eq!(
+        prompt.reasons,
+        vec![None, Some(INCORRECT_PASSPHRASE.to_string())]
+    );
+    assert_eq!(
+        cache.get(&repo.config).as_deref().map(String::as_str),
+        Some(crate::testing::TEST_PASSPHRASE)
     );
     assert_eq!(
         log_lines(&log),
@@ -1158,20 +1097,11 @@ fn refused_passphrase_without_retry_fails_as_passphrase_and_check_still_runs() {
     let tmp = tempfile::tempdir().unwrap();
     let mut repo = local_repo(&tmp, &["src"]);
     repo.config.check.max_percent = 100;
-    let calls = Cell::new(0);
+    repo.config.encryption.passphrase = Some("wrong".into());
+    let mut prompt = ScriptedPrompt::new(&[]);
+    let mut cache = PassphraseCache::default();
 
-    let result = run_full_cycle_with_passphrase_source(
-        &repo,
-        &mut || {
-            calls.set(calls.get() + 1);
-            Ok(Some(Zeroizing::new("wrong".to_string())))
-        },
-        &CancelToken::new(),
-        false,
-        &[],
-        UnavailableRepo::Skip,
-        &mut |_| {},
-    );
+    let result = run_prompted(&repo, &mut prompt, &mut cache);
 
     assert!(
         matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Passphrase),
@@ -1183,17 +1113,24 @@ fn refused_passphrase_without_retry_fails_as_passphrase_and_check_still_runs() {
         "{:?}",
         result.steps
     );
-    assert_eq!(calls.get(), 1);
+    assert_eq!(prompt.asks(), 0);
+    assert!(!cache.contains(&repo.config));
 }
 
 #[test]
 fn source_that_gives_up_skips_check() {
     let tmp = tempfile::tempdir().unwrap();
     let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
     repo.config.check.max_percent = 100;
-    let mut source = Scripted::new("wrong", Vec::new());
+    let mut prompt = ScriptedPrompt::new(&[
+        Reply::Value("wrong"),
+        Reply::Value("wrong"),
+        Reply::Value("wrong"),
+    ]);
+    let mut cache = PassphraseCache::default();
 
-    let result = run_with_source(&repo, &mut source);
+    let result = run_prompted(&repo, &mut prompt, &mut cache);
 
     assert!(
         matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Passphrase),
@@ -1205,23 +1142,22 @@ fn source_that_gives_up_skips_check() {
         "{:?}",
         result.steps
     );
-    assert_eq!(source.retried, 1);
-    assert!(source.accepted.is_empty());
+    assert_eq!(prompt.asks(), 3);
+    assert!(!cache.contains(&repo.config));
 }
 
 #[test]
 fn retry_cancel_skips_the_step() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("log");
-    let repo = backup_hooked_repo(&tmp, &log);
-    let mut source = Scripted::new("wrong", Vec::new());
-    source.exhausted =
-        || PassphraseRetry::Stop(OpsError::Skipped("passphrase prompt canceled".into()));
+    let mut repo = backup_hooked_repo(&tmp, &log);
+    let _env = prompt_only(&mut repo.config);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value("wrong"), Reply::Cancel]);
 
-    let result = run_with_source(&repo, &mut source);
+    let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
     assert!(!result.has_failures(), "{:?}", result.steps);
-    assert_eq!(result.backup_skipped(), Some("passphrase prompt canceled"));
+    assert_eq!(result.backup_skipped(), Some(PASSPHRASE_PROMPT_CANCELED));
     assert_eq!(log_lines(&log), vec!["before_backup", "finally_backup"]);
 }
 
@@ -1229,10 +1165,12 @@ fn retry_cancel_skips_the_step() {
 fn passphrase_is_not_accepted_without_an_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut repo = local_repo(&tmp, &["src"]);
+    let _env = prompt_only(&mut repo.config);
     repo.repo_hooks = hooks(&[("before_backup", "exit 3")]);
-    let mut source = Scripted::new(crate::testing::TEST_PASSPHRASE, Vec::new());
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value(crate::testing::TEST_PASSPHRASE)]);
+    let mut cache = PassphraseCache::default();
 
-    let result = run_with_source(&repo, &mut source);
+    let result = run_prompted(&repo, &mut prompt, &mut cache);
 
     assert!(
         matches!(outcome(&result, CycleStep::Backup), StepOutcome::Failed(e) if e.kind == StepErrorKind::Hook),
@@ -1244,7 +1182,7 @@ fn passphrase_is_not_accepted_without_an_open() {
         "{:?}",
         result.steps
     );
-    assert!(source.accepted.is_empty(), "{:?}", source.accepted);
+    assert!(!cache.contains(&repo.config));
 }
 
 #[test]

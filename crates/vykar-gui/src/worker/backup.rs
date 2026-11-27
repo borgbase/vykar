@@ -1,13 +1,12 @@
-use vykar_core::app::preflight::UnavailableRepo;
+use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::app::{OpsError, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{BackupStatusTracker, format_check_status, format_step_outcome};
-use crate::repo_helpers::{
-    PassphraseRun, cycle_passphrase, log_backup_report, send_log, with_passphrase_retry,
-};
+use crate::repo_helpers::{DialogPrompt, log_backup_report, send_log};
 
 use super::WorkerContext;
 use super::shared::{OpGuard, run_selection_with_progress};
@@ -39,8 +38,13 @@ fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) 
 
 /// Run a full cycle over the configured repositories, optionally restricted to
 /// `only` (per-repo schedules). Names are matched as produced by
-/// `ResolvedRepo::label_or_url`.
-fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[String]>) {
+/// `ResolvedRepo::label_or_url`. Returns the core report (`None` when nothing
+/// matched); handlers ignore it, tests read it.
+fn run_backup_cycle(
+    ctx: &mut WorkerContext,
+    scheduled: bool,
+    only: Option<&[String]>,
+) -> Option<CycleReport> {
     let status = if scheduled {
         "Running scheduled backup cycle..."
     } else {
@@ -69,7 +73,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
                 ),
             );
         }
-        return;
+        return None;
     }
 
     let mut any_snapshots_created = false;
@@ -78,91 +82,101 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
     // a per-iteration flash that a later success would visually overwrite).
     let mut failures: Vec<(String, String)> = Vec::new();
     let total = selected.len();
-    for (i, &repo_idx) in selected.iter().enumerate() {
-        if ctx.cancel_requested.is_cancelled() {
-            send_log(&ctx.ui_tx, "Backup cancelled by user.");
-            break;
-        }
-
-        let Some(repo) = ctx.runtime.repos.get(repo_idx) else {
-            continue;
-        };
-        let repo_name = repo.label_or_url().to_string();
-        let _ = ctx.ui_tx.send(UiEvent::Status(format!(
-            "[{}] ({}/{total})...",
-            repo_name,
-            i + 1
-        )));
-
-        let mut tracker = BackupStatusTracker::new(repo_name.clone());
-        let ui_tx_progress = ctx.ui_tx.clone();
-        let rn = repo_name.clone();
-        let mut passphrase = cycle_passphrase(repo, &mut ctx.passphrases, 3);
-        let result = operations::run_full_cycle_with_passphrase_source(
-            repo,
-            &mut passphrase,
-            &ctx.cancel_requested.current(),
-            false,
-            &[],
-            UnavailableRepo::Skip,
-            &mut |event| match &event {
-                operations::CycleEvent::StepStarted(step) => {
-                    let _ = ui_tx_progress.send(UiEvent::Status(format!(
-                        "[{rn}] {}...",
-                        step.command_name()
-                    )));
+    // `OpGuard` installed this operation's token; it is not renewed until the next one.
+    let cancel = ctx.cancel_requested.current();
+    let ui_tx = ctx.ui_tx.clone();
+    let mut tracker: Option<BackupStatusTracker> = None;
+    let request = CycleRequest {
+        selection: RepoSelection::Indices(selected),
+        ..Default::default()
+    };
+    let report = ctx.service.run_cycle(
+        &ctx.runtime.repos,
+        &request,
+        &mut DialogPrompt,
+        &cancel,
+        &mut |event| match event {
+            AppEvent::RepoStarted {
+                repo,
+                position,
+                total,
+                ..
+            } => {
+                let rn = repo.label_or_url().to_string();
+                let _ = ui_tx.send(UiEvent::Status(format!(
+                    "[{rn}] ({}/{total})...",
+                    position + 1
+                )));
+                tracker = Some(BackupStatusTracker::new(rn));
+            }
+            AppEvent::Cycle { repo, event } => {
+                let rn = repo.label_or_url();
+                match &event {
+                    operations::CycleEvent::StepStarted(step) => {
+                        let _ = ui_tx.send(UiEvent::Status(format!(
+                            "[{rn}] {}...",
+                            step.command_name()
+                        )));
+                    }
+                    operations::CycleEvent::Backup(BackupProgressEvent::Warning { message }) => {
+                        send_log(&ui_tx, format!("[{rn}] warning: {message}"));
+                    }
+                    operations::CycleEvent::Backup(evt) => {
+                        if let Some(status) = tracker.as_mut().and_then(|t| t.format(evt)) {
+                            let _ = ui_tx.send(UiEvent::Status(status));
+                        }
+                    }
+                    operations::CycleEvent::Check(evt) => {
+                        let _ = ui_tx.send(UiEvent::Status(format_check_status(rn, evt)));
+                    }
+                    operations::CycleEvent::HookWarning { warning, .. } => {
+                        send_log(&ui_tx, format!("[{rn}] hook warning: {warning}"));
+                    }
+                    operations::CycleEvent::StepWarning { step, message } => {
+                        send_log(
+                            &ui_tx,
+                            format!("[{rn}] {} warning: {message}", step.command_name()),
+                        );
+                    }
+                    _ => {}
                 }
-                operations::CycleEvent::Backup(BackupProgressEvent::Warning { message }) => {
-                    send_log(&ui_tx_progress, format!("[{rn}] warning: {message}"));
+            }
+            AppEvent::RepoFinished { repo, report } => {
+                let repo_name = repo.label_or_url().to_string();
+                let result = &report.result;
+                if let Some(ref backup) = result.backup_report {
+                    if !backup.created.is_empty() {
+                        any_snapshots_created = true;
+                    }
+                    log_backup_report(&ui_tx, &repo_name, backup);
                 }
-                operations::CycleEvent::Backup(evt) => {
-                    if let Some(status) = tracker.format(evt) {
-                        let _ = ui_tx_progress.send(UiEvent::Status(status));
+                for (step, outcome) in &result.steps {
+                    let msg = format_step_outcome(&repo_name, *step, outcome);
+                    if !msg.is_empty() {
+                        send_log(&ui_tx, msg);
                     }
                 }
-                operations::CycleEvent::Check(evt) => {
-                    let _ = ui_tx_progress.send(UiEvent::Status(format_check_status(&rn, evt)));
-                }
-                operations::CycleEvent::HookWarning { warning, .. } => {
-                    send_log(&ui_tx_progress, format!("[{rn}] hook warning: {warning}"));
-                }
-                operations::CycleEvent::StepWarning { step, message } => {
-                    send_log(
-                        &ui_tx_progress,
-                        format!("[{rn}] {} warning: {message}", step.command_name()),
-                    );
-                }
-                _ => {}
-            },
-        );
 
-        if let Some(ref report) = result.backup_report {
-            if !report.created.is_empty() {
-                any_snapshots_created = true;
+                if result.has_failures() {
+                    let reason = result
+                        .steps
+                        .iter()
+                        .filter_map(|(step, o)| match o {
+                            operations::StepOutcome::Failed(e) => {
+                                Some(format!("{} failed: {e}", step.command_name()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    failures.push((repo_name, reason));
+                }
             }
-            log_backup_report(&ctx.ui_tx, &repo_name, report);
-        }
-        for (step, outcome) in &result.steps {
-            let msg = format_step_outcome(&repo_name, *step, outcome);
-            if !msg.is_empty() {
-                send_log(&ctx.ui_tx, msg);
-            }
-        }
+        },
+    );
 
-        if result.has_failures() {
-            let reason = result
-                .steps
-                .iter()
-                .filter_map(|(step, o)| match o {
-                    operations::StepOutcome::Failed(e) => {
-                        Some(format!("{} failed: {e}", step.command_name()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            failures.push((repo_name.clone(), reason));
-        }
+    if !report.not_reached.is_empty() {
+        send_log(&ctx.ui_tx, "Backup cancelled by user.");
     }
 
     if !failures.is_empty() {
@@ -181,6 +195,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
         let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
         let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
     }
+    Some(report)
 }
 
 pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
@@ -211,18 +226,16 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
         format!("Running backup for [{rn}]..."),
     );
 
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        run_selection_with_progress(
-            &ctx.ui_tx,
-            &ctx.cancel_requested.current(),
-            repo,
-            &repo.sources,
-            pass,
-        )
-    });
+    let outcome = run_selection_with_progress(
+        &mut ctx.service,
+        &ctx.ui_tx,
+        &ctx.cancel_requested.current(),
+        repo,
+        &repo.sources,
+    );
 
     match outcome {
-        Ok(PassphraseRun::Ran(report)) => {
+        Ok(report) => {
             if !report.created.is_empty() {
                 let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
                     repo_selector: rn.clone(),
@@ -234,7 +247,7 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
                 guard.fail(format!("[{rn}] backup failed: {summary}"));
             }
         }
-        Ok(PassphraseRun::Canceled) => {
+        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
             send_log(
                 &ctx.ui_tx,
                 format!("[{rn}] passphrase prompt canceled; skipping."),
@@ -298,18 +311,16 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
             i + 1
         )));
 
-        let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-            run_selection_with_progress(
-                &ctx.ui_tx,
-                &ctx.cancel_requested.current(),
-                repo,
-                &matching_sources,
-                pass,
-            )
-        });
+        let outcome = run_selection_with_progress(
+            &mut ctx.service,
+            &ctx.ui_tx,
+            &ctx.cancel_requested.current(),
+            repo,
+            &matching_sources,
+        );
 
         match outcome {
-            Ok(PassphraseRun::Ran(report)) => {
+            Ok(report) => {
                 if !report.created.is_empty() {
                     any_backed_up = true;
                 }
@@ -318,7 +329,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
                     failures.push((repo_name.clone(), summary));
                 }
             }
-            Ok(PassphraseRun::Canceled) => {
+            Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
                 send_log(
                     &ctx.ui_tx,
                     format!("[{repo_name}] passphrase prompt canceled; skipping."),
@@ -635,6 +646,8 @@ mod tests {
     /// no passphrase probe.
     #[test]
     fn cycle_opens_the_repository_as_often_as_the_core_cycle() {
+        use vykar_core::app::AppService;
+        use vykar_core::app::passphrase::NoPrompt;
         use vykar_core::repo::control::CancelToken;
         use vykar_core::testing::count_repo_opens;
 
@@ -642,77 +655,45 @@ mod tests {
         let b = initialized_harness();
 
         let ((), gui) = count_repo_opens(|| handle_backup_all(&mut a.ctx, true));
-        let repo_b = b.ctx.runtime.repos.first().unwrap();
-        let (result, core) = count_repo_opens(|| {
-            operations::run_full_cycle_for_repo(
-                repo_b,
-                Some(vykar_core::testing::TEST_PASSPHRASE),
+        let (report, core) = count_repo_opens(|| {
+            AppService::new().run_cycle(
+                &b.ctx.runtime.repos,
+                &CycleRequest::default(),
+                &mut NoPrompt,
                 &CancelToken::new(),
-                false,
-                &[],
-                UnavailableRepo::Skip,
                 &mut |_| {},
             )
         });
 
         let (logs, errors) = drain(&a.ui_rx);
         assert!(errors.is_empty(), "{errors:?} {logs:?}");
-        assert!(!result.has_failures(), "{:?}", result.steps);
+        assert!(!report.has_failures());
         assert!(core > 0);
         assert_eq!(gui, core);
-        let url = &a.ctx.runtime.repos.first().unwrap().config.repository.url;
-        assert_eq!(
-            a.ctx.passphrases.get(url).map(|p| p.as_str()),
-            Some(vykar_core::testing::TEST_PASSPHRASE)
-        );
+        let repo = a.ctx.runtime.repos.first().unwrap();
+        assert!(a.ctx.service.is_cached(&repo.config));
     }
 
+    /// The GUI cycle over the conformance fixture reports what the core cycle
+    /// does, without a red status.
     #[test]
-    fn cycle_retries_a_wrong_dialog_entry_once_without_rerunning_hooks() {
-        use crate::repo_helpers::CyclePassphraseRetry;
-        use vykar_core::repo::control::CancelToken;
+    fn conformance_gui_cycle() {
+        use vykar_core::testing::conformance;
 
-        let h = initialized_harness();
-        let repo = h.ctx.runtime.repos.first().unwrap();
-        let url = repo.config.repository.url.clone();
-        let mut cache = std::collections::HashMap::new();
-        let mut lines: Vec<String> = Vec::new();
-        let mut responses = vec!["wrong", vykar_core::testing::TEST_PASSPHRASE];
-        let mut source = CyclePassphraseRetry::new(url.clone(), &mut cache, 3, |line: &str| {
-            lines.push(line.to_string());
-            Ok((
-                Some(zeroize::Zeroizing::new(responses.remove(0).to_string())),
-                true,
-            ))
-        });
+        let mut h = test_support::harness(conformance::config_yaml);
+        conformance::init_present(&h.ctx.runtime.repos);
 
-        let result = operations::run_full_cycle_with_passphrase_source(
-            repo,
-            &mut source,
-            &CancelToken::new(),
-            false,
-            &[],
-            UnavailableRepo::Skip,
-            &mut |_| {},
-        );
-        drop(source);
+        let report = run_backup_cycle(&mut h.ctx, true, None).unwrap();
+        let (logs, errors) = drain(&h.ui_rx);
 
-        assert!(
-            matches!(
-                result.steps.first(),
-                Some((operations::CycleStep::Backup, operations::StepOutcome::Ok))
-            ),
-            "{:?}",
-            result.steps
-        );
-        assert_eq!(lines, ["", "Incorrect passphrase. Please try again."]);
+        assert!(errors.is_empty(), "{errors:?} {logs:?}");
         assert_eq!(
-            cache.get(&url).map(|p| p.as_str()),
-            Some(vykar_core::testing::TEST_PASSPHRASE)
+            conformance::summary(&report, &h.ctx.runtime.repos),
+            conformance::EXPECTED_SUMMARY
         );
         assert_eq!(
-            hook_log(&h),
-            vec!["before_backup", "after_backup", "finally_backup"]
+            conformance::hook_logs(h.tmp.path()),
+            conformance::EXPECTED_HOOKS
         );
     }
 

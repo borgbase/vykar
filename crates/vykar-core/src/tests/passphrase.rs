@@ -4,7 +4,7 @@
 use zeroize::Zeroizing;
 
 use crate::app::passphrase::{
-    InitPassphrase, InitPromptStage, PassphrasePrompt, reset_env_passphrase_cache,
+    InitPassphrase, InitPromptStage, PromptContext, reset_env_passphrase_cache,
     resolve_init_passphrase, resolve_passphrase,
 };
 use crate::config::EncryptionModeConfig;
@@ -162,7 +162,7 @@ fn resolve_passphrase_passes_prompt_context() {
     config.encryption.passcommand = None;
     set_vykar_passphrase(None);
 
-    let mut seen_prompt: Option<PassphrasePrompt> = None;
+    let mut seen_prompt: Option<PromptContext> = None;
     let pass = resolve_passphrase(&config, Some("repo-1"), |prompt| {
         seen_prompt = Some(prompt);
         Ok(Some(Zeroizing::new("prompt-pass".into())))

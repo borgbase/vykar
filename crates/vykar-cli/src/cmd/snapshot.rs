@@ -11,9 +11,9 @@ use vykar_core::repo::control::CancelToken;
 use crate::cli::{SnapshotCommand, SortField};
 use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
-use crate::passphrase::with_repo_passphrase;
 use crate::table::{CliTableTheme, add_kv_row};
 use vykar_common::display::{format_duration_seconds, format_optional_size, format_size_delta};
+use vykar_core::app::passphrase::RepoPassphrase;
 
 fn normalize_path_filter(raw: &str) -> String {
     let s = raw.trim_prefix("./");
@@ -23,8 +23,8 @@ fn normalize_path_filter(raw: &str) -> String {
 pub(crate) fn run_snapshot_command(
     command: &SnapshotCommand,
     config: &VykarConfig,
-    label: Option<&str>,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     match command {
         SnapshotCommand::List {
@@ -42,7 +42,9 @@ pub(crate) fn run_snapshot_command(
                 .map(normalize_path_filter)
                 .filter(|f| !f.is_empty());
             let mut items = Vec::new();
-            with_repo_passphrase(config, label, |passphrase| {
+            passphrase.with(|passphrase| -> CliResult<_> {
+                // A refused passphrase runs this again: start over.
+                items.clear();
                 let push = |item| {
                     items.push(item);
                     Ok(())
@@ -98,11 +100,11 @@ pub(crate) fn run_snapshot_command(
         }
         SnapshotCommand::Delete {
             snapshots, dry_run, ..
-        } => super::delete::run_delete(config, label, snapshots, *dry_run, cancel),
+        } => super::delete::run_delete(config, snapshots, *dry_run, cancel, passphrase),
         SnapshotCommand::Diff {
             snapshot_a,
             snapshot_b,
-        } => run_snapshot_diff(config, label, snapshot_a, snapshot_b),
+        } => run_snapshot_diff(config, snapshot_a, snapshot_b, passphrase),
         SnapshotCommand::Find {
             path,
             source,
@@ -115,10 +117,10 @@ pub(crate) fn run_snapshot_command(
             smaller,
             ..
         } => run_snapshot_find(
-            config, label, path, source, last, name, iname, entry_type, since, larger, smaller,
+            config, path, source, last, name, iname, entry_type, since, larger, smaller, passphrase,
         ),
         SnapshotCommand::Info { snapshot, .. } => {
-            let meta = with_repo_passphrase(config, label, |passphrase| {
+            let meta = passphrase.with(|passphrase| -> CliResult<_> {
                 Ok(commands::list::get_snapshot_meta(
                     config, passphrase, snapshot,
                 )?)
@@ -191,11 +193,11 @@ pub(crate) fn run_snapshot_command(
 
 fn run_snapshot_diff(
     config: &VykarConfig,
-    label: Option<&str>,
     snapshot_a: &str,
     snapshot_b: &str,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let diff = with_repo_passphrase(config, label, |passphrase| {
+    let diff = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::diff::run(
             config, passphrase, snapshot_a, snapshot_b,
         )?)
@@ -235,7 +237,6 @@ fn run_snapshot_diff(
 #[allow(clippy::too_many_arguments)]
 fn run_snapshot_find(
     config: &VykarConfig,
-    label: Option<&str>,
     path: &Option<String>,
     source: &Option<String>,
     last: &Option<u64>,
@@ -245,6 +246,7 @@ fn run_snapshot_find(
     since: &Option<String>,
     larger: &Option<String>,
     smaller: &Option<String>,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     use commands::find::{FileStatus, FindFilter, FindScope};
     use vykar_core::snapshot::item::ItemType;
@@ -300,7 +302,7 @@ fn run_snapshot_find(
         smaller_than,
     )?;
 
-    let timelines = with_repo_passphrase(config, label, |passphrase| {
+    let timelines = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::find::run(config, passphrase, &scope, &filter)?)
     })?;
 

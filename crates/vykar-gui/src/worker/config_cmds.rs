@@ -190,7 +190,7 @@ pub(super) fn apply_config(
         };
     }
     ctx.runtime.repos = repos;
-    ctx.passphrases.clear();
+    ctx.service.reload(&ctx.runtime.repos);
     ctx.repo_info.clear();
 
     // A repo-less config (starter template) has no schedule; the scheduler is

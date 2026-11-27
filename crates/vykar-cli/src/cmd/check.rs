@@ -8,18 +8,18 @@ use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_check(
     config: &VykarConfig,
-    label: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
     repair: bool,
     dry_run: bool,
     yes: bool,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
@@ -27,13 +27,19 @@ pub(crate) fn run_check(
                 "--distrust-server requires --verify-data (flag is meaningless without data verification)",
             ));
         }
-        return run_check_readonly(config, label, verify_data, distrust_server, cancel);
+        return run_check_readonly(config, verify_data, distrust_server, cancel, passphrase);
     }
 
     // --repair mode
     if dry_run {
         // Plan only: show plan and exit.
-        let result = run_repair(config, label, verify_data, RepairMode::PlanOnly, cancel)?;
+        let result = run_repair(
+            config,
+            verify_data,
+            RepairMode::PlanOnly,
+            cancel,
+            passphrase,
+        )?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         eprintln!("Dry run: no changes applied.");
@@ -48,7 +54,7 @@ pub(crate) fn run_check(
 
     if yes {
         // --yes: apply directly without confirmation.
-        let result = run_repair(config, label, verify_data, RepairMode::Apply, cancel)?;
+        let result = run_repair(config, verify_data, RepairMode::Apply, cancel, passphrase)?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         print_repair_result(&result);
@@ -56,7 +62,13 @@ pub(crate) fn run_check(
     }
 
     // Interactive: plan first, then confirm, then apply.
-    let plan_result = run_repair(config, label, verify_data, RepairMode::PlanOnly, cancel)?;
+    let plan_result = run_repair(
+        config,
+        verify_data,
+        RepairMode::PlanOnly,
+        cancel,
+        passphrase,
+    )?;
 
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
@@ -71,7 +83,7 @@ pub(crate) fn run_check(
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let mode = apply_mode_after(&plan_result.plan);
-        let result = run_repair(config, label, verify_data, mode, cancel)?;
+        let result = run_repair(config, verify_data, mode, cancel, passphrase)?;
         print_repair_result(&result);
         return Ok(());
     }
@@ -89,7 +101,7 @@ pub(crate) fn run_check(
 
     // Re-scan and apply in an exclusive session.
     let mode = apply_mode_after(&plan_result.plan);
-    let result = run_repair(config, label, verify_data, mode, cancel)?;
+    let result = run_repair(config, verify_data, mode, cancel, passphrase)?;
     print_repair_result(&result);
 
     Ok(())
@@ -108,12 +120,12 @@ fn apply_mode_after(plan: &RepairPlan) -> RepairMode {
 /// repair's exclusive session, so an earlier `PlanOnly` pass never carries state forward.
 fn run_repair(
     config: &VykarConfig,
-    label: Option<&str>,
     verify_data: bool,
     mode: RepairMode,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<RepairResult> {
-    with_repo_passphrase(config, label, |passphrase| {
+    passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::check::run_with_repair(
             config,
             passphrase,
@@ -127,12 +139,12 @@ fn run_repair(
 
 fn run_check_readonly(
     config: &VykarConfig,
-    label: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let result = with_repo_passphrase(config, label, |passphrase| {
+    let result = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::check::run_with_progress(
             config,
             passphrase,

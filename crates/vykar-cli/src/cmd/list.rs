@@ -5,16 +5,16 @@ use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
 use crate::error::CliResult;
-use crate::passphrase::with_repo_passphrase;
 use crate::table::CliTableTheme;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_list(
     config: &VykarConfig,
-    label: Option<&str>,
     source_filter: &[String],
     last: Option<usize>,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let listing = with_repo_passphrase(config, label, |passphrase| {
+    let listing = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::list::list_snapshots_with_stats(
             config, passphrase,
         )?)

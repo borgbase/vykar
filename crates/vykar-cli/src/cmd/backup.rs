@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 
-use vykar_core::app::operations::{self, BackupRunEvent};
+use vykar_core::app::AppService;
+use vykar_core::app::operations::BackupRunEvent;
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 use vykar_core::repo::control::CancelToken;
@@ -8,7 +9,7 @@ use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::{print_backup_stats, print_dataless_summary};
-use crate::passphrase::with_repo_passphrase;
+use crate::passphrase::TtyPrompt;
 use crate::progress::BackupProgressRenderer;
 
 pub(crate) struct BackupRunOpts<'a> {
@@ -24,7 +25,13 @@ pub(crate) struct BackupRunOpts<'a> {
 
 /// Returns `Ok(true)` if the backup completed with partial success (some files skipped),
 /// `Ok(false)` for full success.
-pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliResult<bool> {
+/// The flags are checked and the sources resolved first; the passphrase is
+/// resolved by the app service, after the repo `before` hooks.
+pub(crate) fn run_backup(
+    service: &mut AppService,
+    repo: &ResolvedRepo,
+    opts: BackupRunOpts<'_>,
+) -> CliResult<bool> {
     let BackupRunOpts {
         user_label,
         compression_override,
@@ -56,134 +63,130 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
         };
     }
 
-    let label = repo.label.as_deref();
+    let is_tty = std::io::stderr().is_terminal();
+    let show_progress = is_tty || verbose > 0;
 
-    with_repo_passphrase(&repo.config, label, |passphrase| {
-        let is_tty = std::io::stderr().is_terminal();
-        let show_progress = is_tty || verbose > 0;
+    if !source_filter.is_empty() && !paths.is_empty() {
+        return Err(CliError::from("cannot combine --source with ad-hoc paths"));
+    }
 
-        if !source_filter.is_empty() && !paths.is_empty() {
-            return Err(CliError::from("cannot combine --source with ad-hoc paths"));
-        }
+    if user_label.is_some() && paths.is_empty() {
+        return Err(CliError::from("--label can only be used with ad-hoc paths"));
+    }
 
-        if user_label.is_some() && paths.is_empty() {
-            return Err(CliError::from("--label can only be used with ad-hoc paths"));
-        }
-
-        // Resolve sources — configured, filtered, or synthesized from ad-hoc paths
-        let sources: Vec<SourceEntry> = if !paths.is_empty() {
-            let expanded: Vec<String> = paths.iter().map(|p| config::expand_tilde(p)).collect();
-            let source_label = if let Some(ref lbl) = user_label {
-                lbl.clone()
-            } else if let [only] = expanded.as_slice() {
-                config::label_from_path(only)
-            } else {
-                "adhoc".to_string()
-            };
-            vec![SourceEntry {
-                paths: expanded,
-                label: source_label,
-                exclude: repo.config.exclude_patterns.clone(),
-                exclude_if_present: repo.config.exclude_if_present.clone(),
-                one_file_system: repo.config.one_file_system,
-                git_ignore: repo.config.git_ignore,
-                xattrs_enabled: repo.config.xattrs.enabled,
-                hooks: Default::default(),
-                retention: None,
-                repos: Vec::new(),
-                command_dumps: Vec::new(),
-            }]
-        } else if repo.sources.is_empty() {
-            return Err(CliError::from(
-                "no sources configured and no paths specified",
-            ));
-        } else if !source_filter.is_empty() {
-            config::select_sources(&repo.sources, source_filter)?
-                .into_iter()
-                .cloned()
-                .collect()
+    // Resolve sources — configured, filtered, or synthesized from ad-hoc paths
+    let sources: Vec<SourceEntry> = if !paths.is_empty() {
+        let expanded: Vec<String> = paths.iter().map(|p| config::expand_tilde(p)).collect();
+        let source_label = if let Some(ref lbl) = user_label {
+            lbl.clone()
+        } else if let [only] = expanded.as_slice() {
+            config::label_from_path(only)
         } else {
-            repo.sources.clone()
+            "adhoc".to_string()
         };
+        vec![SourceEntry {
+            paths: expanded,
+            label: source_label,
+            exclude: repo.config.exclude_patterns.clone(),
+            exclude_if_present: repo.config.exclude_if_present.clone(),
+            one_file_system: repo.config.one_file_system,
+            git_ignore: repo.config.git_ignore,
+            xattrs_enabled: repo.config.xattrs.enabled,
+            hooks: Default::default(),
+            retention: None,
+            repos: Vec::new(),
+            command_dumps: Vec::new(),
+        }]
+    } else if repo.sources.is_empty() {
+        return Err(CliError::from(
+            "no sources configured and no paths specified",
+        ));
+    } else if !source_filter.is_empty() {
+        config::select_sources(&repo.sources, source_filter)?
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        repo.sources.clone()
+    };
 
-        // Delegate to core's hook-aware backup
-        let mut renderer = show_progress.then(|| BackupProgressRenderer::new(verbose, is_tty));
+    // Delegate to core's hook-aware backup
+    let mut renderer = show_progress.then(|| BackupProgressRenderer::new(verbose, is_tty));
 
-        let mut callback = |evt: BackupRunEvent| match evt {
-            BackupRunEvent::Backup(bpe) => {
-                if let Some(ref mut r) = renderer {
-                    r.on_event(bpe);
-                }
+    let mut callback = |evt: BackupRunEvent| match evt {
+        BackupRunEvent::Backup(bpe) => {
+            if let Some(ref mut r) = renderer {
+                r.on_event(bpe);
             }
-            // HookWarning: no action — tracing::warn! already fired
-            BackupRunEvent::HookWarning { .. } => {}
-            // Always printed, even without progress: the run may still end in `Err`.
-            BackupRunEvent::SourceFailed { label, error } => {
-                let line = format!("Error: source '{label}': {error}");
-                match renderer {
-                    Some(ref mut r) => r.print_line(&line),
-                    None => eprintln!("{line}"),
-                }
+        }
+        // HookWarning: no action — tracing::warn! already fired
+        BackupRunEvent::HookWarning { .. } => {}
+        // Always printed, even without progress: the run may still end in `Err`.
+        BackupRunEvent::SourceFailed { label, error } => {
+            let line = format!("Error: source '{label}': {error}");
+            match renderer {
+                Some(ref mut r) => r.print_line(&line),
+                None => eprintln!("{line}"),
             }
-        };
+        }
+    };
 
-        let result = operations::run_backup_selection(
-            &repo,
-            &sources,
-            passphrase,
-            cancel,
-            verbose >= 1,
-            Some(&mut callback),
+    let result = service.backup(
+        &repo,
+        &sources,
+        &mut TtyPrompt,
+        cancel,
+        verbose >= 1,
+        Some(&mut callback),
+    );
+
+    if let Some(ref mut r) = renderer {
+        r.finish();
+    }
+
+    let report = result?;
+
+    let mut had_partial = false;
+    for created in &report.created {
+        let stats = &created.stats;
+        if stats.errors > 0 {
+            had_partial = true;
+            eprintln!(
+                "Warning: {} file(s) could not be read and were excluded from the snapshot",
+                stats.errors
+            );
+        }
+        let paths_display = created.source_paths.join(", ");
+        println!("Snapshot created: {}", created.snapshot_name);
+        println!(
+            "  Source: {paths_display} (label: {})",
+            created.source_label
         );
-
-        if let Some(ref mut r) = renderer {
-            r.finish();
+        print_backup_stats(stats);
+        // Reported, but deliberately not folded into `had_partial` — see
+        // `print_dataless_summary`.
+        print_dataless_summary(
+            created.dataless_files_skipped,
+            created.dataless_dirs_skipped,
+        );
+    }
+    for skipped in &report.skipped {
+        eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
+    }
+    if let Some(aborted) = &report.aborted {
+        crate::format::print_aborted_run(aborted);
+        if aborted.interrupted {
+            return Err(VykarError::Interrupted.into());
         }
+    }
 
-        let report = result?;
+    if report.failure_summary().is_some() {
+        let failed = report.failed.len() + usize::from(report.aborted.is_some());
+        return Err(CliError::from(format!(
+            "{failed} of {} source(s) failed",
+            sources.len()
+        )));
+    }
 
-        let mut had_partial = false;
-        for created in &report.created {
-            let stats = &created.stats;
-            if stats.errors > 0 {
-                had_partial = true;
-                eprintln!(
-                    "Warning: {} file(s) could not be read and were excluded from the snapshot",
-                    stats.errors
-                );
-            }
-            let paths_display = created.source_paths.join(", ");
-            println!("Snapshot created: {}", created.snapshot_name);
-            println!(
-                "  Source: {paths_display} (label: {})",
-                created.source_label
-            );
-            print_backup_stats(stats);
-            // Reported, but deliberately not folded into `had_partial` — see
-            // `print_dataless_summary`.
-            print_dataless_summary(
-                created.dataless_files_skipped,
-                created.dataless_dirs_skipped,
-            );
-        }
-        for skipped in &report.skipped {
-            eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
-        }
-        if let Some(aborted) = &report.aborted {
-            crate::format::print_aborted_run(aborted);
-            if aborted.interrupted {
-                return Err(VykarError::Interrupted.into());
-            }
-        }
-
-        if report.failure_summary().is_some() {
-            let failed = report.failed.len() + usize::from(report.aborted.is_some());
-            return Err(CliError::from(format!(
-                "{failed} of {} source(s) failed",
-                sources.len()
-            )));
-        }
-
-        Ok(had_partial)
-    })
+    Ok(had_partial)
 }

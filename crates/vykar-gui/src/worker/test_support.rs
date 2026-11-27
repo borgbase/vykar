@@ -31,7 +31,7 @@ pub(super) fn harness(build_yaml: impl FnOnce(&Path) -> String) -> Harness {
     let (app_tx, app_rx) = crossbeam_channel::unbounded();
     let (sched_notify_tx, sched_rx) = crossbeam_channel::bounded(1);
     let ctx = WorkerContext {
-        passphrases: HashMap::new(),
+        service: vykar_core::app::AppService::new(),
         repo_info: HashMap::new(),
         config_display_path: path.clone(),
         runtime: vykar_core::app::RuntimeConfig {

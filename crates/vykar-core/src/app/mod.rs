@@ -8,9 +8,11 @@ pub mod operations;
 pub mod passphrase;
 pub mod preflight;
 pub mod scheduler;
+pub mod service;
 pub mod views;
 
-pub use error::{HookError, OpsError, OpsResult, StepError, StepErrorKind};
+pub use error::{HookError, OpsError, OpsResult, PassphraseFailure, StepError, StepErrorKind};
+pub use service::AppService;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

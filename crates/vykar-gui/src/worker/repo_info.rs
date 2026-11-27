@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use slint::SharedString;
-use vykar_core::app::passphrase;
 use vykar_core::app::views::{SnapshotRowView, format_last_snapshot};
+use vykar_core::app::{AppService, passphrase};
 use vykar_core::commands::info::InfoStats;
 use vykar_core::commands::{init, list};
 use vykar_core::config;
@@ -12,8 +10,8 @@ use crate::APP_TITLE;
 use crate::controllers;
 use crate::messages::{RepoInfoData, SnapshotRowData, UiEvent};
 use crate::repo_helpers::{
-    InitTarget, PassphraseRun, classify_init_target, find_repo_for_snapshot, select_repos,
-    send_log, with_passphrase_retry,
+    InitTarget, PassphraseRun, classify_init_target, find_repo_for_snapshot, run_with_passphrase,
+    select_repos, send_log,
 };
 use vykar_common::display::format_bytes;
 
@@ -71,10 +69,10 @@ fn error_repo_info(repo_name: &str, url: &str, error: &str) -> RepoInfoData {
 /// `handle_refresh_snapshots` semantics.
 ///
 /// Takes the disjoint context fields it needs (rather than `&mut WorkerContext`)
-/// so callers can iterate `ctx.runtime.repos` while mutating `ctx.passphrases`.
+/// so callers can iterate `ctx.runtime.repos` while mutating `ctx.service`.
 fn fetch_one_repo_info(
     ui_tx: &crossbeam_channel::Sender<UiEvent>,
-    passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
+    service: &mut AppService,
     repo: &config::ResolvedRepo,
 ) -> (RepoInfoData, Option<String>) {
     let repo_name = repo.label_or_url().to_string();
@@ -83,7 +81,7 @@ fn fetch_one_repo_info(
     // Stash the passphrase the probe resolved so an uninitialized-repo init can
     // reuse it (a configured passcommand is then not executed a second time).
     let mut probe_pass: Option<zeroize::Zeroizing<String>> = None;
-    let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
+    let outcome = run_with_passphrase(service, repo, |pass| {
         probe_pass = pass.map(|s| zeroize::Zeroizing::new(s.to_string()));
         vykar_core::commands::info::run(&repo.config, pass)
     });
@@ -102,7 +100,7 @@ fn fetch_one_repo_info(
         }
         Err(VykarError::RepoNotFound(_)) => match classify_init_target(&url) {
             InitTarget::Remote | InitTarget::Offerable => {
-                init_repo_interactive(ui_tx, passphrases, repo, &repo_name, &url, probe_pass)
+                init_repo_interactive(ui_tx, service, repo, &repo_name, &url, probe_pass)
             }
             // Expected for removable drives: log only, keep the footer clean.
             InitTarget::Unavailable => {
@@ -160,7 +158,7 @@ fn fetch_one_repo_info(
 /// (passphrase mismatch, init error, post-init probe error).
 fn init_repo_interactive(
     ui_tx: &crossbeam_channel::Sender<UiEvent>,
-    passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
+    service: &mut AppService,
     repo: &config::ResolvedRepo,
     repo_name: &str,
     url: &str,
@@ -277,7 +275,7 @@ fn init_repo_interactive(
         Ok(_) => {
             send_log(ui_tx, format!("[{repo_name}] Repository initialized."));
             if let Some(p) = init_pass {
-                passphrases.insert(url.to_string(), p);
+                service.remember(&repo.config, p);
             }
         }
         Err(VykarError::RepoAlreadyExists(_)) => {
@@ -357,7 +355,7 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
             repo_name,
             i + 1
         )));
-        let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+        let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.service, repo);
         if let Some(reason) = failure {
             failures.push((repo_name, reason));
         }
@@ -393,7 +391,7 @@ pub(super) fn handle_fetch_repo_info(ctx: &mut WorkerContext, repo_name: String)
         None => return,
     };
     let url = repo.config.repository.url.clone();
-    let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+    let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.service, repo);
     if let Some(reason) = failure {
         guard.fail(format!("[{repo_name}] {reason}"));
     }
@@ -429,7 +427,7 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
             break;
         }
         let repo_name = repo.label_or_url().to_string();
-        let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        let outcome = run_with_passphrase(&mut ctx.service, repo, |pass| {
             list::list_snapshots_with_stats(&repo.config, pass)
         });
 
@@ -510,7 +508,7 @@ pub(super) fn handle_fetch_snapshot_contents(
         &ctx.runtime.repos,
         &repo_name,
         &snapshot_name,
-        &mut ctx.passphrases,
+        &mut ctx.service,
     ) {
         Ok(PassphraseRun::Ran((repo, passphrase))) => {
             match list::list_snapshot_items_with_source_paths(

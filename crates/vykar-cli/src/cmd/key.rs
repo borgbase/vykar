@@ -12,7 +12,7 @@ use vykar_core::repo::identity::KeyProof;
 use vykar_core::repo::{KEY_PRIMARY, KEY_SECONDARY, KeyCopyState};
 
 use crate::error::{CliError, CliResult};
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 const ARMOR_BEGIN: &str = "-----BEGIN VYKAR REPOSITORY KEY-----";
 const ARMOR_END: &str = "-----END VYKAR REPOSITORY KEY-----";
@@ -89,12 +89,11 @@ pub(crate) fn parse_armor(text: &str) -> CliResult<KeyExport> {
 
 pub(crate) fn run_key_export(
     config: &VykarConfig,
-    label: Option<&str>,
     output: Option<&str>,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let exported = with_repo_passphrase(config, label, |passphrase| {
-        Ok(key::export(config, passphrase)?)
-    })?;
+    let exported =
+        passphrase.with(|passphrase| -> CliResult<_> { Ok(key::export(config, passphrase)?) })?;
 
     eprintln!("{}", describe_selection(exported.copies));
 
@@ -162,13 +161,13 @@ fn write_export_file(path: &Path, armor: &str) -> CliResult<()> {
 
 pub(crate) fn run_key_import(
     config: &VykarConfig,
-    label: Option<&str>,
     source: &str,
     force: bool,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     let export = parse_armor(&read_source(source)?)?;
 
-    let report = with_repo_passphrase(config, label, |passphrase| {
+    let report = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(key::import(config, passphrase, &export, force)?)
     })?;
 

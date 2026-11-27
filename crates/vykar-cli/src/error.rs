@@ -52,6 +52,13 @@ impl vykar_core::app::HookError for CliError {
     }
 }
 
+/// Only an engine error can be a refused passphrase.
+impl vykar_core::app::PassphraseFailure for CliError {
+    fn is_passphrase_failure(&self) -> bool {
+        matches!(self, Self::Vykar(e) if e.is_passphrase_failure())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

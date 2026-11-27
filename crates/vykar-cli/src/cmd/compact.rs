@@ -4,19 +4,19 @@ use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
 use crate::format::{format_bytes, parse_size};
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_compact(
     config: &VykarConfig,
-    label: Option<&str>,
     threshold: f64,
     max_repack_size: Option<String>,
     dry_run: bool,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
-    let stats = with_repo_passphrase(config, label, |passphrase| {
+    let stats = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::compact::run(
             config, passphrase, threshold, max_bytes, dry_run, cancel,
         )?)
@@ -52,10 +52,10 @@ pub(crate) fn run_compact(
 /// `vykar compact --report-unreferenced`: the counts of a mark, on stdout.
 pub(crate) fn run_report_unreferenced(
     config: &VykarConfig,
-    label: Option<&str>,
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let report = with_repo_passphrase(config, label, |passphrase| {
+    let report = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::compact::report_unreferenced(
             config, passphrase, cancel,
         )?)

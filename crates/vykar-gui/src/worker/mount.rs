@@ -3,7 +3,9 @@ use std::sync::Arc;
 use vykar_core::commands::mount::{self, MountProgressEvent};
 
 use crate::messages::UiEvent;
-use crate::repo_helpers::{PassphraseRun, find_repo_for_snapshot, send_log, with_passphrase_retry};
+use crate::repo_helpers::{
+    PassphraseRun, find_repo_for_snapshot, run_with_passphrase_value, send_log,
+};
 
 use super::WorkerContext;
 use super::shared::OpGuard;
@@ -47,8 +49,7 @@ pub(super) fn handle_start_mount(
     // Resolve repo config and passphrase.
     let (repo_cfg, pass) = match &snapshot_name {
         Some(snap) => {
-            match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, snap, &mut ctx.passphrases)
-            {
+            match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, snap, &mut ctx.service) {
                 Ok(PassphraseRun::Ran((repo, pass))) => (repo.config.clone(), pass),
                 Ok(PassphraseRun::Canceled) => {
                     send_log(
@@ -83,16 +84,12 @@ pub(super) fn handle_start_mount(
             };
             // Validate the passphrase before spawning the mount thread so a wrong
             // entry re-prompts (and is never cached) instead of failing async.
-            let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+            let outcome = run_with_passphrase_value(&mut ctx.service, repo, |pass| {
                 vykar_core::commands::info::run(&repo.config, pass)
             });
             match outcome {
-                Ok(PassphraseRun::Ran(_)) => {
-                    // The passphrase is now validated and cached; read it back
-                    // to hand to the mount thread.
-                    let pass = ctx.passphrases.get(&repo.config.repository.url).cloned();
-                    (repo.config.clone(), pass)
-                }
+                // The validated value goes to the mount thread.
+                Ok(PassphraseRun::Ran((_, pass))) => (repo.config.clone(), pass),
                 Ok(PassphraseRun::Canceled) => {
                     send_log(
                         &ctx.ui_tx,

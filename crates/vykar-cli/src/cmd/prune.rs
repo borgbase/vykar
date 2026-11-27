@@ -3,18 +3,18 @@ use vykar_core::config::{SourceEntry, VykarConfig};
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_prune(
     config: &VykarConfig,
-    label: Option<&str>,
     dry_run: bool,
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
     cancel: &CancelToken,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let (stats, list_entries) = with_repo_passphrase(config, label, |passphrase| {
+    let (stats, list_entries) = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::prune::run(
             config,
             passphrase,

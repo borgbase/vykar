@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Local, Utc};
+use vykar_core::app::service::HookedCommand;
 use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 
@@ -26,12 +27,7 @@ pub(super) fn handle_restore_selected(
         "Restoring selected items...",
     );
 
-    match find_repo_for_snapshot(
-        &ctx.runtime.repos,
-        &repo_name,
-        &snapshot,
-        &mut ctx.passphrases,
-    ) {
+    match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, &snapshot, &mut ctx.service) {
         Ok(PassphraseRun::Ran((repo, passphrase))) => {
             let path_set: std::collections::HashSet<String> = paths.into_iter().collect();
             match commands::restore::run_selected(
@@ -291,7 +287,7 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
         ctx,
         &repo_name,
         "Pruning snapshots...",
-        "prune",
+        HookedCommand::Prune,
         |repo, pass, cancel| {
             commands::prune::run(&repo.config, pass, false, false, &repo.sources, &[], cancel)
         },

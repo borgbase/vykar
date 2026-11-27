@@ -646,6 +646,8 @@ Hooks only run for `backup`, `prune`, `check`, and `compact`. The bare form (`be
 
 The CLI, the daemon and the GUI all run them, including for the GUI's Prune action. `vykar prune --compact` runs the prune hooks around prune and then the compact hooks around compact, so `after_prune` fires before compact starts; if prune fails or is skipped, compact does not run. The bare `before`, `after`, `failed` and `finally` hooks run once for each of the two commands, first with `VYKAR_COMMAND=prune` and then with `VYKAR_COMMAND=compact`. A compact failure fires the compact `failed` hooks (bare `failed` and `failed_compact`), not `failed_prune`.
 
+Dry runs (`prune --dry-run`, `compact --dry-run`, `check --repair --dry-run`) run no hooks; `vykar prune --compact --dry-run` runs neither the prune nor the compact hooks.
+
 ### Execution order
 
 1. `before` hooks run: global bare → repo bare → global specific → repo specific
@@ -695,7 +697,7 @@ What each surface reports:
 
 > **Daemon status refresh:** the status page is refreshed in the background and never delays the page or a backup cycle. A repository whose last cycle was skipped is not contacted until its next cycle runs. A repository that fails a status connect is marked `error` and not contacted again until its next cycle or a configuration reload (`SIGHUP`). Status calls do not retry. One case remains: without `on_startup`, each repository gets one status connect attempt at startup, because its hook has not run yet. Each row on the page shows its state (`pending`, `ok`, `skipped`, `error`) and when it was last refreshed.
 
-> **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first. For a local repository that is missing when a cycle starts, the CLI and daemon resolve the passphrase in that cycle after the `before` hooks, once a hook has made the repository available, and a failure to resolve it then is reported as a failed backup step (so `failed` and `finally` hooks run); a repository that stays missing is skipped without one. The daemon still validates every passphrase source at startup and on reload.
+> **Passphrases:** the CLI, the daemon and the GUI resolve the passphrase after the `before` hooks, in the first step that needs one, and then keep it for the rest of the run (the daemon and the GUI keep it until the repository's passphrase settings change). A skip hook therefore runs before any `passcommand` or prompt. A failure to resolve the passphrase is a failed step, so `failed` and `finally` hooks run; a repository that stays missing is skipped without one. A mistyped interactive entry is asked again, up to three prompts; a wrong configured passphrase is not. The daemon still validates every passphrase source at startup and on reload.
 
 ### Unavailable local repositories
 

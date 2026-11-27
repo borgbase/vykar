@@ -10,9 +10,9 @@
 use std::borrow::Cow;
 
 use rand::Rng;
-use zeroize::Zeroizing;
 
 pub use crate::app::error::{StepError, StepErrorKind};
+use crate::app::passphrase::{NoPrompt, PassphraseCache, RepoPassphrase};
 use crate::app::preflight::{self, UnavailableRepo};
 use crate::app::{HookError, OpsError, OpsResult};
 use crate::commands;
@@ -203,133 +203,6 @@ impl FullCycleResult {
             (CycleStep::Backup, StepOutcome::Skipped(reason)) => Some(reason.as_str()),
             _ => None,
         })
-    }
-}
-
-/// Where a full cycle gets its passphrase. The cycle asks lazily, inside the
-/// first step that needs one, after that step's `before` hooks.
-pub trait CyclePassphrase {
-    /// The first value. `Err(OpsError::Skipped)` skips the step without an error.
-    fn resolve(&mut self) -> OpsResult<Option<Zeroizing<String>>>;
-
-    /// The repository refused the last value (`failure.is_passphrase_failure()`)
-    /// and no step of this cycle has opened the repository with it yet.
-    fn retry(&mut self, failure: &OpsError) -> PassphraseRetry {
-        let _ = failure;
-        PassphraseRetry::NoRetry
-    }
-
-    /// A step opened the repository with the last value.
-    fn accepted(&mut self) {}
-}
-
-/// What a [`CyclePassphrase`] answers to a refused value.
-pub enum PassphraseRetry {
-    /// Another value to try in the same step, without re-running the step's
-    /// repo-level hooks.
-    Value(Option<Zeroizing<String>>),
-    /// The source asked again and that failed or was dismissed: the step ends
-    /// with this error (`OpsError::Skipped` for a dismissed prompt), and the
-    /// passphrase counts as failed for the rest of the cycle.
-    Stop(OpsError),
-    /// The source retried and has no more tries: the step fails with the
-    /// refusal, and the passphrase counts as failed for the rest of the cycle.
-    GiveUp,
-    /// The source does not retry (the default): the step fails with the
-    /// refusal and the value stays as it is, so later steps try it again.
-    NoRetry,
-}
-
-/// A plain resolver: one value, no retry.
-impl<F> CyclePassphrase for F
-where
-    F: FnMut() -> OpsResult<Option<Zeroizing<String>>>,
-{
-    fn resolve(&mut self) -> OpsResult<Option<Zeroizing<String>>> {
-        self()
-    }
-}
-
-/// Resolves a cycle's passphrase on first use, so that nothing (including a
-/// prompt or a connection) happens before the `before` hooks pass. Further
-/// values come only from [`CyclePassphrase::retry`] after a refusal.
-struct LazyPassphrase<'a> {
-    source: &'a mut dyn CyclePassphrase,
-    state: PassphraseState,
-    /// A step opened the repository with the current value. From then on a
-    /// decryption failure is damage, not a refused passphrase.
-    accepted: bool,
-}
-
-enum PassphraseState {
-    Unresolved,
-    Resolved(Option<Zeroizing<String>>),
-    /// The error went to the step that asked first; `OpsError` is not `Clone`.
-    Failed,
-}
-
-impl<'a> LazyPassphrase<'a> {
-    fn new(source: &'a mut dyn CyclePassphrase) -> Self {
-        Self {
-            source,
-            state: PassphraseState::Unresolved,
-            accepted: false,
-        }
-    }
-
-    fn failed(&self) -> bool {
-        matches!(self.state, PassphraseState::Failed)
-    }
-
-    fn get(&mut self) -> OpsResult<Option<&str>> {
-        if matches!(self.state, PassphraseState::Unresolved) {
-            match self.source.resolve() {
-                Ok(pass) => self.state = PassphraseState::Resolved(pass),
-                Err(e) => {
-                    self.state = PassphraseState::Failed;
-                    return Err(e);
-                }
-            }
-        }
-        match &self.state {
-            PassphraseState::Resolved(pass) => Ok(pass.as_deref().map(String::as_str)),
-            _ => Err(VykarError::Other("passphrase unavailable".into()).into()),
-        }
-    }
-
-    /// Runs `action` with the passphrase. When the repository refuses it before
-    /// any step opened the repository with it, the source may supply another
-    /// value and `action` runs again, inside the same step.
-    fn run<T>(&mut self, mut action: impl FnMut(Option<&str>) -> OpsResult<T>) -> OpsResult<T> {
-        loop {
-            let failure = match action(self.get()?) {
-                Ok(v) => return Ok(v),
-                // Once accepted, a decryption failure is the step's own error.
-                Err(e) if self.accepted || !e.is_passphrase_failure() => return Err(e),
-                Err(e) => e,
-            };
-            match self.source.retry(&failure) {
-                PassphraseRetry::Value(pass) => self.state = PassphraseState::Resolved(pass),
-                PassphraseRetry::Stop(e) => {
-                    self.state = PassphraseState::Failed;
-                    return Err(e);
-                }
-                PassphraseRetry::GiveUp => {
-                    self.state = PassphraseState::Failed;
-                    return Err(failure);
-                }
-                // The value stays resolved, so later steps try it again.
-                PassphraseRetry::NoRetry => return Err(failure),
-            }
-        }
-    }
-
-    /// Tells the source that a step opened the repository with the value.
-    fn accept(&mut self) {
-        if matches!(self.state, PassphraseState::Resolved(_)) {
-            self.accepted = true;
-            self.source.accepted();
-        }
     }
 }
 
@@ -554,12 +427,14 @@ fn drain_backup_warnings(
 
 // ── Public hook-aware backup API ──────────────────────────────────────────
 
-/// Run backup with full hook lifecycle (repo + source hooks).
-/// Used by: CLI `vykar backup`, GUI RunBackupRepo, GUI RunBackupSource.
-pub fn run_backup_selection(
+/// Backup with the full hook lifecycle (repo + source hooks). The passphrase
+/// is resolved inside the repo lifecycle, after its `before` hooks; a refused
+/// value is retried without re-running them. Used by
+/// [`crate::app::AppService::backup`].
+pub(crate) fn run_backup_selection_with(
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
-    passphrase: Option<&str>,
+    passphrase: &mut RepoPassphrase<'_>,
     cancel: &CancelToken,
     verbose: bool,
     on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
@@ -584,15 +459,22 @@ pub fn run_backup_selection(
         },
         &mut ctx,
         || {
-            run_backup_sources(
-                config,
-                sources,
-                passphrase,
-                repo.label.as_deref(),
-                cancel,
-                verbose,
-                &mut on_event,
-            )
+            let r = passphrase.run(|pass| {
+                run_backup_sources(
+                    config,
+                    sources,
+                    pass,
+                    repo.label.as_deref(),
+                    cancel,
+                    verbose,
+                    &mut on_event,
+                )
+            });
+            // `Ok` means a snapshot was created, so the repository opened.
+            if r.is_ok() {
+                passphrase.accept();
+            }
+            r
         },
         |r| match r.as_ref().map(BackupRunReport::failure_summary) {
             Ok(Some(summary)) => crate::hooks::Verdict::Failed(summary),
@@ -604,13 +486,31 @@ pub fn run_backup_selection(
     outer.and_then(|r| r)
 }
 
-// ── Public hook wrapper for CLI standalone commands ───────────────────────
+/// [`run_backup_selection_with`] over a fixed passphrase (tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_backup_selection(
+    repo: &ResolvedRepo,
+    sources: &[SourceEntry],
+    passphrase: Option<&str>,
+    cancel: &CancelToken,
+    verbose: bool,
+    on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
+) -> OpsResult<BackupRunReport> {
+    let mut cache = PassphraseCache::default();
+    let mut prompt = NoPrompt;
+    let mut scope = RepoPassphrase::preset(&mut cache, &mut prompt, &repo.config, passphrase);
+    run_backup_selection_with(repo, sources, &mut scope, cancel, verbose, on_event)
+}
 
-/// Wrap an action with repo-level hooks. For CLI standalone commands
-/// (prune, compact, check) that aren't part of the full cycle. The action's
-/// error type is the caller's (any [`HookError`]); hook failures and skips
-/// arrive converted from [`OpsError`].
-pub fn run_command_with_hooks<F, T, E>(
+// ── Hook wrapper for standalone commands ──────────────────────────────────
+
+/// Wrap an action with repo-level hooks, for the standalone commands (prune,
+/// compact, check) that aren't part of the full cycle; frontends reach it
+/// through [`crate::app::AppService::run_hooked`]. The action's error type is
+/// the caller's (any [`HookError`]); hook failures and skips arrive
+/// converted from [`OpsError`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_command_with_hooks<F, T, E>(
     repo: &ResolvedRepo,
     command: &str,
     action: F,
@@ -626,7 +526,7 @@ where
 /// (an `after`/`failed`/`finally` failure, already traced) to `on_warning`,
 /// for frontends that do not show tracing output. Errors as in
 /// [`run_command_with_hooks`].
-pub fn run_command_with_hook_warnings<F, T, E>(
+pub(crate) fn run_command_with_hook_warnings<F, T, E>(
     repo: &ResolvedRepo,
     command: &str,
     on_warning: &mut dyn FnMut(String),
@@ -668,8 +568,10 @@ where
 /// Hooks are run internally — callers don't need to handle them.
 /// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
 /// once the backup step's `before` hooks have run is skipped like a hook skip:
-/// only `finally` hooks run and nothing is resolved or opened.
-pub fn run_full_cycle_for_repo(
+/// only `finally` hooks run and nothing is resolved or opened. Over a fixed
+/// passphrase (tests); frontends use [`crate::app::AppService::run_cycle`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_full_cycle_for_repo(
     repo: &ResolvedRepo,
     passphrase: Option<&str>,
     cancel: &CancelToken,
@@ -678,9 +580,12 @@ pub fn run_full_cycle_for_repo(
     unavailable: UnavailableRepo,
     on_event: &mut dyn FnMut(CycleEvent),
 ) -> FullCycleResult {
-    run_full_cycle_with_passphrase_source(
+    let mut cache = PassphraseCache::default();
+    let mut prompt = NoPrompt;
+    let mut scope = RepoPassphrase::preset(&mut cache, &mut prompt, &repo.config, passphrase);
+    run_full_cycle(
         repo,
-        &mut || Ok(passphrase.map(|p| Zeroizing::new(p.to_string()))),
+        &mut scope,
         cancel,
         verbose,
         source_filter,
@@ -689,27 +594,24 @@ pub fn run_full_cycle_for_repo(
     )
 }
 
-/// [`run_full_cycle_for_repo`] for callers whose passphrase step is expensive or
-/// connects to the repository. Values come from `passphrase`: it is first asked
-/// inside the first step that needs one, after that step's `before` hooks pass,
-/// and at most once per cycle; a resolve failure is not retried, and
-/// `Err(OpsError::Skipped)` skips the step without reporting an error. A value
-/// the repository refuses is offered to [`CyclePassphrase::retry`] in the same
-/// step, as long as no step has opened the repository with it;
-/// [`CyclePassphrase::accepted`] is called once a step has.
+/// The full cycle over a passphrase scope. The passphrase is first resolved
+/// inside the first step that needs one, after that step's `before` hooks
+/// pass, and at most once per cycle; a resolve failure is not retried, and a
+/// dismissed prompt skips the step without reporting an error. A value the
+/// repository refuses is replaced by the scope in the same step (see
+/// [`RepoPassphrase`]), as long as no step has opened the repository with it.
 /// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
 /// once the backup step's `before` hooks have run is skipped like a hook skip:
 /// only `finally` hooks run and nothing is resolved or opened.
-pub fn run_full_cycle_with_passphrase_source(
+pub(crate) fn run_full_cycle(
     repo: &ResolvedRepo,
-    passphrase: &mut dyn CyclePassphrase,
+    passphrase: &mut RepoPassphrase<'_>,
     cancel: &CancelToken,
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
     on_event: &mut dyn FnMut(CycleEvent),
 ) -> FullCycleResult {
-    let mut passphrase = LazyPassphrase::new(passphrase);
     let config = &repo.config;
     let sources = &repo.sources;
 
@@ -1087,118 +989,5 @@ fn drain_cycle_warnings(
             scope: HookScope::Repo,
             warning,
         });
-    }
-}
-
-#[cfg(test)]
-mod lazy_passphrase_tests {
-    use super::*;
-
-    /// Resolves "first"; each `retry` pops the next answer.
-    struct Source {
-        answers: Vec<PassphraseRetry>,
-        retried: usize,
-        accepted: usize,
-    }
-
-    impl CyclePassphrase for Source {
-        fn resolve(&mut self) -> OpsResult<Option<Zeroizing<String>>> {
-            Ok(Some(Zeroizing::new("first".into())))
-        }
-
-        fn retry(&mut self, _failure: &OpsError) -> PassphraseRetry {
-            self.retried += 1;
-            self.answers.remove(0)
-        }
-
-        fn accepted(&mut self) {
-            self.accepted += 1;
-        }
-    }
-
-    fn source(answers: Vec<PassphraseRetry>) -> Source {
-        Source {
-            answers,
-            retried: 0,
-            accepted: 0,
-        }
-    }
-
-    fn refused<T>() -> OpsResult<T> {
-        Err(VykarError::DecryptionFailed.into())
-    }
-
-    #[test]
-    fn retry_value_runs_the_action_again() {
-        let mut src = source(vec![PassphraseRetry::Value(Some(Zeroizing::new(
-            "second".into(),
-        )))]);
-        let mut lazy = LazyPassphrase::new(&mut src);
-        let mut seen = Vec::new();
-        let r = lazy.run(|pass| {
-            seen.push(pass.unwrap().to_string());
-            if pass == Some("second") {
-                Ok(1)
-            } else {
-                refused()
-            }
-        });
-        assert_eq!(r.unwrap(), 1);
-        assert_eq!(seen, ["first", "second"]);
-        lazy.accept();
-        assert!(!lazy.failed());
-        assert_eq!(src.retried, 1);
-        assert_eq!(src.accepted, 1);
-    }
-
-    #[test]
-    fn no_retry_keeps_the_value() {
-        let mut src = source(vec![PassphraseRetry::NoRetry]);
-        let mut lazy = LazyPassphrase::new(&mut src);
-        let r = lazy.run(|_| refused::<()>());
-        assert!(r.unwrap_err().is_passphrase_failure());
-        assert!(!lazy.failed());
-        assert_eq!(lazy.get().unwrap(), Some("first"));
-    }
-
-    #[test]
-    fn give_up_and_stop_end_the_passphrase() {
-        let mut src = source(vec![PassphraseRetry::GiveUp]);
-        let mut lazy = LazyPassphrase::new(&mut src);
-        assert!(
-            lazy.run(|_| refused::<()>())
-                .unwrap_err()
-                .is_passphrase_failure()
-        );
-        assert!(lazy.failed());
-
-        let mut src = source(vec![PassphraseRetry::Stop(OpsError::Skipped("c".into()))]);
-        let mut lazy = LazyPassphrase::new(&mut src);
-        let e = lazy.run(|_| refused::<()>()).unwrap_err();
-        assert!(matches!(e, OpsError::Skipped(r) if r == "c"));
-        assert!(lazy.failed());
-    }
-
-    #[test]
-    fn after_accept_a_decryption_failure_is_not_retried() {
-        let mut src = source(Vec::new());
-        let mut lazy = LazyPassphrase::new(&mut src);
-        lazy.run(|_| Ok(())).unwrap();
-        lazy.accept();
-        let e = lazy.run(|_| refused::<()>()).unwrap_err();
-        assert!(matches!(e, OpsError::Engine(VykarError::DecryptionFailed)));
-        assert!(!lazy.failed());
-        assert_eq!(src.retried, 0);
-    }
-
-    #[test]
-    fn other_errors_are_not_retried() {
-        let mut src = source(Vec::new());
-        let mut lazy = LazyPassphrase::new(&mut src);
-        let e = lazy
-            .run(|_| Err::<(), _>(VykarError::Interrupted.into()))
-            .unwrap_err();
-        assert!(matches!(e, OpsError::Engine(VykarError::Interrupted)));
-        assert_eq!(src.retried, 0);
     }
 }

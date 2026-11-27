@@ -351,6 +351,82 @@ impl Drop for EnvGuard {
     }
 }
 
+/// One answer of a [`ScriptedPrompt`].
+#[derive(Clone, Copy, Debug)]
+pub enum Reply {
+    Value(&'static str),
+    Cancel,
+    Unavailable,
+    /// The prompt itself fails, with `VykarError::Other` of this text.
+    Fail(&'static str),
+}
+
+/// A passphrase prompt that answers from a script, in order, and records the
+/// `retry_reason` of every ask. Panics when asked more often than scripted.
+pub struct ScriptedPrompt {
+    replies: std::collections::VecDeque<Reply>,
+    pub reasons: Vec<Option<String>>,
+    /// Runs at every ask, before the answer (e.g. to assert a hook ran first).
+    pub on_ask: Option<Box<dyn FnMut()>>,
+}
+
+impl ScriptedPrompt {
+    pub fn new(replies: &[Reply]) -> Self {
+        Self {
+            replies: replies.iter().copied().collect(),
+            reasons: Vec::new(),
+            on_ask: None,
+        }
+    }
+
+    pub fn asks(&self) -> usize {
+        self.reasons.len()
+    }
+}
+
+impl crate::app::passphrase::PassphrasePrompt for ScriptedPrompt {
+    fn ask(
+        &mut self,
+        _ctx: &crate::app::passphrase::PromptContext,
+        retry_reason: Option<&str>,
+    ) -> vykar_types::error::Result<crate::app::passphrase::PromptReply> {
+        use crate::app::passphrase::PromptReply;
+        self.reasons.push(retry_reason.map(str::to_string));
+        if let Some(on_ask) = &mut self.on_ask {
+            on_ask();
+        }
+        match self.replies.pop_front().expect("a scripted reply") {
+            Reply::Value(v) => Ok(PromptReply::Value(zeroize::Zeroizing::new(v.to_string()))),
+            Reply::Cancel => Ok(PromptReply::Cancel),
+            Reply::Unavailable => Ok(PromptReply::Unavailable),
+            Reply::Fail(msg) => Err(vykar_types::error::VykarError::Other(msg.into())),
+        }
+    }
+}
+
+/// Holds `CWD_LOCK` with `VYKAR_PASSPHRASE` unset and its memo reset, so a
+/// config without a passphrase source reaches the prompt. Fields drop in
+/// order: the variable is restored before the lock is released.
+pub struct PromptOnly {
+    _env: EnvGuard,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Remove `config`'s configured passphrase and return a [`PromptOnly`] guard.
+pub fn prompt_only(config: &mut VykarConfig) -> PromptOnly {
+    let lock = crate::testutil::CWD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let env = EnvGuard::unset("VYKAR_PASSPHRASE");
+    crate::app::passphrase::reset_env_passphrase_cache();
+    config.encryption.passphrase = None;
+    config.encryption.passcommand = None;
+    PromptOnly {
+        _env: env,
+        _lock: lock,
+    }
+}
+
 /// A resolved repo identified only by URL and label — for selector tests, which
 /// never open the repository.
 pub fn make_test_repo(url: &str, label: Option<&str>) -> ResolvedRepo {

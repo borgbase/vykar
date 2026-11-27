@@ -6,7 +6,7 @@ use vykar_core::repo::{UpgradeOutcome, WriterMode, WriterModeReport};
 
 use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
-use crate::passphrase::with_repo_passphrase;
+use vykar_core::app::passphrase::RepoPassphrase;
 
 /// The line `vykar info` and a plain `vykar upgrade` add for a single-writer
 /// repository whose storage offers put-if-absent.
@@ -16,9 +16,9 @@ pub(crate) const MULTI_WRITER_HINT: &str = "This storage offers put-if-absent: \
 
 pub(crate) fn run_upgrade(
     config: &VykarConfig,
-    label: Option<&str>,
     yes: bool,
     mode: Option<WriterMode>,
+    passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
     if !yes {
         if !io::stdin().is_terminal() {
@@ -48,7 +48,7 @@ pub(crate) fn run_upgrade(
         }
     }
 
-    let outcome = with_repo_passphrase(config, label, |passphrase| {
+    let outcome = passphrase.with(|passphrase| -> CliResult<_> {
         Ok(commands::upgrade::run_with_mode(config, passphrase, mode)?)
     })?;
 

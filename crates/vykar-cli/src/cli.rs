@@ -265,7 +265,8 @@ pub(crate) enum Commands {
 
         /// Remove only stale markers (45 minutes old on the storage's clock,
         /// or of a process gone on this machine), without asking; for
-        /// unattended use
+        /// unattended use. Lock files under locks/ are removed only on a v6
+        /// repository; on a v2/v3 one, where they can be live, they are left
         #[arg(long)]
         stale: bool,
     },

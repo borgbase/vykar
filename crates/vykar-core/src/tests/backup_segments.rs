@@ -270,3 +270,45 @@ fn a_recovered_pack_that_is_not_used_stays_out_of_the_segment() {
     );
     assert_eq!(seg.pack_trailers.len(), 1);
 }
+
+/// `vykar clear-sessions --stale` keeps an interrupted session's journal
+/// (`sessions::clear_stale_sessions` skips the reap's journal pass): after
+/// two runs the next session still recovers from it.
+#[test]
+fn clear_stale_sessions_keeps_a_journal_the_next_session_recovers() {
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::with_mtimes());
+    let mut repo = init(&mem);
+    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    store(&repo, &mut ws, b"committed first");
+    commit(&mut repo, ws, "s0");
+    drop(repo);
+
+    let interrupted = open(&mem);
+    let mut wi = interrupted.begin_write_session(&WriteSessionOptions {
+        session_id: "interrupted".into(),
+        ..WriteSessionOptions::default()
+    });
+    store(&interrupted, &mut wi, b"stored by the interrupted session");
+    wi.flush_packs(&interrupted).unwrap();
+    wi.flush_on_abort(&interrupted);
+    drop(interrupted);
+    assert!(mem.exists("sessions/interrupted.index").unwrap());
+
+    for _ in 0..2 {
+        crate::repo::sessions::clear_stale_sessions(mem.as_ref(), &crate::repo::HostEnv::system())
+            .unwrap();
+    }
+    assert!(mem.exists("sessions/interrupted.index").unwrap());
+
+    let repo = open(&mem);
+    let mut ws = repo.begin_write_session(&WriteSessionOptions {
+        session_id: "recovering".into(),
+        ..WriteSessionOptions::default()
+    });
+    // The recovering session's own marker gives recovery "now".
+    mem.put("sessions/recovering.json", b"{}").unwrap();
+    let recovered = ws
+        .recover_pending_index(&repo, &crate::repo::control::CancelToken::new())
+        .unwrap();
+    assert_eq!(recovered.recovered_chunks, 1);
+}

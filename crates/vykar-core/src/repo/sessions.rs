@@ -331,6 +331,46 @@ pub fn clear_legacy_locks(storage: &dyn StorageBackend) -> Result<usize> {
     Ok(removed)
 }
 
+/// What `config` says about `locks/` ([`legacy_locks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyLocks {
+    /// `config` decodes as the current format (v6): no vykar that can open
+    /// the repository writes or reads `locks/`, so everything there is dead.
+    Dead,
+    /// `config` is of another version (`version`: v2/v3, where `locks/*.json`
+    /// are the live locks of vykar 0.24 clients or the legacy key of a
+    /// running upgrade, or a newer one): `locks/` may be live.
+    NotCurrent {
+        /// The version `config` names.
+        version: u32,
+    },
+    /// `config` could not be read or decoded (the reason): `locks/` may be
+    /// live.
+    Unknown(String),
+}
+
+/// Whether everything under `locks/` is dead, from the stored `config`
+/// alone: one GET and a decode (`RepoConfig::decode`, as `vykar upgrade`
+/// reads it before rewriting it), no passphrase and no validation beyond the
+/// version. `vykar clear-sessions --stale` removes `locks/` only on
+/// [`LegacyLocks::Dead`]. Never fails: a failed GET, a missing or an
+/// undecodable `config` is [`LegacyLocks::Unknown`].
+pub fn legacy_locks(storage: &dyn StorageBackend) -> LegacyLocks {
+    let bytes = match storage.get("config") {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return LegacyLocks::Unknown("no config".into()),
+        Err(e) => return LegacyLocks::Unknown(e.to_string()),
+    };
+    match super::RepoConfig::decode(&bytes) {
+        Ok(super::DecodedConfig::Map(c)) if c.version == super::MAP_CONFIG_VERSION => {
+            LegacyLocks::Dead
+        }
+        Ok(super::DecodedConfig::Map(c)) => LegacyLocks::NotCurrent { version: c.version },
+        Ok(super::DecodedConfig::Positional(c)) => LegacyLocks::NotCurrent { version: c.version },
+        Err(e) => LegacyLocks::Unknown(e.to_string()),
+    }
+}
+
 // ── Session markers ──────────────────────────────────────────────────────
 
 /// Prefix of every session object: the markers `sessions/<id>.json`
@@ -2075,8 +2115,9 @@ pub struct StaleSessionsCleared {
     pub live: Vec<LiveSession>,
     /// Whether "now" on the store's clock was read. `false`: the clock
     /// probe failed or was listed without an mtime; no marker listed with an
-    /// mtime is then stale by age, only markers of this machine whose
-    /// process is provably gone are removed.
+    /// mtime is then stale by age (one of this machine whose process is
+    /// provably gone still is removed, and one listed without an mtime is
+    /// judged by its own timestamps, as reaping does).
     pub store_now_known: bool,
 }
 
@@ -2086,17 +2127,19 @@ pub struct StaleSessionsCleared {
 /// (`StoreClock::in_sessions`, the existing-pack check's: the mtime the
 /// store gives an object this call writes), since this caller has no
 /// marker of its own; a failed probe is "now unknown" (fail closed). Then
-/// `cleanup_stale_sessions_keeping` judges every session as the reapers do
+/// `reap_sessions` (the reap of `cleanup_stale_sessions_keeping`, without
+/// its second pass) judges every session as the reapers do
 /// (`judge_session`: stale past `SESSION_STALE_SECS` on that clock, or left
 /// on this machine by a process that is provably gone, `same_host`) and
-/// deletes only the
-/// listed keys of the sessions it judged stale. A heartbeat that writes a
+/// deletes only the listed keys of the sessions it judged stale. A heartbeat that writes a
 /// session's next key after the listing is not deleted (no key is ever
 /// written twice) and its writer sees its superseded key gone. A live
 /// marker, committing, compacting or exclusive alike, is never touched.
-/// Journals and probe debris are handled as maintenance's reap handles
-/// them (a cleaned session's journal kept for recovery, older orphans and
-/// old probes removed). Needs no passphrase and no registration.
+/// Nothing else under `sessions/` is touched: a crash-recovery journal
+/// (`sessions/<id>.index`) stays, also one whose marker is gone, so the
+/// next backup can still recover from it (only maintenance's reap removes
+/// orphan journals), and old probe debris stays for maintenance too. Needs
+/// no passphrase and no registration.
 ///
 /// # Errors
 ///
@@ -2106,8 +2149,13 @@ pub fn clear_stale_sessions(
     env: &HostEnv,
 ) -> Result<StaleSessionsCleared> {
     let now = super::ages::StoreClock::in_sessions().now(storage, env).0;
-    let (removed, live) =
-        cleanup_stale_sessions_keeping(storage, default_stale_session_duration(), env, now)?;
+    let (removed, live, _) = reap_sessions(
+        storage,
+        default_stale_session_duration(),
+        env,
+        ReapNow::Known(now),
+        false,
+    )?;
     Ok(StaleSessionsCleared {
         removed,
         live,

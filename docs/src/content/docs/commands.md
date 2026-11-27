@@ -51,7 +51,7 @@ See [Maintain the Repository](/maintenance).
 | `vykar check` | Verify repository integrity (`--verify-data` for full content verification, `--repair` to fix problems) |
 | `vykar snapshot delete` | Delete one or more snapshots (the space is freed by the next `compact`) |
 | `vykar delete` | Delete an entire repository permanently |
-| `vykar clear-sessions` | Remove leftover lock files under `locks/` (vykar 0.24, an interrupted upgrade) without asking, then list every session marker and remove them all after confirmation; without a terminal it fails when any marker exists. `--stale` removes only stale markers (45 minutes old on the storage's clock, or of a process gone on this machine), without asking and also without a terminal (see [Remove stale session markers](/maintenance#remove-stale-session-markers)) |
+| `vykar clear-sessions` | Remove leftover lock files under `locks/` (vykar 0.24, an interrupted upgrade) without asking, then list every session marker and remove them all after confirmation; without a terminal it fails when any marker exists. `--stale` removes only stale markers (45 minutes old on the storage's clock, or of a process gone on this machine), without asking and also without a terminal; it removes the lock files only on a v6 repository and leaves them on a v2/v3 one, where they can be live (see [Remove stale session markers](/maintenance#remove-stale-session-markers)) |
 | `vykar upgrade` | Upgrade a v2/v3 repository to format v6 in place, writing a pack map for every existing pack (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)); `--commit-mode single|multi` switches a v6 repository's commit mode (see [Commit mode](/maintenance#commit-mode)) |
 
 ## Common flags

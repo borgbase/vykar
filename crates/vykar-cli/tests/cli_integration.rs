@@ -1125,6 +1125,11 @@ fn cli_clear_sessions_stale_removes_only_stale_markers_without_a_terminal() {
     let out = stdout(&removed);
     assert!(out.contains("Removed 1 leftover lock file(s)"), "{out}");
     assert!(
+        !stderr(&removed).contains("Left locks/ alone"),
+        "{}",
+        stderr(&removed)
+    );
+    assert!(
         out.contains(&format!(
             "Removed {expected} stale session(s); 0 live session(s) left."
         )),
@@ -1182,6 +1187,93 @@ fn cli_clear_sessions_stale_removes_only_stale_markers_without_a_terminal() {
         stderr(&plain)
     );
     assert!(live_shared.exists() && live_exclusive_key.exists());
+}
+
+/// `clear-sessions --stale` on a copy of the frozen v3 fixture: a lock file
+/// under `locks/` can be live there (a 0.24 client, a running upgrade), so it
+/// stays, and stderr says why in one line.
+#[test]
+fn cli_clear_sessions_stale_leaves_locks_on_a_v3_repository() {
+    let fx = CliFixture::new();
+    let archive =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vykar-core/tests/fixtures/v3-none.tar.gz");
+    let unpacked = fx._tmp.path().join("v3");
+    tar::Archive::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(&archive).unwrap(),
+    ))
+    .unpack(&unpacked)
+    .unwrap();
+    let repo = unpacked.join("repo");
+    std::fs::create_dir_all(repo.join("locks")).unwrap();
+    let planted = repo.join("locks/planted.json");
+    std::fs::write(&planted, br#"{"hostname":"h","pid":1}"#).unwrap();
+    write_test_config(&fx.config_path, &repo);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let out = fx.run(&["--config", &cfg, "clear-sessions", "--stale"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(planted.exists());
+    let err = stderr(&out);
+    assert!(
+        err.contains("Left locks/ alone: on a format v3 repository its files can be live"),
+        "{err}"
+    );
+    assert!(
+        !stdout(&out).contains("leftover lock file"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// `clear-sessions --stale` where the clock probe's PUT fails (`sessions/`
+/// read-only): it warns on stderr that markers listed with a modification
+/// time were not judged by age, removes nothing, and succeeds.
+#[cfg(unix)]
+#[test]
+fn cli_clear_sessions_stale_warns_when_the_clock_probe_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = CliFixture::new();
+    write_test_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+    let sessions = fx.repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let marker = sessions.join("00000000000000000000000000000001.json");
+    std::fs::write(
+        &marker,
+        br#"{"hostname":"gone-host","pid":5,"registered_at":"2020-01-01T00:00:00Z","last_refresh":"2020-01-01T00:00:00Z","elapsed_secs":0}"#,
+    )
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&marker)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(46 * 60))
+        .unwrap();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(sessions.join("writable"), b"").is_ok() {
+        // Running as root: the directory stays writable, nothing to test.
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let out = fx.run(&["--config", &cfg, "clear-sessions", "--stale"]);
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(
+            "Warning: the storage's clock could not be read; markers the storage lists with a \
+             modification time were not judged by age"
+        ),
+        "{err}"
+    );
+    assert!(
+        stdout(&out).contains("Removed 0 stale session(s); 1 live session(s) left."),
+        "{}",
+        stdout(&out)
+    );
+    assert!(marker.exists());
 }
 
 /// The command was `break-lock` until it became `clear-sessions`, with no

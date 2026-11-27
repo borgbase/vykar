@@ -14,9 +14,12 @@ use crate::error::{CliError, CliResult};
 /// Without a terminal it refuses (an error) whenever a marker exists, after
 /// the lock files were removed.
 ///
-/// `stale` (`--stale`): after the lock files, remove only the markers the
-/// reapers would remove (`sessions::clear_stale_sessions`), without asking
-/// and without a terminal, and succeed whatever live markers remain.
+/// `stale` (`--stale`): remove only the markers the reapers would remove
+/// (`sessions::clear_stale_sessions`), without asking and without a
+/// terminal, and succeed whatever live markers remain. It removes `locks/`
+/// first only when `config` is of the current format (v6), where nothing
+/// there is live (`sessions::legacy_locks`); on a v2/v3 repository, or with
+/// an unreadable `config`, it leaves `locks/` alone and says so on stderr.
 pub(crate) fn run_clear_sessions(
     config: &VykarConfig,
     _label: Option<&str>,
@@ -29,17 +32,36 @@ pub(crate) fn run_clear_sessions(
             .with_cancel(crate::signal::shutdown_token().clone()),
     )?;
 
-    let removed = sessions::clear_legacy_locks(storage.as_ref())?;
+    if stale {
+        match sessions::legacy_locks(storage.as_ref()) {
+            sessions::LegacyLocks::Dead => {
+                remove_legacy_locks(storage.as_ref())?;
+            }
+            sessions::LegacyLocks::NotCurrent { version } => eprintln!(
+                "Left locks/ alone: on a format v{version} repository its files can be live \
+                 (vykar 0.24 locks, a running upgrade's key); plain `vykar clear-sessions` \
+                 removes them."
+            ),
+            sessions::LegacyLocks::Unknown(why) => eprintln!(
+                "Left locks/ alone: the repository config could not be read ({why}), so its \
+                 files may be live; plain `vykar clear-sessions` removes them."
+            ),
+        }
+        return clear_stale(storage.as_ref());
+    }
+    let removed = remove_legacy_locks(storage.as_ref())?;
+    clear_sessions(storage.as_ref(), removed)
+}
+
+/// Remove everything under `locks/` and say how many lock files went.
+fn remove_legacy_locks(storage: &dyn vykar_storage::StorageBackend) -> CliResult<usize> {
+    let removed = sessions::clear_legacy_locks(storage)?;
     if removed > 0 {
         println!(
             "Removed {removed} leftover lock file(s) (vykar 0.24, or an interrupted upgrade)."
         );
     }
-
-    if stale {
-        return clear_stale(storage.as_ref());
-    }
-    clear_sessions(storage.as_ref(), removed)
+    Ok(removed)
 }
 
 /// Remove the stale markers and report what was removed and what was left.
@@ -47,8 +69,9 @@ fn clear_stale(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> {
     let cleared = sessions::clear_stale_sessions(storage, &HostEnv::system())?;
     if !cleared.store_now_known {
         eprintln!(
-            "Warning: the storage's clock could not be read; markers were judged stale only \
-             when their process is provably gone on this machine."
+            "Warning: the storage's clock could not be read; markers the storage lists with a \
+             modification time were not judged by age (only those of a process provably gone \
+             on this machine were removed)."
         );
     }
     for id in &cleared.removed {

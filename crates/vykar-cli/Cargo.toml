@@ -43,6 +43,9 @@ tempfile.workspace = true
 ureq.workspace = true
 # `cli_integration` decodes the repository `config` to read its id.
 rmp-serde.workspace = true
+# `cli_integration` extracts a frozen v3 fixture (vykar-core/tests/fixtures).
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

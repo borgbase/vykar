@@ -3392,4 +3392,132 @@ mod clear_stale {
         assert!(!s.exists("sessions/beat.json").unwrap());
         assert!(s.exists("sessions/beat.1.json").unwrap());
     }
+    /// A failed clock-probe PUT (a store that refuses the probe) is "now
+    /// unknown", as an unlisted probe is: a marker stale by its mtime is
+    /// kept, one of a process gone on this machine still goes.
+    #[test]
+    fn a_failed_probe_put_judges_no_marker_by_age() {
+        struct NoProbePut(LocalBackend);
+        impl InnerBackend for NoProbePut {
+            fn inner_backend(&self) -> &dyn StorageBackend {
+                &self.0
+            }
+        }
+        delegate_storage_backend! {
+            for NoProbePut;
+            except [put, put_pack, begin_staged_put, conditional, profile];
+
+            // Test wrapper: keeps every write on `put`.
+            fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+                None
+            }
+
+            fn profile(&self) -> vykar_storage::BackendProfile {
+                self.0.profile()
+            }
+
+            fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+                if key.starts_with("sessions/vykar-clock-") {
+                    return Err(vykar_types::error::VykarError::Other("denied".into()));
+                }
+                self.0.put(key, data)
+            }
+
+            // Packs and staged writes never take a probe key.
+            fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+                self.0.put_pack(key, data)
+            }
+
+            fn begin_staged_put(
+                &self,
+                prefix: &str,
+            ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+                self.0.begin_staged_put(prefix)
+            }
+        }
+        let (dir, s) = local();
+        put(&s, "sessions/old.json", &other_host());
+        age(dir.path(), "sessions/old.json", STALE);
+        put(&s, "sessions/dead.json", &this_host(9));
+        let s = NoProbePut(s);
+
+        let out = clear_stale_sessions(&s, &env()).unwrap();
+        assert!(!out.store_now_known);
+        assert_eq!(out.removed, ["dead"]);
+        let live: Vec<_> = out.live.iter().map(|l| l.session_id.as_str()).collect();
+        assert_eq!(live, ["old"]);
+        assert!(s.exists("sessions/old.json").unwrap());
+    }
+
+    /// Only markers go: a crash-recovery journal whose marker is gone (an
+    /// interrupted backup's), the journal of a session removed now, and
+    /// probe debris older than `CLOCK_PROBE_DEBRIS_AGE` all stay, however
+    /// often `--stale` runs; maintenance's reap removes the orphans.
+    #[test]
+    fn journals_and_probe_debris_stay() {
+        let (dir, s) = local();
+        s.put("sessions/orphan.index", b"journal").unwrap();
+        put(&s, "sessions/old.json", &other_host());
+        s.put("sessions/old.index", b"journal").unwrap();
+        age(dir.path(), "sessions/old.json", STALE);
+        s.put("sessions/vykar-clock-debris", b"").unwrap();
+        age(
+            dir.path(),
+            "sessions/vykar-clock-debris",
+            Duration::from_secs(2 * 3600),
+        );
+
+        let first = clear_stale_sessions(&s, &env()).unwrap();
+        assert!(first.store_now_known);
+        assert_eq!(first.removed, ["old"]);
+        let second = clear_stale_sessions(&s, &env()).unwrap();
+        assert!(second.removed.is_empty());
+        let mut left = s.list("sessions/").unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "sessions/old.index",
+                "sessions/orphan.index",
+                "sessions/vykar-clock-debris",
+            ]
+        );
+    }
+
+    /// `sessions::legacy_locks` on copies of the frozen v2 and v3 fixtures
+    /// (`locks/` may be live), on a v6 config (dead), and on a missing or
+    /// undecodable config (unknown).
+    #[test]
+    fn legacy_locks_are_dead_only_on_a_v6_config() {
+        use crate::repo::sessions::{LegacyLocks, legacy_locks};
+        for (prefix, version) in [("v2", 2u32), ("v3", 3)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("{prefix}-none.tar.gz"));
+            tar::Archive::new(flate2::read::GzDecoder::new(
+                std::fs::File::open(&archive).unwrap(),
+            ))
+            .unpack(tmp.path())
+            .unwrap();
+            let repo = LocalBackend::new(tmp.path().join("repo").to_str().unwrap()).unwrap();
+            assert_eq!(legacy_locks(&repo), LegacyLocks::NotCurrent { version });
+        }
+
+        let (_dir, s) = local();
+        assert!(matches!(legacy_locks(&s), LegacyLocks::Unknown(_)));
+        s.put("config", b"\xc1").unwrap();
+        assert!(matches!(legacy_locks(&s), LegacyLocks::Unknown(_)));
+        let v6 = crate::repo::RepoConfig::new_v6(
+            vec![0u8; 32],
+            crate::chunker::ChunkerParams::default(),
+            crate::repo::EncryptionMode::Aes256Gcm,
+            Utc::now(),
+            1 << 20,
+            32 << 20,
+            vykar_types::hash::HashAlgorithm::Blake3,
+        );
+        s.put("config", &v6.encode().unwrap()).unwrap();
+        assert_eq!(legacy_locks(&s), LegacyLocks::Dead);
+    }
 }

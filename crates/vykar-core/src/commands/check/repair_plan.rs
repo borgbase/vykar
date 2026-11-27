@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::scan::ScanResult;
+use super::scan::{ScanResult, is_transient_io};
 use super::types::{IndexRecovery, IntegrityIssue, RepairAction, RepairPlan};
 use crate::commands::list::{
     for_each_decoded_item, load_item_stream_of_meta, load_snapshot_meta_of,
@@ -10,7 +10,7 @@ use crate::repo::Repo;
 use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
 use crate::snapshot::SnapshotMeta;
-use crate::snapshot::item::Item;
+use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -532,33 +532,74 @@ pub(super) fn add_pack_maps(actions: &mut Vec<RepairAction>, packs: &mut Vec<Pac
     pack_ids.dedup();
 }
 
+/// When [`reconcile_duplicate_names`] decides a name one of whose objects
+/// names a listing chunk the index lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Judge {
+    /// Before the re-index (`reindex::reindex_lost_entries`): such a name is
+    /// left undecided, its objects in the manifest, so the first scan reports
+    /// the chunks and the re-index can recover them.
+    DeferUnindexed,
+    /// After the re-index: a chunk still missing makes that object's listing
+    /// unreadable.
+    Final,
+}
+
+/// What [`reconcile_duplicate_names`] decided.
+#[derive(Debug, Default)]
+pub(super) struct Reconciled {
+    /// The removals, by ID, first after the key copies in the plan.
+    pub(super) actions: Vec<RepairAction>,
+    /// A name was left undecided ([`Judge::DeferUnindexed`]).
+    pub(super) deferred: bool,
+}
+
+impl Reconciled {
+    pub(super) fn extend(&mut self, later: Reconciled) {
+        self.actions.extend(later.actions);
+        self.deferred = later.deferred;
+    }
+}
+
 /// Reconcile the snapshot names more than one object carries, before the
-/// scan. The scan, the plan and the repair look snapshots up by name, so
-/// with two objects of one name they would check one object twice and act
-/// on the other (an interrupted rewrite's rerun deleted the blob of one
-/// entry and kept that entry, then failed its sweep with "snapshot not
-/// found").
+/// scan the plan is built from. The scan, the plan and the repair look
+/// snapshots up by name, so with two objects of one name they would check one
+/// object twice and act on the other (an interrupted rewrite's rerun deleted
+/// the blob of one entry and kept that entry, then failed its sweep with
+/// "snapshot not found").
 ///
-/// The one such pair repair recognises is its own: an item-level rewrite
-/// (`DropItemsFromSnapshot`) PUTs the rewritten object, then DELETEs the
-/// original, and a run interrupted between the two leaves both. The rewrite
-/// copies every field of the original's metadata but the listing ones
-/// (`item_ptrs`, `stats`, `ext`, `format_version`) and keeps the original's
-/// items, in order, but the dropped ones. So when two objects of one name
-/// agree on those fields and one's items are the other's with some left out
-/// (or all kept), the one with fewer is removed from `repo`'s manifest and
-/// planned for deletion ([`RepairAction::RemoveInterruptedRewrite`]): every
-/// item it has the kept one has too, so the choice cannot lose data,
-/// whichever object is which. The scan then sees the original alone and
-/// plans its rewrite again; equal objects keep the one listed first.
+/// The objects of such a name repair recognises are its own: an item-level
+/// rewrite (`DropItemsFromSnapshot`) PUTs the rewritten object, then DELETEs
+/// the original, and a run interrupted between the two leaves both (a rerun
+/// before this was fixed could leave a third). The rewrite copies every field
+/// of the original's metadata but the listing ones (`item_ptrs`, `ext`,
+/// `format_version`, and `stats.nfiles` and `stats.original_size`, which it
+/// counts from the items it keeps) and keeps the original's items, in order,
+/// but the dropped ones. So of the objects of one name whose listings can be
+/// read, the one every other is a rewrite of (see [`is_rewrite_of`]; of equal
+/// ones, the lowest ID) is kept and the others are removed from `repo`'s
+/// manifest and planned for deletion ([`RepairAction::RemoveInterruptedRewrite`]):
+/// every item they have the kept one has too, so the choice cannot lose data,
+/// whichever object is which. The scan then sees the kept object alone and
+/// plans its repair (an original is rewritten again).
 ///
-/// Any other name carried by more than one object refuses the repair,
-/// before anything is written. Reads the item streams of both objects of
-/// every such name (through the loaded index).
+/// An object whose metadata or listing cannot be read for a reason that is
+/// not transient (an undecryptable object, a listing chunk missing, with
+/// [`Judge::Final`], from the index) is removed by ID as data loss
+/// ([`RepairAction::RemoveUnreadableDuplicate`]), as repair removes a lone
+/// snapshot whose listing cannot be read, when another object of its name
+/// can be read and is kept.
+///
+/// Any other name carried by more than one object refuses the repair, before
+/// anything is written, and so does a transient read failure or an object
+/// written by a newer vykar. Reads the metadata and item streams of every
+/// object of every such name (through the loaded index), holding those of one
+/// name at once.
 pub(super) fn reconcile_duplicate_names(
     repo: &mut Repo,
+    judge: Judge,
     cancel: &CancelToken,
-) -> Result<Vec<RepairAction>> {
+) -> Result<Reconciled> {
     use std::collections::BTreeMap;
 
     let mut by_name: BTreeMap<String, Vec<SnapshotEntry>> = BTreeMap::new();
@@ -568,88 +609,188 @@ pub(super) fn reconcile_duplicate_names(
             .or_default()
             .push(entry.clone());
     }
-    let mut actions = Vec::new();
+    let mut out = Reconciled::default();
     for (name, entries) in by_name {
         if entries.len() < 2 {
             continue;
         }
-        let refuse = |why: String| {
-            let ids: Vec<String> = entries.iter().map(|e| e.id.to_hex()).collect();
-            VykarError::Other(format!(
-                "aborting repair: {} snapshot objects carry the name '{name}' ({}), and {why}; \
-                 nothing was changed",
-                entries.len(),
-                ids.join(", ")
-            ))
-        };
-        let [first, second] = entries.as_slice() else {
+        let mut readable: Vec<ReadObject> = Vec::new();
+        let mut unreadable: Vec<(SnapshotId, String)> = Vec::new();
+        let mut unindexed = false;
+        for entry in &entries {
+            match read_object(repo, entry, cancel)? {
+                Read::Listing(object) => readable.push(*object),
+                Read::Unreadable(detail) => unreadable.push((entry.id, detail)),
+                Read::Unindexed(detail) => {
+                    unindexed = true;
+                    unreadable.push((entry.id, detail));
+                }
+                Read::Gone => {
+                    // Deleted since the listing (a dry run beside a delete):
+                    // as the scan does, skipped.
+                    tracing::warn!(
+                        "snapshot object {} of '{name}' was deleted, skipping",
+                        entry.id
+                    );
+                    let id = entry.id;
+                    repo.manifest_mut().snapshots.retain(|e| e.id != id);
+                }
+            }
+        }
+        if unindexed && judge == Judge::DeferUnindexed {
+            out.deferred = true;
+            continue;
+        }
+        if readable.len() + unreadable.len() < 2 {
+            continue;
+        }
+        let refuse = |why: &str| refuse_duplicate_name(&name, &entries, why);
+        if readable.is_empty() {
+            return Err(refuse("none of their listings can be read"));
+        }
+        let Some((k, kept_id)) = choose_kept(&readable) else {
             return Err(refuse(
-                "an interrupted repair leaves at most two; repair cannot tell which to keep".into(),
+                "they are not a snapshot and its rewrites by an interrupted repair",
             ));
         };
-        let (kept, removed) = match superseded_rewrite(repo, first, second, cancel) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => {
-                return Err(refuse(
-                    "they are not a snapshot and its rewrite by an interrupted repair; repair \
-                     cannot tell which to keep"
-                        .into(),
-                ));
+        let mut removed: Vec<SnapshotId> = Vec::new();
+        for (i, object) in readable.iter().enumerate() {
+            if i == k {
+                continue;
             }
-            Err(e @ VykarError::Interrupted) => return Err(e),
-            Err(e) => {
-                return Err(refuse(format!(
-                    "repair cannot read both to tell whether one is a rewrite an interrupted \
-                     repair left: {e}"
-                )));
-            }
-        };
+            out.actions.push(RepairAction::RemoveInterruptedRewrite {
+                snapshot_name: name.clone(),
+                snapshot_id: object.id,
+                kept_id,
+            });
+            removed.push(object.id);
+        }
+        for (id, detail) in unreadable {
+            out.actions.push(RepairAction::RemoveUnreadableDuplicate {
+                snapshot_name: name.clone(),
+                snapshot_id: id,
+                kept_id,
+                detail,
+            });
+            removed.push(id);
+        }
         tracing::warn!(
             snapshot = name,
-            kept = %kept.id,
-            removed = %removed.id,
-            "two snapshot objects carry one name: an interrupted repair's rewrite beside its \
-             original; the rewrite is removed and the original repaired again"
+            kept = %kept_id,
+            removed = ?removed,
+            "several snapshot objects carry one name; all but one are removed"
         );
-        let removed_id = removed.id;
-        actions.push(RepairAction::RemoveInterruptedRewrite {
-            snapshot_name: name,
-            snapshot_id: removed_id,
-            kept_id: kept.id,
-        });
-        repo.manifest_mut().snapshots.retain(|e| e.id != removed_id);
+        repo.manifest_mut()
+            .snapshots
+            .retain(|e| !removed.contains(&e.id));
     }
-    Ok(actions)
+    Ok(out)
 }
 
-/// Of two objects of one name, `(kept, removed)` when one is the other with
-/// items left out (see [`reconcile_duplicate_names`]); `None` when they are
-/// not.
-fn superseded_rewrite<'a>(
-    repo: &mut Repo,
-    first: &'a SnapshotEntry,
-    second: &'a SnapshotEntry,
-    cancel: &CancelToken,
-) -> Result<Option<(&'a SnapshotEntry, &'a SnapshotEntry)>> {
-    let meta_first = load_snapshot_meta_of(repo, first)?;
-    let meta_second = load_snapshot_meta_of(repo, second)?;
-    if !same_but_listing(&meta_first, &meta_second) {
-        return Ok(None);
+/// The refusal for objects of one name repair cannot reconcile.
+fn refuse_duplicate_name(name: &str, entries: &[SnapshotEntry], why: &str) -> VykarError {
+    let ids: Vec<String> = entries.iter().map(|e| e.id.to_hex()).collect();
+    let first = entries.first().map(|e| e.id.to_hex()).unwrap_or_default();
+    VykarError::Other(format!(
+        "aborting repair: {} snapshot objects carry the name '{name}' ({}), and {why}; repair \
+         cannot tell which to keep, and nothing was changed. `vykar snapshot delete {name}` \
+         removes the first one listed (by time, then ID), {first}",
+        entries.len(),
+        ids.join(", ")
+    ))
+}
+
+/// An object of a duplicated name whose listing was read.
+struct ReadObject {
+    id: SnapshotId,
+    meta: SnapshotMeta,
+    items: Vec<Item>,
+}
+
+/// How reading one object of a duplicated name went.
+enum Read {
+    Listing(Box<ReadObject>),
+    /// Not for a transient reason.
+    Unreadable(String),
+    /// A listing chunk is not in the index (`ChunkNotInIndex`).
+    Unindexed(String),
+    /// The object is not on storage any more.
+    Gone,
+}
+
+/// Read `entry`'s object. Errs (refusing the repair) on a transient failure
+/// and for an object a newer vykar wrote; passes `Interrupted` on.
+fn read_object(repo: &mut Repo, entry: &SnapshotEntry, cancel: &CancelToken) -> Result<Read> {
+    let refuse_transient = |e: &VykarError| {
+        VykarError::Other(format!(
+            "aborting repair: reading snapshot object {} of '{}' failed: {e}; retry when \
+             storage is stable; nothing was changed",
+            entry.id, entry.name
+        ))
+    };
+    let meta = match load_snapshot_meta_of(repo, entry) {
+        Ok(meta) => meta,
+        Err(e @ VykarError::Interrupted) => return Err(e),
+        Err(VykarError::SnapshotNotFound(_)) => return Ok(Read::Gone),
+        Err(
+            e @ (VykarError::UnsupportedSnapshotVersion { .. }
+            | VykarError::IncompatibleSnapshotEnvelope { .. }),
+        ) => {
+            return Err(VykarError::Other(format!(
+                "aborting repair: snapshot object {} of '{}' was written by a newer vykar \
+                 ({e}); upgrade vykar — repair leaves it untouched; nothing was changed",
+                entry.id, entry.name
+            )));
+        }
+        Err(e) if is_transient_io(&e) => return Err(refuse_transient(&e)),
+        Err(e) => return Ok(Read::Unreadable(format!("load metadata: {e}"))),
+    };
+    match items_of(repo, &meta, cancel) {
+        Ok(items) => Ok(Read::Listing(Box::new(ReadObject {
+            id: entry.id,
+            meta,
+            items,
+        }))),
+        Err(e @ VykarError::Interrupted) => Err(e),
+        Err(e @ VykarError::ChunkNotInIndex(_)) => {
+            Ok(Read::Unindexed(format!("load item stream: {e}")))
+        }
+        Err(e) if is_transient_io(&e) => Err(refuse_transient(&e)),
+        Err(e) => Ok(Read::Unreadable(format!("load item stream: {e}"))),
     }
-    let items_first = items_of(repo, &meta_first, cancel)?;
-    let items_second = items_of(repo, &meta_second, cancel)?;
-    Ok(if is_subsequence(&items_second, &items_first) {
-        Some((first, second))
-    } else if is_subsequence(&items_first, &items_second) {
-        Some((second, first))
-    } else {
-        None
-    })
+}
+
+/// Of `objects`, the one every other is a rewrite of ([`is_rewrite_of`]),
+/// with its ID; of several (equal listings), the one with the lowest ID.
+/// `None` when there is none.
+fn choose_kept(objects: &[ReadObject]) -> Option<(usize, SnapshotId)> {
+    objects
+        .iter()
+        .enumerate()
+        .filter(|(k, kept)| {
+            objects
+                .iter()
+                .enumerate()
+                .all(|(i, o)| i == *k || is_rewrite_of(o, kept))
+        })
+        .min_by_key(|(_, kept)| *kept.id.as_bytes())
+        .map(|(k, kept)| (k, kept.id))
+}
+
+/// Whether `rewrite` can be an item-level rewrite of `original`, or of a
+/// rewrite of it: they agree on every field the rewrite copies (metadata
+/// and the copied stats), `rewrite`'s counted stats are those of its items,
+/// and its items are `original`'s with zero or more left out, in order.
+fn is_rewrite_of(rewrite: &ReadObject, original: &ReadObject) -> bool {
+    same_but_listing(&rewrite.meta, &original.meta)
+        && counted_stats_match(&rewrite.meta, &rewrite.items)
+        && is_subsequence(&rewrite.items, &original.items)
 }
 
 /// Whether `a` and `b` agree on every field an item-level rewrite copies
-/// from the original (all but the listing's: `item_ptrs`, `stats`, `ext`
-/// and `format_version`).
+/// from the original: all but the listing's (`item_ptrs`, `ext`,
+/// `format_version`, and the stats it counts, `nfiles` and
+/// `original_size`).
 fn same_but_listing(a: &SnapshotMeta, b: &SnapshotMeta) -> bool {
     a.name == b.name
         && a.hostname == b.hostname
@@ -661,6 +802,19 @@ fn same_but_listing(a: &SnapshotMeta, b: &SnapshotMeta) -> bool {
         && a.source_label == b.source_label
         && a.source_paths == b.source_paths
         && a.label == b.label
+        && a.stats.compressed_size == b.stats.compressed_size
+        && a.stats.deduplicated_size == b.stats.deduplicated_size
+        && a.stats.errors == b.stats.errors
+}
+
+/// Whether `meta`'s `nfiles` and `original_size` are what an item-level
+/// rewrite counts from `items` (its regular files and their sizes).
+fn counted_stats_match(meta: &SnapshotMeta, items: &[Item]) -> bool {
+    let files = items
+        .iter()
+        .filter(|i| i.entry_type == ItemType::RegularFile);
+    let (nfiles, size) = files.fold((0u64, 0u64), |(n, s), i| (n + 1, s + i.size));
+    meta.stats.nfiles == nfiles && meta.stats.original_size == size
 }
 
 fn items_of(repo: &mut Repo, meta: &SnapshotMeta, cancel: &CancelToken) -> Result<Vec<Item>> {
@@ -775,5 +929,175 @@ mod tests {
             })
             .count();
         assert_eq!(count, 1, "expected dedupe, got: {:?}", plan.actions);
+    }
+
+    // -----------------------------------------------------------------
+    // The recognition of an interrupted rewrite
+    // -----------------------------------------------------------------
+
+    fn item(path: &str, size: u64) -> Item {
+        Item {
+            path: path.into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1,
+            atime: None,
+            ctime: None,
+            size,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+            raw_names: None,
+            hardlink: None,
+        }
+    }
+
+    fn meta() -> SnapshotMeta {
+        let time = chrono::DateTime::from_timestamp(1_700_000_000, 7).unwrap();
+        SnapshotMeta {
+            name: "s".into(),
+            hostname: "h".into(),
+            username: "u".into(),
+            time,
+            time_end: time,
+            chunker_params: crate::chunker::ChunkerParams::default(),
+            comment: String::new(),
+            item_ptrs: Vec::new(),
+            stats: crate::snapshot::SnapshotStats {
+                compressed_size: 11,
+                deduplicated_size: 5,
+                errors: 1,
+                ..Default::default()
+            },
+            source_label: "src".into(),
+            source_paths: vec!["/src".into()],
+            label: String::new(),
+            ext: None,
+            format_version: crate::snapshot::CURRENT_FORMAT_VERSION,
+        }
+    }
+
+    /// An object of `items` whose counted stats are its items'.
+    fn object(id: u8, items: Vec<Item>) -> ReadObject {
+        let mut meta = meta();
+        meta.stats.nfiles = items.len() as u64;
+        meta.stats.original_size = items.iter().map(|i| i.size).sum();
+        ReadObject {
+            id: SnapshotId::from_bytes([id; 32]),
+            meta,
+            items,
+        }
+    }
+
+    #[test]
+    fn is_subsequence_of_equal_empty_and_reordered_lists() {
+        let (a, b, c) = (item("a", 1), item("b", 2), item("c", 3));
+        let abc = [a.clone(), b.clone(), c.clone()];
+        assert!(is_subsequence(&abc, &abc), "equal");
+        assert!(is_subsequence(&[], &abc), "empty in non-empty");
+        assert!(is_subsequence(&[], &[]), "empty in empty");
+        assert!(!is_subsequence(&abc, &[]), "non-empty in empty");
+        assert!(
+            is_subsequence(&[a.clone(), c.clone()], &abc),
+            "one left out"
+        );
+        assert!(!is_subsequence(&[c.clone(), a.clone()], &abc), "reordered");
+        assert!(
+            !is_subsequence(&[b.clone(), a.clone()], &[a.clone(), b.clone()]),
+            "swapped pair"
+        );
+        assert!(
+            !is_subsequence(&[a.clone(), a.clone()], std::slice::from_ref(&a)),
+            "repeated"
+        );
+        assert!(
+            !is_subsequence(&[item("a", 9)], &abc),
+            "an item that differs"
+        );
+    }
+
+    #[test]
+    fn same_but_listing_compares_what_a_rewrite_copies() {
+        let a = meta();
+        assert!(same_but_listing(&a, &a.clone()), "equal");
+
+        // What a rewrite replaces may differ.
+        let mut b = a.clone();
+        b.item_ptrs = vec![ChunkId::from_bytes([1; 32])];
+        b.ext = Some(vec![1]);
+        b.format_version = 1;
+        b.stats.nfiles = 9;
+        b.stats.original_size = 9;
+        assert!(same_but_listing(&a, &b), "the listing fields");
+
+        // What it copies may not.
+        type Change = fn(&mut SnapshotMeta);
+        let changes: [(&str, Change); 8] = [
+            ("comment", |m| m.comment = "x".into()),
+            ("hostname", |m| m.hostname = "x".into()),
+            ("time", |m| m.time += chrono::Duration::nanoseconds(1)),
+            ("time_end", |m| {
+                m.time_end += chrono::Duration::nanoseconds(1)
+            }),
+            ("source_paths", |m| m.source_paths.clear()),
+            ("compressed_size", |m| m.stats.compressed_size += 1),
+            ("deduplicated_size", |m| m.stats.deduplicated_size += 1),
+            ("errors", |m| m.stats.errors += 1),
+        ];
+        for (field, change) in changes {
+            let mut b = a.clone();
+            change(&mut b);
+            assert!(!same_but_listing(&a, &b), "{field}");
+        }
+    }
+
+    fn kept(objects: &[ReadObject]) -> Option<usize> {
+        choose_kept(objects).map(|(k, _)| k)
+    }
+
+    #[test]
+    fn choose_kept_keeps_the_object_every_other_is_a_rewrite_of() {
+        let (a, b, c) = (item("a", 1), item("b", 2), item("c", 3));
+        let original = || object(0x50, vec![a.clone(), b.clone(), c.clone()]);
+
+        // An original and two rewrites, in any order.
+        let objects = vec![
+            object(0x10, vec![a.clone(), c.clone()]),
+            original(),
+            object(0x90, vec![a.clone()]),
+        ];
+        assert_eq!(kept(&objects), Some(1));
+
+        // Equal listings: the lowest ID.
+        let objects = vec![
+            object(0x90, vec![a.clone(), c.clone()]),
+            object(0x10, vec![a.clone(), c.clone()]),
+            object(0x50, vec![a.clone(), c.clone()]),
+        ];
+        assert_eq!(kept(&objects), Some(1));
+
+        // One alone is kept.
+        assert_eq!(kept(&[original()]), Some(0));
+
+        // Two rewrites that left out different items: neither is kept.
+        let objects = vec![
+            object(0x10, vec![a.clone(), c.clone()]),
+            object(0x90, vec![a.clone(), b.clone()]),
+        ];
+        assert_eq!(kept(&objects), None);
+
+        // A rewrite whose counted stats are not its items' is none.
+        let mut rewrite = object(0x10, vec![a.clone()]);
+        rewrite.meta.stats.nfiles += 1;
+        assert_eq!(kept(&[rewrite, original()]), None);
+
+        // Nor one whose copied stats differ.
+        let mut rewrite = object(0x10, vec![a.clone()]);
+        rewrite.meta.stats.errors = 0;
+        assert_eq!(kept(&[rewrite, original()]), None);
     }
 }

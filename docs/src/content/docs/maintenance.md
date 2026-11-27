@@ -113,6 +113,15 @@ If a pack upload fails while repair rewrites snapshots, repair stops before
 publishing any rewritten snapshot and changes nothing it had not already
 applied; run it again.
 
+A repair interrupted between publishing a rewritten snapshot and deleting the
+original leaves two snapshot objects of one name; the next repair removes the
+rewrite (it holds nothing the original lacks) and rewrites the original again.
+Of several objects of one name, repair also removes one whose listing cannot
+be read when another can be (data loss, as for a lone snapshot), and refuses,
+changing nothing, any other name carried by more than one object: the
+refusal names the objects and the one `vykar snapshot delete <name>` would
+remove (the first listed, by time, then ID).
+
 If a backup crashes after its index was committed but before its snapshot was
 written, the index keeps orphan chunk entries that no snapshot references; a
 `compact` at least 12 hours later sweeps them and reclaims the space.

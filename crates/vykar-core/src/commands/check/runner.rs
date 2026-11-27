@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::reindex::{self, Reindexed};
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
-use super::repair_plan::{add_pack_maps, build_repair_plan, reconcile_duplicate_names};
+use super::repair_plan::{
+    Judge, Reconciled, add_pack_maps, build_repair_plan, reconcile_duplicate_names,
+};
 use super::scan::{ScanOptions, ScanResult, integrity_scan};
 use super::server_verify::try_server_verify;
 use super::types::{
@@ -44,7 +46,8 @@ fn group_by_pack(index: &LiveIndex) -> PackChunks {
 /// with a warning, when the storage cannot hold them (an older server); when
 /// asking the server fails, the error is returned (nothing has changed yet).
 /// `reindexed`: what was re-indexed before `scan`, shown as the first
-/// action after the key copies.
+/// action after the key copies; `reconciled`: the removals
+/// [`reconcile_duplicate_names`] planned, after it.
 fn plan_repair(
     repo: &Repo,
     scan: &ScanResult,
@@ -75,6 +78,12 @@ fn plan_repair(
         );
     }
     // First after the key copies: what the scan ran without.
+    if reconciled
+        .iter()
+        .any(|a| matches!(a, RepairAction::RemoveUnreadableDuplicate { .. }))
+    {
+        plan.has_data_loss = true;
+    }
     plan.actions.splice(at..at, reconciled);
     plan.index_recovery = load.recovery;
     plan.uncovered_packs = load.uncovered_packs.clone();
@@ -125,11 +134,25 @@ fn refuse_repair_if_plan_changed(mode: RepairMode, plan: &RepairPlan) -> Result<
     Ok(())
 }
 
-/// The scan a repair plans from: `first`, or, when
-/// [`reindex::reindex_lost_entries`] added entries, a second scan on the
-/// re-indexed index, with the check result of `first` (what was wrong).
-/// Progress events then run twice.
-#[allow(clippy::type_complexity)]
+/// What a repair plans from.
+struct RepairScan {
+    scan: ScanResult,
+    /// What [`reindex::reindex_lost_entries`] added before `scan`.
+    reindexed: Option<Reindexed>,
+    /// The check result of the first scan, when `scan` is a second one.
+    found: Option<CheckResult>,
+    reconciled: Reconciled,
+}
+
+/// The scan a repair plans from, on the freshly listed snapshots of `repo`.
+/// The names several objects carry are reconciled first
+/// ([`reconcile_duplicate_names`]), except those with an object whose
+/// listing names a chunk the index lacks: they are reconciled after the first
+/// scan and the re-index, which may recover the chunk. The plan is built
+/// from `first`, or, when [`reindex::reindex_lost_entries`] added entries
+/// or a name was reconciled after the first scan, from a second scan, with
+/// the check result of `first` (what was wrong). Progress events then run
+/// twice.
 fn scan_for_repair(
     repo: &mut Repo,
     config: &VykarConfig,
@@ -137,20 +160,36 @@ fn scan_for_repair(
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
     load: &RepairIndexLoad,
     cancel: &CancelToken,
-) -> Result<(ScanResult, Option<Reindexed>, Option<CheckResult>)> {
+) -> Result<RepairScan> {
+    let mut reconciled = reconcile_duplicate_names(repo, Judge::DeferUnindexed, cancel)?;
     let first = integrity_scan(repo, config, scan_opts, progress, cancel)?;
     // Refuse before building the plan so a dry-run never presents a
     // misleading executable plan for a too-new repo, and in Apply before
     // the delete probe and execute_repair, so not even the probe object is
     // written when a too-new snapshot is present.
     refuse_repair_if_unreadable_snapshots(&first)?;
-    let Some(reindexed) = reindex::reindex_lost_entries(repo, &first, load, cancel)? else {
-        return Ok((first, None, None));
-    };
+    let reindexed = reindex::reindex_lost_entries(repo, &first, load, cancel)?;
+    let deferred = reconciled.deferred;
+    if deferred {
+        reconciled.extend(reconcile_duplicate_names(repo, Judge::Final, cancel)?);
+    }
+    if reindexed.is_none() && !deferred {
+        return Ok(RepairScan {
+            scan: first,
+            reindexed,
+            found: None,
+            reconciled,
+        });
+    }
     let found = CheckResult::from(first);
     let scan = integrity_scan(repo, config, scan_opts, progress, cancel)?;
     refuse_repair_if_unreadable_snapshots(&scan)?;
-    Ok((scan, Some(reindexed), Some(found)))
+    Ok(RepairScan {
+        scan,
+        reindexed,
+        found: Some(found),
+        reconciled,
+    })
 }
 
 /// The check result of a repair that scanned twice: the problems the first
@@ -691,10 +730,13 @@ pub(crate) fn run_with_repair_on_repo(
     if mode == RepairMode::PlanOnly {
         let load = repo.load_chunk_index_for_repair(cancel)?;
         repo.refresh_snapshot_list()?;
-        let reconciled = reconcile_duplicate_names(repo, cancel)?;
 
-        let (scan, reindexed, found) =
-            scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+        let RepairScan {
+            scan,
+            reindexed,
+            found,
+            reconciled,
+        } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
 
         let plan = plan_repair(
             repo,
@@ -702,7 +744,7 @@ pub(crate) fn run_with_repair_on_repo(
             &group_by_pack(repo.chunk_index()),
             &load,
             reindexed.as_ref(),
-            reconciled,
+            reconciled.actions,
         )?;
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
@@ -729,10 +771,13 @@ pub(crate) fn run_with_repair_on_repo(
             repo.commit_mode()?;
             let load = repo.load_chunk_index_for_repair(cancel)?;
             repo.refresh_snapshot_list()?;
-            let reconciled = reconcile_duplicate_names(repo, cancel)?;
 
-            let (scan, reindexed, found) =
-                scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+            let RepairScan {
+                scan,
+                reindexed,
+                found,
+                reconciled,
+            } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
 
             let pack_chunks = group_by_pack(repo.chunk_index());
             let plan = plan_repair(
@@ -741,7 +786,7 @@ pub(crate) fn run_with_repair_on_repo(
                 &pack_chunks,
                 &load,
                 reindexed.as_ref(),
-                reconciled,
+                reconciled.actions,
             )?;
 
             // Before the delete probe.

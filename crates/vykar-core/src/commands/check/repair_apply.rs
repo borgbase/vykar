@@ -443,27 +443,42 @@ pub(super) fn execute_repair(
         }
     }
 
-    // Step 0.75: Remove the rewrites an interrupted repair left beside their
-    // originals. The manifest lacks them already (the scan and plan ran
-    // without them); a failed delete aborts, since a rewrite of the
-    // original below would leave two objects of the name again.
+    // Step 0.75: Remove the objects of a name several carry but the one
+    // kept: the rewrites an interrupted repair left beside their originals,
+    // and those whose listing cannot be read. The manifest lacks them
+    // already (the scan and plan ran without them); a failed delete aborts,
+    // since a rewrite of the kept object below would leave several objects
+    // of the name again, and the sweep would drop the chunks of one left.
     for action in &plan.actions {
-        if let RepairAction::RemoveInterruptedRewrite {
-            snapshot_name,
-            snapshot_id,
-            ..
-        } = action
-        {
-            match repo.storage().delete(&snapshot_id.storage_key()) {
-                Ok(()) => applied.push(action.clone()),
-                Err(e) if exclusion_lost(&e) => return Err(e),
-                Err(e) => {
-                    return Err(VykarError::Other(format!(
-                        "aborting repair: failed to remove snapshot object {snapshot_id}, a \
-                         rewrite of '{snapshot_name}' an interrupted repair left beside the \
-                         original: {e}"
-                    )));
-                }
+        let (snapshot_name, snapshot_id, what) = match action {
+            RepairAction::RemoveInterruptedRewrite {
+                snapshot_name,
+                snapshot_id,
+                ..
+            } => (
+                snapshot_name,
+                snapshot_id,
+                "a rewrite an interrupted repair left beside the original",
+            ),
+            RepairAction::RemoveUnreadableDuplicate {
+                snapshot_name,
+                snapshot_id,
+                ..
+            } => (
+                snapshot_name,
+                snapshot_id,
+                "whose listing cannot be read, beside another object of the name",
+            ),
+            _ => continue,
+        };
+        match repo.storage().delete(&snapshot_id.storage_key()) {
+            Ok(()) => applied.push(action.clone()),
+            Err(e) if exclusion_lost(&e) => return Err(e),
+            Err(e) => {
+                return Err(VykarError::Other(format!(
+                    "aborting repair: failed to remove snapshot object {snapshot_id} of \
+                     '{snapshot_name}', {what}: {e}"
+                )));
             }
         }
     }

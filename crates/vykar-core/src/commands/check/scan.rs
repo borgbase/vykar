@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress};
 use crate::commands::list::{
-    for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
+    for_each_decoded_item, load_item_stream_of_meta, load_snapshot_meta_of,
 };
 use crate::commands::mark::{
     ChunkOutcome, OnChunkError, TreeChunkSet, default_decode_threads, walk_tree_chunks,
@@ -583,7 +583,8 @@ pub(super) fn integrity_scan(
         };
         let entry = &pass.entry;
 
-        let meta = match load_snapshot_meta(repo, &entry.name) {
+        // By the entry's own object: several objects can carry one name.
+        let meta = match load_snapshot_meta_of(repo, entry) {
             Ok(m) => m,
             Err(VykarError::UnsupportedSnapshotVersion { version }) => {
                 // The envelope decoded — the blob is intact, just too new.
@@ -1058,7 +1059,10 @@ fn locate_items_in_missing_packs(
 
     for entry in &entries {
         cancel.check()?;
-        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, cancel) {
+        // By the entry's own object: several objects can carry one name.
+        let items_stream = match load_snapshot_meta_of(repo, entry)
+            .and_then(|meta| load_item_stream_of_meta(repo, &meta, cancel))
+        {
             Ok(s) => s,
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(_) => continue,

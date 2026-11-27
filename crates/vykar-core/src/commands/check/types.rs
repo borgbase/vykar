@@ -384,6 +384,16 @@ pub enum RepairAction {
         snapshot_id: SnapshotId,
         kept_id: SnapshotId,
     },
+    /// Delete `snapshot_id`, one of several objects carrying
+    /// `snapshot_name`, whose metadata or listing cannot be read (`detail`),
+    /// while another object of the name, `kept_id`, can and is kept. Data
+    /// loss, as the removal of a lone snapshot whose listing cannot be read.
+    RemoveUnreadableDuplicate {
+        snapshot_name: String,
+        snapshot_id: SnapshotId,
+        kept_id: SnapshotId,
+        detail: String,
+    },
     /// Rewrite one key copy from the other. Never data-loss: `check` only runs
     /// after `Repo::open` succeeded, so a key was established and `from`
     /// is the copy that carries it.

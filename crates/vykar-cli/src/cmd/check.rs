@@ -368,6 +368,15 @@ fn format_repair_action(action: &RepairAction) -> String {
              interrupted repair left beside the original {kept_id} (it holds nothing the \
              original lacks; the original is repaired as planned below)"
         ),
+        RepairAction::RemoveUnreadableDuplicate {
+            snapshot_name,
+            snapshot_id,
+            kept_id,
+            detail,
+        } => format!(
+            "Remove snapshot object {snapshot_id} of '{snapshot_name}', whose listing cannot be \
+             read ({detail}); the other object of the name, {kept_id}, is kept"
+        ),
         RepairAction::DropItemsFromSnapshot {
             snapshot_name,
             item_indices,

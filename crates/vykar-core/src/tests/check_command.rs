@@ -1926,12 +1926,23 @@ fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
 // blob's DELETE: two blobs under one snapshot name
 // ---------------------------------------------------------------------------
 
-/// Fails the DELETE of `key` as a lost exclusion: the repair stops there
-/// with nothing more written and both blobs stored, as after a crash
-/// between the rewrite's PUT and the DELETE.
+/// Fails the DELETE of `key` with `err()` (a lost exclusion: the repair
+/// stops there with nothing more written and both blobs stored, as after a
+/// crash between the rewrite's PUT and the DELETE).
 struct LoseExclusionAtDelete {
     inner: Arc<dyn StorageBackend>,
     key: String,
+    err: fn() -> VykarError,
+}
+
+impl LoseExclusionAtDelete {
+    fn on(repo_dir: &std::path::Path, key: String, err: fn() -> VykarError) -> Self {
+        Self {
+            inner: Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
+            key,
+            err,
+        }
+    }
 }
 
 impl vykar_storage::InnerBackend for LoseExclusionAtDelete {
@@ -1946,7 +1957,7 @@ vykar_storage::delegate_storage_backend! {
 
     fn delete(&self, key: &str) -> Result<()> {
         if key == self.key {
-            return Err(VykarError::MarkerLostDuringCommit);
+            return Err((self.err)());
         }
         self.inner.delete(key)
     }
@@ -1983,6 +1994,27 @@ fn snapshot_keys(repo_dir: &std::path::Path) -> Vec<String> {
     keys
 }
 
+/// `check --repair` (applied) of `config`'s repository through `storage`.
+fn repair_on(
+    storage: impl StorageBackend + 'static,
+    config: &crate::config::VykarConfig,
+) -> Result<commands::check::RepairResult> {
+    let mut repo = crate::repo::Repo::open(
+        Box::new(storage),
+        Some(crate::testing::TEST_PASSPHRASE),
+        config.cache_dir.as_ref().map(std::path::PathBuf::from),
+        commands::check::repair_open_options(RepairMode::Apply),
+    )?;
+    commands::check::run_with_repair_on_repo(
+        &mut repo,
+        config,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+}
+
 fn interrupted_item_repair() -> InterruptedRewrite {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
@@ -2011,28 +2043,11 @@ fn interrupted_item_repair() -> InterruptedRewrite {
     let before = snapshot_keys(&repo_dir);
 
     // The repair, its exclusion lost at the old blob's DELETE.
-    let storage = LoseExclusionAtDelete {
-        inner: Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
-        key: original.storage_key(),
-    };
-    let mut repo = crate::repo::Repo::open(
-        Box::new(storage),
-        Some(crate::testing::TEST_PASSPHRASE),
-        config.cache_dir.as_ref().map(std::path::PathBuf::from),
-        commands::check::repair_open_options(RepairMode::Apply),
-    )
-    .unwrap();
-    let err = commands::check::run_with_repair_on_repo(
-        &mut repo,
-        &config,
-        false,
-        RepairMode::Apply,
-        None,
-        &CancelToken::new(),
-    )
-    .unwrap_err();
+    let storage = LoseExclusionAtDelete::on(&repo_dir, original.storage_key(), || {
+        VykarError::MarkerLostDuringCommit
+    });
+    let err = repair_on(storage, &config).unwrap_err();
     assert!(matches!(err, VykarError::MarkerLostDuringCommit), "{err}");
-    drop(repo);
 
     let after = snapshot_keys(&repo_dir);
     let added: Vec<&String> = after.iter().filter(|k| !before.contains(k)).collect();
@@ -2081,20 +2096,33 @@ impl InterruptedRewrite {
         to: vykar_types::snapshot_id::SnapshotId,
         change: impl FnOnce(&mut crate::snapshot::SnapshotMeta),
     ) {
-        use crate::repo::format::{ObjectType, pack_object_with_context};
-        let repo = open_local_repo(&self.repo_dir);
-        let blob = repo
+        self.store_meta(self.rewrite, to, change);
+        open_local_repo(&self.repo_dir)
             .storage()
-            .get(&self.rewrite.storage_key())
-            .unwrap()
+            .delete(&self.rewrite.storage_key())
             .unwrap();
-        let mut meta = crate::commands::list::decode_snapshot_meta(
-            &self.rewrite,
-            &blob,
-            repo.crypto().as_ref(),
-        )
-        .unwrap();
+        self.rewrite = to;
+    }
+
+    /// The metadata of the object `from`.
+    fn meta_of(&self, from: vykar_types::snapshot_id::SnapshotId) -> crate::snapshot::SnapshotMeta {
+        let repo = open_local_repo(&self.repo_dir);
+        let blob = repo.storage().get(&from.storage_key()).unwrap().unwrap();
+        crate::commands::list::decode_snapshot_meta(&from, &blob, repo.crypto().as_ref()).unwrap()
+    }
+
+    /// Store the metadata of the object `from`, with `change` applied, as
+    /// the object `to` (`from` itself to change it in place).
+    fn store_meta(
+        &self,
+        from: vykar_types::snapshot_id::SnapshotId,
+        to: vykar_types::snapshot_id::SnapshotId,
+        change: impl FnOnce(&mut crate::snapshot::SnapshotMeta),
+    ) {
+        use crate::repo::format::{ObjectType, pack_object_with_context};
+        let mut meta = self.meta_of(from);
         change(&mut meta);
+        let repo = open_local_repo(&self.repo_dir);
         let packed = pack_object_with_context(
             ObjectType::SnapshotMeta,
             to.as_bytes(),
@@ -2103,8 +2131,26 @@ impl InterruptedRewrite {
         )
         .unwrap();
         repo.storage().put(&to.storage_key(), &packed).unwrap();
-        repo.storage().delete(&self.rewrite.storage_key()).unwrap();
-        self.rewrite = to;
+    }
+
+    /// `check --repair` in `mode`.
+    fn repair(&self, mode: RepairMode) -> Result<commands::check::RepairResult> {
+        commands::check::run_with_repair(
+            &self.config,
+            pass(&self.config),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
+    }
+
+    /// Every file of the repository but the session markers.
+    fn files(&self) -> Vec<String> {
+        collect_repo_files(&self.repo_dir)
+            .into_iter()
+            .filter(|f| !f.starts_with("sessions/"))
+            .collect()
     }
 
     /// One blob per snapshot, the original of `snap-drop` gone; a check finds
@@ -2311,13 +2357,291 @@ fn a_repair_refuses_two_objects_of_one_name_it_did_not_leave() {
         )
         .unwrap_err()
         .to_string();
+        assert_refused(&fx, &err, "{mode:?}");
+        assert_eq!(snapshot_keys(&fx.repo_dir), keys, "{mode:?}");
+    }
+}
+
+/// The refusal names both objects, the one a delete by name removes (the
+/// original: listed first, by time, then ID) and says nothing was changed.
+fn assert_refused(fx: &InterruptedRewrite, err: &str, at: &str) {
+    assert!(
+        err.contains("2 snapshot objects carry the name 'snap-drop'")
+            && err.contains(&fx.original.to_hex())
+            && err.contains(&fx.rewrite.to_hex())
+            && err.contains("nothing was changed")
+            && err.contains(&format!(
+                "`vykar snapshot delete snap-drop` removes the first one listed (by time, then \
+                 ID), {}",
+                fx.original.to_hex()
+            )),
+        "{at}: {err}"
+    );
+}
+
+/// An ID listed after any random one of the same time.
+fn id_after() -> vykar_types::snapshot_id::SnapshotId {
+    let mut id = [0xff; 32];
+    id[31] = 0xfe;
+    vykar_types::snapshot_id::SnapshotId::from_bytes(id)
+}
+
+/// An ID listed before any random one of the same time.
+fn id_before() -> vykar_types::snapshot_id::SnapshotId {
+    let mut id = [0; 32];
+    id[31] = 1;
+    vykar_types::snapshot_id::SnapshotId::from_bytes(id)
+}
+
+/// Same metadata and stats as the original, but items that are not the
+/// original's with some left out (here those of another snapshot): repair
+/// refuses, dry run included, and writes nothing.
+#[test]
+fn a_repair_refuses_two_objects_of_one_name_whose_items_are_not_a_rewrite() {
+    let mut fx = interrupted_item_repair();
+    let keep_id = open_local_repo(&fx.repo_dir)
+        .manifest()
+        .find_snapshot("snap-keep")
+        .unwrap()
+        .id;
+    let keep = fx.meta_of(keep_id);
+    fx.rekey_rewrite_with(id_after(), |meta| {
+        meta.item_ptrs = keep.item_ptrs.clone();
+        meta.ext = keep.ext.clone();
+        meta.format_version = keep.format_version;
+        meta.stats.nfiles = keep.stats.nfiles;
+        meta.stats.original_size = keep.stats.original_size;
+    });
+    let files = fx.files();
+    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
+        let err = fx.repair(mode).unwrap_err().to_string();
         assert!(
-            err.contains("2 snapshot objects carry the name 'snap-drop'")
-                && err.contains(&fx.original.to_hex())
-                && err.contains(&fx.rewrite.to_hex())
-                && err.contains("nothing was changed"),
+            err.contains("they are not a snapshot and its rewrites by an interrupted repair"),
             "{mode:?}: {err}"
         );
-        assert_eq!(snapshot_keys(&fx.repo_dir), keys, "{mode:?}");
+        assert_refused(&fx, &err, &format!("{mode:?}"));
+        assert_eq!(fx.files(), files, "{mode:?}");
+    }
+}
+
+/// The plan a dry run shows, checked by `expect`, then applied: the applied
+/// run plans the same and the repository converges.
+fn dry_run_then_apply(fx: &InterruptedRewrite, expect: impl Fn(&commands::check::RepairPlan)) {
+    let files = fx.files();
+    let shown = fx.repair(RepairMode::PlanOnly).unwrap();
+    expect(&shown.plan);
+    assert_eq!(fx.files(), files, "the dry run changed nothing");
+    let applied = fx.repair(RepairMode::Apply).unwrap();
+    assert_eq!(
+        format!("{:?}", applied.plan.actions),
+        format!("{:?}", shown.plan.actions),
+        "the dry run shows the plan the repair applies"
+    );
+    assert_eq!(applied.plan.has_data_loss, shown.plan.has_data_loss);
+    assert!(
+        applied.repair_errors.is_empty(),
+        "{:?}",
+        applied.repair_errors
+    );
+    fx.assert_converged();
+}
+
+fn removes_rewrite(
+    plan: &commands::check::RepairPlan,
+    id: vykar_types::snapshot_id::SnapshotId,
+    kept: vykar_types::snapshot_id::SnapshotId,
+) -> bool {
+    plan.actions.iter().any(|a| {
+        matches!(
+            a,
+            RepairAction::RemoveInterruptedRewrite { snapshot_name, snapshot_id, kept_id }
+                if snapshot_name == "snap-drop" && *snapshot_id == id && *kept_id == kept
+        )
+    })
+}
+
+fn removes_unreadable(
+    plan: &commands::check::RepairPlan,
+    id: vykar_types::snapshot_id::SnapshotId,
+    kept: vykar_types::snapshot_id::SnapshotId,
+) -> bool {
+    plan.actions.iter().any(|a| {
+        matches!(
+            a,
+            RepairAction::RemoveUnreadableDuplicate { snapshot_name, snapshot_id, kept_id, .. }
+                if snapshot_name == "snap-drop" && *snapshot_id == id && *kept_id == kept
+        )
+    })
+}
+
+fn rewrites(plan: &commands::check::RepairPlan, id: vykar_types::snapshot_id::SnapshotId) -> bool {
+    plan.actions.iter().any(|a| {
+        matches!(
+            a,
+            RepairAction::DropItemsFromSnapshot { snapshot_id, .. } if *snapshot_id == id
+        )
+    })
+}
+
+/// Three objects of one name (a rerun before this fix, interrupted again,
+/// leaves the original and two rewrites): both rewrites are removed and the
+/// original is rewritten again.
+#[test]
+fn a_repair_removes_both_rewrites_of_three_objects_of_one_name() {
+    let fx = interrupted_item_repair();
+    let second = id_before();
+    fx.store_meta(fx.rewrite, second, |_| {});
+    assert_eq!(snapshot_keys(&fx.repo_dir).len(), 4);
+    dry_run_then_apply(&fx, |plan| {
+        assert!(
+            removes_rewrite(plan, fx.rewrite, fx.original),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            removes_rewrite(plan, second, fx.original),
+            "{:?}",
+            plan.actions
+        );
+        assert!(rewrites(plan, fx.original), "{:?}", plan.actions);
+    });
+}
+
+/// A listing chunk no index entry or pack describes.
+fn lost_listing(meta: &mut crate::snapshot::SnapshotMeta) {
+    meta.item_ptrs = vec![ChunkId::from_bytes([0xab; 32])];
+}
+
+/// One of two objects of one name whose listing cannot be read (a chunk
+/// missing from the index and from every pack) is removed by ID as data
+/// loss, as a lone snapshot would be, and the other is kept: the rewrite,
+/// and the original (left so by a rerun before this fix, which swept the
+/// original's listing out of the index).
+#[test]
+fn a_repair_removes_the_unreadable_one_of_two_objects_of_one_name() {
+    // The rewrite unreadable: the original is kept and rewritten again.
+    let mut fx = interrupted_item_repair();
+    fx.rekey_rewrite_with(id_before(), lost_listing);
+    dry_run_then_apply(&fx, |plan| {
+        assert!(plan.has_data_loss);
+        assert!(
+            removes_unreadable(plan, fx.rewrite, fx.original),
+            "{:?}",
+            plan.actions
+        );
+        assert!(rewrites(plan, fx.original), "{:?}", plan.actions);
+    });
+
+    // The original unreadable: the rewrite is kept.
+    let fx = interrupted_item_repair();
+    fx.store_meta(fx.original, fx.original, lost_listing);
+    dry_run_then_apply(&fx, |plan| {
+        assert!(plan.has_data_loss);
+        assert!(
+            removes_unreadable(plan, fx.original, fx.rewrite),
+            "{:?}",
+            plan.actions
+        );
+        assert!(!rewrites(plan, fx.rewrite), "{:?}", plan.actions);
+    });
+}
+
+/// The original's listing chunks dropped out of the index but are still in
+/// their packs: the pair is judged after the re-index recovers them, so the
+/// rewrite is removed and the original rewritten, not the original removed
+/// as unreadable.
+#[test]
+fn a_repair_judges_two_objects_of_one_name_after_the_reindex() {
+    let fx = interrupted_item_repair();
+    let original_ptrs = fx.meta_of(fx.original).item_ptrs;
+    let rewrite_ptrs = fx.meta_of(fx.rewrite).item_ptrs;
+    let mut repo = open_local_repo(&fx.repo_dir);
+    commands::util::with_exclusive_session(&mut repo, |repo| {
+        repo.load_chunk_index()?;
+        let packs: std::collections::HashSet<PackId> = original_ptrs
+            .iter()
+            .map(|c| repo.chunk_index().get(c).unwrap().pack_id)
+            .collect();
+        for c in &rewrite_ptrs {
+            let pack = repo.chunk_index().get(c).unwrap().pack_id;
+            assert!(
+                !packs.contains(&pack),
+                "the rewrite's listing stays indexed"
+            );
+        }
+        for p in &packs {
+            assert!(repo.chunk_index_mut().remove_by_pack(p) > 0);
+        }
+        repo.save_state()
+    })
+    .unwrap();
+    drop(repo);
+    dry_run_then_apply(&fx, |plan| {
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, RepairAction::ReindexChunks { .. })),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            removes_rewrite(plan, fx.rewrite, fx.original),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            !removes_unreadable(plan, fx.original, fx.rewrite),
+            "{:?}",
+            plan.actions
+        );
+        assert!(rewrites(plan, fx.original), "{:?}", plan.actions);
+    });
+}
+
+/// The new action itself interrupted: the DELETE of the rewrite fails, with
+/// a plain error and with the exclusion lost. Nothing is written (no
+/// snapshot, no pack, no index head), and a rerun converges.
+#[test]
+fn a_repair_whose_delete_of_the_rewrite_fails_writes_nothing_and_a_rerun_converges() {
+    type Injected = fn() -> VykarError;
+    let cases: [(&str, Injected); 2] = [
+        ("plain error", || {
+            VykarError::Other("injected delete failure".into())
+        }),
+        ("marker lost", || VykarError::MarkerLostDuringCommit),
+    ];
+    for (what, err) in cases {
+        let fx = interrupted_item_repair();
+        let files = fx.files();
+        let storage = LoseExclusionAtDelete::on(&fx.repo_dir, fx.rewrite.storage_key(), err);
+        let e = repair_on(storage, &fx.config).unwrap_err();
+        if what == "marker lost" {
+            assert!(
+                matches!(e, VykarError::MarkerLostDuringCommit),
+                "{what}: {e}"
+            );
+        } else {
+            let e = e.to_string();
+            assert!(
+                e.contains(&format!(
+                    "aborting repair: failed to remove snapshot object {}",
+                    fx.rewrite
+                )) && e.contains("injected delete failure"),
+                "{what}: {e}"
+            );
+        }
+        assert_eq!(fx.files(), files, "{what}: nothing was written");
+
+        let rerun = fx.repair(RepairMode::Apply).unwrap();
+        assert!(
+            rerun.repair_errors.is_empty(),
+            "{what}: {:?}",
+            rerun.repair_errors
+        );
+        assert!(
+            removes_rewrite(&rerun.plan, fx.rewrite, fx.original),
+            "{what}"
+        );
+        fx.assert_converged();
     }
 }

@@ -296,8 +296,23 @@ impl SegmentAges {
 /// Maintenance segments are foldable at any age because they add nothing a
 /// backup depends on: a sweep removes, a repack relocates by chunk ID, and
 /// the only maintenance segments with additions come from `check
-/// --repair`, which refuses to run beside live sessions. (Part 9 note: once
-/// the lock goes, repair's own sweep needs the young-segment rule too.)
+/// --repair`, which refuses to run beside live sessions.
+///
+/// Repair's own sweep (`commands::check::repair_apply`, steps 6 and 7)
+/// deliberately has no young-segment rule: it removes every entry no
+/// surviving snapshot references and folds the whole index. It runs as an
+/// exclusive session, which refuses beside live sessions and keeps new ones
+/// out, so no backup commits beside it; and keeping unverified,
+/// unreferenced entries is against what a repair is for. Two residuals slip
+/// past the exclusion: a backup whose marker was reaped after a stall of
+/// over 45 min and that is already past its last marker probe, and a backup
+/// on a clone that took the repair's live marker for crashed
+/// (H1-late-clone). Their damage is the recoverable kind: the sweep removes
+/// index entries, not packs, so a snapshot that lands afterwards lacks
+/// index coverage (it does not restore, compacts refuse) until the next
+/// `check --repair` re-indexes its entries from the packs. The first is
+/// scripted in
+/// `tests::sim_exclusion::a_backup_past_a_repairs_exclusion_is_recovered_by_the_next_repair`.
 pub(crate) fn foldable(seg: &SegmentRef, ages: Option<&SegmentAges>, grace: Duration) -> bool {
     match seg.kind {
         SegmentKind::Maintenance => true,

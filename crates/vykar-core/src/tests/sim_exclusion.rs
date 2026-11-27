@@ -736,3 +736,198 @@ fn a_crashed_exclusive_stops_blocking_after_clear_sessions() {
     sim.backup(b, "b2", &tree("b2")).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
+
+/// `check --repair`'s sweep keeps no young-segment rule (see
+/// `repo::ages::foldable`): what a backup that slips past the repair's
+/// exclusion loses is index coverage, recovered by the next repair. Backup
+/// b1 is held at its snapshot PUT (after its index segment, head and last
+/// marker probe) with its heartbeat held at its refresh PUT until its
+/// marker is 47 min old on the store's clock. A `check --repair` reaps that
+/// marker at its registration, so it runs as an exclusive session beside
+/// b1; its sweep removes b1's entries (no snapshot references them yet) and
+/// deletes no pack. Then b1's snapshot PUT lands and b1 ends Ok: b1 does
+/// not restore (invariant 1, its tree chunk not in the index; classified
+/// `AgedSessionReaped`, nothing `Unknown`) and a compact, here or after
+/// `T_PACK`, refuses `MarkRefused` and deletes none of b1's packs (the
+/// `WedgedCompact` of invariant 9). The next `check --repair` re-indexes
+/// b1's chunks from its packs; every snapshot restores byte-exact and every
+/// invariant holds.
+#[test]
+fn a_backup_past_a_repairs_exclusion_is_recovered_by_the_next_repair() {
+    use crate::sim::ViolationKind;
+    use crate::sim::driver::{Signature, classify_end_state};
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    for kind in BOTH_KINDS {
+        for compact_between in [false, true] {
+            let at = format!("{kind:?}, compact between: {compact_between}");
+            let mut sim = sim_on(kind);
+            let (b, r) = (sim.client("b"), sim.client("r"));
+            sim.backup(b, "b0", &tree("b0")).expect_ok();
+            let before = sim.store().keys("packs/");
+            let b_snap = sim.gate(GateRule::new(
+                b,
+                OpMatch::AnyWrite,
+                KeyMatch::Prefix("snapshots/".into()),
+            ));
+            let rb = sim.spawn(b, backup_call("b1"));
+            sim.expect_paused(b_snap, "b1's snapshot PUT, after its last probe");
+            let b_packs: Vec<String> = sim
+                .store()
+                .keys("packs/")
+                .into_iter()
+                .filter(|k| !before.contains(k))
+                .collect();
+            assert!(!b_packs.is_empty(), "{at}: b1 uploaded packs");
+            let b_run = rb.index();
+            let b_runs = |sim: &Sim| records(sim, b, b_run);
+            assert!(
+                b_runs(&sim)
+                    .iter()
+                    .any(|o| o.op.is_write() && o.applied() && o.key.starts_with("index.h/")),
+                "{at}: b1 wrote its head before the hold"
+            );
+
+            // b1's heartbeat held at its refresh PUT (15 min), then its
+            // marker aged to 47 min.
+            let hb = sim.gate(
+                GateRule::new(b, OpMatch::AnyWrite, KeyMatch::Prefix("sessions/".into()))
+                    .filter(|_, k| k.ends_with(".json")),
+            );
+            assert!(
+                sim.time().wait_for_waiters(1, WAIT),
+                "{at}: b's heartbeat waits"
+            );
+            for i in 0..30 {
+                sim.advance(std::time::Duration::from_secs(30));
+                if i < 29 {
+                    assert!(
+                        sim.time().wait_for_waiters(1, WAIT),
+                        "{at}: b's heartbeat waits"
+                    );
+                }
+            }
+            sim.expect_paused(hb, "b1's heartbeat refresh PUT");
+            sim.advance(std::time::Duration::from_secs(32 * 60));
+            let b_markers: Vec<String> = sim
+                .store()
+                .keys("sessions/")
+                .into_iter()
+                .filter(|k| k.ends_with(".json"))
+                .collect();
+            assert!(!b_markers.is_empty(), "{at}: b1's marker keys");
+
+            // The repair reaps b1's aged marker, registers and sweeps.
+            let rr = sim.check_repair(r);
+            rr.expect_ok();
+            assert!(rr.exclusive, "{at}: the repair ran as an exclusive session");
+            let rrecs = records(&sim, r, rr.index);
+            for key in &b_markers {
+                assert!(
+                    rrecs.iter().any(|o| o.op.is_delete() && &o.key == key),
+                    "{at}: the repair reaped {key}"
+                );
+            }
+            assert!(
+                rr.detail().contains("RemoveUnreferencedEntries")
+                    && !rr.detail().contains("ReindexChunks"),
+                "{at}: {}",
+                rr.detail()
+            );
+            assert!(
+                !rrecs
+                    .iter()
+                    .any(|o| o.op.is_delete() && o.key.starts_with("packs/")),
+                "{at}: the repair deleted a pack: {rrecs:?}"
+            );
+            let indexed = indexed_packs(&mut sim, r);
+            assert!(
+                b_packs.iter().all(|k| !indexed.contains(k)),
+                "{at}: the sweep removed b1's entries: {indexed:?}"
+            );
+
+            // b1's snapshot PUT lands after the repair ended.
+            sim.resume(hb);
+            sim.resume(b_snap);
+            let rb = sim.join(rb);
+            rb.expect_ok();
+            let put = b_runs(&sim)
+                .into_iter()
+                .find(|o| o.op.is_write() && o.applied() && o.key.starts_with("snapshots/"))
+                .expect("b1's snapshot PUT");
+            assert!(
+                put.step > rr.last_step,
+                "{at}: the PUT landed after the repair"
+            );
+            let (report, signatures) = classify_end_state(&sim);
+            let kinds: Vec<(Invariant, ViolationKind, &str)> = report
+                .violations
+                .iter()
+                .map(|v| (v.invariant, v.kind, v.subject.as_str()))
+                .collect();
+            assert_eq!(
+                kinds,
+                [(
+                    Invariant::CommittedSnapshotsRestore,
+                    ViolationKind::TreeChunkNotInIndex,
+                    "b1"
+                )],
+                "{at}: {report}"
+            );
+            assert_eq!(
+                signatures,
+                std::collections::BTreeSet::from([Signature::AgedSessionReaped]),
+                "{at}: {report}"
+            );
+            let wedge = sim.check_invariants(&[Invariant::NoPermanentWedge]);
+            assert!(
+                wedge.violations.len() == 1
+                    && wedge.violations[0].kind == ViolationKind::WedgedCompact
+                    && wedge.violations[0].detail.contains("not in the index"),
+                "{at}: {wedge}"
+            );
+
+            if compact_between {
+                sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
+                let rc = sim.compact(r);
+                assert_allowed(&rc, AllowedError::MarkRefused);
+                assert!(
+                    !records(&sim, r, rc.index)
+                        .iter()
+                        .any(|o| o.op.is_delete() && o.key.starts_with("packs/")),
+                    "{at}: the refused compact deleted a pack"
+                );
+            }
+            for key in &b_packs {
+                assert!(sim.store().object(key).is_some(), "{at}: {key} kept");
+            }
+
+            // The next repair re-indexes b1's chunks from its packs.
+            let rr2 = sim.check_repair(r);
+            rr2.expect_ok();
+            assert!(
+                rr2.detail().contains("ReindexChunks"),
+                "{at}: {}",
+                rr2.detail()
+            );
+            let indexed = indexed_packs(&mut sim, r);
+            assert!(
+                b_packs.iter().all(|k| indexed.contains(k)),
+                "{at}: b1's packs indexed again: {indexed:?}"
+            );
+            assert_eq!(snapshot_names(&mut sim, r), ["b0", "b1"], "{at}");
+            for name in ["b0", "b1"] {
+                sim.restore(r, name).expect_ok();
+            }
+            sim.compact(r).expect_ok();
+            let (report, signatures) = classify_end_state(&sim);
+            report.assert_clean();
+            assert!(signatures.is_empty(), "{at}: {signatures:?}");
+            let set = if kind.records_multi_writer() {
+                Invariant::STEP8
+            } else {
+                Invariant::STEP7
+            };
+            sim.check_invariants(set).assert_clean();
+        }
+    }
+}

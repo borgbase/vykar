@@ -166,22 +166,20 @@ pub(super) fn general() -> impl Strategy<Value = Case> {
 
 /// The campaign's random cases: [`general`], and as often [`general`] on
 /// the encrypted template (phase F part 10c: backups commit lock-free
-/// there) on the conditional store, on the store whose plain PUT
-/// overwrites, or on that store with client b in lock mode (the mixed
-/// verdict).
+/// there) on the conditional store or on the store whose plain PUT
+/// overwrites. The family with client b in lock mode (the mixed verdict)
+/// was dropped by 10-single-protocol step 7: no binary is such a client.
 pub(super) fn campaign_cases() -> impl Strategy<Value = Case> {
     prop_oneof![
         general(),
-        (general(), 0u8..3).prop_map(|(c, kind)| {
-            let (storage, lock_clients) = match kind {
-                0 => (StoreKind::Conditional, vec![]),
-                1 => (StoreKind::ConditionalOverwrite, vec![]),
-                _ => (StoreKind::ConditionalOverwrite, vec![1]),
+        (general(), 0u8..2).prop_map(|(c, kind)| {
+            let storage = match kind {
+                0 => StoreKind::Conditional,
+                _ => StoreKind::ConditionalOverwrite,
             };
             Case {
                 template: TemplateKind::Encrypted,
                 storage,
-                lock_clients,
                 ..c
             }
         }),

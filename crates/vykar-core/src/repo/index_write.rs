@@ -616,8 +616,10 @@ impl Repo {
             debug!("no index head written by this run; index garbage collection skipped");
             return Ok(());
         }
-        if self.is_lock_free() {
-            // A lock-free compact's marker check (04 step 9) guards its
+        if !fence.is_lock() {
+            // A session run (maintenance session, backup) checks its fence
+            // before the garbage collection; a lock holder does not. A
+            // maintenance session's marker check (04 step 9) guards its
             // deletes too.
             fence.check()?;
         }

@@ -44,6 +44,10 @@ pub enum AllowedError {
     /// upload started longer ago than its objects' grace allows
     /// (`ages::INDEX_WRITE_LIMIT`; a time jump inside the write).
     SlowIndexWrite,
+    /// A single-writer head write that found another writer's bytes after
+    /// its PUT (`ConcurrentHeadWrite`): the correct reaction to a defeated
+    /// single-writer check (10-single-protocol step 7, decision D4).
+    ConcurrentHeadWrite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +84,7 @@ pub fn classify(err: &VykarError) -> ErrorClass {
         }
         VykarError::MarkRefused(_) => Some(AllowedError::MarkRefused),
         VykarError::SlowIndexWrite { .. } => Some(AllowedError::SlowIndexWrite),
+        VykarError::ConcurrentHeadWrite { .. } => Some(AllowedError::ConcurrentHeadWrite),
         // Text fallbacks: a wrapper that formats one of these into a new
         // Other (repair_load_refusal, check's Other(msg.clone()), the CLI's
         // hooked command) still carries the text.
@@ -129,10 +134,10 @@ pub struct RunRecord {
     /// Store step when the run returned.
     pub last_step: u64,
     pub outcome: RunOutcome,
-    /// The run committed in lock-free mode (04 step 9): its protected
-    /// writes need no lock, and invariant 7 does not judge them. Set for a
-    /// backup on an encrypted repository whose handle's put-if-absent check
-    /// passed (phase F part 10c; maintenance takes the lock in every mode).
+    /// The run committed without a lock (04 step 9): its protected writes
+    /// need no lock, and invariant 7 does not judge them. Since
+    /// 10-single-protocol step 7 every backup that marked its session and
+    /// every maintenance session run, on either mode.
     pub lock_free: bool,
 }
 

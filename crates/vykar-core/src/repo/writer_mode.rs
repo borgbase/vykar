@@ -92,6 +92,75 @@ impl Repo {
         self.repo_url.as_deref().unwrap_or("the storage backend")
     }
 
+    /// Read `config` again (10-single-protocol step 7) and take the
+    /// repository's mode from it: GET `config`, decode and validate it as
+    /// open does (`RepoConfig::decode`, `DecodedConfig::validate`), and
+    /// refuse unless it is this handle's config but for the mode: the same
+    /// `id`, format (version and chunk hash), encryption, chunker
+    /// parameters and pack sizes, compared field by field so the rule fails
+    /// closed. A mode that differs from this handle's is adopted:
+    /// `self.config`'s features are set to it (`set_writer_mode`) and the
+    /// cached commit mode is dropped, so the next [`Self::commit_mode`]
+    /// decides again (a multi-writer one runs this handle's put-if-absent
+    /// check). Returns the mode now in force. Callers: a backup whose
+    /// marker record was not continuous at its commit mark (the suspend
+    /// rule), and every head-writing maintenance session right after its
+    /// registration (a mode switch between its open and its registration
+    /// is seen by neither side otherwise).
+    ///
+    /// # Errors
+    ///
+    /// A failed GET or a missing `config`; `Other("the repository config
+    /// changed …")` for another identity, format or encryption;
+    /// `validate`'s refusal of an unknown feature.
+    pub(crate) fn reread_writer_mode(&mut self) -> Result<WriterMode> {
+        let stored = self
+            .storage
+            .get("config")?
+            .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
+        let decoded = super::RepoConfig::decode(&stored)?;
+        let format = decoded.validate()?;
+        let changed = |what: &str| {
+            VykarError::Other(format!(
+                "the repository config changed while this client had it open ({what}); \
+                 nothing was committed, run the command again"
+            ))
+        };
+        let super::DecodedConfig::Map(config) = decoded else {
+            return Err(changed("no longer a v6 config"));
+        };
+        let mine = &self.config;
+        let differs = [
+            (config.id != mine.id, "another repository id"),
+            (format != self.format, "another format"),
+            (config.version != mine.version, "another version"),
+            (config.chunk_hash != mine.chunk_hash, "another chunk hash"),
+            (config.encryption != mine.encryption, "another encryption"),
+            (
+                config.chunker_params != mine.chunker_params,
+                "other chunker parameters",
+            ),
+            (
+                config.min_pack_size != mine.min_pack_size
+                    || config.max_pack_size != mine.max_pack_size,
+                "other pack sizes",
+            ),
+        ];
+        if let Some((_, what)) = differs.iter().find(|(d, _)| *d) {
+            return Err(changed(what));
+        }
+        let mode = config.writer_mode();
+        if mode != self.config.writer_mode() {
+            tracing::info!(
+                mode = mode.as_str(),
+                "the repository's commit mode changed since this client opened it"
+            );
+            self.config.set_writer_mode(mode);
+            self.commit_mode = None;
+        }
+        Ok(mode)
+    }
+
     /// Whether this handle's storage offers put-if-absent, as far as it
     /// knows without a request (`conditional()` is Some): a single-writer
     /// repository on it could be switched to multi-writer.

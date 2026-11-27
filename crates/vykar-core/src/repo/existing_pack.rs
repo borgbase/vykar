@@ -320,6 +320,7 @@ mod tests {
             refreshes: 1,
             failed_refreshes: 0,
             slow_puts: 0,
+            restarted: false,
         };
         let unsound = MarkerReport {
             slow_puts: 1,

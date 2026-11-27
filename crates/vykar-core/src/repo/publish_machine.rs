@@ -19,9 +19,10 @@
 //! ([`HeadCheck`]), the last step before the head PUT on every path.
 //!
 //! The head step creates the head (04 step 8, [`index_store::create_head`]):
-//! put-if-absent where the backend offers it and its check passed (the
-//! check runs at the fence, before the lock and pack-age checks), else a
-//! plain PUT under the lock. When another writer holds the generation the
+//! put-if-absent on a multi-writer repository (its check runs at the fence,
+//! before the lock and pack-age checks); on a single-writer one EXISTS,
+//! a plain PUT and a read-back (10-single-protocol step 7), where other
+//! bytes read back fail the write (`ConcurrentHeadWrite`). When another writer holds the generation the
 //! write ends there: nothing local changes (the error cleanup runs), the
 //! objects it PUT are unreferenced garbage, no garbage collection runs, and
 //! the output is [`Published::Taken`]. A backup commit rebases and tries
@@ -1203,7 +1204,8 @@ fn write_step(
             // term stay the last checks before the head create; a handle
             // whose storage fails it refuses (`MultiWriterUnsupported`),
             // whatever its commit mode, and undecided fails the write like a
-            // failed PUT. Single-writer: no check.
+            // failed PUT. Single-writer: no check; its head write is EXISTS,
+            // plain PUT, read-back (`create_head`).
             repo.require_writer_mode()?;
             fence.check()?;
             match head_check {
@@ -1273,11 +1275,12 @@ fn write_step(
             Ok(())
         }
         StepKind::CollectGarbage => {
-            // A lock-free maintenance run's marker check (04 step 9) guards
-            // its deletes: when it fails the collection is skipped (the
-            // head has landed; the run's next check ends it). A lock-free
-            // backup's fence passes; under the lock nothing changes.
-            if repo.is_lock_free()
+            // A session run (maintenance session, backup) checks its fence
+            // before the garbage collection; a lock holder does not. A
+            // maintenance session's marker check (04 step 9) guards its
+            // deletes: when it fails the collection is skipped (the head has
+            // landed; the run's next check ends it). A backup's fence passes.
+            if !fence.is_lock()
                 && let Err(e) = fence.check()
             {
                 warn!("index garbage collection skipped: {e}");

@@ -12,9 +12,18 @@
 //! since 04 step 1 (installation ID): [`h1_regression`],
 //! [`h1_session_regression`]. H2-marker is a regression since 04 step 2
 //! (non-resurrecting marker refresh): [`h2_marker_regression`]. 04 step 5
-//! (ages on the store's clock) moved H4's skew route to the regressions
-//! ([`h4_skew_regression`]) and kept H4 on a store clock step
-//! ([`Hosts::StoreStepped`]); H2 reaches its two holders the same way.
+//! (ages on the store's clock) moved H4's skew route to the regressions and
+//! kept H4 on a store clock step ([`Hosts::StoreStepped`]); H2 reaches its
+//! two holders the same way.
+//!
+//! Retired by 10-single-protocol step 7: H4 and H4-skew. Their subject was
+//! compact's own lock route after a lost lock (a compact under the
+//! maintenance lock that lost it to an age reap and deleted on); since step
+//! 7 compact runs in a session on every repository and no command reaches
+//! that route (`compact_repo` under the lock is called by tests only, until
+//! step 9). The neutralised H4 and H4-segment variants and the
+//! no-prerequisite check of H4 went with them. H1, H1-late-clone and H2
+//! take the lock through [`Call::LockedDelete`] since then.
 
 use std::time::Duration;
 
@@ -224,6 +233,19 @@ fn steps_deleting(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64
         .collect()
 }
 
+/// `c`'s second listing of `sessions/` (the first is the open's), after
+/// every pack is uploaded: on a single-writer repository the listing
+/// before its commit mark (10-single-protocol step 7), unflagged; on a
+/// multi-writer one the probe after its mark.
+fn before_commit(c: ClientId) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::ListMeta),
+        KeyMatch::Exact("sessions/".into()),
+    )
+    .nth(2)
+}
+
 /// Steps at which `client`'s run `run` wrote `key`.
 fn steps_writing(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64> {
     records_of(sim, client, run, |r| r.op.is_write() && r.key == key)
@@ -329,6 +351,10 @@ fn not_reproduced_on(id: &str, hosts: &[Hosts], run: fn(Hosts) -> HazardOutcome)
 /// A deletes t0 and is held at its snapshot delete, after its fence check.
 /// B deletes t1: its stale-lock sweep reaps A's lock when it shares A's
 /// hostname, and B is held at its own first fence check. Then A resumes.
+/// Both delete under the maintenance lock ([`Call::LockedDelete`]): since
+/// 10-single-protocol step 7 delete runs in a session, and the lock holders
+/// this models are `check --repair`, upgrade and pack maps, which hold the
+/// lock until step 9.
 pub fn h1_with(hosts: Hosts) -> HazardOutcome {
     settle(h1_scenario(hosts))
 }
@@ -351,7 +377,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
     ));
     let sa = sim.spawn(
         a,
-        Call::Delete {
+        Call::LockedDelete {
             names: vec!["t0".into()],
         },
     );
@@ -362,7 +388,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
     }
     let sb = sim.spawn(
         b,
-        Call::Delete {
+        Call::LockedDelete {
             names: vec!["t1".into()],
         },
     );
@@ -423,9 +449,11 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
 /// the backup fails. The clients are placed by `hosts`; since 04 step 1 no
 /// placement reproduces it.
 ///
-/// A backs up a1 and is held at its commit lock's stale-lock sweep, after
-/// phase 1 uploaded its packs. B compacts beside A's live backup (since 04
-/// step 7 it proceeds, keeping A's uploads). Then A resumes.
+/// A backs up a1 and is held at its single-writer listing before its
+/// commit mark (its commit lock's stale-lock sweep until 10-single-protocol
+/// step 7), after phase 1 uploaded its packs. B compacts beside A's live
+/// backup (since 04 step 7 it proceeds, keeping A's uploads). Then A
+/// resumes.
 pub fn h1_session_with(hosts: Hosts) -> HazardOutcome {
     settle(h1_session_scenario(hosts))
 }
@@ -435,9 +463,10 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
     let c = sim.client("c");
     ok(&sim.backup(c, "t0", &seeded("t0")), "control backup t0")?;
     let (a, b) = pair(&mut sim, hosts);
-    // The 1st LIST of locks/ is the registration probe, the 2nd the commit
-    // lock's sweep, after every pack is uploaded.
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    // The 1st listing of sessions/ is the open's, the 2nd the single-writer
+    // listing before the commit mark (on a multi-writer repository: the
+    // probe of `locks/` after it), after every pack is uploaded.
+    let ga = sim.gate(before_commit(a));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -445,7 +474,7 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
             tree: seeded("a1"),
         },
     );
-    reach(&sim, ga, "a's commit-lock sweep")?;
+    reach(&sim, ga, "a's first commit step")?;
     let a_packs = sim.store().keys_written_by(a, "packs/");
     if a_packs.is_empty() {
         return Err(broken("a paused before uploading; retarget the gate"));
@@ -504,6 +533,10 @@ pub fn h2_lock_refresh_resurrects() -> HazardOutcome {
 
 /// H2 with the reap placed by `reap`; `BeforeFence` neutralises it.
 ///
+/// Both delete under the maintenance lock ([`Call::LockedDelete`], the lock
+/// holders that remain until 10-single-protocol step 9; delete itself runs
+/// in a session since step 7).
+///
 /// A deletes t0 and t2 and is held at its first fence check; time moves
 /// 3 h 1 min, so A's lock is due for refresh, and then the store's clock
 /// steps 3 h forward (an NTP correction on the server): B sees A's lock as
@@ -528,7 +561,7 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     let gb = sim.gate(GateRule::new(b, OpMatch::Kind(OpKind::Exists), locks()));
     let sa = sim.spawn(
         a,
-        Call::Delete {
+        Call::LockedDelete {
             names: vec!["t0".into(), "t2".into()],
         },
     );
@@ -547,7 +580,7 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     }
     sim.advance(Duration::from_secs(3 * 3600 + 60));
     sim.step_store_clock(chrono::Duration::hours(3));
-    let delete_t1 = || Call::Delete {
+    let delete_t1 = || Call::LockedDelete {
         names: vec!["t1".into()],
     };
     let (ra, rb) = match reap {
@@ -795,41 +828,11 @@ pub enum Order {
     Sequential,
 }
 
-/// Where backup B is held in H4.
+/// Where backup B is held in H4-segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackupGate {
-    /// After its head GET, before its segment PUT (H4).
-    Segment,
     /// After its segment PUT and fence, before its head PUT (H4-segment).
     Head,
-}
-
-/// H4: compact loses its lock (the age rule, after the store's clock
-/// stepped 6 h 1 min forward) and deletes sources with no fence after its
-/// head PUT; a backup that read the head before then commits a head that
-/// names the deleted packs.
-pub fn h4_compact_deletes_after_lost_lock() -> HazardOutcome {
-    h4_with(Hosts::StoreStepped, Order::Interleaved)
-}
-
-/// H4 with the clients placed by `hosts` and ordered by `order`.
-/// `Sequential` neutralises it; a placement without the store clock step
-/// removes its prerequisite (a reaped live lock).
-///
-/// Compact A is held at its second head PUT (the first is its sweep's),
-/// after the repack batch's segment PUT. Backup B, whose registration probe
-/// reaps A's lock, is held after its head GET and before its segment PUT. A
-/// resumes, deletes t0's old pack and ends `Ok`; then B commits on the head
-/// it read.
-pub fn h4_with(hosts: Hosts, order: Order) -> HazardOutcome {
-    settle(h4_scenario(hosts, order, BackupGate::Segment))
-}
-
-/// H4-segment: as H4, but B is held at its head PUT, after its segment PUT.
-/// Before 05 step 8, A's end-of-run index upkeep (`collect_garbage`,
-/// unfenced) deleted B's segment, and B's head then named it.
-pub fn h4_segment_with(hosts: Hosts, order: Order) -> HazardOutcome {
-    settle(h4_scenario(hosts, order, BackupGate::Head))
 }
 
 /// H4-segment as a regression: `HeadObjectAbsent` for B's segment if it is
@@ -856,31 +859,6 @@ pub fn h4_segment_regression() -> Report {
         if sim.store().object(&k).is_none() {
             out.add(ViolationKind::HeadObjectAbsent, &k, "b's segment deleted");
         }
-    }
-    out
-}
-
-/// H4-skew: H4's old route, b's wall clock 6 h 1 min ahead. Since 04 step 5
-/// b judges a's lock by its mtime on the store's clock and does not reap
-/// it: the run ends early with b `Locked` and a `Ok`. Anything else is a
-/// `DisallowedError` "H4-skew" with the outcome.
-pub fn h4_skew_regression() -> Report {
-    let mut out = Report::default();
-    match h4_runs(Hosts::Skewed, Order::Interleaved, BackupGate::Segment) {
-        Ok(Err(HazardOutcome::PrerequisiteNotReproduced {
-            prerequisite: "a reaped live lock",
-            ..
-        })) => {}
-        Ok(Ok((_, _, _, ra, rb))) => out.add(
-            ViolationKind::DisallowedError,
-            "H4-skew",
-            format!("b reaped a's live lock\n{}", outcomes(&ra, &rb)),
-        ),
-        Ok(Err(outcome)) | Err(outcome) => out.add(
-            ViolationKind::DisallowedError,
-            "H4-skew",
-            format!("{outcome:?}"),
-        ),
     }
     out
 }
@@ -912,7 +890,6 @@ fn h4_runs(
         b,
         OpMatch::AnyWrite,
         match at {
-            BackupGate::Segment => KeyMatch::Prefix("index.d/".into()),
             BackupGate::Head => head(),
         },
     ));
@@ -975,83 +952,4 @@ fn h4_run(
     at: BackupGate,
 ) -> Result<Result<(Sim, ClientId), HazardOutcome>, HazardOutcome> {
     Ok(h4_runs(hosts, order, at)?.map(|(sim, _, b, _, _)| (sim, b)))
-}
-
-fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
-    let (sim, a, b, ra, rb) = match h4_runs(hosts, order, at)? {
-        Ok(run) => run,
-        Err(outcome) => return Ok(outcome),
-    };
-    if took_no_lock(&sim, a) {
-        return Ok(no_lock_taken(outcomes(&ra, &rb)));
-    }
-    let report = sim.check_invariants(CHECKED);
-    controls(&report)?;
-    let key = lock_key_of(&sim, &ra);
-    let reap = key
-        .as_deref()
-        .map(|k| steps_deleting(&sim, b, rb.index, k))
-        .unwrap_or_default()
-        .into_iter()
-        .find(|s| (ra.first_step..ra.last_step).contains(s));
-    let a_deleted = deleted_in_run(&sim, a, ra.index);
-    let evidence_head = format!(
-        "{}\na's lock {key:?} deleted by b at {reap:?}",
-        outcomes(&ra, &rb)
-    );
-    let healthy = rb.is_ok()
-        && !report.violated(Invariant::IndexIntegrity)
-        && !report.violated_for(Invariant::CommittedSnapshotsRestore, "t1");
-    let reproduced = match at {
-        BackupGate::Segment => {
-            let after_reap = reap.is_some_and(|s1| {
-                !records_of(&sim, a, ra.index, |r| {
-                    r.step > s1 && r.deleted_keys().iter().any(|k| k.starts_with("packs/"))
-                })
-                .is_empty()
-            });
-            let named: Vec<&String> = a_deleted
-                .iter()
-                .filter(|k| {
-                    k.starts_with("packs/")
-                        && report.has_kind(ViolationKind::IndexNamesAbsentPack, k)
-                })
-                .collect();
-            let evidence = format!(
-                "{evidence_head}\na deleted packs after the reap: {after_reap}; \
-                 the index names packs a deleted: {named:?}\n{report}"
-            );
-            let hit = reap.is_some()
-                && after_reap
-                && !named.is_empty()
-                && report.violated_for(Invariant::CommittedSnapshotsRestore, "t1")
-                && rb.is_ok();
-            (hit, evidence)
-        }
-        BackupGate::Head => {
-            let b_segments = sim.store().keys_written_by(b, "index.d/");
-            let dangling: Vec<&String> = b_segments
-                .iter()
-                .filter(|k| {
-                    a_deleted.contains(*k) && report.has_kind(ViolationKind::HeadObjectAbsent, k)
-                })
-                .collect();
-            let evidence = format!(
-                "{evidence_head}\nb's segments {b_segments:?}, deleted by a and named by \
-                 the head: {dangling:?}\n{report}"
-            );
-            (
-                reap.is_some() && !dangling.is_empty() && rb.is_ok(),
-                evidence,
-            )
-        }
-    };
-    let (hit, evidence) = reproduced;
-    Ok(if hit {
-        HazardOutcome::Reproduced { evidence }
-    } else if healthy {
-        HazardOutcome::NotReproduced { evidence }
-    } else {
-        different_damage(evidence)
-    })
 }

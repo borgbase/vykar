@@ -284,7 +284,7 @@ impl WriteSession {
 
     /// [`Self::wait_pending_uploads`], but the final journal write runs in
     /// the background like the debounced ones, so the caller can go on
-    /// (backup: take the commit lock) during its round trip.
+    /// (backup: protect its commit) during its round trip.
     ///
     /// The next `wait_pending_uploads` (the commit's own flush) joins it and
     /// rewrites the journal synchronously if it failed; dropping the session

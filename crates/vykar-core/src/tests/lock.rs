@@ -8,6 +8,7 @@ use crate::repo::lock::{
     format_age_since, parse_session_marker_key, probe_unlocked_at, register_session, release_lock,
     session_marker_key, session_marker_key_at, yield_to_lock_free_writers,
 };
+use crate::repo::lock::{HeadWriter, head_landing_check, single_writer_listing};
 use crate::repo::{HostEnv, HostIdentity, SystemClock};
 use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
@@ -1213,6 +1214,7 @@ fn marker_report(missing: bool, gap_min: u32) -> MarkerReport {
         refreshes: 0,
         failed_refreshes: 0,
         slow_puts: 0,
+        restarted: false,
     }
 }
 
@@ -2354,6 +2356,7 @@ mod deadline {
     use crate::sim::env::{SimTime, TimeMode};
     use crate::testutil::MemoryBackend;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use vykar_storage::StorageBackend;
     use vykar_types::error::VykarError;
@@ -2412,6 +2415,236 @@ mod deadline {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    /// `wait_while_locked`'s deadline (virtual time, `TimeMode::Auto`: each
+    /// backoff sleep advances it at once): an attempt that stays `Locked`
+    /// is retried until `max_wait` has passed, then one final attempt's
+    /// `Locked(holder)` is returned; `on_contended` is called once.
+    #[test]
+    fn wait_while_locked_gives_up_at_the_deadline() {
+        use crate::repo::lock::wait_while_locked;
+        use vykar_types::error::LockHolder;
+        let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
+        let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
+        let max_wait = Duration::from_secs(10 * 60);
+        let holder = LockHolder {
+            key: "locks/rival.json".into(),
+            details: None,
+        };
+        let (mut attempts, mut contended) = (0usize, 0usize);
+        let err = wait_while_locked(
+            &env,
+            max_wait,
+            500,
+            &CancelToken::new(),
+            |_| contended += 1,
+            |_| -> vykar_types::error::Result<()> {
+                attempts += 1;
+                Err(VykarError::Locked(holder.clone()))
+            },
+        )
+        .unwrap_err();
+        match err {
+            VykarError::Locked(h) => assert_eq!(h.key, "locks/rival.json"),
+            other => panic!("got {other:?}"),
+        }
+        assert!(time.elapsed() >= max_wait, "{:?}", time.elapsed());
+        assert!(attempts > 2, "{attempts} attempts");
+        assert_eq!(contended, 1);
+    }
+
+    /// Registers a live compact (session `rival`, flagged `writes_heads`,
+    /// on another host) right after the first PUT of a marker key flagged
+    /// `committing`: a backup's commit mark.
+    struct RivalOnMark {
+        inner: Arc<dyn StorageBackend>,
+        marked: Arc<AtomicBool>,
+    }
+
+    impl vykar_storage::InnerBackend for RivalOnMark {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for RivalOnMark;
+        except [put, put_pack, begin_staged_put, conditional, profile];
+
+        // Every write on `put` (the repository is single-writer).
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            self.inner.profile()
+        }
+
+        // Packs and staged writes are no marker keys.
+        fn put_pack(
+            &self,
+            key: &str,
+            data: vykar_storage::PackData,
+        ) -> vykar_types::error::Result<()> {
+            self.inner.put_pack(key, data)
+        }
+
+        fn begin_staged_put(
+            &self,
+            prefix: &str,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            self.inner.begin_staged_put(prefix)
+        }
+
+        fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+            self.inner.put(key, data)?;
+            let committing = key.starts_with("sessions/")
+                && serde_json::from_slice::<crate::repo::lock::SessionEntry>(data)
+                    .is_ok_and(|e| e.committing);
+            if committing && !self.marked.swap(true, Ordering::SeqCst) {
+                let rival = HostEnv::system().with_host(crate::repo::HostIdentity {
+                    hostname: "compact-host".into(),
+                    pid: 4242,
+                    boot_id: Some("boot-c".into()),
+                    installation_id: Some("inst-c".into()),
+                    pid_ns: Some(1),
+                });
+                crate::repo::lock::register_session_with(
+                    &*self.inner,
+                    "rival",
+                    &rival,
+                    crate::repo::lock::MarkerFlags {
+                        committing: false,
+                        writes_heads: true,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The single-writer arm of `PendingCommit::protect_commit` gives up at
+    /// its deadline (`COMMIT_LOCK_MAX_WAIT`, virtual time) beside a live
+    /// compact (a session flagged `writes_heads` on another host, registered
+    /// right after the backup's commit mark and fresh on the store's clock
+    /// throughout): its listing after the mark unmarks, every later attempt
+    /// waits at the listing before the mark, and at the deadline the result
+    /// is `Locked` naming the compact's session with the backup's marker
+    /// left unmarked (its newest key carries no `committing`).
+    #[test]
+    fn a_single_writer_protection_gives_up_unmarked() {
+        use crate::commands;
+        use crate::repo::lock::SessionEntry;
+        use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat, WriterMode};
+        use crate::tests::helpers::make_test_config;
+        use vykar_storage::local_backend::LocalBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source = tmp.path().join("src");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a"), "alpha").unwrap();
+        let mut config = make_test_config(&repo_dir);
+        let cache = tmp.path().join("cache");
+        config.cache_dir = Some(cache.to_string_lossy().into_owned());
+        let local = || Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+        Repo::init_at_format(
+            local(),
+            EncryptionMode::Aes256Gcm,
+            config.chunker.params(),
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(&config.repository.init_options()),
+            Some(cache.clone()),
+            RepoFormat::CURRENT,
+        )
+        .unwrap();
+        let mut repo = Repo::open(
+            local(),
+            Some(crate::testing::TEST_PASSPHRASE),
+            Some(cache.clone()),
+            OpenOptions::new().legacy_format(),
+        )
+        .unwrap();
+        commands::upgrade::upgrade_repo(&mut repo, Some(WriterMode::Single)).unwrap();
+        drop(repo);
+
+        let storage = local();
+        let marked = Arc::new(AtomicBool::new(false));
+        let wrap = {
+            let marked = Arc::clone(&marked);
+            move |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+                Box::new(RivalOnMark {
+                    inner: Arc::from(inner),
+                    marked: Arc::clone(&marked),
+                })
+            }
+        };
+
+        let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
+        let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
+        let source_paths = vec![source.to_string_lossy().into_owned()];
+        let req = commands::backup::BackupRequest {
+            snapshot_name: "a1",
+            passphrase: Some(crate::testing::TEST_PASSPHRASE),
+            source_paths: &source_paths,
+            source_label: "src",
+            exclude_patterns: &[],
+            exclude_if_present: &[],
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: crate::compress::Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        };
+        let mut pending = commands::backup::upload(
+            &config,
+            &req,
+            &mut None,
+            &CancelToken::new(),
+            Some(&wrap),
+            env,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        let start = Instant::now();
+        let err = pending
+            .protect_commit(&mut None, &CancelToken::new())
+            .unwrap_err();
+        match &err {
+            VykarError::Locked(h) => assert!(h.key.starts_with("sessions/rival"), "{h:?}"),
+            other => panic!("got {other:?}"),
+        }
+        assert!(
+            time.elapsed() >= COMMIT_LOCK_MAX_WAIT,
+            "{:?}",
+            time.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(marked.load(Ordering::SeqCst), "the backup never marked");
+        assert!(!pending.is_marked());
+        let mut own: Vec<String> = storage
+            .list("sessions/")
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.ends_with(".json") && !k.starts_with("sessions/rival"))
+            .collect();
+        own.sort_by_key(|k| {
+            crate::repo::lock::parse_session_marker_key(k)
+                .map(|(_, n)| n)
+                .unwrap_or_default()
+        });
+        let newest = own.last().expect("the backup's marker");
+        let entry: SessionEntry =
+            serde_json::from_slice(&storage.get(newest).unwrap().unwrap()).unwrap();
+        assert!(!entry.committing, "{newest} still flagged committing");
+        drop(pending);
     }
 
     #[test]
@@ -3377,4 +3610,147 @@ fn probe_unlocked_at_reads_now_without_a_lock_listed() {
         Err(VykarError::Locked(_))
     ));
     release_lock(&storage, held).unwrap();
+}
+
+// ── 10-single-protocol step 7: the record's restart, the single-writer listing ──
+
+/// The suspend rule's restart: a record with a gap over `MARKER_GAP_LIMIT`
+/// and a miss is continuous again after `restart_record`, and marked
+/// `restarted`, which keeps the pack-age term binding: past
+/// `PACK_AGE_LIMIT` the landing check and the commit check refuse what
+/// they would let a continuous, unrestarted record do; young they pass. A
+/// refresh after the restart records no miss.
+#[test]
+fn restart_record_forgets_the_gap_and_keeps_the_term_binding() {
+    use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
+    let storage = MemoryBackend::new();
+    let (time, env) = sim_env();
+    let marker = registered(&storage, "gap", &env);
+    storage.delete(&session_marker_key("gap")).unwrap();
+    time.advance(31 * MIN);
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(matches!(outcome, RefreshOutcome::Missing), "{outcome:?}");
+    let before = marker.report(env.clock.as_ref());
+    assert!(!before.continuous() && before.missing, "{before:?}");
+
+    marker.restart_record();
+    let report = marker.report(env.clock.as_ref());
+    assert!(report.continuous() && report.restarted, "{report:?}");
+    let old = PACK_AGE_LIMIT + MIN;
+    let unrestarted = MarkerReport {
+        restarted: false,
+        ..report.clone()
+    };
+    assert!(head_landing_check("s", &unrestarted, old, std::time::Duration::ZERO).is_ok());
+    assert!(is_stale(&head_landing_check(
+        "s",
+        &report,
+        old,
+        std::time::Duration::ZERO
+    )));
+    assert!(head_landing_check("s", &report, YOUNG, HEAD_LANDING_ALLOWANCE).is_ok());
+    assert!(commit_marker_check("s", Ok(true), &unrestarted, old).is_ok());
+    assert!(is_stale(&commit_marker_check("s", Ok(true), &report, old)));
+    assert!(commit_marker_check("s", Ok(true), &report, YOUNG).is_ok());
+
+    time.advance(15 * MIN);
+    let outcome = marker.refresh(&storage, env.clock.as_ref());
+    assert!(
+        matches!(outcome, RefreshOutcome::Refreshed { .. }),
+        "{outcome:?}"
+    );
+    let after = marker.report(env.clock.as_ref());
+    assert!(
+        after.continuous() && !after.missing && after.restarted,
+        "{after:?}"
+    );
+}
+
+/// A marker of `id` written now with `flags`.
+fn write_flagged_marker(storage: &MemoryBackend, id: &str, committing: bool, writes_heads: bool) {
+    let now = Utc::now().to_rfc3339();
+    let entry = SessionEntry {
+        committing,
+        writes_heads,
+        ..SessionEntry {
+            hostname: "elsewhere".into(),
+            pid: 7,
+            registered_at: now.clone(),
+            last_refresh: now,
+            boot_id: None,
+            installation_id: None,
+            pid_ns: None,
+            elapsed_secs: None,
+            committing: false,
+            writes_heads: false,
+        }
+    };
+    storage
+        .put(
+            &format!("sessions/{id}.json"),
+            &serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+}
+
+/// The single-writer listing: no other session, or only unflagged ones,
+/// is `None`; a committing one `Committing`; a `writes_heads` one
+/// `Compact`, also beside a committing one; its own session never counts;
+/// a malformed newest key counts as `Compact` (fail closed); a stale
+/// flagged session is reaped and not reported; orphan journals stay.
+#[test]
+fn single_writer_listing_finds_head_writers() {
+    let env = env_on("other-host", None, pid_always_alive);
+    let fresh = || {
+        let storage = MemoryBackend::new();
+        register_session(&storage, "own", &env).unwrap();
+        storage
+    };
+    let list = |s: &MemoryBackend| single_writer_listing(s, &env, "own").unwrap();
+
+    let s = fresh();
+    assert!(list(&s).is_none());
+    write_flagged_marker(&s, "idle", false, false);
+    assert!(list(&s).is_none());
+    write_flagged_marker(&s, "backup", true, false);
+    assert!(matches!(list(&s), Some(HeadWriter::Committing(_))));
+    write_flagged_marker(&s, "compact", false, true);
+    assert!(matches!(list(&s), Some(HeadWriter::Compact(_))));
+
+    // Its own flags never count.
+    let s = MemoryBackend::new();
+    let reg = crate::repo::lock::register_session_with(
+        &s,
+        "own",
+        &env,
+        crate::repo::lock::MarkerFlags {
+            committing: true,
+            writes_heads: true,
+        },
+    )
+    .unwrap();
+    drop(reg);
+    assert!(list(&s).is_none());
+
+    let s = fresh();
+    s.put("sessions/bad.json", b"{").unwrap();
+    assert!(matches!(list(&s), Some(HeadWriter::Compact(_))));
+
+    let s = fresh();
+    let stale = (Utc::now() - Duration::minutes(46)).to_rfc3339();
+    let entry = SessionEntry {
+        committing: true,
+        writes_heads: true,
+        ..serde_json::from_slice::<SessionEntry>(&{
+            write_session_marker(&s, "gone", &stale);
+            s.get("sessions/gone.json").unwrap().unwrap()
+        })
+        .unwrap()
+    };
+    s.put("sessions/gone.json", &serde_json::to_vec(&entry).unwrap())
+        .unwrap();
+    s.put("sessions/orphan.index", b"journal").unwrap();
+    assert!(list(&s).is_none(), "a stale flagged session is reaped");
+    assert!(!s.exists("sessions/gone.json").unwrap());
+    assert!(s.exists("sessions/orphan.index").unwrap(), "journals stay");
 }

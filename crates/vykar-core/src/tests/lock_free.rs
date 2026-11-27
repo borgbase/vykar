@@ -1,13 +1,20 @@
 //! Lock-free backups (04 step 9, phase F part 10c) on the simulator: two
-//! backups commit without a lock; a lock-free commit waits for a held lock
-//! and a lock holder yields to a committing backup (the marker
-//! handshake); a crashed committing marker blocks lock holders until it is
-//! stale. Lock holders list
-//! sessions only after their lock is confirmed; a marker reaped by age
-//! beside its refresh, an undecided put-if-absent check and a cancel during
-//! the wait each fail the backup as they should. A backup whose marker
-//! record has a gap before its commit commits under the lock, and yields
-//! there to a committing lock-free backup.
+//! backups commit without a lock; a backup waits for a held lock and a
+//! lock holder yields to a committing backup (the marker handshake); a
+//! crashed committing marker blocks lock holders until it is stale. Lock
+//! holders list sessions only after their lock is confirmed; a marker
+//! reaped by age beside its refresh, an undecided put-if-absent check and a
+//! cancel during the wait each fail the backup as they should. A backup
+//! whose marker record has a gap before its commit commits lock-free after
+//! the suspend rule.
+//!
+//! Since 10-single-protocol step 7 no backup or compact takes the lock: the
+//! lock holders here hold the maintenance lock as `check --repair`, upgrade
+//! and pack maps do until step 9 (`Call::LockedCustom`,
+//! `Call::LockedDelete`). `a_locked_compact_fails_locked_beside_a_committing_backup`
+//! moved to `tests::single_writer` (a single-writer compact), and
+//! `a_backup_with_a_gap_yields_to_a_committing_backup` became
+//! `tests::single_writer::a_gap_backup_commits_beside_a_committing_backup`.
 
 use crate::repo::control::CancelToken;
 use crate::sim::history::{AllowedError, ErrorClass};
@@ -78,6 +85,59 @@ fn locks_listing(c: ClientId, n: u32) -> GateRule {
     GateRule::new(c, OpMatch::AnyList, KeyMatch::LockKey).nth(n)
 }
 
+/// A lock holder that writes a head: a fold under the maintenance lock
+/// ([`Call::LockedCustom`]), as `check --repair`, upgrade and pack maps
+/// hold the lock until 10-single-protocol step 9 (lock-mode backups, the
+/// holders here before step 7, exist no more).
+fn locked_fold() -> Call {
+    Call::LockedCustom {
+        label: "locked fold".into(),
+        f: Box::new(|repo| {
+            repo.load_chunk_index_under_lock()?;
+            repo.request_index_fold();
+            repo.mark_index_dirty();
+            repo.save_state()
+        }),
+    }
+}
+
+/// A lock holder that deletes snapshot `name` ([`Call::LockedDelete`]).
+fn locked_delete(name: &str) -> Call {
+    Call::LockedDelete {
+        names: vec![name.into()],
+    }
+}
+
+/// `c`'s snapshot delete: a [`locked_delete`] holds its lock there.
+fn snapshot_delete(c: ClientId) -> GateRule {
+    GateRule::new(c, OpMatch::AnyDelete, KeyMatch::Prefix("snapshots/".into()))
+}
+
+/// `c`'s commit mark: its first marker key after registration.
+fn commit_mark(c: ClientId) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::Put),
+        KeyMatch::Prefix("sessions/".into()),
+    )
+    .filter(|_, k| k.ends_with(".1.json"))
+}
+
+/// The first lock key `c` wrote in `log` and the step its run released it.
+fn first_lock(log: &[OpRecord], c: ClientId) -> (OpRecord, u64) {
+    let put = log
+        .iter()
+        .find(|r| r.client == c && r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
+        .expect("a lock key written")
+        .clone();
+    let released = log
+        .iter()
+        .find(|r| r.client == c && r.step > put.step && r.op.is_delete() && r.key == put.key)
+        .expect("the lock released")
+        .step;
+    (put, released)
+}
+
 fn expect_locked(run: &crate::sim::RunRecord) {
     assert_eq!(
         run.error_class(),
@@ -123,144 +183,115 @@ fn two_lock_free_backups_commit_without_a_lock() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// The handshake, lock-free side: a lock-free commit that meets a held
-/// lock at its probe waits (its marker flagged) and creates no head until
-/// the holder released it, then commits.
+/// The handshake, the session side: a backup (lock-free on a multi-writer
+/// repository, single-writer on the fallback store) that meets a held lock
+/// at its probe waits (its marker flagged) and creates no head until the
+/// holder released it, then commits. The holder deletes under the
+/// maintenance lock (a lock-mode backup until 10-single-protocol step 7).
 #[test]
 fn a_lock_free_commit_waits_for_a_held_lock() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
-    let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
-    // F's listings of locks/: its registration probe, the probe after its
-    // mark (finds L's lock), the probe after one backoff.
-    let f_retry = sim.gate(locks_listing(f, 3));
-    let f_mark = sim.gate(
-        GateRule::new(
-            f,
-            OpMatch::Kind(OpKind::Put),
-            KeyMatch::Prefix("sessions/".into()),
-        )
-        .filter(|_, k| k.ends_with(".1.json")),
-    );
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_mark, "f's commit mark");
-    let l_head = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(OpKind::Put),
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    let rl = sim.spawn(l, backup_call("l1"));
-    sim.expect_paused(l_head, "l's head PUT under its lock");
-    sim.resume(f_mark);
-    sim.expect_paused(f_retry, "f's second probe");
-    let log = sim.store().log();
-    assert!(
-        !log.iter()
-            .any(|r| r.client == f && r.op.is_write() && r.key.starts_with("index.h/")),
-        "f created a head while l held the lock"
-    );
-    sim.resume(l_head);
-    let rl = sim.join(rl);
-    rl.expect_ok();
-    assert!(!rl.lock_free);
-    sim.resume(f_retry);
-    let rf = sim.join(rf);
-    rf.expect_ok();
-    assert!(rf.lock_free);
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    for kind in [StoreKind::Conditional, StoreKind::Plain] {
+        let mut sim = encrypted(kind);
+        let (f, l) = (sim.client("f"), sim.client("l"));
+        sim.backup(l, "l0", &tree("l0")).expect_ok();
+        // F's listings of locks/: its registration probe, the probe after
+        // its mark (finds L's lock), the probe after one backoff.
+        let f_retry = sim.gate(locks_listing(f, 3));
+        let f_mark = sim.gate(commit_mark(f));
+        let rf = sim.spawn(f, backup_call("f1"));
+        sim.expect_paused(f_mark, "f's commit mark");
+        let l_held = sim.gate(snapshot_delete(l));
+        let rl = sim.spawn(l, locked_delete("l0"));
+        sim.expect_paused(l_held, "l's snapshot delete under its lock");
+        sim.resume(f_mark);
+        sim.expect_paused(f_retry, "f's second probe");
+        let log = sim.store().log();
+        assert!(
+            !log.iter()
+                .any(|r| r.client == f && r.op.is_write() && r.key.starts_with("index.h/")),
+            "{kind:?}: f created a head while l held the lock"
+        );
+        sim.resume(l_held);
+        let rl = sim.join(rl);
+        rl.expect_ok();
+        assert!(!rl.lock_free);
+        sim.resume(f_retry);
+        let rf = sim.join(rf);
+        rf.expect_ok();
+        assert!(rf.lock_free);
+        sim.check_invariants(Invariant::STEP8).assert_clean();
+    }
 }
 
-/// The handshake, lock-holder side: a lock-mode backup that acquires the
-/// lock while a lock-free one is between its head create and its snapshot
-/// PUT releases it again before any protected write, and commits after the
-/// lock-free one ended; no head is replaced on a store whose plain PUT
-/// overwrites (invariant 12 clean).
+/// The handshake, lock-holder side: a holder of the maintenance lock that
+/// writes a head ([`locked_fold`]) and acquires the lock while a backup is
+/// between its head create and its snapshot PUT refuses (`Locked`) and
+/// releases the lock before any protected write; run again after the
+/// backup ended it writes its head. No head is replaced on a store whose
+/// plain PUT overwrites (invariant 12 clean on the multi-writer one). Until
+/// 10-single-protocol step 7 the holder was a lock-mode backup, which
+/// waited and retried instead of refusing.
 #[test]
 fn a_lock_holder_yields_to_a_committing_backup() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
-    let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
-    let f_snap = sim.gate(snapshot_put(f));
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_snap, "f before its snapshot PUT");
-    let l_second = sim.gate(GateRule::new(l, OpMatch::Kind(OpKind::Put), KeyMatch::LockKey).nth(2));
-    let rl = sim.spawn(l, backup_call("l1"));
-    sim.expect_paused(l_second, "l's second lock attempt");
-    // L's first attempt: the lock key written, then deleted, nothing
-    // protected in between.
-    let log = sim.store().log();
-    let first_put = log
-        .iter()
-        .find(|r| r.client == l && r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
-        .expect("l wrote a lock key")
-        .clone();
-    let released = log
-        .iter()
-        .find(|r| {
-            r.client == l && r.step > first_put.step && r.op.is_delete() && r.key == first_put.key
-        })
-        .expect("l released its first lock");
-    assert!(
-        !log.iter().any(|r| r.client == l
-            && r.step > first_put.step
-            && r.step < released.step
-            && r.op.is_write()
-            && is_protected(&r.key)),
-        "l wrote under a lock it should have yielded"
-    );
-    sim.resume(f_snap);
-    let rf = sim.join(rf);
-    rf.expect_ok();
-    assert!(rf.lock_free);
-    sim.resume(l_second);
-    let rl = sim.join(rl);
-    rl.expect_ok();
-    assert!(!rl.lock_free);
-    assert!(sim.store().head_overwrites().is_empty());
-    for name in ["f1", "l1"] {
-        sim.restore(f, name).expect_ok();
+    for kind in [StoreKind::ConditionalOverwrite, StoreKind::Plain] {
+        let mut sim = encrypted(kind);
+        let (f, l) = (sim.client("f"), sim.client("l"));
+        let f_snap = sim.gate(snapshot_put(f));
+        let rf = sim.spawn(f, backup_call("f1"));
+        sim.expect_paused(f_snap, "f before its snapshot PUT");
+        let rl = sim.call(l, locked_fold());
+        expect_locked(&rl);
+        let log = sim.store().log();
+        let (first_put, released) = first_lock(&log, l);
+        assert!(
+            !log.iter().any(|r| r.client == l
+                && r.step > first_put.step
+                && r.step < released
+                && r.op.is_write()
+                && is_protected(&r.key)),
+            "{kind:?}: l wrote under a lock it should have yielded"
+        );
+        sim.resume(f_snap);
+        let rf = sim.join(rf);
+        rf.expect_ok();
+        assert!(rf.lock_free);
+        // The segments old enough to fold (04 step 7), so the fold writes a
+        // head.
+        sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
+        let rl = sim.call(l, locked_fold());
+        rl.expect_ok();
+        assert!(!rl.lock_free);
+        assert!(
+            records(&sim, l, rl.index)
+                .iter()
+                .any(|r| r.op.is_write() && r.applied() && r.key.starts_with("index.h/")),
+            "{kind:?}: the holder wrote no head"
+        );
+        assert!(sim.store().head_overwrites().is_empty(), "{kind:?}");
+        sim.restore(f, "f1").expect_ok();
+        let set = if kind.records_multi_writer() {
+            Invariant::STEP8
+        } else {
+            Invariant::STEP7
+        };
+        sim.check_invariants(set).assert_clean();
     }
-    sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// A lock-mode compact (its storage handle offers no put-if-absent, so it
-/// takes the maintenance lock) that meets a committing lock-free backup at
-/// its session listing fails `Locked` naming the committing host, before
-/// any write.
-#[test]
-fn a_locked_compact_fails_locked_beside_a_committing_backup() {
-    let mut sim = encrypted(StoreKind::Conditional);
-    let (f, c) = (sim.client("f"), sim.client("c"));
-    sim.set_lock_client(c);
-    let f_snap = sim.gate(snapshot_put(f));
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_snap, "f before its snapshot PUT");
-    let rc = sim.compact(c);
-    expect_locked(&rc);
-    let host = sim.host(f).hostname;
-    assert!(rc.detail().contains(&host), "{}", rc.detail());
-    let wrote = records(&sim, c, rc.index)
-        .iter()
-        .any(|r| r.op.is_write() && (is_protected(&r.key) || r.key.starts_with("packs/")));
-    assert!(!wrote, "the compact wrote before yielding");
-    sim.resume(f_snap);
-    sim.join(rf).expect_ok();
-    sim.compact(c).expect_ok();
-    sim.check_invariants(Invariant::STEP8).assert_clean();
-}
-
-/// A lock-free backup that crashed after its commit mark leaves a flagged
-/// marker: lock holders yield to it (`Locked`) until it is stale (45 min
-/// on the store's clock), then reap it and proceed. Nothing is wedged.
+/// A backup that crashed after its commit mark leaves a flagged marker:
+/// lock holders yield to it (`Locked`) until it is stale (45 min on the
+/// store's clock), and so does a single-writer compact (its single-writer
+/// check); then they reap it and proceed. Nothing is wedged. Since
+/// 10-single-protocol step 7 on a single-writer repository (the fallback
+/// store), its holders the maintenance lock's ([`locked_fold`]) and a
+/// compact (lock-mode clients' lock and compact before).
 #[test]
 fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
+    let mut sim = encrypted(StoreKind::Plain);
     let (f, l, c) = (sim.client("f"), sim.client("l"), sim.client("c"));
-    sim.set_lock_client(l);
-    sim.set_lock_client(c);
     let f_head = sim.gate(GateRule::new(
         f,
-        OpMatch::Kind(OpKind::PutIfAbsent),
+        OpMatch::Kind(OpKind::Put),
         KeyMatch::Prefix("index.h/".into()),
     ));
     let rf = sim.spawn(f, backup_call("f1"));
@@ -278,14 +309,13 @@ fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
             String::from_utf8_lossy(&body).contains("\"committing\":true")
         });
     assert!(flagged, "the crashed backup's marker stays flagged");
+    expect_locked(&sim.call(l, locked_fold()));
     expect_locked(&sim.compact(c));
     sim.advance(std::time::Duration::from_secs(46 * 60));
+    sim.call(l, locked_fold()).expect_ok();
     sim.compact(c).expect_ok();
-    // The reap cleared it: a lock-mode backup commits at once.
-    let rl = sim.backup(l, "l1", &tree("l1"));
-    rl.expect_ok();
-    assert!(!rl.lock_free);
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    sim.backup(l, "l1", &tree("l1")).expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// Every op of `c`'s run `run` on a lock key or a listing of `locks/` or
@@ -349,90 +379,83 @@ fn assert_lists_sessions_after_its_confirmed_lock(
 }
 
 /// The handshake, lock-holder side, in the order that only a holder whose
-/// session listing follows its confirmed lock survives: the holder is held
-/// at its lock PUT, the lock-free backup marks, probes `locks/` (empty) and
-/// commits up to its snapshot PUT, then the holder writes its lock. Its
-/// listing of `sessions/` after the lock is confirmed sees the flagged
-/// marker and it yields (releases the lock with nothing protected written).
-/// With the holder's order swapped (`sessions/` listed before the lock PUT)
-/// it lists before the mark, does not yield and this test fails.
+/// session listing follows its confirmed lock survives: the holder (a head
+/// writer under the maintenance lock, [`locked_fold`]; a lock-mode backup
+/// until 10-single-protocol step 7) is held at its lock PUT, the backup
+/// marks, probes `locks/` (empty) and commits up to its snapshot PUT, then
+/// the holder writes its lock. Its listing of `sessions/` after the lock
+/// is confirmed sees the flagged marker and it yields (`Locked`, the lock
+/// released with nothing protected written). With the holder's order
+/// swapped (`sessions/` listed before the lock PUT) it lists before the
+/// mark, does not yield and this test fails.
 #[test]
 fn a_lock_holder_lists_sessions_after_its_lock_is_confirmed() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
-    let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
-    let l_put = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(OpKind::Put),
-        KeyMatch::LockKey,
-    ));
-    let rl = sim.spawn(l, backup_call("l1"));
-    sim.expect_paused(l_put, "l's lock PUT");
-    let f_snap = sim.gate(snapshot_put(f));
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_snap, "f before its snapshot PUT");
-    let l_second = sim.gate(GateRule::new(l, OpMatch::Kind(OpKind::Put), KeyMatch::LockKey).nth(2));
-    sim.resume(l_put);
-    sim.expect_paused(l_second, "l's second lock attempt");
-    let log = sim.store().log();
-    let l_run = log
-        .iter()
-        .find(|r| r.client == l)
-        .and_then(|r| r.run)
-        .expect("l ran");
-    let first_put = log
-        .iter()
-        .find(|r| r.client == l && r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
-        .expect("l wrote a lock key")
-        .clone();
-    let released = log
-        .iter()
-        .find(|r| {
-            r.client == l && r.step > first_put.step && r.op.is_delete() && r.key == first_put.key
-        })
-        .expect("l yielded: it released its first lock")
-        .step;
-    assert_lists_sessions_after_its_confirmed_lock(&sim, l, l_run, &first_put, Some(released));
-    let mark = log
-        .iter()
-        .find(|r| {
-            r.client == f
-                && r.op == OpKind::Put
-                && r.key.starts_with("sessions/")
-                && r.key.ends_with(".1.json")
-        })
-        .expect("f marked its commit");
-    assert!(mark.step < first_put.step, "f marked before l's lock PUT");
-    sim.resume(f_snap);
-    let rf = sim.join(rf);
-    rf.expect_ok();
-    assert!(rf.lock_free);
-    sim.resume(l_second);
-    let rl = sim.join(rl);
-    rl.expect_ok();
-    assert!(!rl.lock_free);
-    assert!(sim.store().head_overwrites().is_empty());
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    for kind in [StoreKind::ConditionalOverwrite, StoreKind::Plain] {
+        let mut sim = encrypted(kind);
+        let (f, l) = (sim.client("f"), sim.client("l"));
+        let l_put = sim.gate(GateRule::new(
+            l,
+            OpMatch::Kind(OpKind::Put),
+            KeyMatch::LockKey,
+        ));
+        let rl = sim.spawn(l, locked_fold());
+        sim.expect_paused(l_put, "l's lock PUT");
+        let f_snap = sim.gate(snapshot_put(f));
+        let rf = sim.spawn(f, backup_call("f1"));
+        sim.expect_paused(f_snap, "f before its snapshot PUT");
+        sim.resume(l_put);
+        let rl = sim.join(rl);
+        expect_locked(&rl);
+        let log = sim.store().log();
+        let (first_put, released) = first_lock(&log, l);
+        assert_lists_sessions_after_its_confirmed_lock(
+            &sim,
+            l,
+            rl.index,
+            &first_put,
+            Some(released),
+        );
+        let mark = log
+            .iter()
+            .find(|r| {
+                r.client == f
+                    && r.op == OpKind::Put
+                    && r.key.starts_with("sessions/")
+                    && r.key.ends_with(".1.json")
+            })
+            .expect("f marked its commit");
+        assert!(mark.step < first_put.step, "f marked before l's lock PUT");
+        sim.resume(f_snap);
+        let rf = sim.join(rf);
+        rf.expect_ok();
+        assert!(rf.lock_free);
+        sim.call(l, locked_fold()).expect_ok();
+        assert!(sim.store().head_overwrites().is_empty(), "{kind:?}");
+        let set = if kind.records_multi_writer() {
+            Invariant::STEP8
+        } else {
+            Invariant::STEP7
+        };
+        sim.check_invariants(set).assert_clean();
+    }
 }
 
-/// The same order for both maintenance entry points on an encrypted
-/// repository: delete (`with_maintenance_lock`: the listing right after
-/// the lock) and compact (`with_maintenance_lock_unlisted`: its pack
-/// listing, then the session listing) list `sessions/` only after their
-/// lock is confirmed, and before any protected write.
+/// The same order for the maintenance lock's holders
+/// (`with_maintenance_lock`: the listing right after the lock): a delete
+/// under it ([`locked_delete`]) and `check --repair` list `sessions/` only
+/// after their lock is confirmed, and before any protected write. Until
+/// 10-single-protocol step 7 the subjects were a lock client's delete and
+/// compact, which run in a session since.
 #[test]
 fn maintenance_lists_sessions_after_its_lock_is_confirmed() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
-    // Lock mode: on this store a client with put-if-absent runs its
-    // maintenance lock-free (phase F part 10d).
-    sim.set_lock_client(a);
     for name in ["a1", "a2"] {
         sim.backup(a, name, &tree(name)).expect_ok();
     }
-    let rd = sim.delete(a, &["a1"]);
+    let rd = sim.call(a, locked_delete("a1"));
     rd.expect_ok();
-    let rc = sim.compact(a);
+    let rc = sim.call(a, Call::CheckRepair);
     rc.expect_ok();
     for run in [&rd, &rc] {
         let ops = lock_ops(&sim, a, run.index);
@@ -597,18 +620,11 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
 fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
     let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
+    sim.backup(l, "l0", &tree("l0")).expect_ok();
     // F's listings of locks/: its registration probe, the probe after its
     // mark (finds L's lock), the probe after one backoff.
     let f_retry = sim.gate(locks_listing(f, 3));
-    let f_mark = sim.gate(
-        GateRule::new(
-            f,
-            OpMatch::Kind(OpKind::Put),
-            KeyMatch::Prefix("sessions/".into()),
-        )
-        .filter(|_, k| k.ends_with(".1.json")),
-    );
+    let f_mark = sim.gate(commit_mark(f));
     let cancel = CancelToken::new();
     let rf = sim.spawn(
         f,
@@ -619,13 +635,11 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
         },
     );
     sim.expect_paused(f_mark, "f's commit mark");
-    let l_head = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(OpKind::Put),
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    let rl = sim.spawn(l, backup_call("l1"));
-    sim.expect_paused(l_head, "l's head PUT under its lock");
+    // The holder: a delete under the maintenance lock (a lock-mode backup
+    // until 10-single-protocol step 7).
+    let l_head = sim.gate(snapshot_delete(l));
+    let rl = sim.spawn(l, locked_delete("l0"));
+    sim.expect_paused(l_head, "l's snapshot delete under its lock");
     sim.resume(f_mark);
     sim.expect_paused(f_retry, "f's second probe");
     // From here f's backoff sleeps until the test advances time.
@@ -712,24 +726,33 @@ fn suspend_mid_upload(sim: &mut Sim, c: ClientId, name: &str) -> (GateId, Spawne
 
 /// A backup whose marker record already has a gap over
 /// `MARKER_GAP_LIMIT` when it is about to commit (its machine suspended
-/// for 35 min mid-upload) commits under the lock, on an encrypted
-/// repository on the conditional store: no commit mark (`lock_free` is the
-/// store's record of one), a lock key written, the snapshot committed and
-/// restorable. Lock-free it would refuse its snapshot every time: the
-/// record never becomes continuous again.
+/// for 35 min mid-upload) commits lock-free, on an encrypted repository on
+/// the conditional store (10-single-protocol step 7, the suspend rule; it
+/// committed under the lock before): no lock key written, a GET of
+/// `config` after its commit mark (the rule's re-read), put-if-absent
+/// heads, the snapshot committed and restorable. The next backup's record
+/// is continuous: no `config` GET in its commit.
 #[test]
-fn a_backup_with_a_gap_before_its_commit_commits_under_the_lock() {
+fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
     let (gate, ra) = suspend_mid_upload(&mut sim, a, "a1");
     sim.resume(gate);
     let ra = sim.join(ra);
     ra.expect_ok();
-    assert!(!ra.lock_free, "a commits under the lock");
+    assert!(ra.lock_free, "a commits lock-free");
     let recs = records(&sim, a, ra.index);
-    assert!(!lock_writes(&recs).is_empty(), "the commit lock was taken");
-    // The head create follows the repository's mode (multi-writer), not
-    // the demoted commit mode: put-if-absent, never a plain PUT.
+    assert!(lock_writes(&recs).is_empty(), "a lock was taken: {recs:?}");
+    let mark = recs
+        .iter()
+        .position(|r| r.op == OpKind::Put && r.key.ends_with(".1.json"))
+        .expect("a's commit mark");
+    assert!(
+        recs[mark..]
+            .iter()
+            .any(|r| r.op == OpKind::Get && r.key == "config"),
+        "no config GET after the mark: {recs:?}"
+    );
     let heads: Vec<&OpRecord> = recs
         .iter()
         .filter(|r| r.op.is_write() && r.key.starts_with("index.h/"))
@@ -740,61 +763,19 @@ fn a_backup_with_a_gap_before_its_commit_commits_under_the_lock() {
         "{heads:?}"
     );
     sim.restore(a, "a1").expect_ok();
-    // The next backup's record is continuous again: lock-free.
     let again = sim.backup(a, "a2", &tree("a2"));
     again.expect_ok();
     assert!(again.lock_free);
-    sim.check_invariants(Invariant::STEP8).assert_clean();
-}
-
-/// The handshake still holds for a backup that commits under the lock
-/// because of a gap in its record: it lists `sessions/` after its
-/// confirmed lock, finds a lock-free backup committing (flagged, between
-/// its head create and its snapshot PUT), releases the lock with nothing
-/// protected written, and commits after the lock-free one ended.
-#[test]
-fn a_backup_with_a_gap_yields_to_a_committing_backup() {
-    let mut sim = encrypted(StoreKind::Conditional);
-    let (d, f) = (sim.client("d"), sim.client("f"));
-    let (d_upload, rd) = suspend_mid_upload(&mut sim, d, "d1");
-    let f_snap = sim.gate(snapshot_put(f));
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_snap, "f before its snapshot PUT");
-    let d_second = sim.gate(GateRule::new(d, OpMatch::Kind(OpKind::Put), KeyMatch::LockKey).nth(2));
-    sim.resume(d_upload);
-    sim.expect_paused(d_second, "d's second lock attempt");
-    let log = sim.store().log();
-    let first_put = log
+    let recs = records(&sim, a, again.index);
+    let mark = recs
         .iter()
-        .find(|r| r.client == d && r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
-        .expect("d wrote a lock key")
-        .clone();
-    let released = log
-        .iter()
-        .find(|r| {
-            r.client == d && r.step > first_put.step && r.op.is_delete() && r.key == first_put.key
-        })
-        .expect("d yielded: it released its first lock")
-        .step;
-    assert_lists_sessions_after_its_confirmed_lock(&sim, d, rd.index(), &first_put, Some(released));
+        .position(|r| r.op == OpKind::Put && r.key.ends_with(".1.json"))
+        .expect("a2's commit mark");
     assert!(
-        !log.iter().any(|r| r.client == d
-            && r.step > first_put.step
-            && r.step < released
-            && r.op.is_write()
-            && is_protected(&r.key)),
-        "d wrote under a lock it should have yielded"
+        !recs[mark..]
+            .iter()
+            .any(|r| r.op == OpKind::Get && r.key == "config"),
+        "a continuous record re-read config: {recs:?}"
     );
-    sim.resume(f_snap);
-    let rf = sim.join(rf);
-    rf.expect_ok();
-    assert!(rf.lock_free);
-    sim.resume(d_second);
-    let rd = sim.join(rd);
-    rd.expect_ok();
-    assert!(!rd.lock_free, "d commits under the lock");
-    for name in ["d1", "f1"] {
-        sim.restore(f, name).expect_ok();
-    }
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }

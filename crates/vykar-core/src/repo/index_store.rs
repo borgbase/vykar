@@ -198,8 +198,8 @@ pub(crate) enum HeadPut {
 /// How [`create_head`] writes: the repository's writer mode.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HeadWrite<'a> {
-    /// Single-writer: a plain PUT (until 10-single-protocol step 7 the
-    /// writer holds the repository lock, so the head it read is current).
+    /// Single-writer: EXISTS, plain PUT, GET-compare (10-single-protocol
+    /// step 7); no lock.
     Plain,
     /// Multi-writer: put-if-absent, never a plain PUT. `backend` names the
     /// storage in a `MultiWriterUnsupported`.
@@ -208,7 +208,24 @@ pub(crate) enum HeadWrite<'a> {
 
 /// Create the head bytes `packed` at `head_key(generation)` (04 step 8).
 ///
-/// `Plain`: PUT → `Created`.
+/// `Plain` (single-writer: the best-effort single-writer check keeps
+/// other head writers out, this catches what it missed):
+/// - EXISTS → `Taken`, nothing written: another writer finished this
+///   generation after our head read (a stale base). An EXISTS error passes
+///   through, nothing written.
+/// - PUT ok → GET the key: our bytes → `Created`; other bytes →
+///   `ConcurrentHeadWrite` (two writers wrote the generation; ours may have
+///   replaced a head another writer already committed on); absent →
+///   `Taken` (collected since, or the read lags: the rebase reads the
+///   latest head again).
+/// - PUT refused by a write-once store (vykar-server's 409: nothing was
+///   stored, the other head stands) → GET the key: our bytes →
+///   `Created`, other bytes → `Taken`; absent, or the GET fails → the
+///   PUT's error.
+/// - `Err(InvalidFormat)` passes through.
+/// - Any other PUT error (outcome unknown) → GET the key: our bytes →
+///   `Created`; other bytes → `ConcurrentHeadWrite`; absent, or the GET
+///   fails → the PUT's error.
 ///
 /// `IfAbsent`:
 /// - `Ok(Yes)` → `Created`.
@@ -236,10 +253,7 @@ pub(crate) fn create_head(
 ) -> Result<HeadPut> {
     let key = head_key(generation);
     let backend = match write {
-        HeadWrite::Plain => {
-            storage.put(&key, packed)?;
-            return Ok(HeadPut::Created);
-        }
+        HeadWrite::Plain => return create_head_plain(storage, generation, &key, packed),
         HeadWrite::IfAbsent { backend } => backend,
     };
     let unsupported = |reason: String| VykarError::MultiWriterUnsupported {
@@ -272,6 +286,62 @@ pub(crate) fn create_head(
             Ok(None) | Err(_) => Err(e),
         },
     }
+}
+
+/// [`create_head`]'s `Plain` arm.
+fn create_head_plain(
+    storage: &dyn StorageBackend,
+    generation: u64,
+    key: &str,
+    packed: &[u8],
+) -> Result<HeadPut> {
+    // A key already there: another writer finished this generation after
+    // our head read.
+    if storage.exists(key)? {
+        return Ok(HeadPut::Taken);
+    }
+    let concurrent = || VykarError::ConcurrentHeadWrite { generation };
+    match storage.put(key, packed) {
+        Ok(()) => match storage.get(key)? {
+            Some(stored) if stored == packed => Ok(HeadPut::Created),
+            Some(_) => Err(concurrent()),
+            // Gone right after our PUT: a collector took it (the generation
+            // is far below the latest) or the storage's read lags; rebase.
+            None => Ok(HeadPut::Taken),
+        },
+        Err(e @ VykarError::InvalidFormat(_)) => Err(e),
+        Err(e) if is_write_once_refusal(&e) => match storage.get(key) {
+            Ok(Some(stored)) if stored == packed => Ok(HeadPut::Created),
+            Ok(Some(_)) => Ok(HeadPut::Taken),
+            // Not the write-once rule (a 409 for a digest mismatch, say).
+            Ok(None) | Err(_) => Err(e),
+        },
+        Err(e) => match storage.get(key) {
+            Ok(Some(stored)) if stored == packed => Ok(HeadPut::Created),
+            Ok(Some(_)) => Err(concurrent()),
+            Ok(None) | Err(_) => Err(e),
+        },
+    }
+}
+
+/// Whether a plain head PUT's error is a write-once store's definite
+/// refusal: vykar-server answers 409 to a PUT of an existing `index.h/`
+/// key with other bytes, publishing with a no-clobber rename, so nothing
+/// was stored and the head there stands (its retry of a PUT whose reply
+/// was lost answers 204 for our own bytes instead). The REST backend
+/// carries the status only in its text ("HTTP 409"); the simulator's
+/// conditional store answers "409 Conflict" as vykar-server does.
+///
+/// Every branch a match leads to is safe whatever the 409 meant: the GET
+/// decides, and only other bytes at the key turn it into `Taken`, which
+/// stores nothing of ours and makes the caller rebase onto the head there.
+/// Our own bytes are `Created` (they are stored), and an absent key or a
+/// failed GET gives back the PUT's error, as any unknown outcome does. A
+/// 409 that was not the write-once rule therefore cannot make us skip a
+/// head we need or claim one we did not write. A typed error from the
+/// backend would still be sturdier than matching its text.
+fn is_write_once_refusal(e: &VykarError) -> bool {
+    matches!(e, VykarError::Other(m) if m.contains("HTTP 409") || m.starts_with("409 Conflict"))
 }
 
 /// What the object at `index.h/<gen>` is.

@@ -355,14 +355,7 @@ pub(crate) fn yield_to_lock_free_writers(
         own.is_none(),
     )?;
     let holder = |key: String, entry: Option<&SessionEntry>| {
-        VykarError::Locked(LockHolder {
-            key,
-            details: entry.map(|e| LockHolderDetails {
-                hostname: e.hostname.clone(),
-                pid: e.pid,
-                age: format_age(&env.now_utc(), &e.registered_at),
-            }),
-        })
+        VykarError::Locked(session_holder(key, entry, env))
     };
     let mut unread: Vec<&str> = Vec::new();
     for s in live.iter().filter(|s| Some(s.session_id.as_str()) != own) {
@@ -402,6 +395,132 @@ pub(crate) fn yield_to_lock_free_writers(
         }
     }
     Ok((cleaned, live))
+}
+
+/// A live session as a [`LockHolder`]: its marker key `key` and, when its
+/// newest key was read, its host, PID and age.
+fn session_holder(key: String, entry: Option<&SessionEntry>, env: &HostEnv) -> LockHolder {
+    LockHolder {
+        key,
+        details: entry.map(|e| LockHolderDetails {
+            hostname: e.hostname.clone(),
+            pid: e.pid,
+            age: format_age(&env.now_utc(), &e.registered_at),
+        }),
+    }
+}
+
+/// Another live session that may write heads on a single-writer
+/// repository (10-single-protocol step 7), from one listing of
+/// `sessions/`.
+#[derive(Debug)]
+pub(crate) enum HeadWriter {
+    /// Carries `writes_heads` (a compact), or its newest key is
+    /// unreadable (fail closed).
+    Compact(LockHolder),
+    /// Carries `committing` (a backup), none carries `writes_heads`.
+    Committing(LockHolder),
+}
+
+impl HeadWriter {
+    pub(crate) fn into_holder(self) -> LockHolder {
+        match self {
+            HeadWriter::Compact(h) | HeadWriter::Committing(h) => h,
+        }
+    }
+}
+
+/// The single-writer check's listing (10-single-protocol step 7): one reap
+/// and listing of `sessions/` ([`reap_sessions`] with
+/// [`ReapNow::OwnSession`]`(own)`, orphan journals kept, as
+/// [`yield_to_lock_free_writers`] keeps them for an `own` session), then the first other live
+/// session that may write heads: `Compact` before `Committing`. A live
+/// session whose newest key is malformed or gone is listed and read once
+/// more as [`yield_to_lock_free_writers`] does; still unreadable it counts
+/// as `Compact`, and one with no key left has deregistered. `Ok(None)`:
+/// no other head writer is live. A failed listing is an error.
+///
+/// Why it is enough (invariant I1 of the step): every head writer writes
+/// its flag before the listing it decides on (a backup its commit mark, a
+/// compact its registration), so of two writers whose listings both
+/// passed, one listing started after the other's flag was written and, by
+/// the LIST contract, saw it.
+pub(crate) fn single_writer_listing(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    own: &str,
+) -> Result<Option<HeadWriter>> {
+    let (cleaned, live, _) = reap_sessions(
+        storage,
+        default_stale_session_duration(),
+        env,
+        ReapNow::OwnSession(own),
+        false,
+    )?;
+    if !cleaned.is_empty() {
+        info!(count = cleaned.len(), sessions = ?cleaned, "cleaned up stale backup sessions");
+    }
+    let mut committing: Option<LockHolder> = None;
+    let mut unread: Vec<&str> = Vec::new();
+    for s in live.iter().filter(|s| s.session_id != own) {
+        let key = || session_marker_key(&s.session_id);
+        match &s.entry {
+            Some(entry) if entry.writes_heads => {
+                return Ok(Some(HeadWriter::Compact(session_holder(
+                    key(),
+                    Some(entry),
+                    env,
+                ))));
+            }
+            Some(entry) if entry.committing => {
+                committing.get_or_insert_with(|| session_holder(key(), Some(entry), env));
+            }
+            Some(_) => {}
+            None => unread.push(&s.session_id),
+        }
+    }
+    if !unread.is_empty() {
+        // Malformed, or gone since the LIST (a rotation the LIST half-saw,
+        // or a deregistration): list again and read the newest key again.
+        let keys = storage.list(SESSIONS_PREFIX)?;
+        let sessions = group_session_markers(&keys);
+        for id in unread {
+            let Some(&(_, newest)) = sessions.get(id).and_then(|m| m.last()) else {
+                debug!(
+                    session_id = id,
+                    "session deregistered during the single-writer listing"
+                );
+                continue;
+            };
+            let entry = storage
+                .get(newest)?
+                .and_then(|data| serde_json::from_slice::<SessionEntry>(&data).ok());
+            match entry {
+                Some(entry) if entry.writes_heads => {
+                    return Ok(Some(HeadWriter::Compact(session_holder(
+                        newest.to_string(),
+                        Some(&entry),
+                        env,
+                    ))));
+                }
+                Some(entry) if entry.committing => {
+                    committing.get_or_insert_with(|| {
+                        session_holder(newest.to_string(), Some(&entry), env)
+                    });
+                }
+                Some(_) => {}
+                // Unreadable twice: fail closed, as a compact.
+                None => {
+                    return Ok(Some(HeadWriter::Compact(session_holder(
+                        newest.to_string(),
+                        None,
+                        env,
+                    ))));
+                }
+            }
+        }
+    }
+    Ok(committing.map(HeadWriter::Committing))
 }
 
 /// Where a reaper reads "now" on the store's clock. Resolved only when the
@@ -1191,6 +1310,9 @@ struct MarkerState {
     /// oldest journal pack it recovered or stored pack it accepted
     /// (`existing_pack`; `Duration::MAX` for one of unknown age).
     pullback: std::time::Duration,
+    /// The record was restarted at the commit mark after a gap
+    /// ([`SessionMarker::restart_record`]).
+    restarted: bool,
 }
 
 impl MarkerState {
@@ -1232,6 +1354,10 @@ pub(crate) struct MarkerReport {
     pub failed_refreshes: u32,
     /// Marker PUTs that took longer than `MARGIN` to return.
     pub slow_puts: u32,
+    /// The record was restarted at the commit mark after a gap (the suspend
+    /// rule): it judges only the time since the mark, and the pack-age term
+    /// stays binding at the fences around the head PUT.
+    pub restarted: bool,
 }
 
 impl MarkerReport {
@@ -1292,6 +1418,7 @@ impl SessionMarker {
                 failed_refreshes: 0,
                 slow_puts: 0,
                 pullback: std::time::Duration::ZERO,
+                restarted: false,
             }),
             write: std::sync::Mutex::new(()),
         }
@@ -1569,7 +1696,32 @@ impl SessionMarker {
             refreshes: st.refreshes,
             failed_refreshes: st.failed_refreshes,
             slow_puts: st.slow_puts,
+            restarted: st.restarted,
         }
+    }
+
+    /// The suspend rule (10-single-protocol step 7, open decision 3): forget
+    /// what the record learned before the commit mark (gaps, a miss, slow
+    /// PUTs, superseded keys whose check failed), so that from here on it
+    /// judges only the time since the mark. Called once, right after a
+    /// successful mark and probe of a backup whose record was not
+    /// continuous, and only after the pack-age term passed at the mark. The
+    /// record stays marked `restarted`, which keeps the pack-age term
+    /// binding at the fences around the head PUT ([`head_landing_check`],
+    /// [`commit_marker_check`]). `elapsed` (time since the session's
+    /// start) is not reset.
+    pub(crate) fn restart_record(&self) {
+        let _write = self.write_turn();
+        let mut st = self.lock();
+        st.missing = false;
+        st.longest_gap = std::time::Duration::ZERO;
+        st.slow_puts = 0;
+        st.last_ok = st.current_written;
+        // Keys whose presence was never settled are deleted by the next
+        // refresh, as settled ones are; their outcome no longer counts.
+        let unchecked = std::mem::take(&mut st.unchecked);
+        st.retired.extend(unchecked);
+        st.restarted = true;
     }
 
     /// Every key that may exist, for deregistration.
@@ -1620,6 +1772,10 @@ pub(crate) fn commit_marker_check(
                 VykarError::StaleChunksDuringCommit,
                 "the session marker went unrefreshed for a while (machine suspended?) or a marker write was slow",
             ),
+            Ok(true) if report.restarted => (
+                VykarError::StaleChunksDuringCommit,
+                "the session marker's record was restarted at the commit mark after a gap",
+            ),
             Ok(true) => return Ok(()),
             Err(e) if report.continuous() => {
                 warn!(
@@ -1650,19 +1806,28 @@ pub(crate) fn commit_marker_check(
 /// record is not continuous and `elapsed` + `allowance` >
 /// [`PACK_AGE_LIMIT`]. Before the head PUT `allowance` is
 /// [`HEAD_LANDING_ALLOWANCE`] (an early refusal); after it returned, zero
-/// (the binding check: the head has landed by then).
+/// (the binding check: the head has landed by then). A record restarted at
+/// the commit mark ([`SessionMarker::restart_record`]) is judged as one
+/// that is not continuous, however continuous it is since.
 pub(crate) fn head_landing_check(
     session_id: &str,
     report: &MarkerReport,
     elapsed: std::time::Duration,
     allowance: std::time::Duration,
 ) -> Result<()> {
-    if report.continuous() || elapsed.saturating_add(allowance) <= PACK_AGE_LIMIT {
+    if (report.continuous() && !report.restarted)
+        || elapsed.saturating_add(allowance) <= PACK_AGE_LIMIT
+    {
         return Ok(());
     }
+    let reason = if report.restarted {
+        "the session marker's record was restarted at the commit mark after a gap"
+    } else {
+        "the session marker record is not continuous"
+    };
     pack_age_term(
         session_id,
-        "the session marker record is not continuous",
+        reason,
         VykarError::StaleChunksDuringCommit,
         report,
         elapsed,
@@ -2013,9 +2178,9 @@ pub(crate) fn reap_sessions_registered(
 }
 
 /// [`cleanup_stale_sessions_keeping`]; `delete_orphan_journals`: whether its
-/// second pass runs (a backup's commit-lock yield skips it, so a crashed
-/// session's journal keeps its grace until the next maintenance, as before
-/// backups listed sessions at their lock). The second pass also removes
+/// second pass runs (a backup's single-writer listing skips it, so a
+/// crashed session's journal keeps its grace until the next maintenance, as
+/// before backups listed sessions at their commit). The second pass also removes
 /// probe debris older than [`CLOCK_PROBE_DEBRIS_AGE`] when "now" is known.
 /// Also returns the "now" it judged ages by.
 fn reap_sessions(
@@ -2329,7 +2494,7 @@ fn describe_holder(holder: &LockHolder) -> String {
 /// Run `op` until it returns something other than `Locked`, with exponential
 /// backoff + jitter between attempts. Returns the last `Locked` when attempts
 /// run out. Blocks the calling thread on `clock`.
-fn retry_while_locked<T>(
+pub(crate) fn retry_while_locked<T>(
     max_attempts: usize,
     base_delay_ms: u64,
     clock: &dyn Clock,
@@ -2415,68 +2580,6 @@ pub fn acquire_lock_with_deadline(
         on_contended,
         |clock| acquire_lock_reading(storage, env, clock),
     )
-}
-
-/// [`acquire_lock_with_deadline`] for a backup's commit in lock mode (04
-/// step 9): each attempt, once its lock is confirmed and when
-/// `yield_to_flagged` is set, runs the lock holder's half of the marker handshake
-/// ([`yield_to_lock_free_writers`], `own` excluded) and releases the lock
-/// again when a session that may write heads without it is live: that
-/// counts as contention. A failed session listing releases the lock and
-/// fails.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn acquire_commit_lock(
-    storage: &dyn StorageBackend,
-    env: &HostEnv,
-    max_wait: std::time::Duration,
-    base_delay_ms: u64,
-    cancel: &CancelToken,
-    own: &str,
-    yield_to_flagged: bool,
-    on_contended: impl FnMut(&LockHolder),
-) -> Result<LockGuard> {
-    wait_while_locked(
-        env,
-        max_wait,
-        base_delay_ms,
-        cancel,
-        on_contended,
-        |clock| {
-            let guard = acquire_lock_reading(storage, env, clock)?;
-            commit_lock_yield(storage, env, guard, own, yield_to_flagged)
-        },
-    )
-}
-
-/// One attempt of [`acquire_commit_lock`] after its lock was confirmed:
-/// the guard, or the lock released and the yield's error.
-pub(crate) fn commit_lock_yield(
-    storage: &dyn StorageBackend,
-    env: &HostEnv,
-    guard: LockGuard,
-    own: &str,
-    yield_to_flagged: bool,
-) -> Result<LockGuard> {
-    if !yield_to_flagged {
-        return Ok(guard);
-    }
-    match yield_to_lock_free_writers(storage, env, guard.store_time(), Some(own)) {
-        Ok((cleaned, _)) => {
-            if !cleaned.is_empty() {
-                info!(count = cleaned.len(), sessions = ?cleaned, "cleaned up stale backup sessions");
-            }
-            Ok(guard)
-        }
-        Err(e) => {
-            if let VykarError::Locked(holder) = &e {
-                debug!(holder = %describe_holder(holder), "a lock-free writer is committing; releasing the lock");
-            }
-            if let Err(release) = release_lock(storage, guard) {
-                debug!(error = %release, "could not release the lock after yielding");
-            }
-            Err(e)
-        }
-    }
 }
 
 /// The wait loop of [`acquire_lock_with_deadline`] around `attempt`: until

@@ -153,14 +153,22 @@ fn session_registered_first_is_seen_by_maintenance() {
 }
 
 /// Maintenance holds the lock and is held before listing sessions. A
-/// backup registering now must see the lock and back out.
+/// backup registering now must see the lock and back out. The holder is a
+/// delete under the maintenance lock (`Call::LockedDelete`): compact runs
+/// in a session since 10-single-protocol step 7, and the maintenance lock's
+/// holders are `check --repair`, upgrade and pack maps.
 #[test]
 fn maintenance_lock_first_blocks_session() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     let g = sim.gate(list_of(a, "sessions/"));
-    let sa = sim.spawn(a, Call::Compact);
+    let sa = sim.spawn(
+        a,
+        Call::LockedDelete {
+            names: vec!["t0".into()],
+        },
+    );
     sim.expect_paused(g, "a's session cleanup");
     assert_allowed(&sim.backup(b, "b1", &tree("b1")), AllowedError::Locked);
     let b_markers: Vec<String> = sim

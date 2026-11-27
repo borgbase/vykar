@@ -1,8 +1,10 @@
-//! Backup Phase 1 must leave every pack durable before Phase 2 takes the
-//! commit lock, so the lock is never held across pack uploads.
+//! Backup Phase 1 must leave every pack durable before Phase 2 marks its
+//! commit, so no commit is protected across pack uploads.
 //!
-//! The `register_session` probe only lists `locks/`, so every `locks/` PUT is
-//! the commit lock.
+//! Until 10-single-protocol step 7 single-writer backups took the commit
+//! lock (every `locks/` PUT was it); since then they protect their commit
+//! as multi-writer ones do, so the commit's start is the commit mark: the
+//! first marker PUT carrying `committing`.
 
 use std::fs;
 use std::path::Path;
@@ -21,6 +23,8 @@ use crate::repo::control::CancelToken;
 enum Event {
     PackPutStart,
     PackPutEnd,
+    /// The commit mark: a marker key PUT carrying `committing`.
+    MarkPut,
     LockPut,
     SnapshotPut,
     MarkerDelete,
@@ -52,7 +56,7 @@ impl Gate {
     }
 }
 
-/// Runs once, at the first `locks/` PUT (the commit lock), before it is forwarded.
+/// Runs once, at the commit mark's PUT, before it is forwarded.
 type AtLock = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 fn at_lock(f: impl FnOnce() + Send + 'static) -> Option<AtLock> {
@@ -65,24 +69,24 @@ struct Shared {
     gate: Option<Arc<Gate>>,
     pack_entered: Option<Arc<Mutex<mpsc::Sender<()>>>>,
     fail_packs: bool,
-    /// Delete one stored pack just before the commit lock is taken, as a
-    /// concurrent compact would after reaping this session's marker.
+    /// Delete one stored pack just before the commit mark, as a concurrent
+    /// compact would after reaping this session's marker.
     delete_pack_at_lock: bool,
     /// Answer `object_sizes` like a vykar-server with `?sizes` does, so the
     /// commit verifies its packs with one batch instead of per-pack requests.
     batch_sizes: bool,
     /// Number of `object_sizes` batches answered.
     batches: Arc<Mutex<usize>>,
-    /// Fail every `locks/` PUT, so the commit lock is never acquired.
+    /// Fail the commit mark's PUT, so the commit is never protected.
     fail_lock_put: bool,
     /// Set by the first successful pack PUT and passed to the backup as its
     /// cancel token, so the run is interrupted once packs are durable.
     interrupt_after_pack: Option<CancelToken>,
     /// Fail every `snapshots/` PUT, after the index write it follows.
     fail_snapshot_put: bool,
-    /// Another client's work, run at the commit lock PUT.
+    /// Another client's work, run at the commit mark's PUT.
     at_lock: Option<AtLock>,
-    /// Fail every `exists` of a session marker once the commit lock PUT was
+    /// Fail every `exists` of a session marker once the commit mark was
     /// seen, so the commit's marker probe is inconclusive.
     fail_marker_probe: bool,
     /// Number of marker `exists` calls failed by `fail_marker_probe`.
@@ -121,11 +125,15 @@ impl ObservingBackend {
         self.record(event);
     }
 
-    fn put_with(&self, key: &str, put: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn put_with(&self, key: &str, mark: bool, put: impl FnOnce() -> Result<()>) -> Result<()> {
         if key.starts_with("locks/") {
             self.record(Event::LockPut);
+            return put();
+        }
+        if mark {
+            self.record(Event::MarkPut);
             if self.shared.fail_lock_put {
-                return Err(VykarError::Other("injected lock PUT failure".into()));
+                return Err(VykarError::Other("injected mark PUT failure".into()));
             }
             let hook = self
                 .shared
@@ -177,6 +185,16 @@ impl ObservingBackend {
     }
 }
 
+/// Whether `data` PUT at `key` is a commit mark: a session marker key
+/// whose body carries `committing`. Every later refresh of a marked
+/// session carries it too, so only the first one counts (`Event::MarkPut`
+/// is recorded once per such PUT; the tests take its first position).
+fn is_mark(key: &str, data: &[u8]) -> bool {
+    key.starts_with("sessions/")
+        && key.ends_with(".json")
+        && String::from_utf8_lossy(data).contains("\"committing\":true")
+}
+
 impl InnerBackend for ObservingBackend {
     fn inner_backend(&self) -> &dyn StorageBackend {
         &*self.inner
@@ -226,7 +244,7 @@ delegate_storage_backend! {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.record_index_put(key, data);
-        self.put_with(key, || self.inner.put(key, data))
+        self.put_with(key, is_mark(key, data), || self.inner.put(key, data))
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -242,18 +260,19 @@ delegate_storage_backend! {
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.record_index_put(key, &data);
-        self.put_with(key, || self.inner.put_owned(key, data))
+        let mark = is_mark(key, &data);
+        self.put_with(key, mark, || self.inner.put_owned(key, data))
     }
 
     fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
-        self.put_with(key, || self.inner.put_pack(key, data))
+        self.put_with(key, false, || self.inner.put_pack(key, data))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
         let marker = key.starts_with("sessions/") && key.ends_with(".json");
         if marker
             && self.shared.fail_marker_probe
-            && self.shared.events.lock().unwrap().contains(&Event::LockPut)
+            && self.shared.events.lock().unwrap().contains(&Event::MarkPut)
         {
             *self.shared.marker_probe_failures.lock().unwrap() += 1;
             return Err(VykarError::Other("injected marker probe failure".into()));
@@ -359,7 +378,7 @@ fn repo_keys(config: &crate::config::VykarConfig, prefix: &str) -> Vec<String> {
 }
 
 #[test]
-fn uploads_complete_before_commit_lock() {
+fn uploads_complete_before_the_commit_mark() {
     let (_dir, config, src) = setup();
     let (tx, rx) = mpsc::channel();
     let gate = Arc::new(Gate::default());
@@ -372,7 +391,7 @@ fn uploads_complete_before_commit_lock() {
     let opener = {
         let gate = Arc::clone(&gate);
         std::thread::spawn(move || {
-            // Give the backup thread time to (wrongly) reach the commit lock
+            // Give the backup thread time to (wrongly) reach its commit mark
             // while a pack upload is parked on the gate.
             let _ = rx.recv_timeout(Duration::from_secs(30));
             std::thread::sleep(Duration::from_millis(300));
@@ -390,20 +409,20 @@ fn uploads_complete_before_commit_lock() {
         events.contains(&Event::PackPutStart),
         "expected at least one pack PUT: {events:?}"
     );
-    let commit_lock = events
+    let commit_mark = events
         .iter()
-        .position(|e| *e == Event::LockPut)
-        .expect("commit lock PUT");
+        .position(|e| *e == Event::MarkPut)
+        .expect("the commit mark");
     assert_eq!(
         events.iter().filter(|e| **e == Event::LockPut).count(),
-        1,
-        "expected exactly one locks/ PUT (the commit lock): {events:?}"
+        0,
+        "a backup takes no lock: {events:?}"
     );
     assert!(
-        !events[commit_lock..]
+        !events[commit_mark..]
             .iter()
             .any(|e| matches!(e, Event::PackPutStart | Event::PackPutEnd)),
-        "pack upload activity after the commit lock was taken: {events:?}"
+        "pack upload activity after the commit mark: {events:?}"
     );
 }
 
@@ -423,9 +442,12 @@ fn early_flush_failure_aborts_cleanly() {
 
     let events = shared.events.lock().unwrap().clone();
     assert_eq!(
-        events.iter().filter(|e| **e == Event::LockPut).count(),
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::LockPut | Event::MarkPut))
+            .count(),
         0,
-        "a backup that never commits must not PUT to locks/: {events:?}"
+        "a backup that never commits marks nothing and takes no lock: {events:?}"
     );
     assert!(repo_keys(&config, "snapshots/").is_empty());
     assert!(repo_keys(&config, "locks/").is_empty());
@@ -578,8 +600,9 @@ fn many_pack_backup_commits() {
 }
 
 /// After the commit point the session is deregistered and its journal
-/// deleted (on a helper thread, alongside the local post-commit work), and
-/// only then is the commit lock released. Nothing is left behind.
+/// deleted (on a helper thread, alongside the local post-commit work).
+/// Nothing is left behind, and no lock was taken (10-single-protocol step
+/// 7; the commit lock was released last before).
 #[test]
 fn commit_cleans_up_session_before_releasing_lock() {
     let (_dir, config, src) = setup();
@@ -602,7 +625,9 @@ fn commit_cleans_up_session_before_releasing_lock() {
         "{events:?}"
     );
     assert!(
-        pos(Event::JournalDelete) < pos(Event::LockDelete),
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::LockPut | Event::LockDelete)),
         "{events:?}"
     );
     assert!(repo_keys(&config, "sessions/").is_empty());
@@ -645,9 +670,9 @@ fn session_keys(config: &crate::config::VykarConfig) -> (bool, bool) {
     )
 }
 
-/// A commit that fails after taking the lock deregisters the session while
-/// still holding the lock, and keeps the journal so the next run can recover
-/// the uploaded packs.
+/// A commit that fails after its mark deregisters the session and keeps
+/// the journal so the next run can recover the uploaded packs (it held the
+/// commit lock throughout until 10-single-protocol step 7).
 #[test]
 fn failed_commit_deregisters_before_releasing_lock() {
     let (_dir, config, src) = setup();
@@ -668,10 +693,7 @@ fn failed_commit_deregisters_before_releasing_lock() {
             .position(|x| *x == e)
             .unwrap_or_else(|| panic!("{e:?} missing: {events:?}"))
     };
-    assert!(
-        pos(Event::MarkerDelete) < pos(Event::LockDelete),
-        "{events:?}"
-    );
+    assert!(pos(Event::MarkPut) < pos(Event::MarkerDelete), "{events:?}");
     assert!(!events.contains(&Event::JournalDelete), "{events:?}");
     let (marker, journal) = session_keys(&config);
     assert!(!marker, "session marker should be removed");
@@ -680,8 +702,9 @@ fn failed_commit_deregisters_before_releasing_lock() {
     assert!(repo_keys(&config, "snapshots/").is_empty());
 }
 
-/// A backup that cannot take the commit lock deregisters its session and
-/// keeps the journal.
+/// A backup whose commit mark fails (its commit lock until
+/// 10-single-protocol step 7) deregisters its session and keeps the
+/// journal.
 #[test]
 fn lock_acquisition_failure_deregisters_and_keeps_journal() {
     let (_dir, config, src) = setup();
@@ -691,16 +714,15 @@ fn lock_acquisition_failure_deregisters_and_keeps_journal() {
     };
     let err = run_backup(&config, &src, &shared).unwrap_err().to_string();
     assert!(
-        err.contains("injected lock PUT failure"),
+        err.contains("injected mark PUT failure"),
         "unexpected error: {err}"
     );
 
     let events = shared.events.lock().unwrap().clone();
     let count = |e: Event| events.iter().filter(|x| **x == e).count();
-    assert_eq!(count(Event::LockPut), 1, "{events:?}");
+    assert_eq!(count(Event::MarkPut), 1, "{events:?}");
+    assert_eq!(count(Event::LockPut), 0, "{events:?}");
     assert_eq!(count(Event::SnapshotPut), 0, "{events:?}");
-    // A failed PUT may still have committed, so the key is removed once.
-    assert_eq!(count(Event::LockDelete), 1, "{events:?}");
     assert_eq!(count(Event::JournalDelete), 0, "{events:?}");
     assert!(events.contains(&Event::MarkerDelete), "{events:?}");
     let (marker, journal) = session_keys(&config);
@@ -711,7 +733,7 @@ fn lock_acquisition_failure_deregisters_and_keeps_journal() {
 }
 
 /// An interrupt after packs were uploaded deregisters the session without
-/// touching the commit lock, and keeps the journal.
+/// marking it, and keeps the journal.
 #[test]
 fn interrupt_after_upload_deregisters_and_keeps_journal() {
     let (_dir, config, src) = setup();
@@ -727,6 +749,7 @@ fn interrupt_after_upload_deregisters_and_keeps_journal() {
 
     let events = shared.events.lock().unwrap().clone();
     assert!(!events.contains(&Event::LockPut), "{events:?}");
+    assert!(!events.contains(&Event::MarkPut), "{events:?}");
     assert!(events.contains(&Event::MarkerDelete), "{events:?}");
     let (marker, journal) = session_keys(&config);
     assert!(!marker, "session marker should be removed");
@@ -789,7 +812,8 @@ fn reader_open_failure_writes_no_session_marker() {
 }
 
 /// A v6 commit writes one segment, then the head, then the snapshot, all
-/// under the commit lock, and never `index.gen`.
+/// after its commit mark and before its deregistration (under the commit
+/// lock until 10-single-protocol step 7), and never `index.gen`.
 #[test]
 fn segmented_commit_puts_segment_then_head_then_snapshot() {
     let (_dir, config, src) = setup();
@@ -817,15 +841,14 @@ fn segmented_commit_puts_segment_then_head_then_snapshot() {
         [Event::SegmentPut, Event::HeadPut, Event::SnapshotPut],
         "{events:?}"
     );
-    let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
-    assert_eq!(
-        events.iter().filter(|e| **e == Event::LockPut).count(),
-        1,
-        "{events:?}"
-    );
-    let unlock = events.iter().position(|e| *e == Event::LockDelete).unwrap();
+    let mark = events.iter().position(|e| *e == Event::MarkPut).unwrap();
+    assert!(!events.contains(&Event::LockPut), "{events:?}");
+    let deregistered = events
+        .iter()
+        .position(|e| *e == Event::MarkerDelete)
+        .unwrap();
     assert!(
-        writes.iter().all(|(i, _)| lock < *i && *i < unlock),
+        writes.iter().all(|(i, _)| mark < *i && *i < deregistered),
         "{events:?}"
     );
     let storage =
@@ -1057,8 +1080,9 @@ fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::
 /// Another client commits the same chunks while this session runs: the
 /// commit catches up on the moved head and writes nothing for them (the
 /// existing entries stay; reuse is not counted). Here every chunk of the
-/// session was committed first, so the commit writes no index object and
-/// no head, and both snapshots restore.
+/// session was committed first, so the commit writes no index object, only
+/// a head with the state it read (Q2; a single-writer commit wrote none
+/// until 10-single-protocol step 7), and both snapshots restore.
 #[test]
 fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
     use crate::index::head::IndexHead;
@@ -1085,13 +1109,16 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
     assert_eq!(head_at_lock.segments.len(), 1, "{head_at_lock:?}");
 
     let repo = cold_repo(&config, &dir.path().join("cold-after"));
-    assert_eq!(repo.index_head().unwrap(), &head_at_lock);
+    let after = repo.index_head().unwrap();
+    assert_eq!(after.generation, head_at_lock.generation + 1, "{after:?}");
+    assert_eq!(after.segments, head_at_lock.segments, "{after:?}");
+    assert_eq!(after.base, head_at_lock.base, "{after:?}");
     drop(repo);
     let events = shared.events.lock().unwrap().clone();
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, Event::SegmentPut | Event::HeadPut)),
+    assert!(!events.contains(&Event::SegmentPut), "{events:?}");
+    assert_eq!(
+        events.iter().filter(|e| **e == Event::HeadPut).count(),
+        1,
         "{events:?}"
     );
 
@@ -1110,9 +1137,11 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 /// found them in an applied segment (reuse by key) or, after a fold, in the
 /// table (reuse by position).
 ///
-/// The backup's handle offers no put-if-absent, so it commits under the
-/// lock; the other client runs delete and compact lock-free, and the
-/// lock-free compact reaps the aged marker (a lock-free delete reaps none).
+/// The backup's handle offers no put-if-absent, so the repository is
+/// single-writer; the other client runs delete and compact in sessions,
+/// and the compact's single-writer listing reaps the aged marker (a delete
+/// reaps none). The backup's mark then finds its earlier key gone, the
+/// suspend rule restarts its record and its every attempt re-checks reuse.
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     for (new_chunk, fold_first) in [(true, false), (false, false), (true, true), (false, true)] {
@@ -1233,7 +1262,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
         assert_eq!(latest_head(&*storage), head_at_lock, "the head moved");
         assert_eq!(repo_keys(&config, "index.d/"), objects_at_lock);
         let events = shared.events.lock().unwrap().clone();
-        let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
+        let lock = events.iter().position(|e| *e == Event::MarkPut).unwrap();
         assert!(
             !events[lock..]
                 .iter()

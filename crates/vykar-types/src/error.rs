@@ -363,18 +363,30 @@ pub enum VykarError {
     /// the check passed returns it before its head create. `backend`: the
     /// repository URL, or "the storage backend". `reason`: the check's
     /// verdict.
-    // TODO(10-single-protocol step 7): single-writer no longer means the
-    // lock then; rewrite the last sentence ("one writer at a time on this
-    // storage").
     #[error(
         "this repository is multi-writer (its clients commit without a lock, which needs \
          put-if-absent), but {backend} does not offer put-if-absent to this client ({reason}), \
          so this client cannot run the command on it. If the storage supports conditional \
          writes, check the backend's settings (on S3: s3_conditional_writes). Otherwise run \
-         `vykar upgrade --commit-mode single`: commits then take the repository lock, so \
-         concurrent backups wait for each other instead of committing side by side"
+         `vykar upgrade --commit-mode single`: the repository is then single-writer, one \
+         writer at a time on this storage (a backup waits while another one commits or a \
+         compact runs, a compact refuses beside a committing backup), so backups no longer \
+         commit side by side"
     )]
     MultiWriterUnsupported { backend: String, reason: String },
+
+    /// A single-writer repository's head write (10-single-protocol step 7)
+    /// found, right after its plain PUT, other bytes at the generation it
+    /// wrote: another writer wrote the same generation at the same time
+    /// (the best-effort single-writer check did not keep it out). This run
+    /// writes nothing more: no snapshot, no garbage collection.
+    #[error(
+        "another writer wrote index generation {generation} at the same time as this run \
+         (on a single-writer repository only one writer may commit at a time); this run \
+         wrote nothing more. Run `vykar check`; if it reports chunks missing from the \
+         index, run `vykar check --repair`"
+    )]
+    ConcurrentHeadWrite { generation: u64 },
 
     /// Compact did not run because the live snapshots could not be marked;
     /// nothing was changed. The text starts with vykar-core's

@@ -198,13 +198,20 @@ fn interrupted_at_every_write(prefix: &str, mode: &str, version: u64, hash: &str
                 Some(kind(op)),
                 "{label}: the writes differ: {log:?}"
             );
+            let succeeded = result.is_ok();
             match result {
                 Err(e) => assert!(e.to_string().contains("injected failure"), "{label}: {e}"),
                 // Only the best-effort deletes after the switch may fail
-                // without failing the upgrade (UPG-3).
-                Ok(()) => assert!(op.starts_with("delete "), "{label}: the upgrade succeeded"),
+                // without failing the upgrade (UPG-3), and a head PUT that
+                // landed although the call failed: the single-writer head
+                // write reads it back and finds its own bytes
+                // (10-single-protocol step 7).
+                Ok(()) => assert!(
+                    op.starts_with("delete ") || (applied && op.starts_with("put index.h/")),
+                    "{label}: the upgrade succeeded"
+                ),
             }
-            if k - 1 < switch || (k - 1 == switch && !applied) {
+            if !succeeded && (k - 1 < switch || (k - 1 == switch && !applied)) {
                 assert_eq!(
                     legacy_entries(&fx),
                     legacy,

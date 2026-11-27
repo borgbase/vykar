@@ -8,8 +8,7 @@ use tracing::{debug, info, warn};
 use super::compact_refusal;
 use super::mark;
 use super::util::{
-    MaintenanceSession, list_live_sessions_registered, list_live_sessions_under_lock, open_repo,
-    refuse_on_append_only_server, with_maintenance_lock, with_maintenance_lock_unlisted,
+    MaintenanceSession, list_live_sessions_registered, open_repo, refuse_on_append_only_server,
     with_maintenance_session,
 };
 use crate::config::VykarConfig;
@@ -26,7 +25,7 @@ use crate::repo::pack_trailer::{
     PackTrailer, TrailerPackType, framed_offsets, trailer_blob_len, trailer_frame_len,
 };
 use crate::repo::{
-    CommitMode, HEAD_CREATE_ATTEMPTS, Repo, RepoWriter, TreeChunkSource, retry_delay,
+    HEAD_CREATE_ATTEMPTS, Repo, RepoWriter, TreeChunkSource, WriterMode, retry_delay,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::{
@@ -244,11 +243,9 @@ pub fn report_unreferenced(
 /// drops cached tree chunks no live snapshot uses.
 ///
 /// Read-only for the repository's data: no index, pack or snapshot object is
-/// written. In lock mode it runs under the maintenance lock, whose
-/// stale-session cleanup can delete stale session markers and orphaned
-/// session journals, exactly as `compact --dry-run` does. In lock-free mode
-/// (04 step 9) it takes no lock, registers no session and reaps nothing: it
-/// writes nothing a writer depends on. A mark that fails because a backup
+/// written. It takes no lock, registers no session and reaps nothing (04
+/// step 9; on single-writer repositories too since 10-single-protocol step
+/// 7): it writes nothing a writer depends on. A mark that fails because a backup
 /// committed between the head read and the snapshot listing (a moved head)
 /// is retried on the latest head, at most [`COMPACT_MARK_ATTEMPTS`] times.
 pub(crate) fn report_unreferenced_on_repo(
@@ -265,28 +262,20 @@ pub(crate) fn report_unreferenced_on_repo(
             ))
         }
     };
-    match repo.commit_mode()? {
-        CommitMode::Lock => with_maintenance_lock(repo, |repo| {
-            repo.load_chunk_index_under_lock()?;
-            report_under_lock(repo, cancel).map_err(frame)
-        }),
-        CommitMode::LockFree => {
-            repo.load_chunk_index_under_lock()?;
-            let mut attempt = 1;
-            loop {
-                match report_under_lock(repo, cancel) {
-                    Ok(report) => return Ok(report),
-                    Err(e) if mark::passes_through(&e) => return Err(e),
-                    Err(e) if attempt < COMPACT_MARK_ATTEMPTS && head_moved(repo)? => {
-                        debug!(
-                            "the index head moved during the report's mark ({e}); marking again"
-                        );
-                        repo.load_chunk_index_under_lock()?;
-                        attempt += 1;
-                    }
-                    Err(e) => return Err(frame(e)),
-                }
+    // Refuses `MultiWriterUnsupported` before anything.
+    repo.commit_mode()?;
+    repo.load_chunk_index_under_lock()?;
+    let mut attempt = 1;
+    loop {
+        match report_under_lock(repo, cancel) {
+            Ok(report) => return Ok(report),
+            Err(e) if mark::passes_through(&e) => return Err(e),
+            Err(e) if attempt < COMPACT_MARK_ATTEMPTS && head_moved(repo)? => {
+                debug!("the index head moved during the report's mark ({e}); marking again");
+                repo.load_chunk_index_under_lock()?;
+                attempt += 1;
             }
+            Err(e) => return Err(frame(e)),
         }
     }
 }
@@ -402,6 +391,12 @@ fn report_under_lock(repo: &mut Repo, cancel: &CancelToken) -> Result<Unreferenc
 /// second session listing, the re-read head, the incremental re-mark) and
 /// [`persist_batch_lock_free`] (the relocation rebase).
 ///
+/// Since 10-single-protocol step 7 every compact runs this way, on a
+/// single-writer repository too; there it first makes the single-writer
+/// check ([`single_writer_compact_check`]): it never waits, and refuses
+/// beside a committing backup or another compact, so that only one writer
+/// writes heads at a time.
+///
 /// A mark refused because a live snapshot needs a chunk the index lacks
 /// ([`VykarError::MarkRefused`] of [`VykarError::LiveChunkNotInIndex`]) is
 /// recorded in this machine's repository cache dir, and a compact whose
@@ -445,27 +440,45 @@ fn run_on_repo_inner(
         concurrency,
     };
 
-    match repo.commit_mode()? {
-        CommitMode::Lock => with_maintenance_lock_unlisted(repo, |repo| {
-            let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
-            list_live_sessions_under_lock(repo)?; // 2. sessions
-            repo.load_chunk_index_under_lock()?; // 3. head
-            compact_repo_listed(repo, None, listing, opts, cancel)
-        }),
-        CommitMode::LockFree => {
-            // A dry run writes no head: it does not make lock holders yield.
-            let flags = MarkerFlags {
-                writes_heads: !dry_run,
-                ..MarkerFlags::default()
-            };
-            with_maintenance_session(repo, flags, |repo, own| {
-                let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
-                list_live_sessions_registered(repo, own)?; // 2. sessions #1, "now"
-                repo.load_chunk_index_under_lock()?; // 3. head
-                compact_repo_listed(repo, Some(own), listing, opts, cancel)
-            })
+    // Refuses `MultiWriterUnsupported` before anything is written.
+    repo.commit_mode()?;
+    // A dry run writes no head: it does not make lock holders yield, and
+    // single-writer backups do not wait for it.
+    let flags = MarkerFlags {
+        writes_heads: !dry_run,
+        ..MarkerFlags::default()
+    };
+    with_maintenance_session(repo, flags, |repo, own| {
+        // The mode of the re-read after the registration (cached).
+        if repo.commit_mode()? == WriterMode::Single && !dry_run {
+            single_writer_compact_check(repo, own)?; // compact never waits
         }
-    }
+        let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
+        list_live_sessions_registered(repo, own)?; // 2. sessions #1, "now"
+        repo.load_chunk_index_under_lock()?; // 3. head
+        compact_repo_listed(repo, Some(own), listing, opts, cancel)
+    })
+}
+
+/// A single-writer compact (10-single-protocol step 7): registered with
+/// `writes_heads` (its flag is written before this listing), it refuses
+/// beside a live committing backup or another flagged compact, after
+/// three listings with jittered backoff (`retry_while_locked(3, 2000)`, as
+/// registration retries). `Locked` names the other session; nothing was
+/// written but the registration (the stale temp sweep runs after this
+/// check, in the pack listing).
+fn single_writer_compact_check(repo: &Repo, own: &MaintenanceSession) -> Result<()> {
+    let storage = repo.storage().as_ref();
+    let env = repo.host_env();
+    lock::retry_while_locked(
+        3,
+        2000,
+        env.clock.as_ref(),
+        || match lock::single_writer_listing(storage, env, own.id())? {
+            None => Ok(()),
+            Some(writer) => Err(VykarError::Locked(writer.into_holder())),
+        },
+    )
 }
 
 /// The knobs of one compact run.

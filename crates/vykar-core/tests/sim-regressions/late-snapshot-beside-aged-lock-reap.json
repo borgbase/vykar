@@ -1,9 +1,7 @@
 {
   "name": "late-snapshot-beside-aged-lock-reap",
-  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; AgedLockReaped remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2.",
-  "expect": [
-    "AgedLockReaped"
-  ],
+  "note": "Third campaign of phase F part 8a (random-1867509260314451745): a's snapshot PUT is delayed after its head PUT; b uploads and takes the lock; a jump of 6 h ages b's lock; c's compact reaps it (aged) and, not seeing a's snapshot, sweeps a's chunks; the PUT then lands (TreeChunkNotInIndex for a1). b's later index.d/ PUT outside the reaped lock is AgedLockReaped's; as a segment no head names, of another run than the late snapshot's, it does not keep LateSnapshotWrite from claiming a1. Fixed by 04 step 8. Narrowed by phase F part 8c (04 step 7, young segments): the late snapshot's own new chunks survive the sweep while its backup segment is younger than T_pack, so LateSnapshotWrite is gone; AgedLockReaped remains. Fixed by 04 step 8. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written; the late snapshot is harmless and the aged victim refuses typed.",
+  "expect": [],
   "at": [
     [
       {
@@ -21,7 +19,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -147,7 +172,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -236,6 +288,12 @@
     "crash": false,
     "advances": true,
     "choices": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
       0,
       0,
       0,

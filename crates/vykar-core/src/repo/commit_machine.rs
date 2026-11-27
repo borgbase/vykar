@@ -19,10 +19,10 @@
 //!    the session's marker is gone is `StaleChunksDuringCommit`: compact
 //!    deleted the packs of a reaped session.
 //!    The publish's fence before the head PUT also runs the commit rule's
-//!    pack-age term ([`HeadCheck`]). A commit that adds no chunk writes no
-//!    index under the lock; lock-free (04 step 9) it creates a head anyway,
-//!    the head read's state at generation + 1 ([`PublishMachine::force_head`]),
-//!    so a concurrent sweep conflicts with it.
+//!    pack-age term ([`HeadCheck`]). A commit that adds no chunk creates a
+//!    head anyway (04 step 9, Q2), the head read's state at generation + 1
+//!    ([`PublishMachine::force_head`]), so a concurrent sweep conflicts with
+//!    it.
 //!    4b. If another writer created the head's generation (04 step 8): back
 //!    off, then repeat from 2 with the additions kept (at most
 //!    [`HEAD_CREATE_ATTEMPTS`] attempts). The sync re-checks reused chunks
@@ -32,9 +32,11 @@
 //!    again with no allowance: the binding check; lock-free, that the
 //!    session marker is still there) and PUT the snapshot.
 //!
-//! Under the commit lock, or lock-free (04 step 9): then no lock and no
-//! fence; the session marker carries `committing` from before the flush
-//! (`PendingCommit::wait_until_unlocked`) until deregistration.
+//! No lock and no fence: the session marker carries `committing` from
+//! before the flush (`PendingCommit::protect_commit`) until deregistration.
+//! The head is put-if-absent on a multi-writer repository; on a
+//! single-writer one (10-single-protocol step 7) EXISTS, a plain PUT and a
+//! read-back, behind the single-writer check of the protection.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
+use super::Repo;
 use super::commit::{check_reused_chunks, commit_additions, needs_recheck};
 use super::index_store::{self, SyncedIndex};
 use super::index_write::head_contention_error;
@@ -53,7 +56,6 @@ use super::manifest::SnapshotEntry;
 use super::publish_machine::{HeadCheck, PublishMachine, Published};
 use super::snapshot_cache::{self, SnapshotRefresh};
 use super::write_session::{SessionView, WriteSession};
-use super::{CommitMode, Repo};
 use crate::index::head::{IndexHead, SegmentKind};
 use crate::index::segment_v2::{Location, SegmentBody};
 use crate::index::table::IndexState;
@@ -97,8 +99,7 @@ pub(crate) struct Committed {
     pub(crate) entry: SnapshotEntry,
 }
 
-/// A backup's commit, under the lock or lock-free: the machine of steps
-/// 1-5 above.
+/// A backup's commit: the machine of steps 1-5 above.
 pub(crate) struct BackupCommit {
     entry: Option<SnapshotEntry>,
     packed: Vec<u8>,
@@ -124,11 +125,10 @@ pub(crate) struct BackupCommit {
     delta: Option<IndexDelta>,
     /// Just before the head read that chose this attempt's generation.
     listed_at: Option<MarkerStamp>,
-    /// Lock-free (04 step 9): no lock fence; the marker must still be
-    /// there before the snapshot PUT.
-    lock_free: bool,
-    /// This attempt's index write is a head only (lock-free, no chunk
-    /// added).
+    /// The suspend rule (10-single-protocol step 7): every attempt
+    /// re-checks the reused chunks, whether or not the head moved.
+    recheck_always: bool,
+    /// This attempt's index write is a head only (no chunk added).
     head_only: bool,
     state: CommitState,
     /// The session being committed; handed back by
@@ -257,10 +257,9 @@ impl BackupCommit {
         entry: SnapshotEntry,
         packed: Vec<u8>,
         marker: Option<Arc<SessionMarker>>,
-        mode: CommitMode,
     ) -> Self {
         Self {
-            lock_free: mode == CommitMode::LockFree,
+            recheck_always: false,
             entry: Some(entry),
             packed,
             session_id: write.session_id.clone(),
@@ -277,6 +276,19 @@ impl BackupCommit {
             state: CommitState::Flush,
             write,
         }
+    }
+
+    /// The suspend rule: check every reused chunk against the synced index on
+    /// every attempt, whether or not the head moved (`needs_recheck`).
+    pub(crate) fn recheck_reuse_always(mut self, yes: bool) -> Self {
+        self.recheck_always = yes;
+        self
+    }
+
+    /// Tests: whether every attempt re-checks the reused chunks.
+    #[cfg(test)]
+    pub(crate) fn rechecks_reuse_always(&self) -> bool {
+        self.recheck_always
     }
 
     /// The committed (or failed) session, for `Repo::finish_backup_commit`
@@ -478,13 +490,12 @@ impl BackupCommit {
     /// retry reads its sources again (the failed run saved no file cache)
     /// but deduplicates against that head, which indexes this run's chunks:
     /// it uploads only what it would have uploaded beside a committed run.
-    /// A session whose record was already not continuous before its mark
-    /// does not get here: it commits under the lock
-    /// (`PendingCommit::commit_mode`), so this refusal catches only a
-    /// discontinuity that arose while committing. A failed probe fails the
+    /// A session whose record was not continuous at its commit mark
+    /// restarted it there (`PendingCommit::suspend_rule`), so this refusal
+    /// catches a discontinuity since the mark. A failed probe fails the
     /// commit with its error.
     fn check_marker_before_snapshot(&self, repo: &Repo) -> Result<()> {
-        let (true, Some(m)) = (self.lock_free, &self.marker) else {
+        let Some(m) = &self.marker else {
             return Ok(());
         };
         let present = m.probe(repo.storage.as_ref())?;
@@ -553,8 +564,8 @@ impl BackupCommit {
 
     /// The pending start reads as today's code runs them: a helper thread
     /// refreshes the snapshot list and then probes the marker, while this
-    /// thread fetches the head. All are reads under the commit lock; every
-    /// write follows them.
+    /// thread fetches the head. All are reads inside the commit; every write
+    /// follows them.
     fn read_all(&mut self, repo: &Repo, reads: &mut StartReads) {
         let do_refresh = reads.refresh.pending();
         let marker = reads
@@ -671,10 +682,11 @@ impl BackupCommit {
         self.open_stage(cx, "fetch index");
         let synced = cx.repo.sync_index(Some(head), true)?;
         self.close_stage();
-        let recheck = match &self.start_view {
-            Some((state, sweep_gen)) => needs_recheck(Some((state, *sweep_gen)), &synced.head),
-            None => needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head),
-        };
+        let recheck = self.recheck_always
+            || match &self.start_view {
+                Some((state, sweep_gen)) => needs_recheck(Some((state, *sweep_gen)), &synced.head),
+                None => needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head),
+            };
         if self.attempt == 1 {
             self.start_view = view.as_ref().map(|v| (v.state.clone(), v.sweep_gen));
         }
@@ -743,11 +755,21 @@ impl BackupCommit {
         if let Err(e) = verified {
             // A missing pack while the session's marker is gone: compact
             // deleted the packs of a reaped session, which is what
-            // `StaleChunksDuringCommit` means. With the marker present it is
-            // storage loss and keeps its own error.
+            // `StaleChunksDuringCommit` means. So does a record the suspend
+            // rule restarted at the commit mark (10-single-protocol step 7):
+            // the session may have been taken for ended before the mark,
+            // whose key is then present although the session was reaped.
+            // With the marker present and the record never broken it is
+            // storage loss and keeps its own error. On a restarted record a
+            // genuine storage loss of one of this session's packs is typed
+            // `StaleChunksDuringCommit` too: the two cannot be told apart
+            // once the record restarted. The retry that error asks for
+            // uploads this session's chunks again (none of them was indexed),
+            // so the cost is a misnamed error, not lost data.
             if let Some(m) = &self.marker {
-                let gone = m.report(repo.host_env().clock.as_ref()).missing
-                    || matches!(m.probe(storage), Ok(false));
+                let report = m.report(repo.host_env().clock.as_ref());
+                let gone =
+                    report.missing || report.restarted || matches!(m.probe(storage), Ok(false));
                 if gone {
                     warn!(
                         session_id = self.session_id,
@@ -795,18 +817,14 @@ impl BackupCommit {
         });
         self.head_only = additions.is_empty();
         if additions.is_empty() {
-            if !self.lock_free {
-                debug!("backup added no chunks; no index write");
-                self.retry = None;
-                self.close_stage();
-                return Ok(after_index(repo));
-            }
-            // Lock-free (04 step 9, Q2): a head anyway, the head read's
+            // Q2 (04 step 9), in both modes: a head anyway, the head read's
             // state at its generation + 1. Without it a reuse-only commit
             // conflicts with nothing a concurrent sweep writes, and a sweep
             // whose second session listing preceded this commit's mark could
-            // remove a chunk it reused.
-            debug!("backup added no chunks; writing a head only (lock-free)");
+            // remove a chunk it reused. On a single-writer repository the
+            // head is what a late reuse-only commit conflicts with, as on a
+            // multi-writer one.
+            debug!("backup added no chunks; writing a head only");
             return Ok(CommitState::Publish(Box::new(
                 PublishMachine::publish(repo, Some(head), None, true)
                     .force_head()

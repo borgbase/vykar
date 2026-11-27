@@ -2071,21 +2071,21 @@ fn backup_with(
     .map_err(|(_, e)| e)
     .unwrap();
     tweak(pending.repo_mut());
-    let guard = pending
-        .wait_for_lock(&mut None, &CancelToken::new())
+    pending
+        .protect_commit(&mut None, &CancelToken::new())
         .unwrap();
-    let mut commit = pending.begin_commit(commands::backup::CommitLock::Held(guard));
+    let mut commit = pending.begin_commit();
     let result = commit.drive(&no_events);
     commit
         .finish(result, &mut None, &crate::repo::control::CancelToken::new())
         .unwrap();
 }
 
-/// `begin_commit` runs a commit under the commit lock's fence, and a
-/// lock-free one under `Fence::lock_free_backup` (which passes: the commit
-/// machine checks its marker itself).
+/// `begin_commit` runs every commit under `Fence::lock_free_backup` (which
+/// passes: the commit machine checks its marker itself), on a single-writer
+/// repository too since 10-single-protocol step 7.
 #[test]
-fn begin_commit_picks_the_fence_of_its_exclusion() {
+fn begin_commit_runs_under_the_backups_fence() {
     let fx = fixture(RepoFormat::CURRENT);
     fx.write("a", "alpha");
     let source_paths = vec![fx.source.to_string_lossy().into_owned()];
@@ -2116,21 +2116,23 @@ fn begin_commit_picks_the_fence_of_its_exclusion() {
         .unwrap()
     };
 
-    let free = upload("free").begin_commit(commands::backup::CommitLock::Free);
+    let free = upload("free").begin_commit();
     assert!(free.fence().is_lock_free_backup());
     let err = free
         .finish(Err(VykarError::Interrupted), &mut None, &CancelToken::new())
         .unwrap_err();
     assert!(matches!(err, VykarError::Interrupted));
 
-    let pending = upload("held");
-    let guard = pending
-        .wait_for_lock(&mut None, &CancelToken::new())
+    let mut pending = upload("protected");
+    pending
+        .protect_commit(&mut None, &CancelToken::new())
         .unwrap();
-    let mut held = pending.begin_commit(commands::backup::CommitLock::Held(guard));
-    assert!(!held.fence().is_lock_free_backup());
-    let result = held.drive(&|_: crate::repo::control::CommitEvent| {});
-    held.finish(result, &mut None, &CancelToken::new()).unwrap();
+    let mut commit = pending.begin_commit();
+    assert!(commit.fence().is_lock_free_backup());
+    let result = commit.drive(&|_: crate::repo::control::CommitEvent| {});
+    commit
+        .finish(result, &mut None, &CancelToken::new())
+        .unwrap();
 }
 
 /// A backup whose commit folds (requested: the hard limit's stand-in)

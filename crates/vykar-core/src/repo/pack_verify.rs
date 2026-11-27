@@ -2,7 +2,7 @@
 //! still present in storage.
 //!
 //! This is the backstop against a concurrent `compact` deleting a session's
-//! packs after its marker was reaped: it runs under the commit lock and checks
+//! packs after its marker was reaped: it runs inside the commit and checks
 //! **every** pack. Only the request pattern is chosen here — never which packs
 //! are checked. Each strategy issues independent read-only requests, so they
 //! may run concurrently without changing what is verified.
@@ -170,7 +170,7 @@ mod tests {
         }
     }
 
-    /// Under the commit lock a failing backend must not be asked about every
+    /// Inside a commit a failing backend must not be asked about every
     /// remaining pack.
     #[test]
     fn stops_at_first_failure() {

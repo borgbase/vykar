@@ -1,9 +1,7 @@
 {
   "name": "h1-duplicated-lock",
-  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): a's second backup no longer reaps b's young lock at its registration and ends Locked; kept as a regression: only the aged reap of a's first lock (AgedLockReaped) remains. Runs encrypted since 10-single-protocol step 2.",
-  "expect": [
-    "AgedLockReaped"
-  ],
+  "note": "Shape D of the phase F part 2 campaign (random-2227767431820797050): on one hostname a backup's registration reaps the other backup's young lock, whose duplicated lock PUT is then released and recreates the key, so the victim's writes are no lock violations; its head drops the reaper's snapshot (H1). Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): a's second backup no longer reaps b's young lock at its registration and ends Locked; kept as a regression: only the aged reap of a's first lock (AgedLockReaped) remains. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (was AgedLockReaped): no lock key is written, so the duplicated lock PUT this seed built on no longer exists; the aged victim refuses typed.",
+  "expect": [],
   "at": [
     [
       {
@@ -21,7 +19,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -65,7 +90,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -127,6 +179,24 @@
         }
       },
       "put-segment"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "put-head +local"
     ],
     [
       {
@@ -232,15 +302,22 @@
       0,
       0,
       0,
+      0,
+      0,
+      0,
       7,
       2,
       0,
       2,
+      2,
+      2,
+      2,
       0,
       0,
-      3,
+      2,
       0,
-      3,
+      2,
+      0,
       0,
       0,
       0,
@@ -249,7 +326,8 @@
       0,
       1,
       2,
-      2
+      1,
+      1
     ],
     "policy": "First",
     "template": "Encrypted"

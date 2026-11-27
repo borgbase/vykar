@@ -29,7 +29,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use proptest::test_runner::{TestCaseError, TestError};
 
-use super::sim_exhaustive::{HANDSHAKE_CAMPAIGN_K, backup, campaign_scenarios, handshake_search};
+use super::sim_exhaustive::{
+    SINGLE_WRITER_CAMPAIGN_K, SingleWriterRival, backup, campaign_scenarios, single_writer_search,
+};
 use super::sim_explore::{campaign_cases, runner_with};
 use crate::sim::driver::*;
 use crate::sim::explore::{Bound, Control, explore_with};
@@ -87,15 +89,16 @@ struct CampaignReport {
 
 /// A scenario's family, for the report: which store it runs on (see
 /// `sim_exhaustive::campaign_scenarios`). Every template is encrypted
-/// (10-single-protocol step 2): on the fallback store its clients take the
-/// lock with the marker handshake, on the conditional store they commit
-/// lock-free, and on the store whose plain PUT replaces heads a lock client
-/// runs beside lock-free ones.
+/// (10-single-protocol step 2): on the fallback store its clients run the
+/// single-writer protocol (step 7), on the conditional store they commit
+/// lock-free; the store whose plain PUT replaces heads held the mixed
+/// family (a lock client beside lock-free ones) until step 7 dropped it,
+/// and runs random cases only since (`"overwrite"`).
 fn family(case: &Case) -> &'static str {
     match case.storage {
         StoreKind::Plain => "plain",
         StoreKind::Conditional => "lockfree",
-        StoreKind::ConditionalOverwrite => "mixed",
+        StoreKind::ConditionalOverwrite => "overwrite",
         _ => "other",
     }
 }
@@ -389,28 +392,36 @@ fn campaign() {
         max_failures: 50,
         failure: unknown,
     };
-    // Beside the workers: the marker handshake's gate search at the
-    // campaign's bound (phase F part 10c).
-    let (report, handshake) = std::thread::scope(|s| {
-        let handshake = s.spawn(|| {
-            let start = Instant::now();
-            let (search, tally) = handshake_search(
-                &Template::encrypted(),
-                Bound {
-                    preemptions: HANDSHAKE_CAMPAIGN_K,
-                    max_runs: SEARCH_MAX_RUNS,
-                },
-            );
-            eprintln!(
-                "campaign: handshake search K = {HANDSHAKE_CAMPAIGN_K}: {search:?} {tally:?} in {:?}",
-                start.elapsed()
-            );
-            (search, tally)
+    // Beside the workers: the single-writer check's gate searches at the
+    // campaign's bound (10-single-protocol step 7; they replace the marker
+    // handshake's search of phase F part 10c, whose lock-mode backup no
+    // binary runs any more).
+    let (report, single_writer) = std::thread::scope(|s| {
+        let single_writer = s.spawn(|| {
+            [SingleWriterRival::Backup, SingleWriterRival::Compact].map(|rival| {
+                let start = Instant::now();
+                let (search, tally) = single_writer_search(
+                    &Template::encrypted(),
+                    rival,
+                    Bound {
+                        preemptions: SINGLE_WRITER_CAMPAIGN_K,
+                        max_runs: SEARCH_MAX_RUNS,
+                    },
+                );
+                eprintln!(
+                    "campaign: single-writer search ({rival:?}) K = {SINGLE_WRITER_CAMPAIGN_K}: \
+                     {search:?} {tally:?} in {:?}",
+                    start.elapsed()
+                );
+                (search, tally)
+            })
         });
         let report = run_campaign(&cfg);
         (
             report,
-            handshake.join().expect("the handshake search panicked"),
+            single_writer
+                .join()
+                .expect("the single-writer search panicked"),
         )
     });
     let counts = print_report(&cfg, &report, start.elapsed());
@@ -425,16 +436,22 @@ fn campaign() {
     for gap in &coverage {
         eprintln!("campaign: WARNING: {gap}");
     }
-    let (search, tally) = handshake;
-    assert!(
-        search.complete,
-        "the handshake search did not complete: {search:?}"
-    );
-    assert_eq!(
-        tally.damaged, 0,
-        "the handshake search: {:?}",
-        tally.first_damage
-    );
+    for (search, tally) in &single_writer {
+        assert!(
+            search.complete,
+            "a single-writer search did not complete: {search:?}"
+        );
+        assert_eq!(
+            (
+                tally.damaged,
+                tally.double_generation,
+                tally.concurrent_head_writes,
+                tally.other_endings
+            ),
+            (0, 0, 0, 0),
+            "a single-writer search: {tally:?}"
+        );
+    }
     assert!(
         report.failures.is_empty(),
         "{} failing cases; traces in {}",
@@ -454,13 +471,12 @@ fn campaign() {
 /// The campaign's random cases narrowed to the shape of its stale-session
 /// unknowns (phase F part 10d fix round 3): time jumps, a gate-stepped
 /// compact (one command made `Compact` when the case has none), the
-/// encrypted template on the conditional store, on the store whose plain PUT
-/// overwrites, or on that store with client b in lock mode (as
-/// [`campaign_cases`]: a handle without put-if-absent on vykar-server's
-/// write-once heads is not a deployment), any hosts.
+/// encrypted template on the conditional store or on the store whose plain
+/// PUT overwrites, any hosts. The family with client b in lock mode was
+/// dropped by 10-single-protocol step 7: no binary is such a client.
 fn stale_session_cases() -> impl proptest::strategy::Strategy<Value = Case> {
     use proptest::prelude::*;
-    (super::sim_explore::general(), 0u8..3).prop_map(|(mut c, kind)| {
+    (super::sim_explore::general(), 0u8..2).prop_map(|(mut c, kind)| {
         if !c.clients.iter().flatten().any(|x| *x == Command::Compact)
             && let Some(last) = c.clients.last_mut().and_then(|x| x.last_mut())
         {
@@ -475,7 +491,6 @@ fn stale_session_cases() -> impl proptest::strategy::Strategy<Value = Case> {
             } else {
                 StoreKind::ConditionalOverwrite
             },
-            lock_clients: if kind == 2 { vec![1] } else { vec![] },
             ..c
         }
     })
@@ -569,7 +584,7 @@ fn stale_session_search() {
 /// What the campaign failed to cover: a family with no completed scenario,
 /// no completed K >= 2 search.
 fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts) -> Vec<String> {
-    let mut gaps: Vec<String> = ["plain", "lockfree", "mixed"]
+    let mut gaps: Vec<String> = ["plain", "lockfree"]
         .into_iter()
         .filter(|f| counts.get(f).is_none_or(|c| c.0 == 0))
         .map(|f| format!("no {f} scenario completed"))
@@ -592,7 +607,7 @@ fn coverage_gaps(cfg: &CampaignConfig, r: &CampaignReport, counts: &FamilyCounts
 fn campaign_order_reaches_every_family_early() {
     let all = campaign_scenarios();
     let head = &all[..20];
-    for f in ["plain", "lockfree", "mixed"] {
+    for f in ["plain", "lockfree"] {
         assert!(
             head.iter().any(|(_, c, k)| *k == 1 && family(c) == f),
             "no K = 1 {f} scenario among the first 20: {:?}",
@@ -660,30 +675,4 @@ fn campaign_writes_failing_traces() {
         o.trace.render()
     );
     assert!(!current_path(dir.path(), 0).exists());
-}
-
-/// `LateHeadCreateReplaced` is open only with a lock client on the store
-/// whose plain PUT replaces heads: the same outcome judged as a case
-/// without lock clients, or on the conditional store, is a failure.
-#[test]
-fn late_head_create_replaced_is_closed_without_lock_clients() {
-    let mut o = run_case(
-        &Template::encrypted(),
-        &super::sim_driver::late_create_replaced_case(),
-    );
-    assert_eq!(
-        o.signatures,
-        std::collections::BTreeSet::from([Signature::LateHeadCreateReplaced]),
-        "{}",
-        o.trace.render()
-    );
-    assert!(!unknown(&o));
-    let case = o.trace.case.clone();
-    o.trace.case.lock_clients.clear();
-    assert!(unknown(&o), "without lock clients");
-    o.trace.case = Case {
-        storage: StoreKind::Conditional,
-        ..case
-    };
-    assert!(unknown(&o), "on the conditional store");
 }

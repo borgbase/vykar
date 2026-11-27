@@ -14,22 +14,26 @@
 //! nothing between decisions.
 //!
 //! A backup is upload (registration, open, phase 1 and the commit mode's
-//! decision), then up to [`LOCK_ATTEMPTS`] single attempts at the commit
-//! lock (lock mode) or its commit mark and up to [`LOCK_ATTEMPTS`] probes of
-//! `locks/` (lock-free, 04 step 9: encrypted template, put-if-absent
-//! verified), then one decision per step of its `BackupCommit` machine
-//! (`Local` steps run right after the step before them), then its finish.
+//! decision), then its commit protection one step per decision, with up to
+//! [`LOCK_ATTEMPTS`] contended steps: on a single-writer repository the
+//! listing of `sessions/` before the mark, the commit mark, the listing
+//! after it and the probe of `locks/` (10-single-protocol step 7); on a
+//! multi-writer one the mark and the probe (04 step 9); the suspend rule
+//! runs in the probe's decision. Then one decision per step of its
+//! `BackupCommit` machine (`Local` steps run right after the step before
+//! them), then its finish.
 //! Compact is one decision (`Maintenance::Whole`, every seed recorded
 //! before 04 step 7) or one decision per protocol-key operation
 //! (`Stepped`: gate-stepped on its own thread; the commit machines are
 //! steppable, compact is not a machine; see [`is_maintenance_step`]). No
 //! time jump is offered while a stepped compact under the lock is in
-//! flight: it holds the maintenance lock for its whole run, and a jump
-//! inside it would make it the victim of an aged-lock reap (H4's family),
-//! which no signature describes. A lock-free stepped compact (phase F part
-//! 10d: it registers a session marker instead, its heartbeat running
-//! beside its gated main thread) is offered jumps inside it too. Jumps
-//! before and after it, and crashes, are offered.
+//! flight: it would hold the maintenance lock for its whole run, and a
+//! jump inside it would make it the victim of an aged-lock reap (H4's
+//! family), which no signature describes. A stepped compact in a session
+//! (phase F part 10d; every driver compact since 10-single-protocol step 7:
+//! it registers a session marker, its heartbeat running beside its gated
+//! main thread) is offered jumps inside it too. Jumps before and after it,
+//! and crashes, are offered.
 //! Delete is one decision. Both run their index writes through the same
 //! publish machine, driven to the end inside the command.
 //!
@@ -58,12 +62,14 @@ use crate::commands::backup::{self, BackupRequest, CommitInProgress, PendingComm
 use crate::compress::Compression;
 use crate::repo::control::{CancelToken, CommitEvent};
 use crate::repo::machine::StepKind;
-use crate::repo::{CommitMode, Committed};
+use crate::repo::{Committed, WriterMode};
 use vykar_storage::StorageBackend;
 use vykar_types::error::VykarError;
 
-/// Single attempts at the commit lock before a backup gives up with
-/// `Locked` (production waits up to 2 hours of real time instead).
+/// Contended attempts of a backup's commit protection (a single-writer
+/// listing that found another head writer, a probe that found a live
+/// lock) before it gives up with `Locked` (production waits up to 2 hours
+/// of real time instead).
 pub const LOCK_ATTEMPTS: u32 = 3;
 
 /// More decisions than this in one case is a harness bug.
@@ -366,14 +372,23 @@ pub enum Policy {
     Continue,
 }
 
-/// The label of a lock attempt that found the lock taken.
+/// The label of a backup's protection step that found contention: a
+/// single-writer listing that found another head writer (the backup
+/// waits, unmarked), or a probe of `locks/` that found a live lock.
 pub const LABEL_LOCKED: &str = "lock (locked)";
 
-/// The label of a lock-free backup's commit mark (04 step 9).
+/// The label of a backup's commit mark (04 step 9; both modes since
+/// 10-single-protocol step 7).
 pub const LABEL_MARK_COMMITTING: &str = "mark-committing";
 
-/// The label of a lock-free backup's probe of `locks/` that found no live
-/// lock (one that did is [`LABEL_LOCKED`]).
+/// The label of a single-writer backup's listing of `sessions/` before or
+/// after its mark (10-single-protocol step 7) that found no other head
+/// writer (one that did is [`LABEL_LOCKED`]).
+pub const LABEL_LIST_WRITERS: &str = "list-writers";
+
+/// The label of a backup's probe of `locks/` that found no live lock (one
+/// that did is [`LABEL_LOCKED`]); the suspend rule runs in the same
+/// decision.
 pub const LABEL_PROBE_LOCKS: &str = "probe-locks";
 
 /// Which of `actions` are free under preemption bounding, given the
@@ -700,8 +715,9 @@ pub enum Signature {
     /// plain-PUTs a head over one a lock-free writer created meanwhile
     /// (`StoreKind::ConditionalOverwrite`: local, SFTP, S3). Claims that
     /// `HeadOverwritten` and, from it on, the damage it cascades to (the
-    /// replaced head's snapshot loses its index coverage); known hazard
-    /// `H-mixed-aged-lock`.
+    /// replaced head's snapshot loses its index coverage); it was known
+    /// hazard `H-mixed-aged-lock` until 10-single-protocol step 7 retired
+    /// it with lock-mode commits.
     AgedLockReaped,
     /// A protected write while the store held a lock key that a delayed or
     /// duplicated lock PUT left behind after its writer had deleted it (a
@@ -878,10 +894,11 @@ pub enum Signature {
     /// any other violation of the case stays `Unknown`. While the creating
     /// run is alive (its request in flight) its `committing` marker is
     /// listed and the lock holder yields, so only a run that gave up on its
-    /// create gets here (known hazard `H-mixed-late-create`, seed
-    /// `mixed-late-create-replaced`). Closed (a campaign failure) without
+    /// create gets here (known hazard `H-mixed-late-create` and seed
+    /// `mixed-late-create-replaced` until 10-single-protocol step 7 retired
+    /// both: no binary is a lock client). Closed (a campaign failure) without
     /// lock clients and on `StoreKind::Conditional`, where no plain PUT
-    /// replaces a head. Not planned to close: the lock's fallback.
+    /// replaces a head.
     LateHeadCreateReplaced,
     /// A violation no signature above claims, or anything not evaluated
     /// with no cascading signature.
@@ -1050,10 +1067,8 @@ struct RunCtx {
 enum Phase {
     /// Between commands.
     Idle,
-    /// Uploaded; waiting for the commit lock.
-    Lock(Box<LockWait>),
-    /// Uploaded, lock-free (04 step 9): marking the session marker
-    /// `committing`, then probing `locks/`.
+    /// Uploaded: the commit protection (the single-writer listings, the
+    /// mark, the probe of `locks/`, the suspend rule).
     Probe(Box<ProbeWait>),
     /// The commit machine runs.
     Commit(Box<Running>),
@@ -1076,11 +1091,13 @@ struct MaintRun {
     session: Option<String>,
     /// Its heartbeat thread runs: registered and adopted, not yet ended.
     /// Adopted is known from the first step op after a passed registration
-    /// probe, the listing of the first pack shard (a lock-free compact lists
-    /// `packs/` right after it registers; the probe's own step ops, a
-    /// listing of `sessions/` for a lock's age, come before). Any delete of
-    /// its own key (a failed registration, or the deregistration, which
-    /// stops the heartbeat before its first delete) ends it.
+    /// probe: the probe's own step ops are a listing of `sessions/` for a
+    /// lock's age, made only while `locks/` holds a lock key; any other
+    /// step op after the registration (the single-writer check's listing
+    /// of `sessions/`, 10-single-protocol step 7, or the listing of the
+    /// first pack shard) follows the adoption. Any delete of its own key (a
+    /// failed registration, or the deregistration, which stops the
+    /// heartbeat before its first delete) ends it.
     heartbeat: bool,
     /// A delete of its own marker key was held: no heartbeat from here on.
     ended: bool,
@@ -1089,8 +1106,9 @@ struct MaintRun {
 }
 
 impl MaintRun {
-    /// Track the run's session from the step op it is held at.
-    fn observe(&mut self, held: &super::gate::Paused) {
+    /// Track the run's session from the step op it is held at; `locked`:
+    /// `locks/` holds a lock key.
+    fn observe(&mut self, held: &super::gate::Paused, locked: bool) {
         let own_key = |id: &str| {
             held.key
                 .strip_prefix("sessions/")
@@ -1112,30 +1130,26 @@ impl MaintRun {
         {
             self.ended = true;
         }
-        if self.session.is_some() && held.op == OpKind::ListMeta && held.key == FIRST_PACK_SHARD {
+        let probe_listing = locked && held.op == OpKind::ListMeta && held.key == "sessions/";
+        if self.session.is_some() && !self.ended && !probe_listing {
             self.adopted = true;
         }
         self.heartbeat = self.adopted && !self.ended;
     }
 }
 
-struct LockWait {
-    run: RunCtx,
-    pending: PendingCommit,
-    attempts: u32,
-    fold: bool,
-    /// The wait's reading of the store's clock, shared by its attempts as
-    /// `acquire_lock_with_deadline` shares it.
-    store_clock: crate::repo::ages::StoreClock,
-}
-
-/// A lock-free backup between its upload and its commit machine: the
-/// mark, then up to [`LOCK_ATTEMPTS`] probes of `locks/`, one decision
-/// each, as `PendingCommit::wait_until_unlocked` runs them.
+/// A backup between its upload and its commit machine: the steps of
+/// `PendingCommit::protect_commit`, one decision each, with up to
+/// [`LOCK_ATTEMPTS`] contended ones. Single-writer: the listing before the
+/// mark, the mark, the listing after it, the probe; multi-writer: the mark,
+/// the probe. The suspend rule runs in the probe's decision.
 struct ProbeWait {
     run: RunCtx,
     pending: PendingCommit,
-    marked: bool,
+    /// The listing before the mark passed (single-writer).
+    listed_before: bool,
+    /// The listing after the mark passed (single-writer).
+    listed_after: bool,
     attempts: u32,
     fold: bool,
 }
@@ -1434,7 +1448,6 @@ impl<'c> Driver<'c> {
         let phase = std::mem::replace(&mut self.actors[i].phase, Phase::Idle);
         let label = match phase {
             Phase::Idle => self.start_command(i),
-            Phase::Lock(w) => self.lock_attempt(i, w),
             Phase::Probe(w) => self.probe_step(i, w),
             Phase::Commit(r) => self.commit_step(i, r, pick),
             Phase::Finish(r, result) => self.finish(i, r, *result),
@@ -1526,7 +1539,13 @@ impl<'c> Driver<'c> {
 {}",
                     self.trace_text()
                 );
-                m.observe(&p);
+                let locked = self
+                    .sim
+                    .store()
+                    .keys("locks/")
+                    .iter()
+                    .any(|k| KeyMatch::LockKey.matches(k));
+                m.observe(&p, locked);
                 self.actors[i].phase = Phase::Maint(m);
             }
             None => self.end_maint(*m),
@@ -1609,24 +1628,16 @@ impl<'c> Driver<'c> {
                         pending.join_background_writes();
                         // The mode was decided right after open (its
                         // put-if-absent check wrote probes under sessions/
-                        // before the upload).
-                        match pending.commit_mode() {
-                            Ok(CommitMode::LockFree) => {
+                        // before the upload); this hits the cache.
+                        match pending.decide_mode() {
+                            Ok(_) => {
                                 self.actors[i].phase = Phase::Probe(Box::new(ProbeWait {
                                     run,
                                     pending,
-                                    marked: false,
+                                    listed_before: false,
+                                    listed_after: false,
                                     attempts: 0,
                                     fold,
-                                }));
-                            }
-                            Ok(CommitMode::Lock) => {
-                                self.actors[i].phase = Phase::Lock(Box::new(LockWait {
-                                    run,
-                                    pending,
-                                    attempts: 0,
-                                    fold,
-                                    store_clock: Default::default(),
                                 }));
                             }
                             Err(e) => {
@@ -1660,47 +1671,31 @@ impl<'c> Driver<'c> {
         }
     }
 
-    fn lock_attempt(&mut self, i: usize, mut w: Box<LockWait>) -> String {
-        self.label(i, "lock");
-        match w.pending.try_lock(&mut w.store_clock) {
-            Ok(guard) => {
-                let LockWait {
-                    run,
-                    mut pending,
-                    fold,
-                    ..
-                } = *w;
-                if fold {
-                    pending.repo_mut().request_index_fold();
-                }
-                let commit = pending.begin_commit(backup::CommitLock::Held(guard));
-                let mut label = String::from("lock");
-                self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
-                label
-            }
-            Err(VykarError::Locked(_)) if w.attempts + 1 < LOCK_ATTEMPTS => {
-                w.attempts += 1;
-                self.actors[i].phase = Phase::Lock(w);
-                LABEL_LOCKED.into()
-            }
-            Err(e) => {
-                let LockWait { run, pending, .. } = *w;
-                pending.abandon();
-                self.end_run(i, run, Err(e));
-                "lock (gave up)".into()
-            }
-        }
-    }
-
-    /// A lock-free backup's mark (its first decision after the upload) or
-    /// one probe of `locks/`; a probe that finds no live lock starts the
-    /// commit machine in the same decision, as a lock attempt does.
+    /// One step of a backup's commit protection, mirroring
+    /// `PendingCommit::protect_commit`: the listing before the mark
+    /// (single-writer), the mark, the listing after it (single-writer), or
+    /// the probe of `locks/` with the suspend rule; a probe that finds no
+    /// live lock and a rule that proceeds start the commit machine in the
+    /// same decision.
     fn probe_step(&mut self, i: usize, mut w: Box<ProbeWait>) -> String {
-        if !w.marked {
+        let single = w.pending.protection_mode() == Some(WriterMode::Single);
+        let marked = w.pending.is_marked();
+        if single && !marked && !w.listed_before {
+            self.label(i, LABEL_LIST_WRITERS);
+            return match w.pending.list_before_mark() {
+                Ok(()) => {
+                    w.listed_before = true;
+                    self.actors[i].phase = Phase::Probe(w);
+                    LABEL_LIST_WRITERS.into()
+                }
+                Err(e) => self.contended(i, w, e, LABEL_LIST_WRITERS),
+            };
+        }
+        if !marked {
             self.label(i, LABEL_MARK_COMMITTING);
             return match w.pending.mark_committing() {
                 Ok(()) => {
-                    w.marked = true;
+                    w.listed_before = false;
                     self.actors[i].phase = Phase::Probe(w);
                     LABEL_MARK_COMMITTING.into()
                 }
@@ -1712,9 +1707,26 @@ impl<'c> Driver<'c> {
                 }
             };
         }
+        if single && !w.listed_after {
+            self.label(i, LABEL_LIST_WRITERS);
+            return match w.pending.list_after_mark() {
+                Ok(()) => {
+                    w.listed_after = true;
+                    self.actors[i].phase = Phase::Probe(w);
+                    LABEL_LIST_WRITERS.into()
+                }
+                // Unmarked by the listing: the next attempt lists before
+                // the mark again.
+                Err(e) => self.contended(i, w, e, LABEL_LIST_WRITERS),
+            };
+        }
         self.label(i, LABEL_PROBE_LOCKS);
-        match w.pending.try_probe() {
-            Ok(()) => {
+        let probed = w
+            .pending
+            .try_probe()
+            .and_then(|()| w.pending.suspend_rule());
+        match probed {
+            Ok(backup::Protection::Proceed) => {
                 let ProbeWait {
                     run,
                     mut pending,
@@ -1724,21 +1736,41 @@ impl<'c> Driver<'c> {
                 if fold {
                     pending.repo_mut().request_index_fold();
                 }
-                let commit = pending.begin_commit(backup::CommitLock::Free);
+                let commit = pending.begin_commit();
                 let mut label = String::from(LABEL_PROBE_LOCKS);
                 self.run_locals(i, Box::new(Running { run, commit }), Ok(()), &mut label);
                 label
             }
-            Err(VykarError::Locked(_)) if w.attempts + 1 < LOCK_ATTEMPTS => {
+            Ok(backup::Protection::Restart) => {
+                // Unmarked; the protection runs again in the new mode.
+                w.listed_before = false;
+                w.listed_after = false;
+                self.actors[i].phase = Phase::Probe(w);
+                format!("{LABEL_PROBE_LOCKS} (mode changed)")
+            }
+            Err(e) => self.contended(i, w, e, LABEL_PROBE_LOCKS),
+        }
+    }
+
+    /// A protection step of actor `i` that failed with `e` (`label`: the
+    /// step's): `Locked` with attempts left waits (the next attempt starts
+    /// at the top of the protection: a single-writer backup the listing
+    /// unmarked lists before the mark again, a marked one after it); any
+    /// other error, or the last attempt, abandons the commit.
+    fn contended(&mut self, i: usize, mut w: Box<ProbeWait>, e: VykarError, label: &str) -> String {
+        match e {
+            VykarError::Locked(_) if w.attempts + 1 < LOCK_ATTEMPTS => {
                 w.attempts += 1;
+                w.listed_before = false;
+                w.listed_after = false;
                 self.actors[i].phase = Phase::Probe(w);
                 LABEL_LOCKED.into()
             }
-            Err(e) => {
+            e => {
                 let ProbeWait { run, pending, .. } = *w;
                 pending.abandon();
                 self.end_run(i, run, Err(e));
-                format!("{LABEL_PROBE_LOCKS} (gave up)")
+                format!("{label} (gave up)")
             }
         }
     }
@@ -1816,11 +1848,6 @@ impl<'c> Driver<'c> {
         let phase = std::mem::replace(&mut self.actors[i].phase, Phase::Idle);
         let run = match phase {
             Phase::Idle => None,
-            Phase::Lock(w) => {
-                let LockWait { run, pending, .. } = *w;
-                drop(pending);
-                Some(run)
-            }
             Phase::Probe(w) => {
                 let ProbeWait { run, pending, .. } = *w;
                 drop(pending);
@@ -1887,7 +1914,10 @@ impl<'c> Driver<'c> {
             Invariant::OrphanGrace,
             Invariant::MarkerGapCommit,
         ];
-        if self.case.storage.honours_creates() {
+        // Invariant 12 is asked for by the repository's mode: heads are
+        // put-if-absent on a multi-writer repository (10-single-protocol
+        // step 7; before it, by the store's honouring of creates).
+        if self.case.storage.records_multi_writer() {
             set.push(Invariant::HeadsImmutable);
         }
         let report = self.sim.check_invariants(&set);

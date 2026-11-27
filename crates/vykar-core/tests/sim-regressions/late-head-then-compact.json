@@ -1,9 +1,7 @@
 {
   "name": "late-head-then-compact",
-  "note": "First LateHeadThenCompact case of a 10-minute make sim-campaign (phase F part 2): a late head write names a pack compact removed. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the compact runs seconds after the failed backup and keeps its packs, so the late head names packs that exist and only LateIndexWrite is left. late-head-then-compact-old-packs shows it with packs older than T_pack and a segment younger than T_idx. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-then-compact-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2.",
-  "expect": [
-    "LateIndexWrite"
-  ],
+  "note": "First LateHeadThenCompact case of a 10-minute make sim-campaign (phase F part 2): a late head write names a pack compact removed. Fixed by 04 steps 5 and 8. Since 04 step 5 (phase F part 7) young orphans are kept: the compact runs seconds after the failed backup and keeps its packs, so the late head names packs that exist and only LateIndexWrite is left. late-head-then-compact-old-packs shows it with packs older than T_pack and a segment younger than T_idx. Young orphans kept since 04 step 5 (phase F part 7): this schedule must stay as expected. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-then-compact-conditional is the same case on a conditional store. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. LateIndexWrite's evidence was invariant 7 (a late index write without the lock); single-writer runs take no lock and invariant 7 exempts them. The late PUT does replace a head: a's head PUT of index.h/3 is delayed after its EXISTS, its read-back finds nothing and a fails Injected; a's compact then writes index.h/3 itself (EXISTS, PUT, read-back), and the delayed PUT lands on it afterwards, replacing the compact's head with a's (the shape of H-late-head-single). It damages nothing here: the compact deleted no pack (a's packs are young orphans, kept; nothing repacked), so a's index names only present packs, and invariant 12 (heads immutable) does not hold a single-writer repository. Hence expect [].",
+  "expect": [],
   "at": [
     [
       {
@@ -21,7 +19,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -138,7 +163,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -221,7 +273,13 @@
     "advances": true,
     "choices": [
       0,
-      7,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
       0,
       0,
       0,

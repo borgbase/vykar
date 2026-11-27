@@ -53,7 +53,7 @@ pub(crate) enum OnFailure {
     /// Look up every pack (journal recovery: rejects, never aborts).
     Continue,
     /// Start no new request once any pack is absent or failed (commit
-    /// verification, under the commit lock). Packs not reached have no entry.
+    /// verification, inside the commit). Packs not reached have no entry.
     Stop,
 }
 

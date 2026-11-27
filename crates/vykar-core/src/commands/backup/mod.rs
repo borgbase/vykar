@@ -8,8 +8,9 @@ mod listing;
 mod phases;
 #[cfg(any(test, feature = "sim"))]
 pub(crate) use phases::CommitInProgress;
-pub(crate) use phases::CommitLock;
 pub(crate) use phases::PendingCommit;
+#[cfg(any(test, feature = "sim"))]
+pub(crate) use phases::Protection;
 pub(crate) mod pipeline;
 mod source;
 mod walk;
@@ -36,7 +37,7 @@ use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
-use crate::repo::{CommitMode, HostEnv, Repo, WriteSessionOptions};
+use crate::repo::{HostEnv, Repo, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
@@ -407,24 +408,14 @@ pub(crate) fn run_scoped(
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
     let pending = upload(config, &req, &mut progress, cancel, wrap_backend, host_env)?;
 
-    // ── Phase 2: Commit (lock-free, or under the commit lock) ───────────
+    // ── Phase 2: Commit (no lock; the marker handshake, and the
+    // single-writer check on a single-writer repository) ─────────────────
     let mut pending = pending;
-    let protection = pending.commit_mode().and_then(|mode| match mode {
-        CommitMode::LockFree => pending
-            .wait_until_unlocked(&mut progress, cancel)
-            .map(|()| CommitLock::Free),
-        CommitMode::Lock => pending
-            .wait_for_lock(&mut progress, cancel)
-            .map(CommitLock::Held),
-    });
-    let lock = match protection {
-        Ok(lock) => lock,
-        Err(e) => {
-            pending.abandon();
-            return Err((FailureScope::Repository, e));
-        }
-    };
-    let mut commit = pending.begin_commit(lock);
+    if let Err(e) = pending.protect_commit(&mut progress, cancel) {
+        pending.abandon();
+        return Err((FailureScope::Repository, e));
+    }
+    let mut commit = pending.begin_commit();
     let result = {
         let events = FnMutSink::new(|e: CommitEvent| emit_progress(&mut progress, e.into()));
         commit.drive(&events)
@@ -611,8 +602,8 @@ fn upload_prepared(
     // of the upload pipeline. `BackupSession` owns the guard, and every
     // deregistration is the guard's Drop (stop-thread → join-thread →
     // deregister). Error returns rely on `session` dropping at the return,
-    // after `flush_on_abort`; Phase 2 ends it explicitly where it must precede
-    // the lock release, or hands it to the cleanup thread at the commit point.
+    // after `flush_on_abort`; Phase 2 ends it explicitly after a failed
+    // commit, or hands it to the cleanup thread at the commit point.
     // `session` is declared after `repo` so it drops before `repo`; those
     // error returns depend on that order, and so does `PendingCommit`'s
     // field order.
@@ -673,6 +664,10 @@ fn upload_prepared(
             dataless,
             snapshot_name: snapshot_name.to_string(),
         },
+        mode: None,
+        marked: false,
+        restarted: false,
+        mode_changes: 0,
     })
 }
 

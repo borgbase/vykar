@@ -181,9 +181,10 @@ pub(crate) fn refuse_on_append_only_server(
     Ok(())
 }
 
-/// Execute a maintenance operation while holding an advisory lock (lock
-/// mode; in lock-free mode compact, prune and delete register a session
-/// instead, `with_maintenance_session`).
+/// Execute a maintenance operation while holding an advisory lock: used by
+/// `check --repair`, `vykar upgrade` of a v6 repository and pack maps;
+/// compact, prune and delete register a session in both modes
+/// (`with_maintenance_session`).
 ///
 /// Acquires the lock, cleans up stale sessions (no marker written for 45 min
 /// by the store's clock), lists the sessions that remain live (for compact's
@@ -345,19 +346,26 @@ fn maintenance_marker_fence(
     })
 }
 
-/// Lock-free maintenance (04 step 9): register a session marker carrying
-/// `flags`, adopt it with a heartbeat, run `action`, deregister. No lock is
-/// taken; the action's writer is fenced by the marker check
-/// ([`maintenance_marker_fence`]) for the whole run.
+/// Maintenance in a session (04 step 9; compact, prune and delete in both
+/// modes since 10-single-protocol step 7): register a session marker
+/// carrying `flags`, adopt it with a heartbeat, read `config` again and
+/// take the repository's mode from that read
+/// ([`Repo::reread_writer_mode`], then [`Repo::commit_mode`]), run
+/// `action`, deregister. No lock is taken; the action's writer is fenced by
+/// the marker check ([`maintenance_marker_fence`]) for the whole run.
 ///
 /// The registration probe keeps the lock holders out: the marker is written
 /// before the probe lists `locks/` (a live lock fails `Locked` after the
 /// probe's retries, as a backup's registration does), and every lock holder
 /// lists `sessions/` after its lock is confirmed, so `check --repair` and
 /// `upgrade` refuse beside this session (`refuse_live_sessions`) and a
-/// lock-mode writer yields to a marker that may write heads
-/// (`writes_heads`: a compact). Clears the store time, live sessions and
-/// segment ages at the end (`Repo::clear_lock_state`).
+/// lock holder yields to a marker that may write heads (`writes_heads`: a
+/// compact). The re-read after the registration closes the window between
+/// open and registration: a mode switch (under the lock, refusing beside
+/// any live session) that ran in it is seen by the read, one that runs
+/// after it refuses beside this session. A changed identity or format
+/// refuses. Clears the store time, live sessions and segment ages at the
+/// end (`Repo::clear_lock_state`).
 pub(crate) fn with_maintenance_session<T>(
     repo: &mut Repo,
     flags: lock::MarkerFlags,
@@ -376,6 +384,10 @@ pub(crate) fn with_maintenance_session<T>(
         };
     tracing::debug!(session_id = id, ?flags, "maintenance session registered");
     let session = MaintenanceSession { guard };
+    if let Err(e) = repo.reread_writer_mode().and_then(|_| repo.commit_mode()) {
+        drop(session);
+        return Err(e);
+    }
     let fence = Fence::marker(maintenance_marker_fence(
         session.marker(),
         Arc::clone(repo.storage()),
@@ -388,11 +400,11 @@ pub(crate) fn with_maintenance_session<T>(
 }
 
 /// The exclusion of a command that deletes only snapshot objects and
-/// writes no index (prune, delete): the maintenance lock in lock mode; in
-/// lock-free mode (04 step 9) a registered session without flags
-/// ([`with_maintenance_session`]), which keeps `check --repair` and
+/// writes no index (prune, delete), in both modes: a registered session
+/// without flags ([`with_maintenance_session`]), which keeps `check --repair` and
 /// `upgrade` out and lists no sessions (these commands write no head and
-/// judge no age). Snapshot deletes need no exclusion from writers: a
+/// judge no age, and make no single-writer check). Snapshot deletes need
+/// no exclusion from writers: a
 /// concurrent compact's mark skips a snapshot deleted after its listing
 /// (`mark::load_snapshots_strict`), and a backup that reused chunks of a
 /// deleted snapshot is protected by its commit (the young-segment rule and
@@ -402,12 +414,9 @@ pub(crate) fn with_snapshot_removal_exclusion<T>(
     repo: &mut Repo,
     action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {
-    match repo.commit_mode()? {
-        crate::repo::CommitMode::Lock => with_maintenance_lock(repo, action),
-        crate::repo::CommitMode::LockFree => {
-            with_maintenance_session(repo, lock::MarkerFlags::default(), |repo, _| action(repo))
-        }
-    }
+    // Refuses `MultiWriterUnsupported` before anything is written.
+    repo.commit_mode()?;
+    with_maintenance_session(repo, lock::MarkerFlags::default(), |repo, _| action(repo))
 }
 
 /// Sessions #1 of a lock-free maintenance run (04 step 9): one listing of

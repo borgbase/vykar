@@ -1917,7 +1917,10 @@ fn orphans_inside_a_live_horizon_are_kept() {
 }
 
 /// 04 "Compact" 1: compact lists the packs first, then the sessions, then
-/// reads the head, then lists the snapshots (the mark).
+/// reads the head, then lists the snapshots (the mark). Since
+/// 10-single-protocol step 7 compact runs in a session on a single-writer
+/// repository too: the order is counted from its single-writer check (a
+/// separate, earlier listing of `sessions/`, after the registration).
 #[test]
 fn compact_lists_packs_before_sessions_and_head() {
     use crate::sim::Sim;
@@ -1928,22 +1931,22 @@ fn compact_lists_packs_before_sessions_and_head() {
     let r = sim.compact(c);
     r.expect_ok();
     let recs = crate::tests::commit_op_order::run_records(&sim, &r, false);
-    let lock = recs
+    let check = recs
         .iter()
-        .position(|r| r.op.is_write() && r.key.starts_with("locks/"))
-        .expect("the maintenance lock");
+        .position(|r| !r.op.is_write() && r.key == "sessions/")
+        .expect("the single-writer check's listing");
     let first = |prefix: &str| {
         recs.iter()
             .enumerate()
-            .skip(lock + 1)
+            .skip(check + 1)
             .find(|(_, r)| r.key.starts_with(prefix))
             .map(|(i, _)| i)
-            .unwrap_or_else(|| panic!("no {prefix} op under the lock"))
+            .unwrap_or_else(|| panic!("no {prefix} op after the check"))
     };
     let order = ["packs/", "sessions/", "index.h/", "snapshots/"].map(first);
     assert!(
         order.windows(2).all(|w| w[0] < w[1]),
-        "first ops under the lock at {order:?} (packs/, sessions/, index.h/, snapshots/)"
+        "first ops after the check at {order:?} (packs/, sessions/, index.h/, snapshots/)"
     );
 }
 

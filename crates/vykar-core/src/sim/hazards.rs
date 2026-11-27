@@ -21,11 +21,25 @@
 //! [`with_store_kind`], and their conditional twins are regressions
 //! (H3-conditional, H3-compact-conditional). Every regression names the
 //! store kinds it holds on. Since 10-single-protocol step 2 every scenario
-//! runs on an encrypted repository, so the fallback store means lock mode
-//! with the marker handshake and the conditional store means lock-free
-//! clients, which take no lock: the lock hazards have no prerequisite
-//! there, and the lock regressions hold on the fallback store only. H-racy is a known hazard of
-//! a store that passes the sequential check yet lets a late create win.
+//! runs on an encrypted repository. Since step 7 the fallback store means a
+//! single-writer repository: the session protocol with the single-writer
+//! check and the plain head arm (EXISTS, PUT, read-back), no lock; the
+//! conditional store means lock-free multi-writer clients. The lock hazards
+//! take the lock through [`Call::LockedDelete`] (the lock holders until
+//! step 9 are `check --repair`, upgrade and pack maps), on both stores.
+//! H-racy is a known hazard of a store that passes the sequential check
+//! yet lets a late create win.
+//!
+//! Retired by 10-single-protocol step 7: H4 and H4-skew (compact's own lock
+//! route after a lost lock, which no command reaches since compact runs in a
+//! session; see [`interleavings`]), H-mixed-aged-lock and
+//! H-mixed-late-create (a lock-mode backup beside lock-free ones; lock-mode
+//! commits exist in no binary). The re-read of `config` closes a stale mode
+//! at the commit mark and at a maintenance run's registration; it does not
+//! close a single-writer head PUT already past its EXISTS when the
+//! repository switches to multi-writer: that is H-switch-late-head, and its
+//! twin against a compact on a single-writer repository is
+//! H-late-head-single.
 //!
 //! The driver (`sim::driver`) finds these hazards, and more of today's
 //! protocol, under random schedules; the shapes of damage it recognises are
@@ -120,9 +134,10 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         fixed_by: "not planned: a history of this installation's own boot IDs; \
                    04 step 5 narrows it for markers",
         run: interleavings::h1_late_clone,
-        // Lock-free clients take no lock (10-single-protocol step 2: the
-        // conditional store's clients are encrypted, so lock-free).
-        conditional: OnConditional::NoPrerequisite,
+        // Its lock holders delete under the maintenance lock
+        // (`Call::LockedDelete`, since 10-single-protocol step 7), which
+        // clients take on every store: the lock carries it there too.
+        conditional: OnConditional::Reproduces,
     },
     KnownHazard {
         id: "H2",
@@ -130,22 +145,10 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                   (route: the store's clock steps 3 h forward)",
         fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
         run: interleavings::h2_lock_refresh_resurrects,
-        // Lock-free clients take no lock (10-single-protocol step 2).
-        conditional: OnConditional::NoPrerequisite,
-    },
-    KnownHazard {
-        id: "H4",
-        summary: "compact loses its lock, deletes sources with no fence after its head \
-                  PUT, and a stale head names the deleted packs (route: the store's \
-                  clock steps 6 h 1 min forward)",
-        fixed_by: "04-commit-protocol.md step 8 on conditional backends (compact's \
-                   and the backup's creates of one generation: one wins, the backup \
-                   rebases); the fallback keeps it",
-        run: interleavings::h4_compact_deletes_after_lost_lock,
-        // Lock-free clients take no lock (10-single-protocol step 2); the
-        // regression H4-conditional, of a lock-mode compact losing its lock
-        // on that store, went with the unencrypted template.
-        conditional: OnConditional::NoPrerequisite,
+        // Its holders delete under the maintenance lock
+        // (`Call::LockedDelete`, since 10-single-protocol step 7), which
+        // clients take on every store: the lock carries it there too.
+        conditional: OnConditional::Reproduces,
     },
     KnownHazard {
         id: "H-racy",
@@ -159,14 +162,44 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         conditional: OnConditional::OwnKind,
     },
     KnownHazard {
-        id: "H-mixed-aged-lock",
-        summary: "mixed modes on a store whose plain PUT replaces heads (local, SFTP, S3): \
-                  a lock-mode backup stalls 6 h between its fence and its head PUT, a \
-                  lock-free backup reaps the aged lock and creates the generation, and the \
-                  late plain head PUT replaces it (invariant 12)",
-        fixed_by: "not planned: the lock's documented limit (AgedLockReaped, R4 of phase F \
-                   part 10); only a lock-mode writer's own stall of 6 h opens it",
-        run: h_mixed_aged_lock,
+        id: "H-committing-reaped-single",
+        summary: "on a single-writer repository, a backup that reused chunks of a deleted \
+                  snapshot stalls 46 min after its marker probe, before its snapshot PUT (its \
+                  heartbeat failing): a compact's single-writer listing reaps its committing \
+                  marker, so the compact runs, sweeps the reused chunks and deletes their \
+                  packs; the late snapshot PUT commits a snapshot that does not restore \
+                  (invariant 1), and repair cannot restore a deleted pack",
+        fixed_by: "not planned: the single-writer check is best effort (10-single-protocol \
+                   step 7, the defeated check); step 10 names it with a signature",
+        run: h_committing_reaped_single,
+        conditional: OnConditional::OwnKind,
+    },
+    KnownHazard {
+        id: "H-late-head-single",
+        summary: "on a single-writer repository, a backup stalls 46 min between its head \
+                  EXISTS and its plain PUT: a compact's single-writer listing reaps its \
+                  stale marker, sweeps and deletes packs and writes that generation; the \
+                  late PUT replaces the compact's head and reads back its own bytes, so \
+                  the index names the deleted packs (invariant 4) until check --repair; \
+                  the backup refuses its snapshot (MarkerLostDuringCommit)",
+        fixed_by: "not planned: the single-writer check is best effort (10-single-protocol \
+                   step 7, the defeated check); closed where a plain head PUT cannot \
+                   replace a head (vykar-server); step 10 names it with a signature",
+        run: h_late_head_single,
+        conditional: OnConditional::OwnKind,
+    },
+    KnownHazard {
+        id: "H-switch-late-head",
+        summary: "a single-writer backup stalls 46 min between its head EXISTS and its \
+                  plain PUT; upgrade --commit-mode multi reaps its stale marker and a \
+                  multi-writer backup creates that generation put-if-absent; on \
+                  ConditionalOverwrite (local, SFTP, S3) the late plain PUT replaces \
+                  that head (invariant 12) and its entries are unindexed until \
+                  check --repair; the stalled backup refuses its snapshot",
+        fixed_by: "not planned: the re-read of config closes a stale mode at the commit \
+                   mark and at a maintenance run's registration, not a head PUT already \
+                   past its EXISTS; closed on vykar-server (the PUT is refused 409)",
+        run: h_switch_late_head,
         conditional: OnConditional::OwnKind,
     },
     KnownHazard {
@@ -180,19 +213,6 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                    AgedSessionReaped); the post-head marker probe narrows it to a stall \
                    after that probe",
         run: h_committing_reaped,
-        conditional: OnConditional::OwnKind,
-    },
-    KnownHazard {
-        id: "H-mixed-late-create",
-        summary: "mixed modes on a store whose plain PUT replaces heads (local, SFTP, S3): \
-                  a lock-free backup's head create times out and the backup fails and \
-                  deregisters without a snapshot; the abandoned create lands after a \
-                  lock-mode backup read the head, whose plain PUT then replaces it \
-                  (invariant 12); nothing committed is damaged",
-        fixed_by: "not planned: the lock protocol's fallback beside lock-free writers \
-                   (LateHeadCreateReplaced, phase F part 10c); the failed run's objects \
-                   are debris",
-        run: h_mixed_late_create,
         conditional: OnConditional::OwnKind,
     },
 ];
@@ -244,15 +264,10 @@ pub const REGRESSIONS: &[Regression] = &[
         summary: "compact upkeep no longer deletes a concurrent writer's fresh segment \
                   (age-gated GC)",
         run: interleavings::h4_segment_regression,
-        kinds: BOTH_KINDS,
-    },
-    Regression {
-        id: "H4-skew",
-        summary: "a client 6 h 1 min ahead no longer reaps compact's live lock \
-                  (store-clock ages)",
-        run: interleavings::h4_skew_regression,
-        // Its subject is a lock, which lock-free clients never take.
-        kinds: &[StoreKind::Plain],
+        // On a single-writer repository (10-single-protocol step 7) the
+        // backup waits while the compact is flagged, so the concurrent
+        // writer whose segment the upkeep could delete does not exist there.
+        kinds: &[StoreKind::Conditional],
     },
     Regression {
         id: "H3-compact-young",
@@ -671,57 +686,6 @@ pub fn h_racy() -> HazardOutcome {
     }
 }
 
-/// H-mixed-aged-lock (phase F part 10c, R4): on an encrypted repository
-/// over `StoreKind::ConditionalOverwrite`, lock-mode backup l (its handle
-/// offers no put-if-absent) is held after its fence, at its plain head
-/// PUT; 6 h 1 min pass (its lock ages past the stale age); lock-free
-/// backup f reaps the lock at registration, commits the generation l
-/// computed; l's PUT then replaces f's head: `HeadOverwritten`, and f1
-/// loses its index coverage.
-pub fn h_mixed_aged_lock() -> HazardOutcome {
-    let mut sim = Sim::with_config(SimConfig {
-        kind: StoreKind::ConditionalOverwrite,
-        ..SimConfig::default()
-    });
-    let (l, f) = (sim.client("l"), sim.client("f"));
-    sim.set_lock_client(l);
-    let gate = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(super::fault::OpKind::Put),
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    let rl = sim.spawn(
-        l,
-        Call::Backup {
-            snapshot: "l1".into(),
-            tree: SourceTree::seeded("l1", 3, FILE_SIZE),
-        },
-    );
-    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
-        return broken(String::from("l never reached its head PUT"));
-    }
-    sim.advance(std::time::Duration::from_secs(6 * 3600 + 60));
-    let rf = sim.backup(f, "f1", &SourceTree::seeded("f1", 3, FILE_SIZE));
-    if !rf.is_ok() || !rf.lock_free {
-        return broken(format!("f1 should commit lock-free: {}", rf.detail()));
-    }
-    sim.resume(gate);
-    let rl = sim.join(rl);
-    let report = sim.check_invariants(Invariant::STEP8);
-    let overwritten = report
-        .violations
-        .iter()
-        .any(|v| v.kind == ViolationKind::HeadOverwritten);
-    let evidence = format!("l1: {}; {report}", rl.detail());
-    if overwritten {
-        HazardOutcome::Reproduced { evidence }
-    } else if report.is_clean() {
-        HazardOutcome::NotReproduced { evidence }
-    } else {
-        different_damage(evidence)
-    }
-}
-
 /// H-committing-reaped (phase F part 10d, R1): on an encrypted repository
 /// over `StoreKind::Conditional`, snapshot "old" is deleted and its segment
 /// ages past T_pack; lock-free backup b of the same source again adds no
@@ -733,8 +697,25 @@ pub fn h_mixed_aged_lock() -> HazardOutcome {
 /// unreferenced, and it sweeps them and deletes their packs. b's snapshot
 /// PUT then commits a snapshot that does not restore.
 pub fn h_committing_reaped() -> HazardOutcome {
+    h_committing_reaped_on(StoreKind::Conditional)
+}
+
+/// H-committing-reaped-single (10-single-protocol step 7): H-committing-reaped
+/// on a single-writer repository (the fallback store), the residual of a
+/// defeated single-writer check. b's committing marker, stale on the
+/// store's clock, is reaped by the compact's single-writer listing, so the
+/// compact finds no other head writer and runs; its sweep removes the
+/// chunks b reused and deletes their packs, and b's late snapshot PUT
+/// commits a snapshot that does not restore. `check --repair` cannot bring
+/// back a deleted pack.
+pub fn h_committing_reaped_single() -> HazardOutcome {
+    h_committing_reaped_on(StoreKind::Plain)
+}
+
+/// [`h_committing_reaped`] on a store of `kind`.
+fn h_committing_reaped_on(kind: StoreKind) -> HazardOutcome {
     let mut sim = Sim::with_config(SimConfig {
-        kind: StoreKind::Conditional,
+        kind,
         ..SimConfig::default()
     });
     let (a, b) = (sim.client("a"), sim.client("b"));
@@ -789,81 +770,6 @@ pub fn h_committing_reaped() -> HazardOutcome {
         .any(|v| v.invariant == Invariant::CommittedSnapshotsRestore && v.subject == "again");
     let evidence = format!("compact: {}; {report}", rc.detail());
     if lost {
-        HazardOutcome::Reproduced { evidence }
-    } else if report.is_clean() {
-        HazardOutcome::NotReproduced { evidence }
-    } else {
-        different_damage(evidence)
-    }
-}
-
-/// H-mixed-late-create (phase F part 10c): on an encrypted repository over
-/// `StoreKind::ConditionalOverwrite`, lock-free backup f's head create is
-/// delayed (a request the client abandoned on a timeout); its GET finds the
-/// key absent, so f fails with the error, deregistered and without a
-/// snapshot. Lock-mode backup l (its handle offers no put-if-absent) lists
-/// no session to yield to and is held at its plain head PUT; f's create
-/// lands; l's PUT replaces it: `HeadOverwritten` (invariant 12) and
-/// nothing else (l1 restores, f wrote no snapshot).
-pub fn h_mixed_late_create() -> HazardOutcome {
-    let mut sim = Sim::with_config(SimConfig {
-        kind: StoreKind::ConditionalOverwrite,
-        ..SimConfig::default()
-    });
-    let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
-    sim.fault(
-        FaultRule::new(
-            OpMatch::Kind(super::fault::OpKind::PutIfAbsent),
-            KeyMatch::Prefix("index.h/".into()),
-            FaultAction::Delay,
-        )
-        .client(f),
-    );
-    let rf = sim.backup(f, "f1", &SourceTree::seeded("f1", 3, FILE_SIZE));
-    if rf.error_class() != Some(&ErrorClass::Allowed(AllowedError::Injected)) {
-        return broken(format!(
-            "f1 should fail with the injected fault: {}",
-            rf.detail()
-        ));
-    }
-    let parked = sim.store().parked();
-    if parked.len() != 1 || !parked[0].key.starts_with("index.h/") {
-        return broken(format!("expected f's head create parked, got {parked:?}"));
-    }
-    if !sim.store().keys_written_by(f, "snapshots/").is_empty() {
-        return broken("f wrote a snapshot");
-    }
-    let gate = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(super::fault::OpKind::Put),
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    let rl = sim.spawn(
-        l,
-        Call::Backup {
-            snapshot: "l1".into(),
-            tree: SourceTree::seeded("l1", 3, FILE_SIZE),
-        },
-    );
-    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
-        let rl = sim.join(rl);
-        return broken(format!("l never reached its head PUT: {}", rl.detail()));
-    }
-    sim.release_all();
-    sim.resume(gate);
-    let rl = sim.join(rl);
-    if !rl.is_ok() || rl.lock_free {
-        return broken(format!("l1 should commit under the lock: {}", rl.detail()));
-    }
-    let report = sim.check_invariants(Invariant::STEP8);
-    let evidence = format!("{report}");
-    let only_overwrite = !report.violations.is_empty()
-        && report
-            .violations
-            .iter()
-            .all(|v| v.kind == ViolationKind::HeadOverwritten);
-    if only_overwrite {
         HazardOutcome::Reproduced { evidence }
     } else if report.is_clean() {
         HazardOutcome::NotReproduced { evidence }
@@ -1330,6 +1236,235 @@ pub fn h3_compact_with(late: LateHead) -> HazardOutcome {
         return broken(e);
     }
     if latest_by_a && !dangling.is_empty() {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
+    }
+}
+
+/// The stall of [`h_late_head_single`] and [`h_switch_late_head`]: past
+/// the session staleness (45 min), so the stalled backup's marker is
+/// reaped meanwhile.
+const LATE_HEAD_STALL: std::time::Duration = std::time::Duration::from_secs(46 * 60);
+
+/// Gate `c`'s head PUT (a single-writer head write is past its EXISTS
+/// there), spawn `c`'s backup of `name`, wait for the gate, then suspend
+/// it [`LATE_HEAD_STALL`]: one long jump is one heartbeat poll, which
+/// writes no marker, so its marker is stale after it.
+fn stall_at_head_put(
+    sim: &mut Sim,
+    c: ClientId,
+    name: &str,
+) -> Result<(super::gate::GateId, super::runner::Spawned), HazardOutcome> {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let gate = sim.gate(GateRule::new(
+        c,
+        OpMatch::Kind(super::fault::OpKind::Put),
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let run = sim.spawn(
+        c,
+        Call::Backup {
+            snapshot: name.into(),
+            tree: SourceTree::seeded(name, 3, FILE_SIZE),
+        },
+    );
+    if sim.poll_paused(gate, GATE_TIMEOUT).ok().flatten().is_none() {
+        let run = sim.join(run);
+        return Err(broken(format!(
+            "{name} never reached a plain head PUT: {}",
+            run.detail()
+        )));
+    }
+    if !sim.time().wait_for_waiters(1, WAIT) {
+        return Err(broken("the heartbeat does not wait"));
+    }
+    sim.advance(LATE_HEAD_STALL);
+    if !sim.time().wait_for_waiters(1, WAIT) {
+        return Err(broken("the heartbeat does not wait again"));
+    }
+    Ok((gate, run))
+}
+
+/// The end state of [`h_late_head_single_runs`] and
+/// [`h_switch_late_head_runs`]: the sim, the late writer `a`, the client `c`
+/// that ran the compact or the switch, a's run, and
+/// the report after its late PUT (STEP7 on a single-writer repository,
+/// STEP8 on a multi-writer one).
+pub type LateHeadEnd = (Sim, ClientId, ClientId, super::history::RunRecord, Report);
+
+/// H-late-head-single (10-single-protocol step 7): on a single-writer
+/// repository of a store of `kind` (switched to single-writer first unless
+/// init recorded it), "old" is deleted and ages past T_pack; backup a1
+/// stalls between its head EXISTS and its plain PUT for 46 min, its marker
+/// stale. c's compact's single-writer listing reaps the marker, so the
+/// compact finds no other head writer, sweeps "old"'s chunks, deletes their
+/// packs and writes the next head, the generation a's EXISTS found absent.
+/// a's late PUT then replaces that head and reads back its own bytes
+/// (`Created`); its marker gone, a refuses its snapshot
+/// (`MarkerLostDuringCommit`), but the index is a's: built before the
+/// compact, it names the packs the compact deleted.
+pub fn h_late_head_single_runs(kind: StoreKind) -> Result<LateHeadEnd, HazardOutcome> {
+    let mut sim = Sim::with_config(SimConfig {
+        kind,
+        ..SimConfig::default()
+    });
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    if kind != StoreKind::Plain {
+        let r = sim.call(
+            c,
+            Call::SwitchMode {
+                mode: crate::repo::WriterMode::Single,
+            },
+        );
+        if !r.is_ok() {
+            return Err(broken(format!("switch to single-writer: {}", r.detail())));
+        }
+    }
+    for name in ["old", "keep"] {
+        let r = sim.backup(c, name, &SourceTree::seeded(name, 3, FILE_SIZE));
+        if !r.is_ok() {
+            return Err(broken(format!("{name}: {}", r.detail())));
+        }
+    }
+    if !sim.delete(c, &["old"]).is_ok() {
+        return Err(broken("the delete of old failed"));
+    }
+    sim.advance(ORPHANS_OLD);
+    let (gate, ra) = stall_at_head_put(&mut sim, a, "a1")?;
+    let rc = sim.compact(c);
+    if !rc.is_ok() {
+        sim.resume(gate);
+        let _ = sim.join(ra);
+        return Err(broken(format!("the compact should run: {}", rc.detail())));
+    }
+    sim.resume(gate);
+    let ra = sim.join(ra);
+    // Invariant 12 does not hold a single-writer repository: its plain head
+    // PUT may replace a head by design.
+    let report = sim.check_invariants(Invariant::STEP7);
+    Ok((sim, a, c, ra, report))
+}
+
+/// H-late-head-single on the fallback store: see [`h_late_head_single_runs`].
+pub fn h_late_head_single() -> HazardOutcome {
+    let (sim, a, _, ra, report) = match h_late_head_single_runs(StoreKind::Plain) {
+        Ok(end) => end,
+        Err(outcome) => return outcome,
+    };
+    late_head_verdict(&sim, a, &ra, &report)
+}
+
+/// Reproduced when a's run refused (`MarkerLostDuringCommit`), the latest
+/// head is a's and the index names an absent pack.
+fn late_head_verdict(
+    sim: &Sim,
+    a: ClientId,
+    ra: &super::history::RunRecord,
+    report: &Report,
+) -> HazardOutcome {
+    let refused =
+        ra.error_class() == Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit));
+    let latest_by_a = latest_head_key(sim)
+        .and_then(|k| sim.store().object(&k))
+        .is_some_and(|o| o.writer == a);
+    let dangling = report
+        .violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::IndexNamesAbsentPack);
+    let evidence = format!(
+        "a: {}; latest head written by a: {latest_by_a}\n{report}",
+        ra.detail()
+    );
+    if refused && latest_by_a && dangling {
+        HazardOutcome::Reproduced { evidence }
+    } else if report.is_clean() {
+        HazardOutcome::NotReproduced { evidence }
+    } else {
+        different_damage(evidence)
+    }
+}
+
+/// H-switch-late-head (10-single-protocol step 7): a stale-mode head
+/// writer the re-read of `config` cannot stop. On a store of `kind` switched
+/// to single-writer, backup a1 stalls between its head EXISTS and its plain
+/// PUT for 46 min, its marker stale; `vykar upgrade --commit-mode multi`
+/// runs (its session listing reaps the stale marker) and multi-writer
+/// backup b1 creates the generation a's EXISTS found absent, put-if-absent.
+/// a's late plain PUT then lands: the suspend rule ran at a's commit mark,
+/// before its head write, so nothing re-reads `config` between the EXISTS
+/// and the PUT.
+pub fn h_switch_late_head_runs(kind: StoreKind) -> Result<LateHeadEnd, HazardOutcome> {
+    let mut sim = Sim::with_config(SimConfig {
+        kind,
+        ..SimConfig::default()
+    });
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    let r = sim.call(
+        c,
+        Call::SwitchMode {
+            mode: crate::repo::WriterMode::Single,
+        },
+    );
+    if !r.is_ok() {
+        return Err(broken(format!("switch to single-writer: {}", r.detail())));
+    }
+    let r = sim.backup(c, "c0", &SourceTree::seeded("c0", 3, FILE_SIZE));
+    if !r.is_ok() {
+        return Err(broken(format!("control backup c0 failed: {}", r.detail())));
+    }
+    let (gate, ra) = stall_at_head_put(&mut sim, a, "a1")?;
+    let r = sim.call(
+        c,
+        Call::SwitchMode {
+            mode: crate::repo::WriterMode::Multi,
+        },
+    );
+    if !r.is_ok() {
+        sim.resume(gate);
+        let _ = sim.join(ra);
+        return Err(broken(format!("switch to multi-writer: {}", r.detail())));
+    }
+    let rb = sim.backup(b, "b1", &SourceTree::seeded("b1", 3, FILE_SIZE));
+    if !rb.is_ok() || !rb.lock_free {
+        sim.resume(gate);
+        let _ = sim.join(ra);
+        return Err(broken(format!(
+            "b1 should commit lock-free: {}",
+            rb.detail()
+        )));
+    }
+    sim.resume(gate);
+    let ra = sim.join(ra);
+    let report = sim.check_invariants(Invariant::STEP8);
+    Ok((sim, a, c, ra, report))
+}
+
+/// H-switch-late-head on `StoreKind::ConditionalOverwrite` (local, SFTP,
+/// S3): see [`h_switch_late_head_runs`]. Reproduced when a refused
+/// (`MarkerLostDuringCommit`), its head replaced b1's (invariant 12) and
+/// b1 is unindexed.
+pub fn h_switch_late_head() -> HazardOutcome {
+    let (sim, a, _, ra, report) = match h_switch_late_head_runs(StoreKind::ConditionalOverwrite) {
+        Ok(end) => end,
+        Err(outcome) => return outcome,
+    };
+    let refused =
+        ra.error_class() == Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit));
+    let latest_by_a = latest_head_key(&sim)
+        .and_then(|k| sim.store().object(&k))
+        .is_some_and(|o| o.writer == a);
+    let overwritten = report
+        .violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::HeadOverwritten);
+    let evidence = format!(
+        "a: {}; latest head written by a: {latest_by_a}\n{report}",
+        ra.detail()
+    );
+    if refused && latest_by_a && overwritten && b1_unindexed(&report) {
         HazardOutcome::Reproduced { evidence }
     } else if report.is_clean() {
         HazardOutcome::NotReproduced { evidence }

@@ -1,6 +1,6 @@
 {
   "name": "session-reaped",
-  "note": "First SessionReaped case of a 10-minute make sim-campaign (phase F part 2): a same-hostname compact reaps a live backup's session marker. The same-hostname delete before it reaped the backup's young lock and the backup went on to put its snapshot, so it is also TwoLockHolders. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): neither the delete nor the compact reaps the backup's live lock or marker any more; kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2.",
+  "note": "First SessionReaped case of a 10-minute make sim-campaign (phase F part 2): a same-hostname compact reaps a live backup's session marker. The same-hostname delete before it reaped the backup's young lock and the backup went on to put its snapshot, so it is also TwoLockHolders. Fixed by 04 step 1 (installation ID). H1 fixed by 04 step 1 (phase F part 5): neither the delete nor the compact reaps the backup's live lock or marker any more; kept as a regression: this schedule must stay clean. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature (as before).",
   "expect": [],
   "at": [
     [
@@ -19,7 +19,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -157,6 +184,9 @@
     "crash": false,
     "advances": false,
     "choices": [
+      0,
+      0,
+      0,
       0,
       0,
       0,

@@ -58,6 +58,7 @@ mod sim_exclusion;
 mod sim_exhaustive;
 mod sim_explore;
 mod sim_regressions;
+mod single_writer;
 pub(crate) mod tree_cache;
 pub(crate) mod tree_cut;
 mod two_openers;

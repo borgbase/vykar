@@ -38,9 +38,11 @@ pub enum StoreKind {
     /// No put-if-absent (`conditional()` is None): a backend that does not
     /// offer it (S3 off AWS with `s3_conditional_writes: auto`, SFTP without
     /// `hardlink@openssh.com`) or whose check failed. Init records a
-    /// single-writer repository: heads are plain PUTs under the lock, and
-    /// one with other bytes replaces the head. Every seed recorded before
-    /// 04 step 8 runs on it.
+    /// single-writer repository: since 10-single-protocol step 7 its clients
+    /// commit in sessions with the single-writer check and the plain head
+    /// write (EXISTS, PUT, read-back), no lock (under the lock before), and a
+    /// late PUT with other bytes replaces the head. Every seed recorded
+    /// before 04 step 8 runs on it.
     #[default]
     Plain,
     /// vykar-server: honest put-if-absent; a plain PUT of an existing head
@@ -48,7 +50,7 @@ pub enum StoreKind {
     Conditional,
     /// Garage 2.5.0: put-if-absent overwrites and answers Yes; init's check
     /// concludes Unsupported, so the repository is single-writer and heads
-    /// are plain PUTs under the lock, which overwrite.
+    /// are plain PUTs (the single-writer head write), which overwrite.
     Ignoring,
     /// IDrive e2: passes the sequential check; a delayed or duplicated
     /// create that lands later overwrites whatever is there (the
@@ -636,9 +638,10 @@ impl SimStore {
 
     /// Every later [`Self::handle`] of `client` offers no put-if-absent and
     /// reads `config` as single-writer: a client that read `config` before
-    /// a switch to multi-writer, the one way lock mode and lock-free commits
-    /// still meet on one repository after 10-single-protocol step 5 besides
-    /// the suspend demotion. Step 10 removes lock clients.
+    /// a switch to multi-writer. Since 10-single-protocol step 7 a lock
+    /// client models no client (it once modelled a lock-mode commit beside
+    /// lock-free ones; the re-read of `config` closes the stale-config
+    /// route); kept until step 10 removes it.
     pub fn set_lock_client(&self, client: ClientId) {
         self.state().lock_clients.insert(client);
     }

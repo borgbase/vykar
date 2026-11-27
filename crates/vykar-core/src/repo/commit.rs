@@ -202,7 +202,7 @@ impl Repo {
         new_file_cache: &mut file_cache::FileCache,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
-        let mut m = BackupCommit::new(ws, entry, packed, None, super::CommitMode::Lock);
+        let mut m = BackupCommit::new(ws, entry, packed, None);
         let result = drive_blocking(
             &mut m,
             &mut StepCx {

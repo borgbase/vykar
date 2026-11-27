@@ -186,6 +186,44 @@ pub enum Call {
         label: String,
         f: CustomFn,
     },
+    /// [`Call::Delete`]'s delete under the maintenance lock
+    /// (`util::with_maintenance_lock`: its stale-session reap, the lock
+    /// holder's half of the marker handshake): a lock holder that deletes,
+    /// standing in for the commands that hold the lock until
+    /// 10-single-protocol step 9 (`check --repair`, upgrade, pack maps) in
+    /// the lock hazards and tests whose lock holder was a delete before step
+    /// 7 (delete runs in a session since). History op: `ClientOp::Delete`
+    /// (`RunRecord::lock_free` false: no session is registered).
+    LockedDelete {
+        names: Vec<String>,
+    },
+    /// [`Call::Custom`] under the maintenance lock
+    /// (`util::with_maintenance_lock`: its stale-session reap and the lock
+    /// holder's half of the marker handshake) instead of `with_repo_lock`:
+    /// a lock holder as `check --repair`, upgrade and pack maps are until
+    /// 10-single-protocol step 9.
+    LockedCustom {
+        label: String,
+        f: CustomFn,
+    },
+    /// Tests: [`Call::Backup`] that records in `rechecks` whether its commit
+    /// machine re-checks reused chunks on every attempt (the suspend rule's
+    /// `recheck_reuse_always`, 10-single-protocol step 7), as
+    /// `PendingCommit::begin_commit` built it.
+    #[cfg(test)]
+    BackupRecordingRecheck {
+        snapshot: String,
+        tree: SourceTree,
+        rechecks: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// `vykar upgrade --commit-mode` on a v6 repository
+    /// (`commands::upgrade::upgrade_repo` on a handle opened with
+    /// `OpenOptions::legacy_format`, as `run_with_mode` opens it): the
+    /// production switch, under the maintenance lock, refusing beside live
+    /// sessions. History op: `ClientOp::Custom { label: "switch-mode" }`.
+    SwitchMode {
+        mode: crate::repo::WriterMode,
+    },
 }
 
 /// Virtual time added before every run, so consecutive runs never share a
@@ -1068,6 +1106,109 @@ impl Sim {
                 );
                 (ClientOp::CheckRepair, body)
             }
+            #[cfg(test)]
+            Call::BackupRecordingRecheck {
+                snapshot,
+                tree,
+                rechecks,
+            } => {
+                let src = self.prepare_backup_source(&snapshot, tree);
+                let op = ClientOp::Backup {
+                    snapshot: snapshot.clone(),
+                };
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let handle = store.handle(c);
+                        let wrap = move |_: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+                            Box::new(handle.clone())
+                        };
+                        let source_paths = vec![src.to_string_lossy().into_owned()];
+                        let req = backup::BackupRequest {
+                            snapshot_name: &snapshot,
+                            passphrase: cfg.encryption.passphrase.as_deref(),
+                            source_paths: &source_paths,
+                            source_label: "sim",
+                            exclude_patterns: &[],
+                            exclude_if_present: &[],
+                            one_file_system: true,
+                            git_ignore: false,
+                            xattrs_enabled: false,
+                            compression: Compression::None,
+                            command_dumps: &[],
+                            verbose: false,
+                        };
+                        let cancel = CancelToken::new();
+                        let mut pending =
+                            backup::upload(&cfg, &req, &mut None, &cancel, Some(&wrap), env)
+                                .map_err(|(_, e)| e)?;
+                        if let Err(e) = pending.protect_commit(&mut None, &cancel) {
+                            pending.abandon();
+                            return Err(e);
+                        }
+                        let mut commit = pending.begin_commit();
+                        rechecks.store(
+                            commit.rechecks_reuse_always(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        let result = commit.drive(&|_: crate::repo::control::CommitEvent| {});
+                        let outcome = commit.finish(result, &mut None, &cancel)?;
+                        Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
+                    },
+                );
+                (op, body)
+            }
+            Call::LockedCustom { label, f } => {
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let mut repo = open_for(store, c, &cfg, env)?;
+                        util::with_maintenance_lock(&mut repo, f)?;
+                        Ok((Vec::new(), String::new()))
+                    },
+                );
+                (ClientOp::Custom { label }, body)
+            }
+            Call::LockedDelete { names } => {
+                let op = ClientOp::Delete {
+                    names: names.clone(),
+                };
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let mut repo = open_for(store, c, &cfg, env)?;
+                        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                        let result = util::with_maintenance_lock(&mut repo, |w| {
+                            delete::delete_on_writer(w, &refs, false, &CancelToken::new())
+                        })?;
+                        let removed = result
+                            .stats
+                            .iter()
+                            .map(|s| s.snapshot_name.clone())
+                            .collect();
+                        Ok((removed, result.warnings.join("; ")))
+                    },
+                );
+                (op, body)
+            }
+            Call::SwitchMode { mode } => {
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let mut repo = util::open_repo_on(
+                            Box::new(store.handle(c)),
+                            &util::open_request(&cfg),
+                            cfg.encryption.passphrase.as_deref(),
+                            OpenOptions::new().legacy_format().host_env(env),
+                        )?;
+                        let outcome =
+                            crate::commands::upgrade::upgrade_repo(&mut repo, Some(mode))?;
+                        Ok((Vec::new(), format!("{outcome:?}")))
+                    },
+                );
+                (
+                    ClientOp::Custom {
+                        label: "switch-mode".into(),
+                    },
+                    body,
+                )
+            }
             Call::Restore { snapshot } => {
                 let op = ClientOp::Restore {
                     snapshot: snapshot.clone(),
@@ -1311,12 +1452,11 @@ impl Sim {
 
     /// Insert the run in index order and its observation in step order.
     fn record(&mut self, index: usize, c: ClientId, op: ClientOp, f: Finished) -> RunRecord {
-        // A backup commits lock-free once it decided to (an encrypted
-        // repository, a passed put-if-absent check and a continuous marker
-        // record: `PendingCommit::commit_mode`), which its commit mark
-        // shows. Maintenance (compact, prune, delete, a lock-free custom
-        // run) runs lock-free in a registered session (phase F part 10d),
-        // which its marker shows: under the lock it registers none.
+        // A backup commits without a lock once it marked its session
+        // `committing` (in both modes since 10-single-protocol step 7). Maintenance
+        // (compact, prune, delete, a lock-free custom run) runs lock-free in
+        // a registered session (phase F part 10d; in both modes since step
+        // 7), which its marker shows: under the lock it registers none.
         let lock_free = match op {
             ClientOp::Backup { .. } => self.store.committed_lock_free_in_run(index),
             ClientOp::Compact

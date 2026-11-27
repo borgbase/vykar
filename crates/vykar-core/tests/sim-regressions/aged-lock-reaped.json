@@ -1,9 +1,7 @@
 {
   "name": "aged-lock-reaped",
-  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) aged-lock-reaped-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2.",
-  "expect": [
-    "AgedLockReaped"
-  ],
+  "note": "First AgedLockReaped case of a 10-minute make sim-campaign (phase F part 2): a time jump past the 6 h lock staleness, then another client reaps the holder's lock. Fixed by 04 steps 5 and 8. Since 04 step 8 (phase F part 9) aged-lock-reaped-conditional is the same case on a conditional store, which keeps it too. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): no signature. No lock key is written, so AgedLockReaped cannot occur; the marker reap left ends the victim with an allowed error before its snapshot.",
+  "expect": [],
   "at": [
     [
       {
@@ -21,7 +19,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -127,6 +152,24 @@
           "pick": 0
         }
       },
+      "put-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "fence"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
       "finish"
     ],
     [
@@ -153,7 +196,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -320,6 +390,9 @@
       0,
       0,
       0,
+      0,
+      0,
+      0,
       7,
       2,
       0,
@@ -329,22 +402,27 @@
       0,
       0,
       0,
+      0,
+      0,
       4,
       0,
       0,
       0,
+      0,
+      0,
+      0,
       4,
       0,
-      4,
-      0,
-      2,
       0,
       0,
       0,
       0,
       0,
       0,
-      7
+      0,
+      0,
+      0,
+      0
     ],
     "policy": "First",
     "template": "Encrypted"

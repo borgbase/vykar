@@ -5,10 +5,10 @@ use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, RunOutcome, classify};
-use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap, Order};
+use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap};
 use crate::sim::{
     Call, ClientId, FaultAction, FaultRule, GateRule, INIT_PID_NS, KeyMatch, OpKind, OpMatch,
-    OpOutcome, Sim, SimMachine, SourceTree,
+    OpOutcome, Sim, SimMachine, SourceTree, StoreKind,
 };
 use vykar_types::error::{ActiveSessionList, LockHolder, VykarError};
 
@@ -374,7 +374,14 @@ fn crash_then_break_lock_then_backup() {
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
     sim.fault(FaultRule::new(OpMatch::AnyWrite, KeyMatch::LockKey, FaultAction::Crash).client(a));
-    let r = sim.compact(a);
+    // A lock holder (a compact until 10-single-protocol step 7, which moved
+    // compact into a session).
+    let r = sim.call(
+        a,
+        Call::LockedDelete {
+            names: vec!["t0".into()],
+        },
+    );
     assert_eq!(
         r.error_class(),
         Some(&ErrorClass::Allowed(AllowedError::Injected)),
@@ -600,15 +607,24 @@ fn crash_backup_leaving_marker(sim: &mut Sim, a: ClientId) -> String {
     markers.into_iter().next().unwrap()
 }
 
-/// `a`'s backup crashes at its commit lock's PUT, after every pack is
-/// uploaded, leaving its marker and journal behind. Returns the marker key
-/// and a's packs.
+/// `a`'s backup crashes at its single-writer listing before its commit
+/// mark ([`before_mark`]; its commit lock's PUT until 10-single-protocol
+/// step 7), after every pack is uploaded, leaving its unflagged marker
+/// behind. Returns the marker key and a's packs.
 fn crash_backup_after_upload(
     sim: &mut Sim,
     a: ClientId,
     tree: &SourceTree,
 ) -> (String, Vec<String>) {
-    sim.fault(FaultRule::new(OpMatch::AnyWrite, KeyMatch::LockKey, FaultAction::Crash).client(a));
+    sim.fault(
+        FaultRule::new(
+            OpMatch::Kind(OpKind::ListMeta),
+            KeyMatch::Exact("sessions/".into()),
+            FaultAction::Crash,
+        )
+        .client(a)
+        .nth(2),
+    );
     let r = sim.backup(a, "x1", tree);
     assert!(allowed_as(&r, AllowedError::Injected), "{}", r.detail());
     let marker = sim
@@ -888,16 +904,15 @@ const TESTED_IDS: &[&str] = &[
     "H1-late-clone",
     "H2",
     "H2-marker",
-    "H4",
     "H4-segment",
-    "H4-skew",
     "H3-compact-young",
     "H-racy",
     "H3-conditional",
     "H3-compact-conditional",
-    "H-mixed-aged-lock",
-    "H-mixed-late-create",
     "H-committing-reaped",
+    "H-committing-reaped-single",
+    "H-late-head-single",
+    "H-switch-late-head",
 ];
 
 #[test]
@@ -927,22 +942,6 @@ fn known_hazard_h_racy() {
     hazards::assert_reproduces("H-racy");
 }
 
-/// H-mixed-aged-lock (phase F part 10c, R4): a lock-mode backup whose lock
-/// aged out while it stalled before its plain head PUT replaces the head a
-/// lock-free backup created meanwhile.
-#[test]
-fn known_hazard_h_mixed_aged_lock() {
-    hazards::assert_reproduces("H-mixed-aged-lock");
-}
-
-/// H-mixed-late-create (phase F part 10c): a failed lock-free backup's
-/// late head create is replaced by a lock-mode backup's plain head PUT;
-/// the overwrite is the only damage.
-#[test]
-fn known_hazard_h_mixed_late_create() {
-    hazards::assert_reproduces("H-mixed-late-create");
-}
-
 /// H-committing-reaped (phase F part 10d, R1): a lock-free backup whose
 /// committing marker is reaped by age after its marker probe, before its
 /// snapshot PUT, commits a snapshot a lock-free compact swept meanwhile.
@@ -951,8 +950,141 @@ fn known_hazard_h_committing_reaped() {
     hazards::assert_reproduces("H-committing-reaped");
 }
 
-/// What each known hazard does on a store that honours put-if-absent: H3,
-/// H3-compact and H4 are closed (their twins are regressions), the lock
+/// H-committing-reaped-single (10-single-protocol step 7): the same on a
+/// single-writer repository, where the compact's single-writer listing
+/// reaps the stale committing marker: the residual of a defeated check.
+#[test]
+fn known_hazard_h_committing_reaped_single() {
+    hazards::assert_reproduces("H-committing-reaped-single");
+}
+
+/// H-late-head-single (10-single-protocol step 7): a single-writer backup
+/// stalled between its head EXISTS and its plain PUT, its marker reaped by
+/// a compact's single-writer listing, replaces the compact's head with an
+/// index that names the packs the compact deleted.
+#[test]
+fn known_hazard_h_late_head_single() {
+    hazards::assert_reproduces("H-late-head-single");
+}
+
+/// H-switch-late-head (10-single-protocol step 7): a single-writer backup
+/// stalled between its head EXISTS and its plain PUT across a switch to
+/// multi-writer replaces a put-if-absent head on `ConditionalOverwrite`.
+#[test]
+fn known_hazard_h_switch_late_head() {
+    hazards::assert_reproduces("H-switch-late-head");
+}
+
+/// After a late head: `check --repair` leaves the repository clean (every
+/// invariant of `set`), and a later compact and a restore of each of
+/// `survivors` are clean too.
+fn repaired_clean(sim: &mut Sim, c: ClientId, survivors: &[&str], set: &[Invariant]) {
+    sim.check_repair(c).expect_ok();
+    sim.check_invariants(set).assert_clean();
+    sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
+    sim.compact(c).expect_ok();
+    for name in survivors {
+        sim.restore(c, name).expect_ok();
+    }
+    sim.check_invariants(set).assert_clean();
+}
+
+/// H-late-head-single on each store kind. Plain and ConditionalOverwrite
+/// (switched to single-writer): a refuses its snapshot
+/// (`MarkerLostDuringCommit`), its head replaced the compact's and the
+/// index names the packs the compact deleted (invariant 4); `check
+/// --repair` drops those entries, and a compact and a restore of "keep"
+/// are clean afterwards. Conditional (vykar-server, switched to
+/// single-writer): the late plain PUT is refused 409, which reads as
+/// `Taken` (D14), so a rebases, finds its marker gone and refuses:
+/// clean. The classifier has no signature for this shape yet (`Unknown`;
+/// 10-single-protocol step 10 names it), so the test asserts invariants.
+#[test]
+fn a_late_single_writer_head_over_a_compact_is_repaired() {
+    for kind in [StoreKind::Plain, StoreKind::ConditionalOverwrite] {
+        let (mut sim, a, c, ra, report) =
+            hazards::h_late_head_single_runs(kind).unwrap_or_else(|o| panic!("{kind:?}: {o:?}"));
+        assert_eq!(
+            ra.error_class(),
+            Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
+            "{kind:?}: {}",
+            ra.detail()
+        );
+        assert!(sim.store().keys_written_by(a, "snapshots/").is_empty());
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|v| v.kind == ViolationKind::IndexNamesAbsentPack),
+            "{kind:?}: {report}"
+        );
+        assert_eq!(
+            report.violated_set(),
+            BTreeSet::from([Invariant::IndexIntegrity]),
+            "{kind:?}: {report}"
+        );
+        repaired_clean(&mut sim, c, &["keep"], Invariant::STEP7);
+    }
+    let (_, _, _, ra, report) = hazards::h_late_head_single_runs(StoreKind::Conditional)
+        .unwrap_or_else(|o| panic!("Conditional: {o:?}"));
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
+        "{}",
+        ra.detail()
+    );
+    report.assert_clean();
+}
+
+/// H-switch-late-head on each store kind. ConditionalOverwrite: a refuses
+/// (`MarkerLostDuringCommit`), its plain PUT replaced b1's put-if-absent
+/// head (invariant 12) and b1's entries are unindexed (invariant 1; a
+/// compact refuses its mark, so invariant 9 too); `check --repair`
+/// re-indexes b1 from its packs, and a compact and restores of c0 and b1
+/// are clean afterwards (invariant 12 aside: the replaced head stays
+/// replaced). Conditional: the plain PUT is refused 409 (`Taken`), a
+/// finds its marker gone and refuses: clean. Plain offers no
+/// put-if-absent, so the switch to multi-writer refuses there.
+#[test]
+fn a_late_head_across_a_switch_to_multi_writer_is_repaired() {
+    let (mut sim, _, c, ra, report) =
+        hazards::h_switch_late_head_runs(StoreKind::ConditionalOverwrite)
+            .unwrap_or_else(|o| panic!("{o:?}"));
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
+        "{}",
+        ra.detail()
+    );
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::HeadOverwritten),
+        "{report}"
+    );
+    assert!(
+        report.violated_for(Invariant::CommittedSnapshotsRestore, "b1"),
+        "{report}"
+    );
+    repaired_clean(&mut sim, c, &["c0", "b1"], Invariant::STEP7);
+    let (_, _, _, ra, report) = hazards::h_switch_late_head_runs(StoreKind::Conditional)
+        .unwrap_or_else(|o| panic!("Conditional: {o:?}"));
+    assert_eq!(
+        ra.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::MarkerLostDuringCommit)),
+        "{}",
+        ra.detail()
+    );
+    report.assert_clean();
+    assert!(matches!(
+        hazards::h_switch_late_head_runs(StoreKind::Plain),
+        Err(HazardOutcome::ScenarioBroken { .. })
+    ));
+}
+
+/// What each known hazard does on a store that honours put-if-absent: H3
+/// and H3-compact are closed (their twins are regressions), the lock
 /// hazards remain.
 #[test]
 fn known_hazards_on_a_conditional_store() {
@@ -1148,7 +1280,9 @@ fn step3_clean_on_sequential_flows() {
     sim.check_invariants(Invariant::STEP3).assert_clean();
 }
 
-/// `c` backs up t0; `a` deletes it and is held at its snapshot delete.
+/// `c` backs up t0; `a` deletes it under the maintenance lock
+/// ([`Call::LockedDelete`]: a delete runs in a session since
+/// 10-single-protocol step 7) and is held at its snapshot delete.
 fn held_delete() -> (
     Sim,
     ClientId,
@@ -1166,7 +1300,7 @@ fn held_delete() -> (
     ));
     let run = sim.spawn(
         a,
-        Call::Delete {
+        Call::LockedDelete {
             names: vec!["t0".into()],
         },
     );
@@ -1271,11 +1405,6 @@ fn known_hazard_h2_lock_refresh_resurrects() {
 }
 
 #[test]
-fn known_hazard_h4_compact_deletes_after_lost_lock() {
-    hazards::assert_reproduces("H4");
-}
-
-#[test]
 fn neutralised_h1_not_reproduced() {
     expect_not_reproduced("H1", interleavings::h1_with(Hosts::Distinct));
 }
@@ -1299,46 +1428,6 @@ fn neutralised_h2_not_reproduced() {
 fn h2_marker_placements_not_reproduced() {
     for reap in [MarkerReap::BeforeRefresh, MarkerReap::AfterPut] {
         expect_not_reproduced("H2-marker", interleavings::h2_marker_with(reap));
-    }
-}
-
-#[test]
-fn neutralised_h4_not_reproduced() {
-    expect_not_reproduced(
-        "H4",
-        interleavings::h4_with(Hosts::StoreStepped, Order::Sequential),
-    );
-}
-
-#[test]
-fn neutralised_h4_segment_not_reproduced() {
-    expect_not_reproduced(
-        "H4-segment",
-        interleavings::h4_segment_with(Hosts::StoreStepped, Order::Sequential),
-    );
-}
-
-/// Without a store clock step no client reaps compact's live lock: on
-/// distinct hosts, since 04 step 1 on cloned machines either (the H1 fix
-/// seen through H4), and since 04 step 5 with b's clock 6 h 1 min ahead.
-#[test]
-fn h4_without_a_reaper_has_no_prerequisite() {
-    for hosts in [Hosts::Distinct, Hosts::SameHostname, Hosts::Skewed] {
-        for outcome in [
-            interleavings::h4_with(hosts, Order::Interleaved),
-            interleavings::h4_segment_with(hosts, Order::Interleaved),
-        ] {
-            assert!(
-                matches!(
-                    outcome,
-                    HazardOutcome::PrerequisiteNotReproduced {
-                        prerequisite: "a reaped live lock",
-                        ..
-                    }
-                ),
-                "H4 on {hosts:?} should report the missing prerequisite: {outcome:?}"
-            );
-        }
     }
 }
 
@@ -1367,7 +1456,13 @@ fn allowed_as(run: &crate::sim::history::RunRecord, e: AllowedError) -> bool {
 /// A live marker written before 04 step 7 (no `elapsed_secs`) gives compact
 /// no horizon: it deletes no orphan pack, not even a crashed backup's 12 h
 /// old ones, nor the old packs its own sweep emptied (since phase F part 8c
-/// those obey I1 like any orphan); repack goes on.
+/// those obey I1 like any orphan). Until 10-single-protocol step 7 repack
+/// went on under the lock; compact runs in a session since, and a session
+/// compact repacks no pack that is not before every live backup's horizon
+/// (04 step 9's source rule), so with a horizon of −∞ it holds the repack
+/// for a later run: `repacked` is 0 and `held` counts the held packs, where
+/// this test asserted `repacked > 0` before step 7 (a behaviour change of
+/// compact leaving the lock, not of the horizon).
 #[test]
 fn an_unknown_horizon_keeps_every_orphan() {
     let mut sim = Sim::new();
@@ -1393,7 +1488,8 @@ fn an_unknown_horizon_keeps_every_orphan() {
     // The crashed backup's packs and the ones the sweep emptied.
     assert!(compact_stat(d, "live") > packs.len() as u64, "{d}");
     assert_eq!(compact_stat(d, "deleted_empty"), 0, "{d}");
-    assert!(compact_stat(d, "repacked") > 0, "{d}");
+    assert_eq!(compact_stat(d, "repacked"), 0, "{d}");
+    assert!(compact_stat(d, "held") > 0, "{d}");
     for k in &packs {
         assert!(
             sim.store().object(k).is_some(),
@@ -1411,7 +1507,7 @@ fn a_sweep_beside_a_live_backup_keeps_its_uploads() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    let gb = sim.gate(GateRule::new(b, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let gb = sim.gate(before_mark(b));
     let sb = sim.spawn(
         b,
         Call::Backup {
@@ -1419,7 +1515,7 @@ fn a_sweep_beside_a_live_backup_keeps_its_uploads() {
             tree: tree("b1"),
         },
     );
-    sim.expect_paused(gb, "b's commit-lock sweep");
+    sim.expect_paused(gb, "b's listing before its commit mark");
     let b_packs = sim.store().keys_written_by(b, "packs/");
     assert!(!b_packs.is_empty());
     let ra = sim.compact(a);
@@ -1451,9 +1547,13 @@ fn sweepable(sim: &mut Sim, c: ClientId) {
     sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 }
 
-/// SIM-2: a backup that starts while a compact is between its sweep's
-/// first index write and its head is refused (the lock is held); the
-/// compact completes and the repository is consistent.
+/// SIM-2: a backup that finishes uploading while a compact is between its
+/// sweep's first index write and its head waits (10-single-protocol step 7:
+/// the compact's marker carries `writes_heads`; until then the compact's
+/// lock refused the backup at its registration): its listing before its
+/// commit mark finds the compact, it writes no `committing` key and no
+/// index object, and it commits once the compact ended. The compact
+/// completes and the repository is consistent.
 #[test]
 fn backup_during_a_sweep_is_locked_out() {
     for prefix in ["index.h/", "index.d/"] {
@@ -1467,17 +1567,42 @@ fn backup_during_a_sweep_is_locked_out() {
         ));
         let sa = sim.spawn(a, Call::Compact);
         sim.expect_paused(ga, "compact a's first index write");
-        let rb = sim.backup(b, "b1", &tree("b1"));
-        assert!(
-            allowed_as(&rb, AllowedError::Locked),
-            "{prefix}: {:?}",
-            rb.outcome
+        // b's second listing before its mark, after the first found a.
+        let gb = sim.gate(
+            GateRule::new(
+                b,
+                OpMatch::Kind(OpKind::ListMeta),
+                KeyMatch::Exact("sessions/".into()),
+            )
+            .nth(3),
+        );
+        let sb = sim.spawn(b, backup_call("b1"));
+        sim.expect_paused(gb, "b's second listing before its mark");
+        let b_writes: Vec<String> = sim
+            .store()
+            .log()
+            .into_iter()
+            .filter(|r| r.client == b && r.op.is_write() && r.applied())
+            .map(|r| r.key)
+            .filter(|k| k.starts_with("index.") || k.starts_with("snapshots/"))
+            .collect();
+        assert!(b_writes.is_empty(), "{prefix}: {b_writes:?}");
+        assert_eq!(
+            sim.store()
+                .keys_written_by(b, "sessions/")
+                .iter()
+                .filter(|k| k.ends_with(".json"))
+                .count(),
+            1,
+            "{prefix}: b wrote a key after its registration (its mark) while a ran"
         );
         sim.resume(ga);
         let ra = sim.join(sa);
         ra.expect_ok();
         assert!(ra.detail().contains("unreferenced"), "{}", ra.detail());
         assert!(!ra.detail().contains("unreferenced 0"), "{}", ra.detail());
+        sim.resume(gb);
+        sim.join(sb).expect_ok();
         sim.check_invariants(interleavings::CHECKED).assert_clean();
     }
 }
@@ -1568,7 +1693,7 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
     // step 7 keeps those of segments younger than T_pack).
     sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
 
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1576,7 +1701,7 @@ fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
             tree: x.file("new.bin", b"a file of its own".to_vec()),
         },
     );
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     assert!(!sim.store().keys_written_by(a, "packs/").is_empty());
     let marker = sim
         .store()
@@ -1631,7 +1756,7 @@ fn missing_pack_with_a_live_marker_stays_untyped() {
     let mut sim = Sim::new();
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(c, "c0", &tree("c0")).expect_ok();
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1639,7 +1764,7 @@ fn missing_pack_with_a_live_marker_stays_untyped() {
             tree: SourceTree::seeded("own", 3, 64 * KIB),
         },
     );
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     let pack = sim
         .store()
         .keys_written_by(a, "packs/")
@@ -1686,7 +1811,7 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
     sim.backup(c, "t0", &x).expect_ok();
     sim.delete(c, &["t0"]).expect_ok();
 
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -1694,7 +1819,7 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
             tree: SourceTree::seeded("own", 3, 64 * KIB),
         },
     );
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     let marker = sim
         .store()
         .keys_written_by(a, "sessions/")
@@ -1875,8 +2000,10 @@ fn hours(h: i64) -> chrono::Duration {
     chrono::Duration::hours(h)
 }
 
-/// a's compact is held at its first `index.h/` write, holding the lock; b
-/// backs up with its wall clock skewed by `b_skew`, a's by `a_skew`.
+/// a's delete under the maintenance lock ([`Call::LockedDelete`]; a
+/// compact under the lock until 10-single-protocol step 7, when compact
+/// moved into a session) is held at its snapshot delete, holding the lock;
+/// b backs up with its wall clock skewed by `b_skew`, a's by `a_skew`.
 fn lock_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
@@ -1885,11 +2012,16 @@ fn lock_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     sim.set_skew(b, b_skew);
     let ga = sim.gate(GateRule::new(
         a,
-        OpMatch::AnyWrite,
-        KeyMatch::Prefix("index.h/".into()),
+        OpMatch::AnyDelete,
+        KeyMatch::Prefix("snapshots/".into()),
     ));
-    let sa = sim.spawn(a, Call::Compact);
-    sim.expect_paused(ga, "a's first head PUT");
+    let sa = sim.spawn(
+        a,
+        Call::LockedDelete {
+            names: vec!["t0".into()],
+        },
+    );
+    sim.expect_paused(ga, "a's snapshot delete");
     let rb = sim.backup(b, "b1", &tree("b1"));
     assert!(allowed_as(&rb, AllowedError::Locked), "{:?}", rb.outcome);
     sim.resume(ga);
@@ -1905,9 +2037,9 @@ fn marker_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     sim.set_skew(a, a_skew);
     sim.set_skew(b, b_skew);
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(a, backup_call("a1"));
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     let marker = sim
         .store()
         .keys_written_by(a, "sessions/")
@@ -2046,7 +2178,7 @@ fn a_dedup_hit_on_a_fresh_chunk_survives_a_concurrent_sweep() {
     let t0_packs = backup_packs(&mut sim, c, "t0", &x);
     sim.delete(c, &["t0"]).expect_ok();
 
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(
         a,
         Call::Backup {
@@ -2054,7 +2186,7 @@ fn a_dedup_hit_on_a_fresh_chunk_survives_a_concurrent_sweep() {
             tree: x.clone().file("new.bin", b"a file of its own".to_vec()),
         },
     );
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     let a_packs = sim.store().keys_written_by(a, "packs/");
     assert!(!a_packs.is_empty());
     let rb = sim.compact(b);
@@ -2218,13 +2350,19 @@ fn a_store_clock_step_ages_every_object() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
+    // A lock holder (a compact until 10-single-protocol step 7).
     let ga = sim.gate(GateRule::new(
         a,
-        OpMatch::AnyWrite,
-        KeyMatch::Prefix("index.h/".into()),
+        OpMatch::AnyDelete,
+        KeyMatch::Prefix("snapshots/".into()),
     ));
-    let sa = sim.spawn(a, Call::Compact);
-    sim.expect_paused(ga, "a's first head PUT");
+    let sa = sim.spawn(
+        a,
+        Call::LockedDelete {
+            names: vec!["t0".into()],
+        },
+    );
+    sim.expect_paused(ga, "a's snapshot delete");
     let lock = sim
         .store()
         .keys_written_by(a, "locks/")
@@ -2538,15 +2676,29 @@ fn marker_of(sim: &Sim, a: ClientId) -> String {
         .expect("a's marker")
 }
 
-/// Spawn a's backup of `a1` and hold it at its commit lock's stale-lock
-/// sweep, after every pack is uploaded.
+/// `c`'s single-writer listing of `sessions/` before its commit mark
+/// (10-single-protocol step 7), after every pack is uploaded: its second
+/// listing, the first being the open's. The scripted tests held a backup
+/// at its commit lock's stale-lock sweep (its second listing of `locks/`)
+/// before; both are the first op of its commit, unflagged, its marker live.
+fn before_mark(c: ClientId) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::ListMeta),
+        KeyMatch::Exact("sessions/".into()),
+    )
+    .nth(2)
+}
+
+/// Spawn a's backup of `a1` and hold it at its single-writer listing
+/// before its commit mark ([`before_mark`]).
 fn hold_after_upload(
     sim: &mut Sim,
     a: ClientId,
 ) -> (crate::sim::GateId, crate::sim::runner::Spawned) {
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let ga = sim.gate(before_mark(a));
     let sa = sim.spawn(a, backup_call("a1"));
-    sim.expect_paused(ga, "a's commit-lock sweep");
+    sim.expect_paused(ga, "a's listing before its commit mark");
     assert!(!sim.store().keys_written_by(a, "packs/").is_empty());
     (ga, sa)
 }
@@ -2751,98 +2903,6 @@ fn a_late_head_of_a_refreshed_backup_names_packs_compact_deleted() {
     assert_eq!(
         classify_case(&sim, &report, &[]),
         BTreeSet::from([Signature::LateHeadThenCompact]),
-        "{report:?}"
-    );
-}
-
-/// AgedLockPacksCollected (no seed reaches it since phase F part 8c): a
-/// is held after its uploads while 6 h 1 min pass (one heartbeat poll, so
-/// its marker goes stale), takes its commit lock and is held again at its
-/// head PUT, after the fence; another 6 h 1 min age its lock past the
-/// stale age and its packs past T_pack. b's compact reaps the lock and the
-/// marker and deletes a's packs as orphans; its index GC keeps a's segment
-/// (written after the first jump, about 6 h old: younger than the 12 h
-/// `INDEX_OBJECT_GRACE`), so a's head, published outside any lock, names a
-/// present segment whose entries name absent packs. The driver's verdict
-/// claims it as exactly `AgedLockReaped` (the head PUT) and
-/// `AgedLockPacksCollected` (fixed by 04 step 8 on conditional stores).
-#[test]
-fn an_aged_lock_head_names_packs_compact_deleted() {
-    use crate::sim::driver::{Action, Signature, TraceEntry, classify as classify_case};
-    const WAIT: Duration = Duration::from_secs(5);
-    const JUMP: Duration = Duration::from_secs(6 * 3600 + 60);
-    // The classifier ages a reaped lock on the trace clock: one entry per
-    // stretch of store steps between the jumps, with the store clock then.
-    let mut entries: Vec<TraceEntry> = Vec::new();
-    let mut span = |sim: &Sim, label: &str| {
-        let first = entries.last().map_or(0, |e| e.steps.1);
-        let last = sim.store().log().last().map_or(0, |r| r.step);
-        entries.push(TraceEntry {
-            n: entries.len(),
-            choice: 0,
-            options: 1,
-            action: Action::Stop,
-            label: label.into(),
-            ops: Vec::new(),
-            steps: (first, last),
-            actions: Vec::new(),
-            ended: false,
-            clock: sim.store().now(),
-        });
-    };
-    let mut sim = Sim::new();
-    let (a, b) = (sim.client("a"), sim.client("b"));
-    sim.backup(b, "t0", &tree("t0")).expect_ok();
-    let (ga, sa) = hold_after_upload(&mut sim, a);
-    let a_packs = sim.store().keys_written_by(a, "packs/");
-    span(&sim, "upload");
-    assert!(sim.time().wait_for_waiters(1, WAIT));
-    sim.advance(JUMP);
-    assert!(sim.time().wait_for_waiters(1, WAIT));
-    let gh = sim.gate(GateRule::new(
-        a,
-        OpMatch::AnyWrite,
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    sim.resume(ga);
-    sim.expect_paused(gh, "a's head PUT");
-    let a_segments = sim.store().keys_written_by(a, "index.d/");
-    assert!(!a_segments.is_empty(), "a's segment");
-    span(&sim, "commit to the fence");
-    assert!(sim.time().wait_for_waiters(1, WAIT));
-    sim.advance(JUMP);
-    assert!(sim.time().wait_for_waiters(1, WAIT));
-    sim.compact(b).expect_ok();
-    span(&sim, "compact");
-    for k in &a_packs {
-        assert!(sim.store().object(k).is_none(), "{k} kept");
-    }
-    for k in &a_segments {
-        assert!(sim.store().object(k).is_some(), "{k} collected");
-    }
-    sim.resume(gh);
-    let _ = sim.join(sa);
-    span(&sim, "head PUT");
-    let report = sim.check_invariants(&[
-        Invariant::CommittedSnapshotsRestore,
-        Invariant::AcknowledgedCommitsDurable,
-        Invariant::NoSilentRemoval,
-        Invariant::IndexIntegrity,
-        Invariant::AllowedErrors,
-        Invariant::LockExclusion,
-        Invariant::OrphanGrace,
-        Invariant::MarkerGapCommit,
-    ]);
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|v| v.kind == ViolationKind::IndexNamesAbsentPack),
-        "{report:?}"
-    );
-    assert_eq!(
-        classify_case(&sim, &report, &entries),
-        BTreeSet::from([Signature::AgedLockReaped, Signature::AgedLockPacksCollected]),
         "{report:?}"
     );
 }
@@ -3054,7 +3114,7 @@ fn a_recovered_journal_pulls_the_marker_back() {
     sim.backup(c, "t0", &tree("t0")).expect_ok();
     let x_packs = fail_backup_leaving_journal(&mut sim, x, &tree("x1"));
     sim.advance(Duration::from_secs(46 * 60));
-    let gb = sim.gate(GateRule::new(b, OpMatch::AnyList, KeyMatch::Exact("locks/".into())).nth(2));
+    let gb = sim.gate(before_mark(b));
     let sb = sim.spawn(
         b,
         Call::Backup {
@@ -3062,7 +3122,7 @@ fn a_recovered_journal_pulls_the_marker_back() {
             tree: tree("x1"),
         },
     );
-    sim.expect_paused(gb, "b's commit-lock sweep");
+    sim.expect_paused(gb, "b's listing before its commit mark");
     let b_packs = sim.store().keys_written_by(b, "packs/");
     assert!(
         b_packs.iter().all(|k| !x_packs.contains(k)),

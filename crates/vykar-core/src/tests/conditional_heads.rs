@@ -332,13 +332,7 @@ fn session(repo: &mut Repo, name: &str, chunks: &[&[u8]]) -> BackupCommit {
         ws.store_chunk(repo, c, Compression::None, PackType::Data)
             .unwrap();
     }
-    BackupCommit::new(
-        ws,
-        entry(name),
-        b"snapshot".to_vec(),
-        None,
-        crate::repo::CommitMode::Lock,
-    )
+    BackupCommit::new(ws, entry(name), b"snapshot".to_vec(), None)
 }
 
 fn no_events(_: CommitEvent) {}
@@ -1092,20 +1086,11 @@ fn a_refusal_after_a_passed_check_fails_the_commit() {
         OpenOptions::new().with_index().host_env(sim.host_env(a)),
     )
     .unwrap();
-    assert_eq!(
-        repo.commit_mode().unwrap(),
-        crate::repo::CommitMode::LockFree
-    );
+    assert_eq!(repo.commit_mode().unwrap(), WriterMode::Multi);
     let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
     ws.store_chunk(&repo, b"chunk of a", Compression::None, PackType::Data)
         .unwrap();
-    let mut m = BackupCommit::new(
-        ws,
-        entry("a1"),
-        b"snapshot".to_vec(),
-        None,
-        crate::repo::CommitMode::LockFree,
-    );
+    let mut m = BackupCommit::new(ws, entry("a1"), b"snapshot".to_vec(), None);
     let err = step_until(&mut repo, &mut m, |_| false).unwrap_err();
     assert!(
         matches!(err, VykarError::MultiWriterUnsupported { .. }),

@@ -7,9 +7,12 @@
 //! batch rebases onto a backup's head, and drops a relocation another
 //! compact made; the mark skips a snapshot deleted after its listing; a
 //! backup that adds no chunk creates a head (Q2), also after a taken
-//! generation, and that head conflicts with a concurrent sweep. Repair and
-//! lock-mode writers stay apart from lock-free maintenance by the marker
-//! handshake. Each invariant that judges a lock-free run's deletes now that
+//! generation, and that head conflicts with a concurrent sweep. Repair
+//! stays apart from lock-free maintenance by the marker handshake. Since
+//! 10-single-protocol step 7 the tests whose second writer was a lock
+//! client (a lock-mode backup or compact) run on a single-writer repository
+//! instead: compacts refuse each other, a backup waits for a compact, and
+//! the stalled-compact residuals with a single-writer backup. Each invariant that judges a lock-free run's deletes now that
 //! invariant 7 exempts it flags a wrong delete (V3).
 
 use crate::repo::lock::MarkerFlags;
@@ -97,6 +100,29 @@ fn snapshot_put(c: ClientId) -> GateRule {
         OpMatch::Kind(OpKind::Put),
         KeyMatch::Prefix("snapshots/".into()),
     )
+}
+
+/// `c`'s `n`th single-writer head write (10-single-protocol step 7): its
+/// EXISTS of the generation, the first op of the head step.
+fn plain_head_write(c: ClientId, n: u32) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::Exists),
+        KeyMatch::Prefix("index.h/".into()),
+    )
+    .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+    .nth(n)
+}
+
+/// `c`'s single-writer listing of `sessions/` before its commit mark, its
+/// `n`th attempt (the open lists first).
+fn before_mark(c: ClientId, n: u32) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::ListMeta),
+        KeyMatch::Exact("sessions/".into()),
+    )
+    .nth(n + 1)
 }
 
 fn expect_class(run: &crate::sim::RunRecord, class: AllowedError) {
@@ -627,46 +653,38 @@ fn a_backup_starts_and_commits_during_a_lock_free_compact() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// Mixed modes: a lock-mode compact (its handle offers no put-if-absent)
-/// yields with `Locked` to a lock-free compact's `writes_heads` marker, and
-/// a lock-free compact whose registration meets the lock-mode one's lock
-/// fails `Locked`; heads stay immutable on a store whose plain PUT
-/// overwrites (invariant 12).
+/// Two compacts on a single-writer repository (10-single-protocol step 7;
+/// a lock-mode compact beside a lock-free one before): each registers with
+/// `writes_heads` before its single-writer check, so the one that checks
+/// second finds the other and refuses `Locked` before any write, in either
+/// order.
 #[test]
-fn a_lock_mode_compact_yields_to_a_lock_free_compact() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
+fn single_writer_compacts_refuse_each_other() {
+    let mut sim = encrypted(StoreKind::Plain);
     let (f, l) = (sim.client("f"), sim.client("l"));
-    sim.set_lock_client(l);
     swept_and_aged(&mut sim, f);
-    let held = sim.gate(GateRule::new(
-        f,
-        OpMatch::Kind(OpKind::ListMeta),
-        KeyMatch::Exact("sessions/".into()),
-    ));
-    let rf = sim.spawn(f, Call::Compact);
-    sim.expect_paused(held, "the lock-free compact, registered");
-    let rl = sim.compact(l);
-    expect_class(&rl, AllowedError::Locked);
-    assert!(
-        !records(&sim, l, rl.index)
-            .iter()
-            .any(|r| r.op.is_write() && r.key.starts_with("index.")),
-        "the lock-mode compact wrote before yielding"
-    );
-    sim.resume(held);
-    sim.join(rf).expect_ok();
-
-    let l_held = sim.gate(GateRule::new(
-        l,
-        OpMatch::Kind(OpKind::ListMeta),
-        KeyMatch::Exact("sessions/".into()),
-    ));
-    let rl = sim.spawn(l, Call::Compact);
-    sim.expect_paused(l_held, "the lock-mode compact under its lock");
-    expect_class(&sim.compact(f), AllowedError::Locked);
-    sim.resume(l_held);
-    sim.join(rl).expect_ok();
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    for (first, second) in [(f, l), (l, f)] {
+        // The first's single-writer check: registered and flagged.
+        let held = sim.gate(GateRule::new(
+            first,
+            OpMatch::Kind(OpKind::ListMeta),
+            KeyMatch::Exact("sessions/".into()),
+        ));
+        let rf = sim.spawn(first, Call::Compact);
+        sim.expect_paused(held, "the first compact, registered");
+        let rl = sim.compact(second);
+        expect_class(&rl, AllowedError::Locked);
+        assert!(
+            !records(&sim, second, rl.index)
+                .iter()
+                .any(|r| r.op.is_write()
+                    && (r.key.starts_with("index.") || r.key.starts_with("packs/"))),
+            "the second compact wrote before refusing"
+        );
+        sim.resume(held);
+        sim.join(rf).expect_ok();
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 // ── 10d review, F1 and F2: a stalled compact, a recovered journal pack ──
@@ -870,51 +888,70 @@ fn a_compact_stalled_after_its_marker_check_is_aged_session_reaped() {
     assert_narrow_aged_session_claim(&sim, &report, victim);
 }
 
-/// The residual of F1 (b): the compact stalls 46 min between its marker
-/// check and its sweep head create; a lock-path backup reaps the stale
-/// marker, does not yield, and commits a reuse-only snapshot without a
-/// head; the late sweep head removes its chunks. Claimed by
-/// `AgedSessionReaped` alone.
+/// The residual of F1 (b), re-derived on a single-writer repository by
+/// 10-single-protocol step 7 (its victim was a lock-path backup, which
+/// committed a reuse-only snapshot without a head): the compact stalls
+/// 46 min between its marker check and its sweep head write (its EXISTS of
+/// the generation). The backup's single-writer listing reaps the stale
+/// marker and it commits its reuse-only snapshot, with a head now (Q2 on
+/// both modes). That head takes the generation the sweep head was for: the
+/// compact's EXISTS finds it, the sweep writes nothing, and `again`
+/// restores. The damage the lock-path backup showed needs a head-less
+/// reuse-only commit, which no binary makes.
 #[test]
 fn a_sweep_stalled_after_its_marker_check_is_aged_session_reaped() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
+    let mut sim = encrypted(StoreKind::Plain);
     let (a, c, l) = (sim.client("a"), sim.client("c"), sim.client("l"));
-    sim.set_lock_client(l);
     swept_and_aged(&mut sim, a);
-    let sweep = sim.gate(head_create(c, 1));
+    let sweep = sim.gate(plain_head_write(c, 1));
     let rc = sim.spawn(c, Call::Compact);
-    sim.expect_paused(sweep, "c's sweep head create, after its check");
+    sim.expect_paused(sweep, "c's sweep head write, after its check");
     let hb = sim.gate(heartbeat_put(c));
     sim.advance(std::time::Duration::from_secs(46 * 60));
-    sim.call(
+    let rl = sim.call(
         l,
         Call::BackupSameSource {
             snapshot: "again".into(),
             of: "old".into(),
         },
-    )
-    .expect_ok();
+    );
+    rl.expect_ok();
+    assert!(
+        records(&sim, l, rl.index)
+            .iter()
+            .any(|r| r.op == OpKind::Put && r.key.starts_with("index.h/")),
+        "the reuse-only commit wrote a head"
+    );
     sim.resume(hb);
     sim.resume(sweep);
-    let victim = sim.join(rc).index;
-    let report = sim.check_invariants(Invariant::STEP8);
-    assert!(!report.violations.is_empty(), "the residual reproduces");
-    assert_narrow_aged_session_claim(&sim, &report, victim);
+    let rc = sim.join(rc);
+    assert!(
+        !records(&sim, c, rc.index)
+            .iter()
+            .any(|r| r.op == OpKind::Put && r.key.starts_with("index.h/")),
+        "the stalled sweep wrote its head: {}",
+        rc.detail()
+    );
+    for name in ["keep", "again"] {
+        sim.restore(a, name).expect_ok();
+    }
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
-/// F1 (b): a lock-free compact stalls 46 min after its mark, before its
-/// sweep's index write. A lock-path backup (a lock client) reaps the stale
-/// marker at its lock-side listing, so it does not yield, and commits a
-/// reuse-only snapshot of the deleted `old`'s source: under the lock that
-/// writes no head. Resumed, the compact's marker check fails before the
-/// sweep head (`MarkerLostDuringCommit`), so the sweep planned from the
-/// older mark removes nothing; `again` restores. Without the check the
-/// sweep removed `again`'s chunks and deleted their packs.
+/// F1 (b): a compact stalls 46 min after its mark, before its sweep's
+/// index write. A backup reaps the stale marker at its listing, so it does
+/// not wait, and commits a reuse-only snapshot of the deleted `old`'s
+/// source. Resumed, the compact's marker check fails before the sweep head
+/// (`MarkerLostDuringCommit`), so the sweep planned from the older mark
+/// removes nothing; `again` restores. Without the check the sweep removed
+/// `again`'s chunks and deleted their packs. Since 10-single-protocol step
+/// 7 on a single-writer repository, the backup single-writer (a lock
+/// client's lock-path backup before, whose reuse-only commit wrote no
+/// head; it writes one now).
 #[test]
 fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
+    let mut sim = encrypted(StoreKind::Plain);
     let (a, c, l) = (sim.client("a"), sim.client("c"), sim.client("l"));
-    sim.set_lock_client(l);
     swept_and_aged(&mut sim, a);
     let sweep = sim.gate(index_object_put(c));
     let rc = sim.spawn(c, Call::Compact);
@@ -931,13 +968,12 @@ fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
         },
     );
     rl.expect_ok();
-    assert!(!rl.lock_free);
+    assert!(rl.lock_free);
     assert!(
-        head_creates(&records(&sim, l, rl.index)).is_empty()
-            && !records(&sim, l, rl.index)
-                .iter()
-                .any(|r| r.op.is_write() && r.key.starts_with("index.h/")),
-        "the lock-path reuse-only commit wrote no head"
+        records(&sim, l, rl.index)
+            .iter()
+            .any(|r| r.op == OpKind::Put && r.key.starts_with("index.h/")),
+        "the reuse-only commit wrote a head"
     );
     sim.resume(hb);
     sim.resume(sweep);
@@ -945,27 +981,32 @@ fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
     for name in ["keep", "again"] {
         sim.restore(a, name).expect_ok();
     }
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
     expect_class(&rc, AllowedError::MarkerLostDuringCommit);
-    assert!(head_creates(&records(&sim, c, rc.index)).is_empty());
+    assert!(
+        !records(&sim, c, rc.index)
+            .iter()
+            .any(|r| r.op.is_write() && r.key.starts_with("index.h/")),
+        "the stalled compact wrote a head"
+    );
 }
 
-/// F1 (b) without a stall: a lock-path backup cannot commit between a
-/// lock-free compact's mark and its sweep head. Its lock-side listing finds
-/// the compact's `writes_heads` marker (kept for the compact's whole run)
-/// and it yields, releasing its lock, until the compact is done; then its
+/// F1 (b) without a stall: a backup cannot commit between a compact's mark
+/// and its sweep head. On a single-writer repository (10-single-protocol
+/// step 7; a lock client's lock-path backup before) its listing before its
+/// mark finds the compact's `writes_heads` marker (kept for the compact's
+/// whole run) and it waits, unmarked, until the compact is done; then its
 /// reuse of the swept chunks fails it typed (`StaleChunksDuringCommit`) or
 /// what it commits restores.
 #[test]
 fn a_lock_path_backup_waits_for_a_lock_free_compact() {
-    let mut sim = encrypted(StoreKind::ConditionalOverwrite);
+    let mut sim = encrypted(StoreKind::Plain);
     let (a, c, l) = (sim.client("a"), sim.client("c"), sim.client("l"));
-    sim.set_lock_client(l);
     swept_and_aged(&mut sim, a);
-    let sweep = sim.gate(head_create(c, 1));
+    let sweep = sim.gate(plain_head_write(c, 1));
     let rc = sim.spawn(c, Call::Compact);
-    sim.expect_paused(sweep, "c's sweep head create, after its mark");
-    let second = sim.gate(GateRule::new(l, OpMatch::AnyWrite, KeyMatch::LockKey).nth(2));
+    sim.expect_paused(sweep, "c's sweep head write, after its mark");
+    let second = sim.gate(before_mark(l, 2));
     let sl = sim.spawn(
         l,
         Call::BackupSameSource {
@@ -973,19 +1014,23 @@ fn a_lock_path_backup_waits_for_a_lock_free_compact() {
             of: "old".into(),
         },
     );
-    sim.expect_paused(second, "l's second commit-lock attempt, after it yielded");
+    sim.expect_paused(
+        second,
+        "l's second listing before its mark, after it waited",
+    );
     let recs = records(&sim, l, sl.index());
-    assert!(lock_writes(&recs) >= 1, "l took the lock once");
     assert!(
-        recs.iter()
-            .any(|r| r.op.is_delete() && KeyMatch::LockKey.matches(&r.key)),
-        "l released it again (the yield)"
+        !recs
+            .iter()
+            .any(|r| r.op.is_write()
+                && (r.key.starts_with("snapshots/") || r.key.starts_with("index."))),
+        "l wrote beside the compact"
     );
     assert!(
         !recs
             .iter()
-            .any(|r| r.op.is_write() && r.key.starts_with("snapshots/")),
-        "l wrote no snapshot beside the compact"
+            .any(|r| r.op == OpKind::Put && r.key.ends_with(".1.json")),
+        "l marked its commit beside the compact"
     );
     sim.resume(sweep);
     let rc = sim.join(rc);
@@ -1003,7 +1048,7 @@ fn a_lock_path_backup_waits_for_a_lock_free_compact() {
         expect_class(&rl, AllowedError::StaleChunksDuringCommit);
     }
     sim.restore(a, "keep").expect_ok();
-    sim.check_invariants(Invariant::STEP8).assert_clean();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// F2: a repack source gains an entry after the batch's head read. B1 runs

@@ -178,8 +178,9 @@ fn switch(
 }
 
 /// The client whose storage lost put-if-absent switches the repository to
-/// single-writer, then backs up in lock mode with a plain head PUT; its
-/// switch back to multi-writer refuses. A client whose storage passes the
+/// single-writer, then backs up as the single writer (no lock since
+/// 10-single-protocol step 7) with a plain head PUT; its switch back to
+/// multi-writer refuses. A client whose storage passes the
 /// check switches back, after which the first client refuses again and the
 /// other commits lock-free.
 #[test]
@@ -200,10 +201,10 @@ fn switch_to_single_and_back() {
 
     let run = sim.backup(u, "u1", &tree("u1"));
     run.expect_ok();
-    assert!(!run.lock_free);
     let recs = records(&sim, u, run.index);
     assert!(
-        recs.iter()
+        !recs
+            .iter()
             .any(|r| r.op.is_write() && KeyMatch::LockKey.matches(&r.key)),
         "a lock was taken: {recs:?}"
     );
@@ -385,4 +386,87 @@ fn a_failed_init_race_records_single_writer() {
         panic!("a map config");
     };
     assert!(config.features.is_empty(), "{:?}", config.features);
+}
+
+// ── The re-read of config (10-single-protocol step 7) ───────────────────
+
+/// `c`'s handle on `sim`'s store, opened as a writer opens it.
+fn open_handle(sim: &Sim, c: ClientId) -> Repo {
+    Repo::open(
+        Box::new(sim.store().handle(c)),
+        sim.store().passphrase(),
+        Some(sim.client_dir(c).join("repo-cache")),
+        crate::repo::OpenOptions::new().host_env(sim.host_env(c)),
+    )
+    .unwrap()
+}
+
+/// The stored config, decoded, changed by `change` and written back.
+fn rewrite_config(sim: &mut Sim, change: impl FnOnce(&mut crate::repo::RepoConfig)) {
+    let stored = sim.store().object("config").unwrap().data;
+    let crate::repo::DecodedConfig::Map(mut config) =
+        crate::repo::RepoConfig::decode(&stored).unwrap()
+    else {
+        panic!("a v6 config");
+    };
+    change(&mut config);
+    sim.tamper_put("config", &config.encode().unwrap());
+}
+
+/// `reread_writer_mode`: the same config keeps the mode; a mode added or
+/// removed is adopted, the cached commit mode decided again; another
+/// identity or chunk hash refuses as a changed config; an unknown feature
+/// is refused as validate refuses it; a missing config is an error.
+#[test]
+fn the_config_re_read_adopts_a_mode_and_refuses_another_repository() {
+    let mut sim = Sim::with_config(SimConfig {
+        kind: StoreKind::Conditional,
+        ..SimConfig::default()
+    });
+    let c = sim.client("c");
+    let mut repo = open_handle(&sim, c);
+    assert_eq!(repo.commit_mode().unwrap(), WriterMode::Multi);
+    assert_eq!(repo.reread_writer_mode().unwrap(), WriterMode::Multi);
+    assert_eq!(repo.writer_mode(), WriterMode::Multi);
+
+    rewrite_config(&mut sim, |c| c.set_writer_mode(WriterMode::Single));
+    assert_eq!(repo.reread_writer_mode().unwrap(), WriterMode::Single);
+    assert_eq!(repo.writer_mode(), WriterMode::Single);
+    assert_eq!(
+        repo.commit_mode().unwrap(),
+        WriterMode::Single,
+        "decided again"
+    );
+
+    rewrite_config(&mut sim, |c| c.set_writer_mode(WriterMode::Multi));
+    assert_eq!(repo.reread_writer_mode().unwrap(), WriterMode::Multi);
+    assert_eq!(repo.commit_mode().unwrap(), WriterMode::Multi);
+
+    let changed = |e: VykarError| e.to_string().contains("the repository config changed");
+    let stored = sim.store().object("config").unwrap().data;
+    rewrite_config(&mut sim, |c| c.id = vec![0x42; c.id.len()]);
+    assert!(changed(repo.reread_writer_mode().unwrap_err()));
+    sim.tamper_put("config", &stored);
+    rewrite_config(&mut sim, |c| {
+        c.chunk_hash = if c.chunk_hash == "blake3" {
+            "blake2b".into()
+        } else {
+            "blake3".into()
+        };
+    });
+    assert!(changed(repo.reread_writer_mode().unwrap_err()));
+    sim.tamper_put("config", &stored);
+    // Store-level tampering: the checker's observer would refuse to open
+    // these configs.
+    let crate::repo::DecodedConfig::Map(mut future) =
+        crate::repo::RepoConfig::decode(&stored).unwrap()
+    else {
+        panic!("a v6 config");
+    };
+    future.features.push("from-the-future".into());
+    sim.store().tamper_put("config", &future.encode().unwrap());
+    let err = repo.reread_writer_mode().unwrap_err();
+    assert!(err.to_string().contains("newer vykar"), "{err}");
+    assert!(sim.store().tamper_delete("config"));
+    assert!(repo.reread_writer_mode().is_err());
 }

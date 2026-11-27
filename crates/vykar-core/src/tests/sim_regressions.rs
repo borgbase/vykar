@@ -11,12 +11,27 @@
 //! step 2; the plaintext template went, and with it the `<name>-conditional`
 //! seeds of phase F part 9, which were that template on the conditional
 //! store). A seed without `storage` runs on the fallback store
-//! (`StoreKind::Plain`, every seed recorded before 04 step 8), where its
-//! clients take the lock with the marker handshake; a `<name>-lockfree` seed
-//! is the same case on the conditional store, where its backups commit
+//! (`StoreKind::Plain`, every seed recorded before 04 step 8), a
+//! single-writer repository: until 10-single-protocol step 7 its clients
+//! took the lock with the marker handshake, since then they run the
+//! single-writer protocol (the lock decision became the single-writer
+//! listings, the commit mark and the probe of `locks/`; a stepped compact
+//! registers and makes its single-writer check). A `<name>-lockfree` seed is
+//! the same case on the conditional store, where its backups commit
 //! lock-free (phase F part 10c: each lock decision becomes the commit mark
-//! and the probe of `locks/`), and a `mixed-…` seed has a lock client
-//! beside a lock-free one.
+//! and the probe of `locks/`). Step 7 re-derived every fallback-store seed
+//! from its decisions ([`rederive`]; each note says what it shows since);
+//! the `-lockfree` seeds replay unchanged.
+//!
+//! Retired by 10-single-protocol step 7: the seven `mixed-…` seeds
+//! (`mixed-aged-lock-overwrites-lock-free-head`,
+//! `mixed-aged-marker-head-overwritten`, `mixed-aged-marker-late-compact-head`,
+//! `mixed-aged-session-reaped-before-listing`, `mixed-late-create-replaced`,
+//! `mixed-late-lock-head-replaced`, `mixed-late-lock-head-replaces-compact-head`):
+//! a lock client's lock-mode commit beside lock-free ones, which no binary
+//! makes since then (and the stale-config route that produced one is closed
+//! by the re-read of `config`); the single-writer late-head residual they
+//! touched is H3's. `orphan-lock-key`: no backup writes a lock key.
 
 // Printing a seed is the point of the promotion helper; every other path
 // asserts.
@@ -261,4 +276,190 @@ fn promote_from_env() {
         "{}",
         serde_json::to_string_pretty(&seed).expect("seed serializes")
     );
+}
+
+/// Labels of a backup's commit protection (10-single-protocol step 7).
+fn is_protection(label: &str) -> bool {
+    label.starts_with("lock")
+        || label.starts_with(LABEL_LIST_WRITERS)
+        || label.starts_with(LABEL_MARK_COMMITTING)
+        || label.starts_with(LABEL_PROBE_LOCKS)
+}
+
+/// Whether the new decision labelled `new` ends what the old decision
+/// labelled `old` did, for a step of the same client: the same label; a
+/// lock attempt that started the commit machine (`lock`, its local steps
+/// following) and a probe that did; a contended attempt and a contended
+/// one; a stepped compact's lock fence and its marker fence.
+fn ends_intent(old: &str, new: &str) -> bool {
+    if old == new {
+        return true;
+    }
+    let commit_started =
+        |l: &str| l == "lock" || l.starts_with("lock +") || l.starts_with(LABEL_PROBE_LOCKS);
+    if commit_started(old) && new.starts_with(LABEL_PROBE_LOCKS) && !new.contains('(') {
+        return true;
+    }
+    if old == LABEL_LOCKED && new == LABEL_LOCKED {
+        return true;
+    }
+    if old.ends_with("(gave up)") && new.ends_with("(gave up)") {
+        return true;
+    }
+    // A protection that ended otherwise than it did (no lock key left to
+    // give up on): the commit machine's first step.
+    if is_protection(old) && !is_protection(new) {
+        return true;
+    }
+    old == "compact Exists locks/" && new == "compact Exists sessions/"
+}
+
+/// Re-derive `seed`'s choices on today's protocol from what its decisions
+/// did (10-single-protocol step 7): each old decision's action is taken
+/// again where the driver offers it, and a step of a client is repeated
+/// (up to 12 inserted steps) until its label ends what the old step did
+/// ([`ends_intent`]): a lock attempt becomes the single-writer listings,
+/// the mark and the probe; a stepped compact's new steps (its registration,
+/// its single-writer check, the head's EXISTS and read-back) are taken on
+/// the way to the old one's next step. `Err` names the first old decision
+/// no new decision can stand for.
+fn rederive(templates: &Templates, seed: &Seed) -> Result<Case, String> {
+    let mut case = seed.case.clone();
+    case.choices.clear();
+    let mut o = templates.run(&case);
+    for (i, (action, label)) in seed.at.iter().enumerate() {
+        let mut inserted = 0;
+        loop {
+            let n = case.choices.len();
+            let entry = o
+                .trace
+                .entries
+                .get(n)
+                .ok_or_else(|| format!("decision {i} ({action:?} {label}): the case ended"))?;
+            let offered = entry.actions.iter().position(|a| a == action);
+            let pick = match (offered, action) {
+                (Some(p), _) => p,
+                // The client's command ended earlier than it did (a commit
+                // that refuses sooner): the old decision has no stand-in.
+                (None, Action::Step { client, .. })
+                    if !entry
+                        .actions
+                        .iter()
+                        .any(|a| matches!(a, Action::Step { client: c, .. } if c == client)) =>
+                {
+                    eprintln!(
+                        "REDERIVE {}: decision {i} ({action:?} {label}) skipped: its client ended",
+                        seed.name
+                    );
+                    break;
+                }
+                // Stop once every client is done: the remaining clients'
+                // steps first (a client that waits now where it did not).
+                (None, Action::Stop) if inserted < 40 => {
+                    inserted += 1;
+                    entry
+                        .actions
+                        .iter()
+                        .position(|a| matches!(a, Action::Step { pick: 0, .. }))
+                        .ok_or_else(|| format!("decision {i}: neither Stop nor a step offered"))?
+                }
+                _ => {
+                    return Err(format!(
+                        "decision {i} ({action:?} {label}): not offered at {n} ({:?})",
+                        entry.actions
+                    ));
+                }
+            };
+            if matches!(action, Action::Stop) && offered.is_none() {
+                case.choices.push(u16::try_from(pick).expect("few actions"));
+                o = templates.run(&case);
+                continue;
+            }
+            case.choices.push(u16::try_from(pick).expect("few actions"));
+            o = templates.run(&case);
+            let new = &o.trace.entries[n].label;
+            let is_step = matches!(action, Action::Step { .. });
+            if !is_step || ends_intent(label, new) {
+                break;
+            }
+            let compact = label.starts_with("compact") && new.starts_with("compact");
+            if !(is_protection(new) || compact || inserted < 3) || inserted >= 12 {
+                return Err(format!(
+                    "decision {i} ({action:?} {label}): the step became {new:?}"
+                ));
+            }
+            inserted += 1;
+        }
+    }
+    Ok(case)
+}
+
+/// `VYKAR_SIM_REDERIVE=<dir>`: re-derive every seed ([`rederive`]) and
+/// write each as `<dir>/<name>.json` (its note kept, its choices, `at` and
+/// expect new) with its trace, printing per seed the old and new
+/// signatures and run outcomes, for review before a seed is replaced
+/// (10-single-protocol step 7 re-derived the corpus this way).
+/// `VYKAR_SIM_REDERIVE_ONLY=<a,b>` names the seeds, and
+/// `VYKAR_SIM_REDERIVE_FROM=<dir>` reads them from another directory (a
+/// seed edited by hand first). A no-op otherwise.
+#[test]
+fn rederive_from_env() {
+    let Some(out) = std::env::var_os("VYKAR_SIM_REDERIVE").map(PathBuf::from) else {
+        return;
+    };
+    std::fs::create_dir_all(&out).unwrap();
+    let only = std::env::var("VYKAR_SIM_REDERIVE_ONLY").ok();
+    let dir = std::env::var_os("VYKAR_SIM_REDERIVE_FROM").map_or_else(seed_dir, PathBuf::from);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    let templates = Templates::new();
+    for path in &paths {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|x| x == stem))
+        {
+            continue;
+        }
+        let seed: Seed = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let replay = templates.run(&seed.case);
+        if taken(&replay, seed.case.choices.len()) == seed.at {
+            eprintln!(
+                "REDERIVE {stem}: replays; signatures {:?} (expect {:?}); runs {:?}",
+                replay.signatures,
+                seed.expect,
+                run_classes(&replay)
+            );
+            continue;
+        }
+        match rederive(&templates, &seed) {
+            Ok(case) => {
+                let o = templates.run(&case);
+                eprintln!(
+                    "REDERIVE {stem}: re-derived; signatures {:?} (expect {:?}); runs {:?}",
+                    o.signatures,
+                    seed.expect,
+                    run_classes(&o)
+                );
+                let new = Seed {
+                    name: seed.name.clone(),
+                    note: seed.note.clone(),
+                    expect: o.signatures.clone(),
+                    at: taken(&o, case.choices.len()),
+                    case,
+                };
+                std::fs::write(
+                    out.join(format!("{stem}.json")),
+                    serde_json::to_string_pretty(&new).unwrap() + "\n",
+                )
+                .unwrap();
+                std::fs::write(out.join(format!("{stem}.trace")), o.trace.render()).unwrap();
+            }
+            Err(e) => eprintln!("REDERIVE {stem}: FAILED {e}"),
+        }
+    }
 }

@@ -79,8 +79,8 @@ impl FileCacheStamp {
 
 /// How long a file-cache save waits for another process's save on the same
 /// cache directory before it saves without the lock. The save runs after the
-/// commit point, with the repository's commit lock still held, so it must
-/// never block for long.
+/// commit point, inside the commit's post-commit work, so it must never
+/// block for long.
 pub(crate) const FILE_CACHE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Interval of the polls of [`FileCacheLock::acquire`].

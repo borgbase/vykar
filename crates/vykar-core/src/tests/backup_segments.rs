@@ -131,9 +131,14 @@ fn a_chunk_in_an_applied_segment_is_deduplicated() {
         packs_before,
         "no new pack"
     );
+    // Nothing new, so no segment: a head only, the same state at the next
+    // generation (Q2, on a single-writer repository too since
+    // 10-single-protocol step 7).
+    let after = repo.index_head().unwrap();
+    assert_eq!(after.generation, head.generation + 1, "{after:?}");
+    assert_eq!(after.base, head.base, "nothing new, nothing written");
     assert_eq!(
-        repo.index_head().unwrap(),
-        &head,
+        after.segments, head.segments,
         "nothing new, nothing written"
     );
 }

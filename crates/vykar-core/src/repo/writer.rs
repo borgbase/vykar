@@ -54,8 +54,7 @@ impl Fence {
     }
 
     /// The fence of a lock-free backup commit: passes (the commit machine
-    /// checks its marker itself). Built only by `PendingCommit::begin_commit`
-    /// for `CommitLock::Free`.
+    /// checks its marker itself). Built only by `PendingCommit::begin_commit`.
     pub(crate) fn lock_free_backup() -> Self {
         Self(FenceKind::LockFreeBackup)
     }
@@ -64,6 +63,13 @@ impl Fence {
     #[cfg(test)]
     pub(crate) fn unchecked() -> Self {
         Self(FenceKind::Unchecked)
+    }
+
+    /// Whether this is a held lock's fence. A session run (maintenance
+    /// session, backup) checks its fence before the index garbage
+    /// collection; a lock holder does not.
+    pub(crate) fn is_lock(&self) -> bool {
+        matches!(self.0, FenceKind::Lock(_))
     }
 
     /// Tests: whether this is the lock-free backup's fence.

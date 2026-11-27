@@ -2213,8 +2213,9 @@ fn create_head_classifies_every_answer() {
     );
     assert!(plain.get(&head_key(2)).unwrap().is_none());
 
-    // Single-writer: a plain PUT, never put-if-absent.
-    let s = scripted(Some(other), |_, _, _| {
+    // Single-writer: a plain PUT, never put-if-absent
+    // (`plain_head_write_classifies_every_answer`).
+    let s = scripted(None, |_, _, _| {
         panic!("a single-writer head create never calls put-if-absent")
     });
     assert_eq!(
@@ -2232,4 +2233,176 @@ fn create_head_classifies_every_answer() {
         Err(VykarError::InvalidFormat(_))
     ));
     assert!(s.inner.get(&head_key(2)).unwrap().is_none());
+}
+
+/// A scripted PUT: it sees the store and may write to it first.
+type PutScript = Box<dyn Fn(&dyn StorageBackend, &str, &[u8]) -> Result<()> + Send + Sync>;
+
+/// A memory backend that records its EXISTS, PUT and GET of heads and
+/// answers them as the test scripts (`None`: the store's own answer).
+struct ScriptedPlain {
+    inner: Arc<dyn StorageBackend>,
+    ops: Mutex<Vec<&'static str>>,
+    exists: Option<Box<dyn Fn() -> Result<bool> + Send + Sync>>,
+    /// Runs instead of the PUT; may write to the store first.
+    put: Option<PutScript>,
+}
+
+impl ScriptedPlain {
+    fn new(stored: Option<&[u8]>) -> Self {
+        let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        if let Some(bytes) = stored {
+            inner.put(&head_key(2), bytes).unwrap();
+        }
+        Self {
+            inner,
+            ops: Mutex::new(Vec::new()),
+            exists: None,
+            put: None,
+        }
+    }
+
+    fn on_put(
+        mut self,
+        f: impl Fn(&dyn StorageBackend, &str, &[u8]) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.put = Some(Box::new(f));
+        self
+    }
+
+    fn ops(&self) -> Vec<&'static str> {
+        self.ops.lock().unwrap().clone()
+    }
+}
+
+impl InnerBackend for ScriptedPlain {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for ScriptedPlain;
+    except [get, put, exists, put_pack, begin_staged_put, conditional, profile];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.ops.lock().unwrap().push("get");
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.ops.lock().unwrap().push("put");
+        match &self.put {
+            Some(f) => f(&*self.inner, key, data),
+            None => self.inner.put(key, data),
+        }
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        self.ops.lock().unwrap().push("exists");
+        match &self.exists {
+            Some(f) => f(),
+            None => self.inner.exists(key),
+        }
+    }
+
+    fn put_pack(&self, _key: &str, _data: vykar_storage::PackData) -> Result<()> {
+        Err(VykarError::Other("a head write uploads no pack".into()))
+    }
+
+    fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        panic!("a single-writer head write never asks for put-if-absent")
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
+    }
+}
+
+/// The single-writer head write (10-single-protocol step 7): EXISTS, plain
+/// PUT, GET-compare, and every answer of each.
+#[test]
+fn plain_head_write_classifies_every_answer() {
+    let mine: &[u8] = b"mine";
+    let other: &[u8] = b"other";
+    let plain = HeadWrite::Plain;
+    let lost = || VykarError::Other("connection reset".into());
+    let concurrent = |r: Result<HeadPut>| {
+        assert!(
+            matches!(r, Err(VykarError::ConcurrentHeadWrite { generation: 2 })),
+            "{r:?}"
+        );
+    };
+
+    // Absent: EXISTS, PUT, our bytes read back.
+    let s = ScriptedPlain::new(None);
+    assert_eq!(create_head(&s, 2, mine, plain).unwrap(), HeadPut::Created);
+    assert_eq!(s.ops(), ["exists", "put", "get"]);
+
+    // Present: taken, nothing written.
+    let s = ScriptedPlain::new(Some(other));
+    assert_eq!(create_head(&s, 2, mine, plain).unwrap(), HeadPut::Taken);
+    assert_eq!(s.ops(), ["exists"]);
+    assert_eq!(s.inner.get(&head_key(2)).unwrap().as_deref(), Some(other));
+
+    // PUT ok, then another writer's bytes, or nothing.
+    let s = ScriptedPlain::new(None).on_put(move |st, k, _| st.put(k, other));
+    concurrent(create_head(&s, 2, mine, plain));
+    let s = ScriptedPlain::new(None).on_put(|_, _, _| Ok(()));
+    assert_eq!(create_head(&s, 2, mine, plain).unwrap(), HeadPut::Taken);
+
+    // PUT error, outcome unknown: the read-back decides; absent keeps the
+    // error.
+    let s = ScriptedPlain::new(None).on_put(move |st, k, d| {
+        st.put(k, d)?;
+        Err(lost())
+    });
+    assert_eq!(create_head(&s, 2, mine, plain).unwrap(), HeadPut::Created);
+    let s = ScriptedPlain::new(None).on_put(move |st, k, _| {
+        st.put(k, other)?;
+        Err(lost())
+    });
+    concurrent(create_head(&s, 2, mine, plain));
+    let s = ScriptedPlain::new(None).on_put(move |_, _, _| Err(lost()));
+    let err = create_head(&s, 2, mine, plain).unwrap_err();
+    assert!(err.to_string().contains("connection reset"), "{err}");
+
+    // A write-once store's 409 (vykar-server): nothing stored, the other
+    // head stands, so the generation is taken; a 409 with no head there is
+    // not that rule and keeps the error.
+    for refusal in [
+        "REST PUT index.h/2: REST PUT index.h/2: HTTP 409",
+        "409 Conflict: index head index.h/2 exists with other bytes; heads are write-once",
+    ] {
+        let s = ScriptedPlain::new(None).on_put(move |st, k, _| {
+            st.put(k, other)?;
+            Err(VykarError::Other(refusal.into()))
+        });
+        assert_eq!(create_head(&s, 2, mine, plain).unwrap(), HeadPut::Taken);
+        let s =
+            ScriptedPlain::new(None).on_put(move |_, _, _| Err(VykarError::Other(refusal.into())));
+        assert!(create_head(&s, 2, mine, plain).is_err());
+    }
+
+    // An EXISTS error: nothing written.
+    let mut s = ScriptedPlain::new(None);
+    s.exists = Some(Box::new(move || Err(lost())));
+    assert!(create_head(&s, 2, mine, plain).is_err());
+    assert_eq!(s.ops(), ["exists"]);
+
+    // InvalidFormat from the PUT passes through without a read-back.
+    let s = ScriptedPlain::new(None)
+        .on_put(|_, _, _| Err(VykarError::InvalidFormat("too large".into())));
+    assert!(matches!(
+        create_head(&s, 2, mine, plain),
+        Err(VykarError::InvalidFormat(_))
+    ));
+    assert_eq!(s.ops(), ["exists", "put"]);
 }

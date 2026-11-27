@@ -1,6 +1,6 @@
 {
   "name": "late-head-segment-collected",
-  "note": "Shape B of the phase F part 2 campaign (random-2011594728773953191): a delayed head PUT, the commit fails, the client's next commit (a fold) collects the unnamed segment after a jump past INDEX_GC_GRACE, then the late head lands naming it (04 Current issues 2 meeting 3). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the later backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's segment and keeps the young ones); its garbage collection still collects the segment the late head names. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the jumps of 61 s and 3 h 1 min before the fold's head left the segment younger than the object grace at the fold's garbage collection, so the case now takes two 6 h 1 min jumps between the first backup's end and the second backup's upload, before the fold writes anything (a jump inside the fold's write would make its head create refuse). The segment is 12 h 2 min old at the collection. Unchanged signatures. Runs encrypted since 10-single-protocol step 2.",
+  "note": "Shape B of the phase F part 2 campaign (random-2011594728773953191): a delayed head PUT, the commit fails, the client's next commit (a fold) collects the unnamed segment after a jump past INDEX_GC_GRACE, then the late head lands naming it (04 Current issues 2 meeting 3). Fixed by 04 step 8 (create-if-absent heads). Re-derived for phase F part 8c (04 step 7): the later backup's fold takes a fold-prefix step and writes its own segment after the base (it folds c0's segment and keeps the young ones); its garbage collection still collects the segment the late head names. Unchanged signatures. Since 04 step 8 (phase F part 9) this runs on the fallback store, which keeps the hazard; late-head-segment-collected-conditional is the same case on a conditional store. Re-derived for phase F part 10b2 (an unreferenced index.d/ object is kept INDEX_OBJECT_GRACE = T_pack, 12 h, instead of T_idx = 1 h, and an index write whose first object PUT started more than 11 h 20 min before its head create is refused): the jumps of 61 s and 3 h 1 min before the fold's head left the segment younger than the object grace at the fold's garbage collection, so the case now takes two 6 h 1 min jumps between the first backup's end and the second backup's upload, before the fold writes anything (a jump inside the fold's write would make its head create refuse). The segment is 12 h 2 min old at the collection. Unchanged signatures. Runs encrypted since 10-single-protocol step 2. Re-derived by 10-single-protocol step 7 (no backup or compact takes the lock: each lock decision became the single-writer listings, the commit mark and the probe of locks/; a stepped compact registers and makes its single-writer check; heads are EXISTS, PUT and read-back): the same signature.",
   "expect": [
     "LateHeadSegmentCollected"
   ],
@@ -21,7 +21,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -111,6 +138,33 @@
           "pick": 0
         }
       },
+      "lock (locked)"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "lock (locked)"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers (gave up)"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
       "upload"
     ],
     [
@@ -163,7 +217,34 @@
           "pick": 0
         }
       },
-      "lock"
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 0,
+          "pick": 0
+        }
+      },
+      "probe-locks"
     ],
     [
       {
@@ -318,6 +399,132 @@
       "release"
     ],
     [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 1,
+          "pick": 0
+        }
+      },
+      "probe-locks (gave up)"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "mark-committing"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "list-writers"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "probe-locks"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "flush"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "refresh-snapshots"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "probe-marker"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "fetch-head +local"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "sync-index"
+    ],
+    [
+      {
+        "Step": {
+          "client": 2,
+          "pick": 0
+        }
+      },
+      "finish"
+    ],
+    [
       "Stop",
       "stop"
     ]
@@ -383,31 +590,54 @@
       0,
       0,
       0,
-      1,
-      1,
-      0,
-      0,
-      7,
-      7,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
       0,
       0,
       0,
       1,
-      0,
-      0,
-      0,
-      0,
       1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      8,
+      8,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
       0
     ],
     "policy": "First",

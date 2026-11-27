@@ -376,10 +376,10 @@ fn backup_with_fold(c: &Client, name: &str) {
     .map_err(|(_, e)| e)
     .unwrap();
     pending.repo_mut().request_index_fold();
-    let guard = pending
-        .wait_for_lock(&mut None, &CancelToken::new())
+    pending
+        .protect_commit(&mut None, &CancelToken::new())
         .unwrap();
-    let mut commit = pending.begin_commit(commands::backup::CommitLock::Held(guard));
+    let mut commit = pending.begin_commit();
     let result = commit.drive(&no_events);
     commit
         .finish(result, &mut None, &crate::repo::control::CancelToken::new())

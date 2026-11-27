@@ -204,8 +204,9 @@ pub const KNOWN_CONFIG_FEATURES: &[&str] = &[MULTI_WRITER_FEATURE];
 /// A repository's commit mode as its config records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriterMode {
-    /// No `multi_writer`: commits take the repository lock (until
-    /// 10-single-protocol step 7).
+    /// No `multi_writer`: one writer at a time, kept apart by a
+    /// best-effort check of the session markers, no lock
+    /// (10-single-protocol step 7).
     Single,
     /// `multi_writer`: lock-free commits with put-if-absent heads.
     Multi,
@@ -669,9 +670,9 @@ pub struct Repo {
     /// Set by init when it recorded single-writer: the init-time check's
     /// verdict (10-single-protocol step 5).
     single_writer_reason: Option<String>,
-    /// How this handle commits, decided once (`Self::commit_mode`); `None`
-    /// until a writer asked.
-    commit_mode: Option<CommitMode>,
+    /// The mode this handle commits in, decided once (`Self::commit_mode`);
+    /// `None` until a writer asked, or after the mode changed.
+    commit_mode: Option<WriterMode>,
     /// What the next index write records in the head's `sweep`; consumed by it.
     pending_sweep: Option<index_write::PendingSweep>,
     /// Graces of `collect_index_garbage`: `IndexGcGrace::DEFAULT`; tests
@@ -696,15 +697,6 @@ pub struct Repo {
     segment_ages: Option<ages::SegmentAges>,
     /// The latest index a relocation loaded, see [`relocate`].
     relocation: relocate::RelocationCache,
-}
-
-/// How a handle commits (04 step 9): `LockFree` on a multi-writer
-/// repository, `Lock` (the repository lock) on a single-writer one, and for
-/// a backup demoted by [`Repo::commit_under_lock`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CommitMode {
-    Lock,
-    LockFree,
 }
 
 /// What [`Repo::save_file_cache_cancellable`] did.
@@ -765,7 +757,7 @@ impl Repo {
     /// directory. The save takes the local lock `filecache.lock` beside the
     /// file ([`file_cache::FileCacheLock`]; polled for at most
     /// [`file_cache::FILE_CACHE_LOCK_WAIT`] or until `cancel`, since it runs
-    /// after the commit point with the commit lock held; then it saves
+    /// after the commit point, before the session ends; then it saves
     /// without the lock, with one warning). When the file is the one this
     /// handle loaded or last saved (its stamp), the save is a single atomic
     /// write as before. When another process replaced it, the copies of the
@@ -1107,47 +1099,28 @@ impl Repo {
         ages::foldable_prefix(segments, self.segment_ages.as_ref(), self.segment_grace)
     }
 
-    /// How this handle commits, decided once per handle from the
-    /// repository's mode (`config`, 10-single-protocol step 5): `LockFree`
-    /// on a multi-writer repository whose storage passed this handle's
-    /// put-if-absent check ([`Self::require_writer_mode`]), `Lock` on a
-    /// single-writer repository (no request). A multi-writer repository
-    /// whose storage fails the check refuses (`MultiWriterUnsupported`)
-    /// and never falls back; an undecided check is an error. An error is
-    /// not cached.
-    pub(crate) fn commit_mode(&mut self) -> Result<CommitMode> {
+    /// The repository's mode as this handle commits in it, decided once per
+    /// handle from `config` (or from the re-read of the suspend rule,
+    /// [`Self::reread_writer_mode`]): `Multi` once this handle's storage
+    /// passed its put-if-absent check ([`Self::require_writer_mode`]; else
+    /// `MultiWriterUnsupported`, never a fallback; an undecided check is an
+    /// error), `Single` with no request. An error is not cached.
+    pub(crate) fn commit_mode(&mut self) -> Result<WriterMode> {
         if let Some(mode) = self.commit_mode {
             return Ok(mode);
         }
-        let mode = match self.config.writer_mode() {
+        let mode = self.config.writer_mode();
+        match mode {
             WriterMode::Multi => {
                 self.require_writer_mode()?;
-                CommitMode::LockFree
+                tracing::debug!("this client commits lock-free (multi-writer)");
             }
-            WriterMode::Single => CommitMode::Lock,
-        };
-        match mode {
-            CommitMode::LockFree => tracing::debug!("this client commits lock-free"),
-            CommitMode::Lock => tracing::debug!("this client commits under the repository lock"),
+            WriterMode::Single => {
+                tracing::debug!("this client commits as the single writer (single-writer)");
+            }
         }
         self.commit_mode = Some(mode);
         Ok(mode)
-    }
-
-    /// Commit under the repository lock from now on, whatever the mode
-    /// decided: a backup whose session marker record is not continuous
-    /// before its commit mark (`PendingCommit::commit_mode`), until
-    /// 10-single-protocol step 7 replaces the demotion with the suspend
-    /// rule. Heads stay put-if-absent on a multi-writer repository
-    /// (`create_head` follows the repository's mode, not this one).
-    pub(crate) fn commit_under_lock(&mut self) {
-        self.commit_mode = Some(CommitMode::Lock);
-    }
-
-    /// Whether this handle decided to commit lock-free: its head creates
-    /// then never fall back to a plain PUT (04 step 9, O4).
-    pub(crate) fn is_lock_free(&self) -> bool {
-        self.commit_mode == Some(CommitMode::LockFree)
     }
 }
 

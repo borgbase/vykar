@@ -1,9 +1,18 @@
 //! Bounded exhaustive search over the driver (08 step 5): every schedule of
-//! a small scenario with at most K preemptions, and a gate-stepped search
-//! over two raw lock acquisitions. The expectations are exact: a clean
-//! scenario must stay clean, and so must the one-hostname pair since 04
-//! step 1 (installation ID) removed H1. The scenario builders and the
-//! campaign's list are shared with `tests::sim_campaign`.
+//! a small scenario with at most K preemptions, a gate-stepped search over
+//! two raw lock acquisitions, and gate-stepped searches of the
+//! single-writer check (10-single-protocol step 7). The expectations are
+//! exact: a clean scenario must stay clean, and so must the one-hostname
+//! pair since 04 step 1 (installation ID) removed H1. The scenario builders
+//! and the campaign's list are shared with `tests::sim_campaign`.
+//!
+//! Retired by 10-single-protocol step 7 (lock clients' lock-mode commits
+//! exist in no binary): `lock_free_backup_against_a_locked_compact_is_clean`
+//! (its "locked compact" was a lock client's), `mixed_lock_and_lock_free_backups_are_clean`
+//! and `the_marker_handshake_keeps_heads_immutable` with its
+//! `handshake_search` (a lock-mode backup beside a lock-free one; the
+//! handshake itself still guards the exclusive commands, searched by
+//! `tests::lock_free` and `tests::sim_exclusion`).
 
 // The searches print their counts for the commit message and for anyone
 // re-measuring the bound; every other path asserts.
@@ -83,16 +92,6 @@ pub(super) fn encrypted(c: Case) -> Case {
     }
 }
 
-/// `c` on the store whose plain PUT overwrites heads (local, SFTP, S3),
-/// with clients `lock_clients` falling back to the lock protocol.
-pub(super) fn mixed(c: Case, lock_clients: Vec<u8>) -> Case {
-    Case {
-        storage: StoreKind::ConditionalOverwrite,
-        lock_clients,
-        ..c
-    }
-}
-
 /// Two backups.
 pub(super) fn lock_pair(hosts: HostPlan) -> Case {
     base(hosts, vec![vec![backup()], vec![backup()]])
@@ -143,7 +142,10 @@ pub(super) fn three_clients() -> Case {
 }
 
 /// One fault on one operation (08's "fault placement"): client a or b, any
-/// protocol key class, any kind, on its first write of that class.
+/// protocol key class but the lock (since 10-single-protocol step 7 no
+/// backup or maintenance run of the driver writes a lock key, so a lock
+/// fault repeats its no-fault twin), any kind, on its first write of that
+/// class.
 pub(super) fn fault_plans() -> Vec<FaultSpec> {
     let mut out = Vec::new();
     for client in 0..2u8 {
@@ -151,7 +153,6 @@ pub(super) fn fault_plans() -> Vec<FaultSpec> {
             KeyClass::IndexHead,
             KeyClass::IndexObject,
             KeyClass::Snapshot,
-            KeyClass::Lock,
             KeyClass::Session,
         ] {
             for kind in [
@@ -174,8 +175,8 @@ pub(super) fn fault_plans() -> Vec<FaultSpec> {
 
 /// The campaign's searches, in the order the campaign hands them out:
 /// (name, base, K). The K = 1 scenarios (the faults, time jumps and
-/// crashes) take turns by store family (plain, conditional, lock-free,
-/// mixed, then plain again), and the K >= 2 searches are placed at a fixed
+/// crashes) take turns by store family (plain, lock-free, then plain
+/// again), and the K >= 2 searches are placed at a fixed
 /// stride through that list, the first at its head, K = 2 before K = 3 and
 /// taking turns by family too. Within one family and K the cheapest
 /// variants come first ([`scenario_cost`]). A budget cut short so covers
@@ -259,40 +260,23 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
     }
     // Every scenario lock-free too (phase F part 10c: the encrypted
     // template on the conditional store; local, OpenSSH SFTP, AWS S3 and
-    // vykar-server all offer put-if-absent, 04 step 8, N6), and the pair and
-    // three-client scenarios with client b in lock mode beside the others on
-    // the store whose plain PUT replaces heads (the mixed verdict). Families:
-    // 0 plain (the fallback store, lock mode with the marker handshake),
-    // 1 lock-free, 2 mixed. The plaintext template's conditional family went
-    // with 10-single-protocol step 2: encrypted, it is the lock-free one.
+    // vykar-server all offer put-if-absent, 04 step 8, N6). Families: 0
+    // plain (the fallback store: the single-writer protocol since
+    // 10-single-protocol step 7), 1 lock-free. The plaintext template's
+    // conditional family went with step 2, and the mixed family (client b
+    // in lock mode on the store whose plain PUT replaces heads) with step 7:
+    // no binary commits in lock mode.
     let mut all: Vec<(u32, usize, (String, Case, u32))> = Vec::new();
     for (name, c, k) in out {
-        // A fault on a lock key never fires in the lock-free family: since
-        // phase F part 10d no client there takes the lock (backups and
-        // maintenance alike), so such a scenario repeats its no-fault twin.
-        let lock_fault = c.faults.iter().any(|f| f.class == KeyClass::Lock);
-        if !lock_fault {
-            all.push((
+        all.push((
+            k,
+            1,
+            (
+                format!("{name}-lockfree"),
+                encrypted(conditional(c.clone())),
                 k,
-                1,
-                (
-                    format!("{name}-lockfree"),
-                    encrypted(conditional(c.clone())),
-                    k,
-                ),
-            ));
-        }
-        if name.starts_with("pair") || name.starts_with("three") {
-            all.push((
-                k,
-                2,
-                (
-                    format!("{name}-mixed"),
-                    encrypted(mixed(c.clone(), vec![1])),
-                    k,
-                ),
-            ));
-        }
+            ),
+        ));
         all.push((k, 0, (name, c, k)));
     }
     for (name, c, k) in lock_free_only {
@@ -301,7 +285,7 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
     // Within one (K, family) the cheapest first; stable, so the build order
     // stays among equals.
     all.sort_by_key(|(k, family, (name, _, _))| (*k, *family, scenario_cost(name)));
-    let mut narrow: Vec<Vec<(String, Case, u32)>> = vec![Vec::new(); 3];
+    let mut narrow: Vec<Vec<(String, Case, u32)>> = vec![Vec::new(); 2];
     let mut wide: Vec<Vec<Vec<(String, Case, u32)>>> = Vec::new();
     for (k, family, s) in all {
         if k == 1 {
@@ -309,7 +293,7 @@ pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
         } else {
             let at = usize::try_from(k - 2).expect("small K");
             if wide.len() <= at {
-                wide.resize_with(at + 1, || vec![Vec::new(); 3]);
+                wide.resize_with(at + 1, || vec![Vec::new(); 2]);
             }
             wide[at][family].push(s);
         }
@@ -481,28 +465,6 @@ fn lock_free_pair_is_clean() {
     );
 }
 
-/// A lock-free backup against a lock-mode delete + compact (client b's
-/// handle offers no put-if-absent, so it takes the maintenance lock: phase
-/// F part 10c's shape, now the mixed case), whole and stepped: every
-/// schedule is clean. Compact yields (`Locked`) at its session listing to
-/// a backup that has marked its commit; a commit that marks after compact
-/// took the lock waits at its probe; one that commits before compact's
-/// listing is swept from by the rules of 04 step 7, as under the lock.
-#[test]
-fn lock_free_backup_against_a_locked_compact_is_clean() {
-    assert_clean_lock_free(
-        "lock-free-backup-locked-compact-distinct",
-        &encrypted(mixed(commit_vs_compact(HostPlan::Distinct), vec![1])),
-    );
-    assert_clean_lock_free(
-        "lock-free-backup-locked-compact-distinct-stepped",
-        &encrypted(mixed(
-            stepped(commit_vs_compact(HostPlan::Distinct)),
-            vec![1],
-        )),
-    );
-}
-
 /// A lock-free backup against a lock-free delete + compact (phase F part
 /// 10d: both clients' handles pass the put-if-absent check), whole and
 /// gate-stepped, on the aged and the young template: every schedule is
@@ -600,19 +562,6 @@ fn two_lock_free_compacts_are_clean() {
     assert_clean_lock_free(
         "two-lock-free-compacts",
         &stepped(encrypted(conditional(two_compacts()))),
-    );
-}
-
-/// A lock-free backup and a lock-mode one (client b's handle offers no
-/// put-if-absent) on a store whose plain PUT replaces heads, through the
-/// driver: every schedule is clean, invariant 12 included (the marker
-/// handshake; [`the_marker_handshake_keeps_heads_immutable`] searches it
-/// operation by operation).
-#[test]
-fn mixed_lock_and_lock_free_backups_are_clean() {
-    assert_clean_lock_free(
-        "mixed-pair-distinct",
-        &encrypted(mixed(lock_pair(HostPlan::Distinct), vec![1])),
     );
 }
 
@@ -929,111 +878,105 @@ fn lock_acquisitions_race() {
     }
 }
 
-/// Most gated ops one client makes in one schedule of the handshake search
-/// (about a dozen are expected); one more is a harness bug.
-const MAX_HANDSHAKE_OPS: usize = 64;
+/// Most gated ops one client makes in one schedule of the single-writer
+/// search (about a dozen are expected); one more is a harness bug.
+const MAX_SINGLE_WRITER_OPS: usize = 64;
+
+/// What [`single_writer_search`] runs against a backup.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SingleWriterRival {
+    /// A second backup.
+    Backup,
+    /// A compact (registered `writes_heads`; with nothing to remove it
+    /// still writes a head).
+    Compact,
+}
 
 #[derive(Default, Debug)]
-pub(super) struct HandshakeTally {
+pub(super) struct SingleWriterTally {
     schedules: usize,
-    /// Schedules whose end state violates [`HANDSHAKE_INVARIANTS`].
+    /// Schedules whose end state violates `Invariant::STEP1`.
     pub(super) damaged: usize,
-    /// Schedules in which the lock holder released a lock it had confirmed
-    /// with no head PUT in between: it yielded to the flagged marker.
-    yields: usize,
-    /// Schedules in which the lock-free backup listed `locks/` more than
-    /// twice (registration, the probe after its mark): it met a live lock.
-    waits: usize,
+    /// Schedules in which both clients PUT one `index.h/` key.
+    pub(super) double_generation: usize,
+    /// Runs that ended `ConcurrentHeadWrite`.
+    pub(super) concurrent_head_writes: usize,
+    /// Runs that ended neither Ok nor `Locked`.
+    pub(super) other_endings: usize,
+    /// Schedules in which a client backed off: a backup unmarked after its
+    /// mark (a third marker key) or ended `Locked`, or the compact ended
+    /// `Locked`.
+    backoffs: usize,
     both_ok: usize,
     pub(super) first_damage: Option<(Vec<usize>, String)>,
 }
 
-/// Which of a client's ops the handshake search holds at a gate.
-type GateFilter = fn(OpKind, &str) -> bool;
-
-/// The lock-free writer's half of the handshake: its marker PUTs (the
-/// flagged one among them), its listings of `locks/`, its head creates.
-fn lock_free_gated(op: OpKind, key: &str) -> bool {
-    (op == OpKind::Put && key.starts_with("sessions/") && key.ends_with(".json"))
-        || (OpMatch::AnyList.matches(op) && key == "locks/")
-        || (op == OpKind::PutIfAbsent && key.starts_with("index.h/"))
+/// The single-writer check's ops (10-single-protocol step 7): every
+/// listing of `sessions/`, every marker PUT, and the head write's EXISTS
+/// and PUT.
+fn single_writer_gated(op: OpKind, key: &str) -> bool {
+    (OpMatch::AnyList.matches(op) && key == "sessions/")
+        || (op == OpKind::Put && key.starts_with("sessions/") && key.ends_with(".json"))
+        || (matches!(op, OpKind::Exists | OpKind::Put) && key.starts_with("index.h/"))
 }
 
-/// The lock holder's half: every op on a lock key or `locks/`, its
-/// listings of `sessions/` (the yield's among them), its plain head PUTs.
-fn lock_mode_gated(op: OpKind, key: &str) -> bool {
-    KeyMatch::LockKey.matches(key)
-        || (OpMatch::AnyList.matches(op) && key == "sessions/")
-        || (op == OpKind::Put && key.starts_with("index.h/"))
-}
-
-/// What the handshake search judges: invariant 12 and the snapshots.
-const HANDSHAKE_INVARIANTS: &[Invariant] = &[
-    Invariant::CommittedSnapshotsRestore,
-    Invariant::AcknowledgedCommitsDurable,
-    Invariant::IndexIntegrity,
-    Invariant::AllowedErrors,
-    Invariant::HeadsImmutable,
-];
-
-/// The marker handshake (04 step 9, phase F part 10c), operation by
-/// operation: on an encrypted repository over a store whose plain PUT
-/// replaces heads (local, SFTP, S3), client a backs up lock-free and client
-/// b, whose handle offers no put-if-absent, backs up under the lock. Every
-/// op of a's half ([`lock_free_gated`]) and of b's ([`lock_mode_gated`]) is
-/// held at a gate, the head writes included (without them each side's
-/// commit would run between two of the other's gated ops, and no order of
-/// the handshake could show damage); the search picks which held op
-/// proceeds next, as [`lock_acquisitions_on`] does. Each schedule's end
-/// state is judged by [`HANDSHAKE_INVARIANTS`].
-pub(super) fn handshake_search(template: &Template, bound: Bound) -> (Search, HandshakeTally) {
-    let mut tally = HandshakeTally::default();
+/// The single-writer check (10-single-protocol step 7, invariant I1),
+/// operation by operation: on a single-writer repository (the fallback
+/// store) client a backs up and client b backs up or compacts. Every op of
+/// both in [`single_writer_gated`] (the main threads only) is held at a
+/// gate; the search picks which held op proceeds next. A client held again
+/// at a listing of `sessions/` right after one (it backed off) gives way:
+/// continuing it costs a preemption, so a wait loop is bounded by K.
+pub(super) fn single_writer_search(
+    template: &Template,
+    rival: SingleWriterRival,
+    bound: Bound,
+) -> (Search, SingleWriterTally) {
+    let mut tally = SingleWriterTally::default();
     let search = dfs(bound, |prefix| {
-        let mut sim = template.fork_as(StoreKind::ConditionalOverwrite);
+        let mut sim = template.fork();
         let (a, b) = (sim.client("a"), sim.client("b"));
-        sim.set_lock_client(b);
-        let halves: [(ClientId, GateFilter); 2] = [(a, lock_free_gated), (b, lock_mode_gated)];
-        let mut cs: Vec<Contender> = halves
+        let mut cs: Vec<Contender> = [a, b]
             .into_iter()
-            .map(|(id, f)| Contender {
+            .map(|id| Contender {
                 id,
-                gates: (1..=MAX_HANDSHAKE_OPS as u32)
+                gates: (1..=MAX_SINGLE_WRITER_OPS as u32)
                     .map(|n| {
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, KeyMatch::Any)
-                                .filter(f)
+                                .filter(single_writer_gated)
+                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
                                 .nth(n),
                         )
                     })
                     .collect(),
                 next: 0,
                 held: false,
-                max: MAX_HANDSHAKE_OPS,
+                max: MAX_SINGLE_WRITER_OPS,
             })
             .collect();
+        let backup_of = |name: &str| Call::Backup {
+            snapshot: name.into(),
+            tree: crate::sim::SourceTree::seeded(name, 2, 16 * 1024),
+        };
         let mut spawned = Vec::new();
-        for (c, name) in cs.iter_mut().zip(["a1", "b1"]) {
-            spawned.push(sim.spawn(
-                c.id,
-                Call::Backup {
-                    snapshot: name.into(),
-                    tree: crate::sim::SourceTree::seeded(name, 2, 16 * 1024),
-                },
-            ));
+        for (i, c) in cs.iter_mut().enumerate() {
+            let call = match (i, rival) {
+                (1, SingleWriterRival::Compact) => Call::Compact,
+                (1, SingleWriterRival::Backup) => backup_of("b1"),
+                _ => backup_of("a1"),
+            };
+            spawned.push(sim.spawn(c.id, call));
             c.wait(&sim);
         }
 
-        // A client that backed off (the holder released a lock it yielded,
-        // the lock-free backup met a live lock) and is held at its next
-        // attempt gives way: continuing it costs a preemption, so a retry
-        // loop is bounded by K.
         let held_at = |c: &Contender| {
             sim.store()
                 .gate_paused(c.gates[c.next])
                 .map(|p| (p.op, p.key))
         };
-        let is_listing = |(op, _): &(OpKind, String)| OpMatch::AnyList.matches(*op);
-        let is_locks_listing = |at: &(OpKind, String)| is_listing(at) && at.1 == "locks/";
+        let is_sessions_listing =
+            |(op, key): &(OpKind, String)| OpMatch::AnyList.matches(*op) && key == "sessions/";
         let mut points = Vec::new();
         let mut last: Option<(usize, bool)> = None;
         loop {
@@ -1059,62 +1002,57 @@ pub(super) fn handshake_search(template: &Template, bound: Bound) -> (Search, Ha
             sim.resume(cs[i].gates[cs[i].next]);
             cs[i].next += 1;
             cs[i].wait(&sim);
-            // Held again at a listing of the directory it just listed, or
-            // at a listing of `locks/` right after releasing a lock.
+            // Held again at a listing of `sessions/` right after one, or
+            // after the unmark that follows one: it backed off.
             let backed_off = cs[i].held
                 && held_at(&cs[i]).is_some_and(|at| {
-                    (is_listing(&at) && is_listing(&resumed) && at.1 == resumed.1)
-                        || (is_locks_listing(&at)
-                            && resumed.0.is_delete()
-                            && KeyMatch::LockKey.matches(&resumed.1))
+                    is_sessions_listing(&at)
+                        && (is_sessions_listing(&resumed) || resumed.0 == OpKind::Put)
                 });
             last = Some((i, backed_off));
         }
 
         let runs: Vec<RunRecord> = spawned.into_iter().map(|s| sim.join(s)).collect();
-        assert!(
-            !runs[0].is_ok() || runs[0].lock_free,
-            "a commits lock-free: {}",
-            runs[0].detail()
-        );
-        assert!(!runs[1].lock_free, "b commits under the lock");
         tally.schedules += 1;
+        let locked =
+            |r: &RunRecord| r.error_class() == Some(&ErrorClass::Allowed(AllowedError::Locked));
+        for r in &runs {
+            if r.error_class() == Some(&ErrorClass::Allowed(AllowedError::ConcurrentHeadWrite)) {
+                tally.concurrent_head_writes += 1;
+            } else if !r.is_ok() && !locked(r) {
+                tally.other_endings += 1;
+            }
+        }
         if runs.iter().all(RunRecord::is_ok) {
             tally.both_ok += 1;
         }
         let log = sim.store().log();
-        let lock_free_listings = log
-            .iter()
-            .filter(|r| r.client == a && OpMatch::AnyList.matches(r.op) && r.key == "locks/")
-            .count();
-        if lock_free_listings > 2 {
-            tally.waits += 1;
+        let marker_puts = |c: ClientId| {
+            log.iter()
+                .filter(|r| {
+                    r.client == c
+                        && r.op == OpKind::Put
+                        && r.key.starts_with("sessions/")
+                        && r.key.ends_with(".json")
+                })
+                .count()
+        };
+        if runs.iter().any(locked)
+            || marker_puts(a) > 2
+            || matches!(rival, SingleWriterRival::Backup) && marker_puts(b) > 2
+        {
+            tally.backoffs += 1;
         }
-        let yielded = log.iter().any(|put| {
-            put.client == b
-                && put.op == OpKind::Put
-                && KeyMatch::LockKey.matches(&put.key)
-                && put.key != "locks/"
-                && log
-                    .iter()
-                    .find(|d| {
-                        d.client == b && d.step > put.step && d.op.is_delete() && d.key == put.key
-                    })
-                    .is_some_and(|d| {
-                        !log.iter().any(|w| {
-                            w.client == b
-                                && w.step > put.step
-                                && w.step < d.step
-                                && w.op.is_write()
-                                && w.key.starts_with("index.h/")
-                        })
-                    })
-                && runs[1].is_ok()
-        });
-        if yielded {
-            tally.yields += 1;
+        let heads_of = |c: ClientId| -> std::collections::BTreeSet<String> {
+            log.iter()
+                .filter(|r| r.client == c && r.op == OpKind::Put && r.key.starts_with("index.h/"))
+                .map(|r| r.key.clone())
+                .collect()
+        };
+        if heads_of(a).intersection(&heads_of(b)).next().is_some() {
+            tally.double_generation += 1;
         }
-        let report = sim.check_invariants(HANDSHAKE_INVARIANTS);
+        let report = sim.check_invariants(Invariant::STEP1);
         if !report.violations.is_empty() {
             tally.damaged += 1;
             if tally.first_damage.is_none() {
@@ -1129,43 +1067,331 @@ pub(super) fn handshake_search(template: &Template, bound: Bound) -> (Search, Ha
     (search, tally)
 }
 
-/// Preemption bound of the campaign's handshake search: the least that
-/// reaches a lock holder whose session listing came before its lock PUT
-/// (`tests::sim_campaign::campaign` runs it; 921 schedules, about 70 s).
-pub(super) const HANDSHAKE_CAMPAIGN_K: u32 = 4;
+/// Preemption bound of the campaign's single-writer searches
+/// (`tests::sim_campaign::campaign` runs them).
+pub(super) const SINGLE_WRITER_CAMPAIGN_K: u32 = 4;
 
-/// The marker handshake's search (04 step 9) at [`GATE_K`]: no schedule
-/// replaces a head or leaves a committed snapshot unrestorable, and the
-/// search reaches both halves of the handshake (the lock holder yielding to
-/// the flagged marker, the lock-free backup waiting for a held lock). With
-/// the lock-free side's order swapped (`locks/` probed before the mark) it
-/// finds replaced heads at this bound (8 of 434 schedules when it was
-/// tried); with the lock holder's swapped (`sessions/` listed before the
-/// lock PUT) only at [`HANDSHAKE_CAMPAIGN_K`] (12 of 530), which the
-/// campaign runs.
-#[test]
-fn the_marker_handshake_keeps_heads_immutable() {
+/// Preemption bound of the pre-commit single-writer searches.
+const SINGLE_WRITER_K: u32 = 2;
+
+/// [`single_writer_search`] at [`SINGLE_WRITER_K`] with `rival`: every schedule is
+/// clean under `Invariant::STEP1`, no head generation is PUT by both, no
+/// run ends `ConcurrentHeadWrite` (the check kept the second writer out
+/// before its head write) and every run ends Ok or `Locked`; the search
+/// reaches a back-off and a schedule where both commit.
+fn assert_single_writer_race(name: &str, rival: SingleWriterRival) {
     let start = Instant::now();
-    let t = Template::encrypted();
-    let (s, tally) = handshake_search(
-        &t,
+    let (s, t) = single_writer_search(
+        &Template::encrypted(),
+        rival,
         Bound {
-            preemptions: GATE_K,
+            preemptions: SINGLE_WRITER_K,
             max_runs: PRECOMMIT_MAX_RUNS,
         },
     );
     eprintln!(
-        "handshake search, K = {GATE_K}: {s:?} {tally:?} in {:?}",
+        "{name}, K = {SINGLE_WRITER_K}: {s:?} {t:?} in {:?}",
         start.elapsed()
     );
-    assert!(s.complete, "{s:?}");
-    assert_eq!(tally.damaged, 0, "{:?}", tally.first_damage);
-    assert!(tally.yields > 0, "the holder never yielded: {tally:?}");
-    assert!(
-        tally.waits > 0,
-        "the lock-free backup never waited: {tally:?}"
+    assert!(s.complete, "{name}: {s:?}");
+    assert_eq!(t.damaged, 0, "{name}: {:?}", t.first_damage);
+    assert_eq!(t.double_generation, 0, "{name}: {t:?}");
+    assert_eq!(t.concurrent_head_writes, 0, "{name}: {t:?}");
+    assert_eq!(t.other_endings, 0, "{name}: {t:?}");
+    assert!(t.backoffs > 0, "{name}: no schedule backed off: {t:?}");
+    assert!(t.both_ok > 0, "{name}: {t:?}");
+}
+
+/// Two single-writer backups (10-single-protocol step 7), their
+/// `sessions/` listings, marker PUTs and head EXISTS and PUT one at a time
+/// (replaces `lock_acquisitions_race`'s role for backups, whose commits no
+/// longer take the lock): each flags its marker before the listing it
+/// decides on, so no two pass it (I1).
+#[test]
+fn single_writer_checks_race() {
+    assert_single_writer_race("single-writer backups", SingleWriterRival::Backup);
+}
+
+/// A single-writer backup against a compact, the same way: the compact
+/// never waits and refuses beside a committing backup; the backup waits
+/// while the compact is flagged.
+#[test]
+fn single_writer_compact_race() {
+    assert_single_writer_race(
+        "single-writer backup and compact",
+        SingleWriterRival::Compact,
     );
-    assert!(tally.both_ok > 0, "{tally:?}");
+}
+
+/// What [`gapped_backup_search`] runs against a suspended backup
+/// (10-single-protocol step 7, the suspend rule; review A5).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GappedRival {
+    /// `vykar upgrade --commit-mode multi` of a single-writer repository
+    /// whose storage passes the check.
+    SwitchToMulti,
+    /// `vykar upgrade --commit-mode single` of a multi-writer repository.
+    SwitchToSingle,
+    /// `check --repair` (under the maintenance lock).
+    CheckRepair,
+    /// A compact (a session) after the delete of c0, on a single-writer
+    /// repository.
+    Compact,
+}
+
+#[derive(Default, Debug)]
+pub(super) struct GappedTally {
+    schedules: usize,
+    /// Schedules whose end state violates [`GAPPED_INVARIANTS`].
+    pub(super) damaged: usize,
+    /// Schedules in which the suspended backup committed.
+    committed: usize,
+    /// Schedules in which it re-read `config` after its mark.
+    reread: usize,
+    pub(super) first_damage: Option<(Vec<usize>, String)>,
+}
+
+/// What the gapped search judges: invariants 1 to 4, the allowed errors,
+/// and invariant 11 (a commit whose record had a gap keeps the pack-age
+/// term).
+const GAPPED_INVARIANTS: &[Invariant] = &[
+    Invariant::CommittedSnapshotsRestore,
+    Invariant::AcknowledgedCommitsDurable,
+    Invariant::NoSilentRemoval,
+    Invariant::IndexIntegrity,
+    Invariant::AllowedErrors,
+    Invariant::MarkerGapCommit,
+];
+
+/// The ops [`gapped_backup_search`] holds: every listing of `sessions/`,
+/// every marker PUT, every op on `config`, lock keys' writes and deletes,
+/// and the head writes (EXISTS, PUT, put-if-absent).
+fn gapped_gated(op: OpKind, key: &str) -> bool {
+    (OpMatch::AnyList.matches(op) && key == "sessions/")
+        || (op == OpKind::Put && key.starts_with("sessions/") && key.ends_with(".json"))
+        || key == "config"
+        || (KeyMatch::LockKey.matches(key) && key != "locks/" && (op.is_write() || op.is_delete()))
+        || (matches!(op, OpKind::Exists | OpKind::Put | OpKind::PutIfAbsent)
+            && key.starts_with("index.h/"))
+}
+
+/// The suspend rule against what can run while a backup is suspended
+/// (review A5): client a's backup is held after its uploads, its machine
+/// suspended 46 min (its marker stale, its record with a gap), then a and
+/// `rival` (client b) race with every op of both in [`gapped_gated`] held
+/// at a gate, the search picking which proceeds next (as
+/// [`single_writer_search`]). Each end state is judged by
+/// [`GAPPED_INVARIANTS`].
+pub(super) fn gapped_backup_search(
+    template: &Template,
+    rival: GappedRival,
+    bound: Bound,
+) -> (Search, GappedTally) {
+    let mut tally = GappedTally::default();
+    let kind = match rival {
+        GappedRival::SwitchToMulti | GappedRival::SwitchToSingle => StoreKind::Conditional,
+        GappedRival::CheckRepair | GappedRival::Compact => StoreKind::Plain,
+    };
+    let search = dfs(bound, |prefix| {
+        let mut sim = template.fork_as(kind);
+        let (a, b) = (sim.client("a"), sim.client("b"));
+        if matches!(rival, GappedRival::SwitchToMulti) {
+            let r = sim.call(
+                b,
+                Call::SwitchMode {
+                    mode: crate::repo::WriterMode::Single,
+                },
+            );
+            assert!(r.is_ok(), "{}", r.detail());
+        }
+        if matches!(rival, GappedRival::Compact) {
+            let r = sim.call(
+                b,
+                Call::Delete {
+                    names: vec!["c0".into()],
+                },
+            );
+            assert!(r.is_ok(), "{}", r.detail());
+        }
+        let upload = sim.gate(GateRule::new(
+            a,
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("packs/".into()),
+        ));
+        let sa = sim.spawn(
+            a,
+            Call::Backup {
+                snapshot: "a1".into(),
+                tree: crate::sim::SourceTree::seeded("a1", 2, 16 * 1024),
+            },
+        );
+        sim.expect_paused(upload, "a's first pack PUT");
+        let wait = Duration::from_secs(10);
+        assert!(sim.time().wait_for_waiters(1, wait));
+        sim.advance(Duration::from_secs(46 * 60));
+        assert!(sim.time().wait_for_waiters(1, wait));
+        let mut cs: Vec<Contender> = [a, b]
+            .into_iter()
+            .map(|id| Contender {
+                id,
+                gates: (1..=MAX_SINGLE_WRITER_OPS as u32)
+                    .map(|n| {
+                        sim.gate(
+                            GateRule::new(id, OpMatch::Any, KeyMatch::Any)
+                                .filter(gapped_gated)
+                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .nth(n),
+                        )
+                    })
+                    .collect(),
+                next: 0,
+                held: false,
+                max: MAX_SINGLE_WRITER_OPS,
+            })
+            .collect();
+        sim.resume(upload);
+        cs[0].wait(&sim);
+        let call = match rival {
+            GappedRival::SwitchToMulti => Call::SwitchMode {
+                mode: crate::repo::WriterMode::Multi,
+            },
+            GappedRival::SwitchToSingle => Call::SwitchMode {
+                mode: crate::repo::WriterMode::Single,
+            },
+            GappedRival::CheckRepair => Call::CheckRepair,
+            GappedRival::Compact => Call::Compact,
+        };
+        let sb = sim.spawn(b, call);
+        cs[1].wait(&sim);
+        // A client held again at a listing of `sessions/` right after one
+        // (a wait: a backup's contended protection) gives way: continuing
+        // it costs a preemption, so a wait loop is bounded by K.
+        let held_at = |c: &Contender| {
+            sim.store()
+                .gate_paused(c.gates[c.next])
+                .map(|p| (p.op, p.key))
+        };
+        let is_listing =
+            |(op, key): &(OpKind, String)| OpMatch::AnyList.matches(*op) && key == "sessions/";
+        let mut points = Vec::new();
+        let mut last: Option<(usize, bool)> = None;
+        loop {
+            let held: Vec<usize> = (0..cs.len()).filter(|&i| cs[i].held).collect();
+            if held.is_empty() {
+                break;
+            }
+            let costs: Vec<u32> = held
+                .iter()
+                .map(|&i| match last {
+                    Some((l, false)) if cs[l].held => u32::from(i != l),
+                    Some((l, true)) if cs[l].held => u32::from(i == l && held.len() > 1),
+                    _ => 0,
+                })
+                .collect();
+            let taken = prefix
+                .get(points.len())
+                .copied()
+                .unwrap_or_else(|| costs.iter().position(|c| *c == 0).expect("a free option"));
+            let i = held[taken];
+            points.push(Point { costs, taken });
+            let resumed = held_at(&cs[i]).expect("held");
+            sim.resume(cs[i].gates[cs[i].next]);
+            cs[i].next += 1;
+            cs[i].wait(&sim);
+            let backed_off = cs[i].held
+                && held_at(&cs[i]).is_some_and(|at| is_listing(&at) && is_listing(&resumed));
+            last = Some((i, backed_off));
+        }
+        let ra = sim.join(sa);
+        let _ = sim.join(sb);
+        tally.schedules += 1;
+        if ra.is_ok() {
+            tally.committed += 1;
+        }
+        let log = sim.store().log();
+        let mark = log.iter().position(|r| {
+            r.client == a
+                && r.op == OpKind::Put
+                && r.key.starts_with("sessions/")
+                && r.key.ends_with(".1.json")
+        });
+        if mark.is_some_and(|m| {
+            log[m..]
+                .iter()
+                .any(|r| r.client == a && r.op == OpKind::Get && r.key == "config")
+        }) {
+            tally.reread += 1;
+        }
+        let report = sim.check_invariants(GAPPED_INVARIANTS);
+        if !report.violations.is_empty() {
+            tally.damaged += 1;
+            if tally.first_damage.is_none() {
+                tally.first_damage = Some((
+                    points.iter().map(|p| p.taken).collect(),
+                    format!("{report}"),
+                ));
+            }
+        }
+        Some(points)
+    });
+    (search, tally)
+}
+
+/// Preemption bound of the pre-commit gapped searches: K = 2 takes about
+/// 4 s each (34 to 88 runs); K = 3 was run when they were added (see the
+/// step's report).
+const GAPPED_K: u32 = 2;
+
+/// [`gapped_backup_search`] at [`GAPPED_K`] against `rival`: every
+/// schedule is clean and the search completes; the suspended backup
+/// re-reads `config` after its mark in some schedule (and commits in some,
+/// except beside `check --repair`, which may refuse it nothing).
+fn assert_gapped_clean(name: &str, rival: GappedRival) {
+    let start = Instant::now();
+    let (s, t) = gapped_backup_search(
+        &Template::encrypted(),
+        rival,
+        Bound {
+            preemptions: GAPPED_K,
+            max_runs: PRECOMMIT_MAX_RUNS,
+        },
+    );
+    eprintln!(
+        "{name}, K = {GAPPED_K}: {s:?} {t:?} in {:?}",
+        start.elapsed()
+    );
+    assert!(s.complete, "{name}: {s:?}");
+    assert_eq!(t.damaged, 0, "{name}: {:?}", t.first_damage);
+    assert!(
+        t.reread > 0,
+        "{name}: the backup never re-read config: {t:?}"
+    );
+    assert!(t.committed > 0, "{name}: the backup never committed: {t:?}");
+}
+
+/// A5: a suspended backup against a switch to multi-writer.
+#[test]
+fn gapped_backup_against_a_switch_to_multi_writer_is_clean() {
+    assert_gapped_clean("gapped vs switch to multi", GappedRival::SwitchToMulti);
+}
+
+/// A5: a suspended backup against a switch to single-writer.
+#[test]
+fn gapped_backup_against_a_switch_to_single_writer_is_clean() {
+    assert_gapped_clean("gapped vs switch to single", GappedRival::SwitchToSingle);
+}
+
+/// A5: a suspended backup against `check --repair`.
+#[test]
+fn gapped_backup_against_check_repair_is_clean() {
+    assert_gapped_clean("gapped vs check --repair", GappedRival::CheckRepair);
+}
+
+/// A5: a suspended backup against a compact (one op at a time, as every
+/// gated op of both runs is a decision).
+#[test]
+fn gapped_backup_against_a_compact_is_clean() {
+    assert_gapped_clean("gapped vs compact", GappedRival::Compact);
 }
 
 /// `VYKAR_SIM_MEASURE=1`: every pre-commit driver search at K = 1 and
@@ -1228,11 +1454,11 @@ fn measure_bounds() {
     }
 }
 
-/// `VYKAR_SIM_MEASURE=1`: the searches phase F parts 10c and 10d name, as
-/// far as they exist before them, on the encrypted template (runs and wall
-/// time, against `PRECOMMIT_MAX_RUNS`): every client still commits under
-/// the lock here, so a lock-free search's size is estimated by its
-/// lock-mode twin.
+/// `VYKAR_SIM_MEASURE=1`: the searches phase F parts 10c and 10d name, on
+/// the encrypted template (runs and wall time, against
+/// `PRECOMMIT_MAX_RUNS`). Their mixed-mode searches (a lock client beside
+/// lock-free ones) went with 10-single-protocol step 7: no binary is such a
+/// client.
 #[test]
 fn measure_part_10_searches() {
     if std::env::var("VYKAR_SIM_MEASURE").ok().as_deref() != Some("1") {
@@ -1271,19 +1497,14 @@ fn measure_part_10_searches() {
             encrypted(conditional(lock_pair(HostPlan::SameHostname))),
         ),
         k1(
-            "lock_free_backup_against_a_locked_compact: whole",
+            "lock_free_backup_against_lock_free_compact: whole",
             &enc,
             encrypted(conditional(cvc())),
         ),
         k1(
-            "lock_free_backup_against_a_locked_compact: stepped",
+            "lock_free_backup_against_lock_free_compact: stepped",
             &enc,
             encrypted(conditional(stepped(cvc()))),
-        ),
-        k1(
-            "mixed_lock_and_lock_free_backups: pair-distinct",
-            &enc,
-            encrypted(mixed(lock_pair(HostPlan::Distinct), vec![1])),
         ),
         // 10d.
         k1(
@@ -1330,12 +1551,6 @@ fn measure_part_10_searches() {
             "three-clients-lockfree (campaign) K = 2".to_string(),
             &enc,
             encrypted(conditional(three_clients())),
-            2,
-        ),
-        (
-            "three-clients-mixed (campaign) K = 2".to_string(),
-            &enc,
-            encrypted(mixed(three_clients(), vec![2])),
             2,
         ),
     ];

@@ -59,8 +59,8 @@ pub(crate) use chunks::{
     ChunkInput, ExistingAt, ExistingChunk, PreparedChunk, StoredChunk, WorkerChunk,
 };
 pub use write_session::WriteSession;
-pub(crate) use writer::Fence;
 pub use writer::RepoWriter;
+pub(crate) use writer::{Fence, FenceFn};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -682,8 +682,12 @@ pub struct Repo {
     /// lock): "now" on the store's clock for the ages this lock holder
     /// judges. `None` outside a lock, or when the storage reports no mtime.
     lock_store_time: Option<vykar_storage::StoreNow>,
-    /// The sessions the maintenance lock found live, for compact's horizon;
-    /// `None` outside `with_maintenance_lock`.
+    /// How long one EXISTS of an exclusive session's marker vouches for it
+    /// (`lock::EXCLUSIVE_CHECK_REUSE`); tests lower it.
+    exclusive_check_reuse: std::time::Duration,
+    /// The sessions a maintenance run found live, for compact's horizon (an
+    /// exclusive session's registration finds none, or refuses); `None`
+    /// outside a run.
     live_sessions: Option<Vec<lock::LiveSession>>,
     /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
     /// (zero turns the guard off, so a test double without mtimes deletes).
@@ -888,9 +892,10 @@ impl Repo {
         self.storage = storage;
     }
 
-    /// Replace the backend this handle uses; returns the previous one. The
-    /// v2/v3 upgrade wraps the backend in a write check for its run
-    /// (`commands::upgrade`). Callers restore the previous backend after.
+    /// Replace the backend this handle uses; returns the previous one. An
+    /// exclusive session wraps the backend in a write check for its run
+    /// (`commands::util::with_exclusive_session`). Callers restore the
+    /// previous backend after.
     pub(crate) fn swap_storage(
         &mut self,
         storage: Arc<dyn StorageBackend>,
@@ -1033,6 +1038,18 @@ impl Repo {
     /// Record the store's clock reading of the lock this handle works under.
     pub(crate) fn set_lock_store_time(&mut self, t: Option<vykar_storage::StoreNow>) {
         self.lock_store_time = t;
+    }
+
+    /// How long one EXISTS of an exclusive session's marker vouches for it.
+    pub(crate) fn exclusive_check_reuse(&self) -> std::time::Duration {
+        self.exclusive_check_reuse
+    }
+
+    /// Tests: set how long one EXISTS of an exclusive session's marker
+    /// vouches for it (zero: every write sends one).
+    #[cfg(test)]
+    pub(crate) fn set_exclusive_check_reuse(&mut self, d: std::time::Duration) {
+        self.exclusive_check_reuse = d;
     }
 
     /// "Now" on the store's clock as the held lock read it, if any.

@@ -84,7 +84,7 @@ impl Fx {
     /// (`index_base.*`).
     fn fold(&self) {
         let mut repo = self.open();
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
+        commands::util::with_exclusive_session(&mut repo, |repo| {
             repo.request_full_index_fold();
             repo.mark_index_dirty();
             repo.save_state()

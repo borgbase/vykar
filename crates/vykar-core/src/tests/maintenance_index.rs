@@ -14,7 +14,7 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::commands;
 use crate::commands::backup::{self, BackupProgressEvent};
-use crate::commands::util::with_maintenance_lock;
+use crate::commands::util::with_exclusive_session;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::ChunkIndexEntry;
 use crate::index::head::IndexHead;
@@ -604,34 +604,33 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         let objects_before = env.index_objects();
 
         let mut repo = env.open(env.local(), OpenOptions::new());
-        let result = with_maintenance_lock(&mut repo, |repo| {
+        // Every write checks the marker (no reuse of an earlier EXISTS).
+        repo.set_exclusive_check_reuse(std::time::Duration::ZERO);
+        let result = with_exclusive_session(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
             repo.mark_index_dirty();
             repo.request_full_index_fold();
-            for key in repo.storage().list("locks/").unwrap() {
-                if key.ends_with(".json") {
-                    repo.storage().delete(&key).unwrap();
-                }
-            }
+            delete_markers(repo);
             repo.save_state()
         });
         let err = result.unwrap_err();
         assert!(
-            matches!(err, VykarError::LockExpired(_)),
-            "expected LockExpired, got: {err}"
+            matches!(err, VykarError::MarkerLostDuringCommit),
+            "expected MarkerLostDuringCommit, got: {err}"
         );
         drop(repo);
 
         assert!(table_at(&id, &env.cache_dir, &head));
         assert_eq!(env.open_fresh().index_generation(), generation);
         assert_eq!(env.index_bytes(), index_before, "{format:?}");
-        // The base is PUT, then the lock checked before the head PUT.
-        assert_eq!(env.index_objects(), objects_before + 1, "{format:?}");
+        // The exclusive check runs before every write: not even the base is
+        // PUT (the lock's fence ran only before the head PUT, after it).
+        assert_eq!(env.index_objects(), objects_before, "{format:?}");
     }
 }
 
-/// Persists the index as a full fold (a new base and head); call under the
-/// maintenance lock.
+/// Persists the index as a full fold (a new base and head); call in an
+/// exclusive session.
 fn fold_and_save(repo: &mut RepoWriter<'_>) -> Result<()> {
     repo.load_chunk_index_under_lock()?;
     repo.mark_index_dirty();
@@ -639,22 +638,25 @@ fn fold_and_save(repo: &mut RepoWriter<'_>) -> Result<()> {
     repo.save_state()
 }
 
-fn delete_locks(repo: &Repo) {
-    for key in repo.storage().list("locks/").unwrap() {
-        if key.ends_with(".json") {
+/// Delete this handle's exclusive session's marker keys (a reaper, or
+/// `break-lock --sessions`).
+fn delete_markers(repo: &Repo) {
+    for key in repo.storage().list("sessions/").unwrap() {
+        if key.starts_with("sessions/x-") && key.ends_with(".json") {
             repo.storage().delete(&key).unwrap();
         }
     }
 }
 
-/// Persists a fold under the maintenance lock, then loses the
-/// lock before the action returns. Returns the generation before and after.
+/// Persists a fold in an exclusive session, then loses the session's
+/// marker before the action returns. Returns the generation before and
+/// after.
 fn save_then_lose_lock(env: &Env) -> (u64, u64) {
     let before = env.open_fresh().index_generation();
     let mut repo = env.open(env.local(), OpenOptions::new());
-    with_maintenance_lock(&mut repo, |repo| {
+    with_exclusive_session(&mut repo, |repo| {
         fold_and_save(repo)?;
-        delete_locks(repo);
+        delete_markers(repo);
         Ok(())
     })
     .unwrap();
@@ -676,16 +678,17 @@ fn lock_lost_after_save_still_installs_the_table_segmented() {
     assert!(table_at(&id, &env.cache_dir, &head));
 }
 
-/// Saves under the maintenance lock, loses it, and lets another writer on
-/// this host persist a newer index. Returns our head.
+/// Saves in an exclusive session, loses its marker, and lets another
+/// writer on this host persist a newer index (its exclusive registration
+/// finds our marker gone, so it runs). Returns our head.
 fn save_then_get_taken_over(env: &Env) -> IndexHead {
     let mut repo = env.open(env.local(), OpenOptions::new());
-    let ours = with_maintenance_lock(&mut repo, |repo| {
+    let ours = with_exclusive_session(&mut repo, |repo| {
         fold_and_save(repo)?;
         let ours = repo.index_head().unwrap().clone();
-        delete_locks(repo);
+        delete_markers(repo);
         let mut other = env.open(env.local(), OpenOptions::new());
-        with_maintenance_lock(&mut other, fold_and_save)?;
+        with_exclusive_session(&mut other, fold_and_save)?;
         Ok(ours)
     })
     .unwrap();

@@ -10,7 +10,13 @@
 //! with its single-writer check, heads as EXISTS, PUT and read-back. The
 //! `multi_writer_*` scenarios pin the conditional store's multi-writer
 //! protocol, fixed through step 7 (invariant I6) but for the one `config`
-//! GET a maintenance session makes after its registration.
+//! GET a maintenance session makes after its registration. Step 8 breaks I6
+//! by design: every registration lists `sessions/` instead of `locks/` (a
+//! compact's extra `ListMeta sessions/`), a backup's commit lists
+//! `sessions/` only before its head (no `ListMeta locks/`), and the
+//! `Sim::custom` scenarios run as exclusive sessions (their marker PUT, one
+//! EXISTS per reuse interval, the re-read of `config` and the marker's
+//! delete instead of the lock's keys).
 
 // Printing is the point of the env-driven helpers here (projections,
 // replays, the measurement); every other path asserts.
@@ -90,15 +96,18 @@ pub(crate) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
         })
         .collect();
     // Phase 1 ends with the last pack upload; a backup that uploads no
-    // pack is past its open once the open's first listing of `sessions/`
-    // ran. The commit starts at the first `locks/` or session-marker op
+    // pack is past its open once the open's listing of `sessions/` ran
+    // (its second: the registration lists first, 10-single-protocol step 8). The commit starts at the first `locks/` or session-marker op
     // after both: the commit lock, the commit mark or the single-writer
     // listing, whichever the protocol runs first.
     let last_pack = mine.iter().rposition(|r| r.op == OpKind::PutPack);
     let open_listing = mine
         .iter()
-        .position(|r| !r.op.is_write() && r.key == "sessions/")
-        .expect("a backup lists sessions/ at its open");
+        .enumerate()
+        .filter(|(_, r)| !r.op.is_write() && r.key == "sessions/")
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a backup lists sessions/ at its registration and its open");
     let after = last_pack.map_or(open_listing, |p| p.max(open_listing));
     let start = (after + 1..mine.len())
         .find(|&i| {
@@ -138,14 +147,13 @@ fn first_backup_writes_a_segment() {
         "first backup",
         project(&run_records(&sim, &r, true)),
         &[
-            // The marker handshake's listing under the lock (encrypted repository).
+            // The single-writer listing before the commit mark (encrypted repository).
             "ListMeta sessions/ ok",
             "Put sessions/ ok",
             "Exists sessions/ ok x2",
             "Get index.h/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
-            "ListMeta locks/ ok",
             "ListMeta sessions/ ok x2",
             "reads packs/",
             "Put index.d/ ok",
@@ -170,14 +178,13 @@ fn second_backup_of_the_same_tree_writes_a_segment() {
         "second backup, same tree",
         project(&run_records(&sim, &r, true)),
         &[
-            // The marker handshake's listing under the lock (encrypted repository).
+            // The single-writer listing before the commit mark (encrypted repository).
             "ListMeta sessions/ ok",
             "Put sessions/ ok",
             "Exists sessions/ ok x2",
             "Get index.h/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
-            "ListMeta locks/ ok",
             "ListMeta sessions/ ok x2",
             "reads packs/",
             "Put index.d/ ok",
@@ -245,21 +252,20 @@ fn commit_with_no_new_additions_writes_a_head_only() {
         "commit, no new additions",
         project(&recs),
         &[
+            "Exists sessions/ ok",
             "PutPack packs/ ok",
             "Put sessions/ ok",
             "Exists index.h/ not-found",
-            "Exists locks/ ok",
             "Get index.d/ ok",
             "Get index.h/ ok",
             "Get snapshots/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
             "Put index.h/ ok",
-            "Exists locks/ ok",
             "Get index.h/ ok",
             "ListMeta index.h/ ok",
             "Put snapshots/ ok",
-            "Delete locks/ ok",
+            "Delete sessions/ ok",
         ],
     );
 }
@@ -321,8 +327,7 @@ fn compact_after_delete_writes_a_record_and_a_segment() {
             "List sessions/ ok",
             "List snapshots/ ok",
             "ListMeta index.d/ ok",
-            "ListMeta locks/ ok",
-            "ListMeta sessions/ ok x2",
+            "ListMeta sessions/ ok x3",
             "reads packs/",
             "Put index.d/ ok x2",
             "Exists index.h/ not-found",
@@ -373,8 +378,7 @@ fn compact_with_nothing_to_remove_writes_a_head_only() {
             "List sessions/ ok",
             "List snapshots/ ok",
             "ListMeta index.d/ ok",
-            "ListMeta locks/ ok",
-            "ListMeta sessions/ ok x2",
+            "ListMeta sessions/ ok x3",
             "reads packs/",
             "Put index.d/ ok",
             "Exists index.h/ not-found",
@@ -416,20 +420,20 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
             "Get keys/ ok x2",
             "List index.h/ ok",
             "List snapshots/ ok",
-            "ListMeta locks/ ok",
-            "Put locks/ ok",
+            "Put sessions/ ok",
+            "Exists sessions/ ok",
+            "Get config ok",
             "Get index.h/ ok x2",
             "List index.h/ ok x2",
             "ListMeta index.d/ ok",
-            "ListMeta locks/ ok",
+            "ListMeta sessions/ ok",
             "Put index.d/ ok",
             "Exists index.h/ not-found",
-            "Exists locks/ ok",
             "Put index.h/ ok",
             "Get index.h/ ok x3",
             "ListMeta index.d/ ok",
             "ListMeta index.h/ ok",
-            "Delete locks/ ok",
+            "Delete sessions/ ok",
         ],
     );
 }
@@ -463,7 +467,6 @@ fn multi_writer_first_backup_writes_a_segment() {
             "Get index.h/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
-            "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
             "reads packs/",
             "Put index.d/ ok",
@@ -491,7 +494,6 @@ fn multi_writer_second_backup_of_the_same_tree_writes_a_segment() {
             "Get index.h/ ok",
             "List index.h/ ok",
             "List snapshots/ ok",
-            "ListMeta locks/ ok",
             "ListMeta sessions/ ok",
             "reads packs/",
             "Put index.d/ ok",
@@ -604,8 +606,7 @@ fn multi_writer_compact_after_delete_writes_a_record_and_a_segment() {
             "List sessions/ ok",
             "List snapshots/ ok",
             "ListMeta index.d/ ok",
-            "ListMeta locks/ ok",
-            "ListMeta sessions/ ok",
+            "ListMeta sessions/ ok x2",
             "reads packs/",
             "Put index.d/ ok x2",
             "Exists sessions/ ok",
@@ -647,7 +648,7 @@ fn multi_writer_delete_removes_a_snapshot() {
             "Put sessions/ ok",
             "Exists sessions/ ok",
             "Get config ok",
-            "ListMeta locks/ ok",
+            "ListMeta sessions/ ok",
             "Delete snapshots/ ok",
             "Delete sessions/ ok",
         ],

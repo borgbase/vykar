@@ -130,13 +130,18 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
     KnownHazard {
         id: "H1-late-clone",
         summary: "a clone of the installation that booted after the holder's last write \
-                  takes a live lock for one of its earlier boot and reaps it",
+                  takes a live exclusive session's marker for one of its earlier boot and \
+                  reaps it; the holder's write already past its check lands under the \
+                  reaper's session (after a removal that keeps the record continuous \
+                  every write within the 5 s reuse interval passes, plus the one in \
+                  flight: RX1); its next check refuses",
         fixed_by: "not planned: a history of this installation's own boot IDs; \
-                   04 step 5 narrows it for markers",
+                   04 step 5 narrows it for markers; 10-single-protocol step 8 narrows it \
+                   from writes under the reaper's lock to the writes past their check",
         run: interleavings::h1_late_clone,
-        // Its lock holders delete under the maintenance lock
-        // (`Call::LockedDelete`, since 10-single-protocol step 7), which
-        // clients take on every store: the lock carries it there too.
+        // Its holders delete as exclusive sessions (`Call::ExclusiveDelete`,
+        // since 10-single-protocol step 8), which clients register on every
+        // store.
         conditional: OnConditional::Reproduces,
     },
     KnownHazard {
@@ -147,7 +152,12 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: interleavings::h2_lock_refresh_resurrects,
         // Its holders delete under the maintenance lock
         // (`Call::LockedDelete`, since 10-single-protocol step 7), which
-        // clients take on every store: the lock carries it there too.
+        // clients take on every store: the lock carries it there too. No
+        // command takes the lock since step 8; step 9 deletes it with the
+        // lock. With an exclusive holder it does not reproduce: the marker
+        // refresh does not resurrect a key (H2-marker, a regression), and
+        // the 3 h stall breaks the marker record's continuity, so the
+        // holder's next check refuses (`tests::sim_exclusion` case (e)).
         conditional: OnConditional::Reproduces,
     },
     KnownHazard {
@@ -237,12 +247,14 @@ pub const REGRESSIONS: &[Regression] = &[
     },
     Regression {
         id: "H1",
-        summary: "same hostname: a live lock is kept by cloned machines, namesakes (also \
+        summary: "same hostname: a live exclusive session's marker (a lock before \
+                  10-single-protocol step 8) is kept by cloned machines, namesakes (also \
                   one booted after the holder's write) and containers (installation ID, \
                   boot ID and uptime, PID namespace)",
         run: interleavings::h1_regression,
-        // Its subject is a lock, which lock-free clients never take.
-        kinds: &[StoreKind::Plain],
+        // Its subject is an exclusive session (a lock until
+        // 10-single-protocol step 8), which every store's clients register.
+        kinds: BOTH_KINDS,
     },
     Regression {
         id: "H1-session",

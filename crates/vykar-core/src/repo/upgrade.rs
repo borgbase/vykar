@@ -2,8 +2,9 @@
 //! (v2 keeps BLAKE2b IDs, v3 BLAKE3; the config names the hash), on a
 //! repository opened without its index. A v2/v3 repository is upgraded
 //! under the legacy lock key ([`LegacyUpgradeLock`]: 0.24's lock format,
-//! rewritten every few minutes, checked before every write); a v6 one
-//! (the resume after the switch, a mode switch) under the maintenance lock.
+//! rewritten every few minutes, checked before every write) and as an
+//! exclusive session (10-single-protocol step 8); a v6 one (the resume after
+//! the switch, a mode switch) as an exclusive session.
 //!
 //! 1. Probe the server capabilities and PUT the stored `config` bytes back
 //!    unchanged: a server that refuses overwrites (append-only) fails here,
@@ -53,7 +54,6 @@ use super::host_env::HostEnv;
 use super::index_store;
 use super::index_write::PendingSweep;
 use super::lock::{EntryAge, EntryHost, SameHost, format_age_since, same_host};
-use super::write_check::WriteChecked;
 use super::writer::FenceFn;
 use super::writer_mode::{ModeCheck, init_time_check};
 use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat, WriterMode};
@@ -160,8 +160,8 @@ pub(crate) fn is_index_head(data: &[u8]) -> bool {
 
 impl Repo {
     /// Upgrade a v2/v3 repository to v6 in place; see the module docs.
-    /// The caller holds the legacy lock key (v2/v3) or the maintenance
-    /// lock (v6), whose check is `fence`
+    /// The caller runs as an exclusive session, holding the legacy lock key
+    /// too on v2/v3; their check is `fence`
     /// (`RepoWriter::upgrade_index_layout`). One-way: older binaries cannot
     /// read the repository afterwards.
     ///
@@ -213,11 +213,12 @@ impl Repo {
                 "the repository config changed after it was opened; retry the upgrade".into(),
             ));
         }
-        // A lost legacy lock key (the write check) is reported as itself.
+        // A lost exclusion (the write check: the legacy lock key, the
+        // exclusive session's marker) is reported as itself.
         self.storage
             .put("config", &config_bytes)
             .map_err(|e| match e {
-                e @ VykarError::LockExpired(_) => e,
+                e @ (VykarError::LockExpired(_) | VykarError::MarkerLostDuringCommit) => e,
                 e => VykarError::Other(format!(
                     "the repository config cannot be rewritten ({e}). The upgrade rewrites \
                  `config` and deletes `index`; on an append-only server, disable \
@@ -413,6 +414,13 @@ impl Repo {
         let bytes = config.encode()?;
         fence.check()?;
         self.storage.put("config", &bytes).map_err(|e| {
+            if matches!(
+                e,
+                VykarError::LockExpired(_) | VykarError::MarkerLostDuringCommit
+            ) {
+                // A lost exclusion (the write check) is reported as itself.
+                return e;
+            }
             VykarError::Other(format!(
                 "the repository config cannot be rewritten ({e}). Switching the commit mode \
                  rewrites config; on an append-only server, disable append-only for the \
@@ -551,8 +559,9 @@ impl LegacyLockEntry {
 /// The lock key a v2/v3 upgrade holds: a 0.24 advisory lock, so 0.24
 /// backups, reads and maintenance refuse while the upgrade runs, and a
 /// lock of any version makes the upgrade refuse. Its [check](Self::check)
-/// runs before every write of the upgrade (the writer's fence and a
-/// [`WriteChecked`] storage wrapper), rewrites the key every few minutes
+/// runs before every write of the upgrade, after the exclusive session's
+/// check (the writer's fence and the session's [`WriteChecked`](super::write_check::WriteChecked) storage
+/// wrapper, `commands::util::with_exclusive_session_as`), rewrites the key every few minutes
 /// and fails once the key is gone or its last rewrite is 5.5 h old.
 ///
 /// Self-contained, apart from the age and same-host judgements it shares
@@ -566,8 +575,6 @@ struct LegacyKey {
     storage: Arc<dyn StorageBackend>,
     env: HostEnv,
     key: String,
-    /// The key's mtime in the confirming listing.
-    store_acquired: Option<StoreNow>,
     state: Mutex<LegacyKeyState>,
 }
 
@@ -671,7 +678,6 @@ impl LegacyUpgradeLock {
                 storage: Arc::clone(&storage),
                 env: env.clone(),
                 key,
-                store_acquired: store_now,
                 state: Mutex::new(LegacyKeyState {
                     last_rewrite: now.timestamp(),
                     lost: false,
@@ -683,12 +689,6 @@ impl LegacyUpgradeLock {
 
     pub(crate) fn key(&self) -> &str {
         &self.shared.key
-    }
-
-    /// The key's mtime in the confirming listing: "now" on the store's
-    /// clock at acquisition. `None` when the storage reports no mtime.
-    pub(crate) fn store_time(&self) -> Option<StoreNow> {
-        self.shared.store_acquired
     }
 
     /// Tests: one check ([`Self::check_fn`]).
@@ -707,14 +707,6 @@ impl LegacyUpgradeLock {
     pub(crate) fn check_fn(&self) -> FenceFn {
         let shared = Arc::clone(&self.shared);
         Arc::new(move || shared.check())
-    }
-
-    /// `storage` wrapped so that every write runs [`Self::check`] first.
-    pub(crate) fn checked_storage(
-        &self,
-        storage: Arc<dyn StorageBackend>,
-    ) -> Arc<dyn StorageBackend> {
-        Arc::new(WriteChecked::new(storage, self.check_fn()))
     }
 
     /// Delete the key; sends nothing when a check found it gone. The error

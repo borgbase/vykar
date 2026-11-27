@@ -100,7 +100,7 @@ impl Fixture {
     /// segment (the index keeps knowing their trailer lengths).
     fn drop_entries_of(&self, packs: &HashSet<PackId>) {
         let mut repo = self.open(&self.config);
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
+        commands::util::with_exclusive_session(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
             for p in packs {
                 assert!(repo.chunk_index_mut().remove_by_pack(p) > 0);

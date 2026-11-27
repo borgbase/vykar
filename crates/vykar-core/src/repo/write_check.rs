@@ -1,21 +1,24 @@
-//! A storage wrapper that runs a check before every write it forwards
-//! (10-single-protocol step 6: the v2/v3 upgrade's legacy lock key,
-//! `upgrade::LegacyUpgradeLock`; step 8 reuses it for exclusive sessions).
+//! A storage wrapper that runs a check before every write it forwards: the
+//! storage of every exclusive session (`check --repair`, `vykar upgrade`,
+//! pack maps; 10-single-protocol step 8, `commands::util::with_exclusive_session`),
+//! whose check on a v2/v3 upgrade also runs the legacy lock key's
+//! (`upgrade::LegacyUpgradeLock`, step 6).
 //!
 //! Checked: `put`, `delete`, `create_dir`, `put_owned`, `put_pack`,
-//! `remove_stale_temp_files`, a staged put's `commit` and
-//! `batch_delete().delete_keys`. Not checked: reads, a staged put's
-//! `append` (nothing is visible before `commit`), put-if-absent writes
-//! through `conditional()` (in the upgrade only the init-time check's probes
-//! under `sessions/`) and `server_ops()` (the upgrade uses only its reads).
+//! `remove_stale_temp_files`, a staged put's `commit`,
+//! `batch_delete().delete_keys` and `conditional().put_if_absent`. Not
+//! checked: reads, a staged put's `append` (nothing is visible before
+//! `commit`), `conditional().verify` and `verify_at_init` (they write only
+//! probe keys under `sessions/vykar-probe-*`), and `server_ops()` (no
+//! exclusive run uses a server-side write: repack is compact's).
 
 use std::sync::Arc;
 
 use vykar_storage::{
-    BackendProfile, BatchDelete, BatchDeleteScope, ConditionalWrite, InnerBackend, PackData,
-    StagedPut, StorageBackend, delegate_storage_backend,
+    BackendProfile, BatchDelete, BatchDeleteScope, ConditionalSupport, ConditionalWrite, Created,
+    InnerBackend, PackData, StagedPut, StorageBackend, delegate_storage_backend,
 };
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 
 use super::writer::FenceFn;
 
@@ -83,11 +86,10 @@ delegate_storage_backend! {
         self.inner.remove_stale_temp_files(older_than)
     }
 
-    // Forwarded unchecked: returning `None` would make the init-time check
-    // record single-writer. TODO(10-single-protocol step 8): check these
-    // too once exclusive sessions use this wrapper beside conditional heads.
+    // Offered when the inner backend offers it: `None` would make the
+    // init-time check record single-writer.
     fn conditional(&self) -> Option<&dyn ConditionalWrite> {
-        self.inner.conditional()
+        self.inner.conditional().map(|_| self as &dyn ConditionalWrite)
     }
 
     fn batch_delete(&self) -> Option<&dyn BatchDelete> {
@@ -107,6 +109,35 @@ impl BatchDelete for WriteChecked {
             Some(batch) => batch.delete_keys(keys, scope),
             // The inner backend stopped offering its batch API.
             None => keys.iter().try_for_each(|k| self.inner.delete(k)),
+        }
+    }
+}
+
+impl ConditionalWrite for WriteChecked {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+        (self.check)()?;
+        match self.inner.conditional() {
+            Some(c) => c.put_if_absent(key, data),
+            // The inner backend stopped offering it (as `batch_delete` above).
+            None => Err(VykarError::UnsupportedBackend("put-if-absent".into())),
+        }
+    }
+
+    // Forwarded unchecked: they write only probe keys under
+    // `sessions/vykar-probe-*`, which no reader takes for data and the reaper
+    // removes once an hour old; checking them would turn a lost marker into
+    // an "undecided" check (`Other`) instead of `MarkerLostDuringCommit`.
+    fn verify(&self) -> Result<ConditionalSupport> {
+        match self.inner.conditional() {
+            Some(c) => c.verify(),
+            None => Err(VykarError::UnsupportedBackend("put-if-absent".into())),
+        }
+    }
+
+    fn verify_at_init(&self) -> Result<ConditionalSupport> {
+        match self.inner.conditional() {
+            Some(c) => c.verify_at_init(),
+            None => Err(VykarError::UnsupportedBackend("put-if-absent".into())),
         }
     }
 }
@@ -142,6 +173,8 @@ mod tests {
     struct Inner {
         mem: MemoryBackend,
         log: Arc<Mutex<Vec<String>>>,
+        /// Whether `conditional()` offers the map-based put-if-absent.
+        offers_conditional: bool,
     }
 
     impl Inner {
@@ -236,7 +269,7 @@ mod tests {
             self.0.mem.remove_stale_temp_files(older_than)
         }
         fn conditional(&self) -> Option<&dyn ConditionalWrite> {
-            None
+            self.0.offers_conditional.then_some(self as &dyn ConditionalWrite)
         }
         fn batch_delete(&self) -> Option<&dyn BatchDelete> {
             Some(self)
@@ -249,6 +282,27 @@ mod tests {
                 staged_put: true,
                 ..self.0.mem.profile()
             }
+        }
+    }
+
+    /// A trivial put-if-absent over the memory map (not atomic; the tests
+    /// are sequential).
+    impl ConditionalWrite for Shared {
+        fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+            self.0.note("put_if_absent", key);
+            if self.0.mem.exists(key)? {
+                return Ok(Created::AlreadyExists);
+            }
+            self.0.mem.put(key, data)?;
+            Ok(Created::Yes)
+        }
+        fn verify(&self) -> Result<ConditionalSupport> {
+            self.0.note("verify", "");
+            Ok(ConditionalSupport::Verified)
+        }
+        fn verify_at_init(&self) -> Result<ConditionalSupport> {
+            self.0.note("verify_at_init", "");
+            Ok(ConditionalSupport::Verified)
         }
     }
 
@@ -268,10 +322,15 @@ mod tests {
 
     impl Rig {
         fn new() -> Self {
+            Self::offering_conditional(true)
+        }
+
+        fn offering_conditional(offers_conditional: bool) -> Self {
             let log = Arc::new(Mutex::new(Vec::new()));
             let inner = Arc::new(Shared(Arc::new(Inner {
                 mem: MemoryBackend::new(),
                 log: Arc::clone(&log),
+                offers_conditional,
             })));
             let checks = Arc::new(AtomicUsize::new(0));
             let fail = Arc::new(AtomicBool::new(false));
@@ -344,6 +403,16 @@ mod tests {
                 },
                 "delete_keys k",
             ),
+            (
+                "put_if_absent",
+                |s| {
+                    s.conditional()
+                        .unwrap()
+                        .put_if_absent("k", b"v")
+                        .map(|_| ())
+                },
+                "put_if_absent k",
+            ),
         ]
     }
 
@@ -401,9 +470,29 @@ mod tests {
     }
 
     #[test]
-    fn conditional_and_profile_are_the_inner_backends() {
+    fn the_conditional_checks_are_forwarded_unchecked() {
         let rig = Rig::new();
+        let c = rig
+            .checked
+            .conditional()
+            .expect("offered by the inner backend");
+        assert!(matches!(c.verify(), Ok(ConditionalSupport::Verified)));
+        assert!(matches!(
+            c.verify_at_init(),
+            Ok(ConditionalSupport::Verified)
+        ));
+        assert_eq!(rig.checks.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rig.take_log(),
+            vec!["verify ".to_string(), "verify_at_init ".to_string()]
+        );
+    }
+
+    #[test]
+    fn conditional_and_profile_are_the_inner_backends() {
+        let rig = Rig::offering_conditional(false);
         assert!(rig.checked.conditional().is_none());
+        assert!(Rig::new().checked.conditional().is_some());
         assert!(rig.checked.profile().staged_put);
         // A backend with put-if-absent keeps offering it.
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());

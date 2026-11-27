@@ -1160,7 +1160,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 &CancelToken::new(),
             )
             .unwrap();
-            crate::commands::util::with_maintenance_lock(&mut repo, |repo| {
+            crate::commands::util::with_exclusive_session(&mut repo, |repo| {
                 repo.request_full_index_fold();
                 repo.mark_index_dirty();
                 repo.save_state()

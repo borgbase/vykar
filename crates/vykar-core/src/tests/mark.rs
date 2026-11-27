@@ -237,7 +237,7 @@ impl Fx {
     /// Edit the index under the maintenance lock and persist it.
     pub(super) fn edit_index(&self, f: impl FnOnce(&mut Repo)) {
         let mut repo = self.open();
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
+        commands::util::with_exclusive_session(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
             f(repo);
             repo.save_state()
@@ -1998,7 +1998,7 @@ fn compact_dry_run_reports_the_sweep_and_writes_nothing() {
 fn compact_deletes_the_maps_of_deleted_packs() {
     let fx = two_disjoint_snapshots();
     let mut repo = fx.open();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         repo.write_pack_maps_grouped(None, 1, &CancelToken::new())
             .map(|_| ())
@@ -2074,7 +2074,7 @@ fn compact_collects_old_heads_and_unnamed_objects() {
     let fx = two_snapshots();
     let mut repo = fx.open();
     for _ in 0..20u32 {
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
+        commands::util::with_exclusive_session(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
             // No edit: a requested (full) fold makes each round a head.
             repo.mark_index_dirty();

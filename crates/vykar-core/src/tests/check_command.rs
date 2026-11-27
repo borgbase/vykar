@@ -1318,8 +1318,9 @@ fn listing_reports_incompatible_envelope_as_hidden() {
 }
 
 /// Collect every file under `root` as repo-relative paths, excluding the
-/// transient `locks/` directory (the maintenance lock writes/removes its own
-/// lock file during a repair attempt). Sorted for stable comparison.
+/// `locks/` directory (written by no command since 10-single-protocol
+/// step 8: a repair attempt registers an exclusive session, whose
+/// `sessions/x-*` marker it removes again). Sorted for stable comparison.
 fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
     fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {

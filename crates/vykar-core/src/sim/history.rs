@@ -139,6 +139,10 @@ pub struct RunRecord {
     /// 10-single-protocol step 7 every backup that marked its session and
     /// every maintenance session run, on either mode.
     pub lock_free: bool,
+    /// The run registered an exclusive session (10-single-protocol step 8):
+    /// invariant 7 judges it against its `x-` marker as a hold. Never
+    /// `lock_free`.
+    pub exclusive: bool,
 }
 
 impl RunRecord {

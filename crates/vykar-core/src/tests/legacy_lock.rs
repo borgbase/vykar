@@ -218,7 +218,6 @@ fn acquire_writes_a_0_24_lock() {
         None,
         &|_| true,
     ));
-    assert!(lock.store_time().is_some());
     lock.release().unwrap();
     assert!(lock_keys(&*storage).is_empty());
 }

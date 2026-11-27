@@ -1920,7 +1920,8 @@ fn orphans_inside_a_live_horizon_are_kept() {
 /// reads the head, then lists the snapshots (the mark). Since
 /// 10-single-protocol step 7 compact runs in a session on a single-writer
 /// repository too: the order is counted from its single-writer check (a
-/// separate, earlier listing of `sessions/`, after the registration).
+/// separate, earlier listing of `sessions/`, after the registration's
+/// own listing of `sessions/`, step 8).
 #[test]
 fn compact_lists_packs_before_sessions_and_head() {
     use crate::sim::Sim;
@@ -1933,7 +1934,10 @@ fn compact_lists_packs_before_sessions_and_head() {
     let recs = crate::tests::commit_op_order::run_records(&sim, &r, false);
     let check = recs
         .iter()
-        .position(|r| !r.op.is_write() && r.key == "sessions/")
+        .enumerate()
+        .filter(|(_, r)| !r.op.is_write() && r.key == "sessions/")
+        .nth(1)
+        .map(|(i, _)| i)
         .expect("the single-writer check's listing");
     let first = |prefix: &str| {
         recs.iter()

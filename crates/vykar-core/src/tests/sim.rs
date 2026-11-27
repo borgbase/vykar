@@ -392,14 +392,20 @@ fn crash_then_break_lock_then_backup() {
     // The crash hit the lock PUT itself, so no lock was written.
     assert!(sim.store().keys("locks/").is_empty());
 
-    // A planted lock that never ages out: the backup's registration probe
-    // retries on virtual time and gives up with Locked.
-    sim.tamper_put("locks/planted.json", b"{}");
+    // A planted exclusive session marker that is not refreshed: the
+    // backup's registration listing retries on virtual time and gives up
+    // with Locked (10-single-protocol step 8; a planted lock before).
+    plant_exclusive_marker(&mut sim, "hostp", 4242, None);
     let (virt, real) = (sim.time().elapsed(), Instant::now());
     let r = sim.backup(b, "t1", &tree("t1"));
     assert_eq!(
         r.error_class(),
         Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    assert!(
+        r.detail().contains("exclusive maintenance run"),
         "{}",
         r.detail()
     );
@@ -416,31 +422,73 @@ fn crash_then_break_lock_then_backup() {
     );
 
     sim.break_lock(b, true).expect_ok();
+    assert!(exclusive_keys(&sim).is_empty());
     // The failed backup used up its name.
     sim.backup(b, "t2", &tree("t2")).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
-/// A fault that crashes `c` on its first delete of a lock key: its lock
-/// release, so the lock stays behind.
-fn crash_on_lock_release(sim: &Sim, c: ClientId) {
-    sim.fault(FaultRule::new(OpMatch::AnyDelete, KeyMatch::LockKey, FaultAction::Crash).client(c));
+/// Plant (tamper) an exclusive session's marker written now by `hostname`
+/// and `pid`; `installation_id` `None`: the body of a writer before
+/// installation IDs. Returns its key.
+fn plant_exclusive_marker(
+    sim: &mut Sim,
+    hostname: &str,
+    pid: u32,
+    installation_id: Option<&str>,
+) -> String {
+    let now = sim.time().now_utc().to_rfc3339();
+    let mut body = serde_json::json!({
+        "hostname": hostname,
+        "pid": pid,
+        "registered_at": now,
+        "last_refresh": now,
+        "boot_id": "boot1",
+    });
+    if let Some(id) = installation_id {
+        body["installation_id"] = id.into();
+    }
+    let key = format!("sessions/x-{:032x}.json", 0x5eed_u128);
+    sim.tamper_put(&key, &serde_json::to_vec(&body).unwrap());
+    key
 }
 
-/// `c` takes the lock and crashes releasing it.
-fn hold_lock_and_crash(sim: &mut Sim, c: ClientId) {
-    crash_on_lock_release(sim, c);
+/// The exclusive sessions' marker keys (`sessions/x-*.json`).
+fn exclusive_keys(sim: &Sim) -> Vec<String> {
+    sim.store()
+        .keys("sessions/x-")
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .collect()
+}
+
+/// `c` runs an exclusive session (`Sim::custom`, 10-single-protocol step
+/// 8: what `check --repair`, upgrade and pack maps run as) and crashes
+/// deregistering it, so its marker stays. Before step 8 `c` took the lock
+/// and crashed releasing it; the backups these tests block no longer look
+/// at `locks/`.
+fn hold_exclusive_and_crash(sim: &mut Sim, c: ClientId) {
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyDelete,
+            KeyMatch::Prefix("sessions/x-".into()),
+            FaultAction::Crash,
+        )
+        .client(c),
+    );
     sim.custom(c, "hold", |_| Ok(()));
     assert!(sim.store().is_crashed(c));
-    assert_eq!(sim.store().keys("locks/").len(), 1);
+    assert_eq!(exclusive_keys(sim).len(), 1);
 }
 
+/// 45 min after its last refresh (by the store's clock) a crashed exclusive
+/// session no longer blocks a backup on another machine.
 #[test]
-fn crashed_lock_holder_ages_out() {
+fn crashed_exclusive_holder_ages_out() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    hold_lock_and_crash(&mut sim, a);
+    hold_exclusive_and_crash(&mut sim, a);
 
     // Another machine cannot tell the holder is dead.
     let r = sim.backup(b, "t1", &tree("t1"));
@@ -450,21 +498,24 @@ fn crashed_lock_holder_ages_out() {
         "{}",
         r.detail()
     );
+    sim.advance(Duration::from_secs(40 * 60));
+    let r = sim.backup(b, "t2", &tree("t2"));
+    assert!(allowed_as(&r, AllowedError::Locked), "{}", r.detail());
 
-    sim.advance(Duration::from_secs(6 * 3600 + 60));
-    sim.backup(b, "t2", &tree("t2")).expect_ok();
-    assert!(sim.store().keys("locks/").is_empty());
+    sim.advance(Duration::from_secs(6 * 60));
+    sim.backup(b, "t3", &tree("t3")).expect_ok();
+    assert!(exclusive_keys(&sim).is_empty());
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
 #[test]
-fn same_machine_reaps_dead_holder_at_once() {
+fn same_machine_reaps_dead_exclusive_holder_at_once() {
     let mut sim = Sim::new();
     let a = sim.client_on("a", "hostx", Some("boot1"));
     let c = sim.client_on("c", "hostx", Some("boot1"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    hold_lock_and_crash(&mut sim, a);
-    let held = sim.store().keys("locks/");
+    hold_exclusive_and_crash(&mut sim, a);
+    let held = exclusive_keys(&sim);
 
     sim.backup(c, "t1", &tree("t1")).expect_ok();
     for key in &held {
@@ -474,14 +525,15 @@ fn same_machine_reaps_dead_holder_at_once() {
 }
 
 /// A clone of hostx's installation (same hostname, other boot ID, booted
-/// long before) cannot tell a's lock from a live one: it waits for its age.
+/// long before) cannot tell a's exclusive marker from a live one: it waits
+/// for its age.
 #[test]
-fn clone_keeps_lock_until_stale() {
+fn clone_keeps_exclusive_marker_until_stale() {
     let mut sim = Sim::new();
     let a = sim.client_on("a", "hostx", Some("boot1"));
     let d = sim.client_on("d", "hostx", Some("boot2"));
     sim.backup(d, "t0", &tree("t0")).expect_ok();
-    hold_lock_and_crash(&mut sim, a);
+    hold_exclusive_and_crash(&mut sim, a);
 
     let r = sim.backup(d, "t1", &tree("t1"));
     assert_eq!(
@@ -490,23 +542,23 @@ fn clone_keeps_lock_until_stale() {
         "{}",
         r.detail()
     );
-    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.advance(Duration::from_secs(46 * 60));
     sim.backup(d, "t2", &tree("t2")).expect_ok();
-    assert!(sim.store().keys("locks/").is_empty());
+    assert!(exclusive_keys(&sim).is_empty());
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
-/// hostx rebooted: its new boot reaps the lock of the earlier boot once
-/// the lock is older than the uptime; a clone that booted long ago does
-/// not.
+/// hostx rebooted: its new boot reaps the exclusive marker of the earlier
+/// boot once the marker is older than the uptime; a clone that booted long
+/// ago does not.
 #[test]
-fn rebooted_machine_reaps_lock_of_earlier_boot() {
+fn rebooted_machine_reaps_exclusive_marker_of_earlier_boot() {
     let mut sim = Sim::new();
     let a = sim.client_on("a", "hostx", Some("boot1"));
     let clone = sim.client_on("clone", "hostx", Some("boot3"));
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    hold_lock_and_crash(&mut sim, a);
+    hold_exclusive_and_crash(&mut sim, a);
     sim.advance(Duration::from_secs(10 * 60));
     let booted = chrono::Duration::from_std(sim.time().elapsed()).unwrap();
     let d = sim.client_at(
@@ -523,7 +575,7 @@ fn rebooted_machine_reaps_lock_of_earlier_boot() {
         r.detail()
     );
     sim.backup(d, "t2", &tree("t2")).expect_ok();
-    assert!(sim.store().keys("locks/").is_empty());
+    assert!(exclusive_keys(&sim).is_empty());
     sim.check_invariants(Invariant::STEP1).assert_clean();
 }
 
@@ -552,20 +604,16 @@ fn containers_sharing_a_hostname_reap_by_age_only() {
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
-/// A lock in the format of 0.24 and older (no installation ID) from c's
-/// own hostname and boot, with a dead PID, is judged by age only.
+/// An exclusive marker in the format of a writer before installation IDs
+/// from c's own hostname and boot, with a dead PID, is judged by age only
+/// (a 0.24-format lock before 10-single-protocol step 8: a backup no longer
+/// looks at `locks/`).
 #[test]
-fn old_format_lock_from_same_hostname_waits_for_age() {
+fn old_format_marker_from_same_hostname_waits_for_age() {
     let mut sim = Sim::new();
     let c = sim.client_on("c", "hostx", Some("boot1"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    let body = serde_json::json!({
-        "hostname": "hostx",
-        "pid": 999_999,
-        "time": sim.time().now_utc().to_rfc3339(),
-        "boot_id": "boot1",
-    });
-    sim.tamper_put("locks/old-client.json", &serde_json::to_vec(&body).unwrap());
+    plant_exclusive_marker(&mut sim, "hostx", 999_999, None);
 
     let r = sim.backup(c, "t1", &tree("t1"));
     assert_eq!(
@@ -574,9 +622,9 @@ fn old_format_lock_from_same_hostname_waits_for_age() {
         "{}",
         r.detail()
     );
-    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.advance(Duration::from_secs(46 * 60));
     sim.backup(c, "t2", &tree("t2")).expect_ok();
-    assert!(sim.store().keys("locks/").is_empty());
+    assert!(exclusive_keys(&sim).is_empty());
 }
 
 /// `a`'s backup crashes on its first pack upload, leaving its session
@@ -608,8 +656,8 @@ fn crash_backup_leaving_marker(sim: &mut Sim, a: ClientId) -> String {
 }
 
 /// `a`'s backup crashes at its single-writer listing before its commit
-/// mark ([`before_mark`]; its commit lock's PUT until 10-single-protocol
-/// step 7), after every pack is uploaded, leaving its unflagged marker
+/// mark ([`before_mark`], its third listing of `sessions/`; its commit
+/// lock's PUT until 10-single-protocol step 7), after every pack is uploaded, leaving its unflagged marker
 /// behind. Returns the marker key and a's packs.
 fn crash_backup_after_upload(
     sim: &mut Sim,
@@ -623,7 +671,7 @@ fn crash_backup_after_upload(
             FaultAction::Crash,
         )
         .client(a)
-        .nth(2),
+        .nth(3),
     );
     let r = sim.backup(a, "x1", tree);
     assert!(allowed_as(&r, AllowedError::Injected), "{}", r.detail());
@@ -772,8 +820,8 @@ fn markers_carry_client_identity() {
     let a = sim.client_on("a", "hosta", Some("b1"));
     let b = sim.client("b");
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    hold_lock_and_crash(&mut sim, a);
-    let key = sim.store().keys("locks/").pop().unwrap();
+    hold_exclusive_and_crash(&mut sim, a);
+    let key = exclusive_keys(&sim).pop().unwrap();
     let entry: serde_json::Value =
         serde_json::from_slice(&sim.store().object(&key).unwrap().data).unwrap();
     let pid = sim.host(a).pid;
@@ -1095,8 +1143,10 @@ fn known_hazards_on_a_conditional_store() {
 
 // ── Scripted pause points (08 step 3) ───────────────────────────────────
 
+/// `c`'s second listing of `sessions/`: a backup's journal recovery at its
+/// open (the first is its registration's, 10-single-protocol step 8).
 fn sessions_list(c: ClientId) -> GateRule {
-    GateRule::new(c, OpMatch::AnyList, KeyMatch::Exact("sessions/".into()))
+    GateRule::new(c, OpMatch::AnyList, KeyMatch::Exact("sessions/".into())).nth(2)
 }
 
 fn backup_call(name: &str) -> Call {
@@ -1574,7 +1624,7 @@ fn backup_during_a_sweep_is_locked_out() {
                 OpMatch::Kind(OpKind::ListMeta),
                 KeyMatch::Exact("sessions/".into()),
             )
-            .nth(3),
+            .nth(4),
         );
         let sb = sim.spawn(b, backup_call("b1"));
         sim.expect_paused(gb, "b's second listing before its mark");
@@ -1882,11 +1932,7 @@ fn a_marker_key_that_stays_unchecked_commits_while_young() {
         sim.backup(c, "t0", &tree("t0")).expect_ok();
         let a = sim.client("a");
         // A's first main-thread operation after the heartbeat started.
-        let g_main = sim.gate(GateRule::new(
-            a,
-            OpMatch::AnyList,
-            KeyMatch::Exact("sessions/".into()),
-        ));
+        let g_main = sim.gate(sessions_list(a));
         let sa = sim.spawn(
             a,
             Call::Backup {
@@ -2000,11 +2046,11 @@ fn hours(h: i64) -> chrono::Duration {
     chrono::Duration::hours(h)
 }
 
-/// a's delete under the maintenance lock ([`Call::LockedDelete`]; a
-/// compact under the lock until 10-single-protocol step 7, when compact
-/// moved into a session) is held at its snapshot delete, holding the lock;
-/// b backs up with its wall clock skewed by `b_skew`, a's by `a_skew`.
-fn lock_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
+/// a's delete as an exclusive session ([`Call::ExclusiveDelete`]; under
+/// the maintenance lock until 10-single-protocol step 8) is held at its
+/// snapshot delete, its marker live; b backs up with its wall clock skewed
+/// by `b_skew`, a's by `a_skew`.
+fn exclusive_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
@@ -2017,7 +2063,7 @@ fn lock_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     ));
     let sa = sim.spawn(
         a,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t0".into()],
         },
     );
@@ -2057,11 +2103,12 @@ fn marker_reap_attempt(a_skew: chrono::Duration, b_skew: chrono::Duration) {
     sim.check_invariants(interleavings::CHECKED).assert_clean();
 }
 
-/// A client 7 h ahead no longer reaps a live lock (it was older than 6 h
-/// by that client's clock).
+/// A client 1 h ahead does not reap a live exclusive session's marker (it
+/// is older than 45 min by that client's clock; a live lock 7 h ahead
+/// before 10-single-protocol step 8).
 #[test]
-fn client_ahead_does_not_reap_a_live_lock() {
-    lock_reap_attempt(chrono::Duration::zero(), hours(7));
+fn client_ahead_does_not_reap_a_live_exclusive_marker() {
+    exclusive_reap_attempt(chrono::Duration::zero(), hours(1));
 }
 
 /// A client 1 h ahead no longer reaps a live marker.
@@ -2074,7 +2121,7 @@ fn client_ahead_does_not_reap_a_live_marker() {
 /// clocks; they are judged by their mtimes and not reaped early.
 #[test]
 fn client_behind_is_not_reaped_early() {
-    lock_reap_attempt(hours(-7), chrono::Duration::zero());
+    exclusive_reap_attempt(hours(-1), chrono::Duration::zero());
     marker_reap_attempt(hours(-1), chrono::Duration::zero());
 }
 
@@ -2343,14 +2390,15 @@ fn a_segment_that_repeats_an_old_object_reads_old() {
 }
 
 /// D17: a forward step of the store's clock ages every object at once, a
-/// live lock too: b's backup reaps a's lock after a 6 h 1 min step. The
-/// route H2 and H4 take; not a hazard of its own.
+/// live exclusive session's marker too: b's backup reaps a's marker after a
+/// 46 min step (a's lock after a 6 h 1 min step before 10-single-protocol
+/// step 8). The route H2 and H4 take; not a hazard of its own.
 #[test]
 fn a_store_clock_step_ages_every_object() {
     let mut sim = Sim::new();
     let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
     sim.backup(c, "t0", &tree("t0")).expect_ok();
-    // A lock holder (a compact until 10-single-protocol step 7).
+    // An exclusive holder (a lock holder until 10-single-protocol step 8).
     let ga = sim.gate(GateRule::new(
         a,
         OpMatch::AnyDelete,
@@ -2358,18 +2406,15 @@ fn a_store_clock_step_ages_every_object() {
     ));
     let sa = sim.spawn(
         a,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t0".into()],
         },
     );
     sim.expect_paused(ga, "a's snapshot delete");
-    let lock = sim
-        .store()
-        .keys_written_by(a, "locks/")
-        .into_iter()
-        .find(|k| k.ends_with(".json"))
-        .expect("a holds a lock");
-    sim.step_store_clock(chrono::Duration::seconds(6 * 3600 + 60));
+    let lock = exclusive_keys(&sim)
+        .pop()
+        .expect("a holds an exclusive marker");
+    sim.step_store_clock(chrono::Duration::seconds(46 * 60));
     let rb = sim.backup(b, "b1", &tree("b1"));
     assert!(sim.store().object(&lock).is_none(), "{:?}", rb.outcome);
     sim.resume(ga);
@@ -2677,8 +2722,9 @@ fn marker_of(sim: &Sim, a: ClientId) -> String {
 }
 
 /// `c`'s single-writer listing of `sessions/` before its commit mark
-/// (10-single-protocol step 7), after every pack is uploaded: its second
-/// listing, the first being the open's. The scripted tests held a backup
+/// (10-single-protocol step 7), after every pack is uploaded: its third
+/// listing, the first being its registration's (step 8), the second the
+/// open's. The scripted tests held a backup
 /// at its commit lock's stale-lock sweep (its second listing of `locks/`)
 /// before; both are the first op of its commit, unflagged, its marker live.
 fn before_mark(c: ClientId) -> GateRule {
@@ -2687,7 +2733,7 @@ fn before_mark(c: ClientId) -> GateRule {
         OpMatch::Kind(OpKind::ListMeta),
         KeyMatch::Exact("sessions/".into()),
     )
-    .nth(2)
+    .nth(3)
 }
 
 /// Spawn a's backup of `a1` and hold it at its single-writer listing

@@ -1,17 +1,18 @@
 //! Lock-free backups (04 step 9, phase F part 10c) on the simulator: two
-//! backups commit without a lock; a backup waits for a held lock and a
-//! lock holder yields to a committing backup (the marker handshake); a
-//! crashed committing marker blocks lock holders until it is stale. Lock
-//! holders list sessions only after their lock is confirmed; a marker
+//! backups commit without a lock; a backup waits for a live exclusive
+//! session at its pre-head listing and an exclusive session refuses beside a
+//! committing backup; a crashed committing marker blocks exclusive sessions
+//! until it is stale. Exclusive sessions list `sessions/` only after their
+//! marker PUT; a marker
 //! reaped by age beside its refresh, an undecided put-if-absent check and a
 //! cancel during the wait each fail the backup as they should. A backup
 //! whose marker record has a gap before its commit commits lock-free after
 //! the suspend rule.
 //!
-//! Since 10-single-protocol step 7 no backup or compact takes the lock: the
-//! lock holders here hold the maintenance lock as `check --repair`, upgrade
-//! and pack maps do until step 9 (`Call::LockedCustom`,
-//! `Call::LockedDelete`). `a_locked_compact_fails_locked_beside_a_committing_backup`
+//! Since 10-single-protocol step 7 no backup or compact takes the lock, and
+//! since step 8 no command does: the holders here are exclusive sessions
+//! (`Call::ExclusiveCustom`, `Call::ExclusiveDelete`), as `check --repair`,
+//! upgrade and pack maps run. `a_locked_compact_fails_locked_beside_a_committing_backup`
 //! moved to `tests::single_writer` (a single-writer compact), and
 //! `a_backup_with_a_gap_yields_to_a_committing_backup` became
 //! `tests::single_writer::a_gap_backup_commits_beside_a_committing_backup`.
@@ -80,18 +81,18 @@ fn snapshot_put(c: ClientId) -> GateRule {
     )
 }
 
-/// `c`'s `n`th listing of `locks/`.
-fn locks_listing(c: ClientId, n: u32) -> GateRule {
-    GateRule::new(c, OpMatch::AnyList, KeyMatch::LockKey).nth(n)
+/// `c`'s `n`th listing of `sessions/`.
+fn sessions_listing(c: ClientId, n: u32) -> GateRule {
+    GateRule::new(c, OpMatch::AnyList, KeyMatch::Exact("sessions/".into())).nth(n)
 }
 
-/// A lock holder that writes a head: a fold under the maintenance lock
-/// ([`Call::LockedCustom`]), as `check --repair`, upgrade and pack maps
-/// hold the lock until 10-single-protocol step 9 (lock-mode backups, the
-/// holders here before step 7, exist no more).
-fn locked_fold() -> Call {
-    Call::LockedCustom {
-        label: "locked fold".into(),
+/// An exclusive session that writes a head: a fold
+/// ([`Call::ExclusiveCustom`]), as `check --repair`, upgrade and pack maps
+/// run since 10-single-protocol step 8 (a fold under the maintenance lock
+/// before).
+fn exclusive_fold() -> Call {
+    Call::ExclusiveCustom {
+        label: "exclusive fold".into(),
         f: Box::new(|repo| {
             repo.load_chunk_index_under_lock()?;
             repo.request_index_fold();
@@ -101,14 +102,14 @@ fn locked_fold() -> Call {
     }
 }
 
-/// A lock holder that deletes snapshot `name` ([`Call::LockedDelete`]).
-fn locked_delete(name: &str) -> Call {
-    Call::LockedDelete {
+/// An exclusive session that deletes snapshot `name` ([`Call::ExclusiveDelete`]).
+fn exclusive_delete(name: &str) -> Call {
+    Call::ExclusiveDelete {
         names: vec![name.into()],
     }
 }
 
-/// `c`'s snapshot delete: a [`locked_delete`] holds its lock there.
+/// `c`'s snapshot delete: an [`exclusive_delete`] holds its session there.
 fn snapshot_delete(c: ClientId) -> GateRule {
     GateRule::new(c, OpMatch::AnyDelete, KeyMatch::Prefix("snapshots/".into()))
 }
@@ -123,19 +124,44 @@ fn commit_mark(c: ClientId) -> GateRule {
     .filter(|_, k| k.ends_with(".1.json"))
 }
 
-/// The first lock key `c` wrote in `log` and the step its run released it.
-fn first_lock(log: &[OpRecord], c: ClientId) -> (OpRecord, u64) {
+/// Whether `key` is an exclusive session's marker key.
+fn is_exclusive_key(key: &str) -> bool {
+    key.starts_with("sessions/x-") && key.ends_with(".json")
+}
+
+/// The first exclusive marker key `c` wrote in `log` and the step its run
+/// deleted it.
+fn first_exclusive(log: &[OpRecord], c: ClientId) -> (OpRecord, u64) {
     let put = log
         .iter()
-        .find(|r| r.client == c && r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
-        .expect("a lock key written")
+        .find(|r| r.client == c && r.op == OpKind::Put && is_exclusive_key(&r.key))
+        .expect("an exclusive marker written")
         .clone();
     let released = log
         .iter()
         .find(|r| r.client == c && r.step > put.step && r.op.is_delete() && r.key == put.key)
-        .expect("the lock released")
+        .expect("the marker deleted")
         .step;
     (put, released)
+}
+
+/// Delete every marker key of `c` (tamper): a reaper that misjudged its
+/// session (I3), so an exclusive session can register beside it.
+fn reap_markers_of(sim: &mut Sim, c: ClientId) {
+    for key in sim.store().keys_written_by(c, "sessions/") {
+        if key.ends_with(".json") && sim.store().object(&key).is_some() {
+            sim.tamper_delete(&key);
+        }
+    }
+}
+
+fn expect_active_sessions(run: &crate::sim::RunRecord) {
+    assert_eq!(
+        run.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
+        "{}",
+        run.detail()
+    );
 }
 
 fn expect_locked(run: &crate::sim::RunRecord) {
@@ -183,73 +209,83 @@ fn two_lock_free_backups_commit_without_a_lock() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// The handshake, the session side: a backup (lock-free on a multi-writer
-/// repository, single-writer on the fallback store) that meets a held lock
-/// at its probe waits (its marker flagged) and creates no head until the
-/// holder released it, then commits. The holder deletes under the
-/// maintenance lock (a lock-mode backup until 10-single-protocol step 7).
+/// The pre-head listing (10-single-protocol step 8; the handshake's
+/// session side before): a backup whose marker was reaped (a misjudging
+/// reaper, I3) while it was at its commit mark lets an exclusive session
+/// register; at its pre-head listing it finds that session live
+/// (`Locked`), waits with its mark kept and creates no head while the
+/// exclusive marker exists; once the session ended it goes on (the suspend
+/// rule: its record shows the miss) and ends Ok or with an allowed error.
+/// The exclusive session deletes (a delete under the maintenance lock
+/// before step 8, a lock-mode backup before step 7).
 #[test]
-fn a_lock_free_commit_waits_for_a_held_lock() {
-    for kind in [StoreKind::Conditional, StoreKind::Plain] {
+fn a_commit_waits_for_a_live_exclusive_session() {
+    // The retry of the pre-head listing: multi-writer, the listings are the
+    // registration's, the open's, the pre-head one (Locked) and its retry;
+    // single-writer, two more (before and after the mark), and the retry
+    // lists after the mark first.
+    for (kind, retry) in [(StoreKind::Conditional, 4), (StoreKind::Plain, 6)] {
         let mut sim = encrypted(kind);
         let (f, l) = (sim.client("f"), sim.client("l"));
         sim.backup(l, "l0", &tree("l0")).expect_ok();
-        // F's listings of locks/: its registration probe, the probe after
-        // its mark (finds L's lock), the probe after one backoff.
-        let f_retry = sim.gate(locks_listing(f, 3));
+        let f_retry = sim.gate(sessions_listing(f, retry));
         let f_mark = sim.gate(commit_mark(f));
         let rf = sim.spawn(f, backup_call("f1"));
         sim.expect_paused(f_mark, "f's commit mark");
+        reap_markers_of(&mut sim, f);
         let l_held = sim.gate(snapshot_delete(l));
-        let rl = sim.spawn(l, locked_delete("l0"));
-        sim.expect_paused(l_held, "l's snapshot delete under its lock");
+        let rl = sim.spawn(l, exclusive_delete("l0"));
+        sim.expect_paused(l_held, "l's snapshot delete in its exclusive session");
         sim.resume(f_mark);
-        sim.expect_paused(f_retry, "f's second probe");
+        sim.expect_paused(f_retry, "f's retry of its pre-head listing");
         let log = sim.store().log();
         assert!(
             !log.iter()
                 .any(|r| r.client == f && r.op.is_write() && r.key.starts_with("index.h/")),
-            "{kind:?}: f created a head while l held the lock"
+            "{kind:?}: f created a head while l's exclusive session was live"
         );
         sim.resume(l_held);
         let rl = sim.join(rl);
         rl.expect_ok();
-        assert!(!rl.lock_free);
+        assert!(!rl.lock_free && rl.exclusive);
         sim.resume(f_retry);
         let rf = sim.join(rf);
-        rf.expect_ok();
-        assert!(rf.lock_free);
-        sim.check_invariants(Invariant::STEP8).assert_clean();
+        assert!(
+            rf.is_ok() || matches!(rf.error_class(), Some(ErrorClass::Allowed(_))),
+            "{kind:?}: {}",
+            rf.detail()
+        );
+        let set = if kind.records_multi_writer() {
+            Invariant::STEP8
+        } else {
+            Invariant::STEP7
+        };
+        sim.check_invariants(set).assert_clean();
     }
 }
 
-/// The handshake, lock-holder side: a holder of the maintenance lock that
-/// writes a head ([`locked_fold`]) and acquires the lock while a backup is
-/// between its head create and its snapshot PUT refuses (`Locked`) and
-/// releases the lock before any protected write; run again after the
-/// backup ended it writes its head. No head is replaced on a store whose
-/// plain PUT overwrites (invariant 12 clean on the multi-writer one). Until
-/// 10-single-protocol step 7 the holder was a lock-mode backup, which
-/// waited and retried instead of refusing.
+/// An exclusive session (a head writer, [`exclusive_fold`]) started while a
+/// backup is between its head create and its snapshot PUT refuses
+/// (`ActiveSessions`) and writes nothing; run again after the backup ended
+/// it writes its head. No head is replaced on a store whose plain PUT
+/// overwrites (invariant 12 clean on the multi-writer one). Until
+/// 10-single-protocol step 8 the holder took the lock and yielded with
+/// `Locked` (a lock-mode backup that waited before step 7).
 #[test]
-fn a_lock_holder_yields_to_a_committing_backup() {
+fn an_exclusive_session_refuses_beside_a_committing_backup() {
     for kind in [StoreKind::ConditionalOverwrite, StoreKind::Plain] {
         let mut sim = encrypted(kind);
         let (f, l) = (sim.client("f"), sim.client("l"));
         let f_snap = sim.gate(snapshot_put(f));
         let rf = sim.spawn(f, backup_call("f1"));
         sim.expect_paused(f_snap, "f before its snapshot PUT");
-        let rl = sim.call(l, locked_fold());
-        expect_locked(&rl);
-        let log = sim.store().log();
-        let (first_put, released) = first_lock(&log, l);
+        let rl = sim.call(l, exclusive_fold());
+        expect_active_sessions(&rl);
         assert!(
-            !log.iter().any(|r| r.client == l
-                && r.step > first_put.step
-                && r.step < released
-                && r.op.is_write()
-                && is_protected(&r.key)),
-            "{kind:?}: l wrote under a lock it should have yielded"
+            !records(&sim, l, rl.index)
+                .iter()
+                .any(|r| r.op.is_write() && is_protected(&r.key)),
+            "{kind:?}: l wrote beside the committing backup"
         );
         sim.resume(f_snap);
         let rf = sim.join(rf);
@@ -258,14 +294,14 @@ fn a_lock_holder_yields_to_a_committing_backup() {
         // The segments old enough to fold (04 step 7), so the fold writes a
         // head.
         sim.advance(crate::repo::ages::T_PACK + std::time::Duration::from_secs(60));
-        let rl = sim.call(l, locked_fold());
+        let rl = sim.call(l, exclusive_fold());
         rl.expect_ok();
         assert!(!rl.lock_free);
         assert!(
             records(&sim, l, rl.index)
                 .iter()
                 .any(|r| r.op.is_write() && r.applied() && r.key.starts_with("index.h/")),
-            "{kind:?}: the holder wrote no head"
+            "{kind:?}: the exclusive session wrote no head"
         );
         assert!(sim.store().head_overwrites().is_empty(), "{kind:?}");
         sim.restore(f, "f1").expect_ok();
@@ -278,13 +314,13 @@ fn a_lock_holder_yields_to_a_committing_backup() {
     }
 }
 
-/// A backup that crashed after its commit mark leaves a flagged marker:
-/// lock holders yield to it (`Locked`) until it is stale (45 min on the
-/// store's clock), and so does a single-writer compact (its single-writer
-/// check); then they reap it and proceed. Nothing is wedged. Since
-/// 10-single-protocol step 7 on a single-writer repository (the fallback
-/// store), its holders the maintenance lock's ([`locked_fold`]) and a
-/// compact (lock-mode clients' lock and compact before).
+/// A backup that crashed after its commit mark leaves a flagged marker: an
+/// exclusive session refuses beside it (`ActiveSessions`) until it is stale
+/// (45 min on the store's clock), and so does a single-writer compact
+/// (`Locked`, its single-writer check); then they reap it and proceed.
+/// Nothing is wedged. On a single-writer repository (the fallback store);
+/// the first holder took the maintenance lock and yielded `Locked` before
+/// 10-single-protocol step 8.
 #[test]
 fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
     let mut sim = encrypted(StoreKind::Plain);
@@ -309,68 +345,47 @@ fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
             String::from_utf8_lossy(&body).contains("\"committing\":true")
         });
     assert!(flagged, "the crashed backup's marker stays flagged");
-    expect_locked(&sim.call(l, locked_fold()));
+    expect_active_sessions(&sim.call(l, exclusive_fold()));
     expect_locked(&sim.compact(c));
     sim.advance(std::time::Duration::from_secs(46 * 60));
-    sim.call(l, locked_fold()).expect_ok();
+    sim.call(l, exclusive_fold()).expect_ok();
     sim.compact(c).expect_ok();
     sim.backup(l, "l1", &tree("l1")).expect_ok();
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
-/// Every op of `c`'s run `run` on a lock key or a listing of `locks/` or
-/// `sessions/`, in order.
-fn lock_ops(sim: &Sim, c: ClientId, run: usize) -> Vec<OpRecord> {
-    records(sim, c, run)
-        .into_iter()
-        .filter(|r| {
-            KeyMatch::LockKey.matches(&r.key)
-                || (OpMatch::AnyList.matches(r.op) && (r.key == "locks/" || r.key == "sessions/"))
-        })
-        .collect()
-}
-
-/// The lock holder's order (04 step 9, the marker handshake): the
-/// listing of `sessions/` that judges the lock it holds comes after that
-/// lock's PUT and after the `locks/` listing that confirmed it, and before
-/// any protected write under it. `released`: the step at which that lock
-/// was deleted (`None`: held to the end of the run). Returns the step of
-/// the session listing.
-fn assert_lists_sessions_after_its_confirmed_lock(
+/// The exclusive registration's order (10-single-protocol step 8, X1): its
+/// listing of `sessions/` (the first op of the run on `sessions/` after
+/// its marker PUT) comes after that PUT, before the marker's delete, and
+/// before any protected write. `released`: the step at which the marker
+/// was deleted (`None`: not deleted in the run). Returns the step of the
+/// listing.
+fn assert_lists_sessions_after_its_marker(
     sim: &Sim,
     c: ClientId,
     run: usize,
-    lock_put: &OpRecord,
+    put: &OpRecord,
     released: Option<u64>,
 ) -> u64 {
-    let ops = lock_ops(sim, c, run);
-    let confirm = ops
+    let recs = records(sim, c, run);
+    let listing = recs
         .iter()
-        .find(|r| r.step > lock_put.step && OpMatch::AnyList.matches(r.op) && r.key == "locks/")
-        .unwrap_or_else(|| panic!("no locks/ listing after the lock PUT: {ops:?}"));
-    let end = released.unwrap_or(u64::MAX);
-    // The listing judged under this lock: the first one after its PUT. It
-    // must follow the confirming listing and precede the release.
-    let listing = ops
-        .iter()
-        .find(|r| r.step > lock_put.step && OpMatch::AnyList.matches(r.op) && r.key == "sessions/")
-        .unwrap_or_else(|| panic!("no sessions/ listing after the lock PUT: {ops:?}"));
+        .find(|r| r.step > put.step && OpMatch::AnyList.matches(r.op) && r.key == "sessions/")
+        .unwrap_or_else(|| panic!("no sessions/ listing after the marker PUT: {recs:?}"));
     assert!(
-        listing.step > confirm.step,
-        "sessions/ listed at {} before the lock PUT at {} was confirmed at {}: {ops:?}",
-        listing.step,
-        lock_put.step,
-        confirm.step
+        listing.step < released.unwrap_or(u64::MAX),
+        "the listing after the marker PUT at {} came after its delete: {recs:?}",
+        put.step
     );
     assert!(
-        listing.step < end,
-        "the first sessions/ listing after the lock PUT at {} came at {}, after the release at {end}: {ops:?}",
-        lock_put.step,
-        listing.step
+        !recs.iter().any(|r| r.step < listing.step
+            && OpMatch::AnyList.matches(r.op)
+            && r.key == "sessions/"),
+        "sessions/ listed before the marker PUT: {recs:?}"
     );
-    let early = records(sim, c, run).into_iter().find(|r| {
-        r.step > lock_put.step && r.step < listing.step && r.op.is_write() && is_protected(&r.key)
-    });
+    let early = recs
+        .iter()
+        .find(|r| r.step < listing.step && r.op.is_write() && is_protected(&r.key));
     assert!(
         early.is_none(),
         "a protected write before the session listing: {early:?}"
@@ -378,58 +393,44 @@ fn assert_lists_sessions_after_its_confirmed_lock(
     listing.step
 }
 
-/// The handshake, lock-holder side, in the order that only a holder whose
-/// session listing follows its confirmed lock survives: the holder (a head
-/// writer under the maintenance lock, [`locked_fold`]; a lock-mode backup
-/// until 10-single-protocol step 7) is held at its lock PUT, the backup
-/// marks, probes `locks/` (empty) and commits up to its snapshot PUT, then
-/// the holder writes its lock. Its listing of `sessions/` after the lock
-/// is confirmed sees the flagged marker and it yields (`Locked`, the lock
-/// released with nothing protected written). With the holder's order
-/// swapped (`sessions/` listed before the lock PUT) it lists before the
-/// mark, does not yield and this test fails.
+/// X1 in the order that only a registration listing after its marker PUT
+/// survives: the exclusive session (a head writer, [`exclusive_fold`]) is
+/// held at its marker PUT, the backup registers, marks and commits up to
+/// its snapshot PUT, then the exclusive marker is written. Its listing of
+/// `sessions/` sees the backup's marker and it refuses (`ActiveSessions`,
+/// its marker deleted, nothing protected written). With the order swapped
+/// (`sessions/` listed before the PUT) it would list before the backup's
+/// registration, run and this test fails. The holder took the lock before
+/// 10-single-protocol step 8.
 #[test]
-fn a_lock_holder_lists_sessions_after_its_lock_is_confirmed() {
+fn an_exclusive_session_lists_sessions_after_its_marker_put() {
     for kind in [StoreKind::ConditionalOverwrite, StoreKind::Plain] {
         let mut sim = encrypted(kind);
         let (f, l) = (sim.client("f"), sim.client("l"));
-        let l_put = sim.gate(GateRule::new(
-            l,
-            OpMatch::Kind(OpKind::Put),
-            KeyMatch::LockKey,
-        ));
-        let rl = sim.spawn(l, locked_fold());
-        sim.expect_paused(l_put, "l's lock PUT");
+        let l_put = sim.gate(
+            GateRule::new(
+                l,
+                OpMatch::Kind(OpKind::Put),
+                KeyMatch::Prefix("sessions/x-".into()),
+            )
+            .filter(|_, k| k.ends_with(".json")),
+        );
+        let rl = sim.spawn(l, exclusive_fold());
+        sim.expect_paused(l_put, "l's marker PUT");
         let f_snap = sim.gate(snapshot_put(f));
         let rf = sim.spawn(f, backup_call("f1"));
         sim.expect_paused(f_snap, "f before its snapshot PUT");
         sim.resume(l_put);
         let rl = sim.join(rl);
-        expect_locked(&rl);
+        expect_active_sessions(&rl);
         let log = sim.store().log();
-        let (first_put, released) = first_lock(&log, l);
-        assert_lists_sessions_after_its_confirmed_lock(
-            &sim,
-            l,
-            rl.index,
-            &first_put,
-            Some(released),
-        );
-        let mark = log
-            .iter()
-            .find(|r| {
-                r.client == f
-                    && r.op == OpKind::Put
-                    && r.key.starts_with("sessions/")
-                    && r.key.ends_with(".1.json")
-            })
-            .expect("f marked its commit");
-        assert!(mark.step < first_put.step, "f marked before l's lock PUT");
+        let (put, released) = first_exclusive(&log, l);
+        assert_lists_sessions_after_its_marker(&sim, l, rl.index, &put, Some(released));
         sim.resume(f_snap);
         let rf = sim.join(rf);
         rf.expect_ok();
         assert!(rf.lock_free);
-        sim.call(l, locked_fold()).expect_ok();
+        sim.call(l, exclusive_fold()).expect_ok();
         assert!(sim.store().head_overwrites().is_empty(), "{kind:?}");
         let set = if kind.records_multi_writer() {
             Invariant::STEP8
@@ -440,40 +441,41 @@ fn a_lock_holder_lists_sessions_after_its_lock_is_confirmed() {
     }
 }
 
-/// The same order for the maintenance lock's holders
-/// (`with_maintenance_lock`: the listing right after the lock): a delete
-/// under it ([`locked_delete`]) and `check --repair` list `sessions/` only
-/// after their lock is confirmed, and before any protected write. Until
-/// 10-single-protocol step 7 the subjects were a lock client's delete and
-/// compact, which run in a session since.
+/// The same order for the exclusive commands: a delete as an exclusive
+/// session ([`exclusive_delete`]) and `check --repair` list `sessions/`
+/// only after their marker PUT, and before any protected write (after
+/// their lock was confirmed before 10-single-protocol step 8).
 #[test]
-fn maintenance_lists_sessions_after_its_lock_is_confirmed() {
+fn exclusive_runs_list_sessions_after_their_marker_put() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
     for name in ["a1", "a2"] {
         sim.backup(a, name, &tree(name)).expect_ok();
     }
-    let rd = sim.call(a, locked_delete("a1"));
+    let rd = sim.call(a, exclusive_delete("a1"));
     rd.expect_ok();
     let rc = sim.call(a, Call::CheckRepair);
     rc.expect_ok();
     for run in [&rd, &rc] {
-        let ops = lock_ops(&sim, a, run.index);
-        let put = ops
+        assert!(
+            run.exclusive,
+            "run {} registered no exclusive session",
+            run.index
+        );
+        let recs = records(&sim, a, run.index);
+        let put = recs
             .iter()
-            .find(|r| r.op == OpKind::Put && KeyMatch::LockKey.matches(&r.key))
-            .unwrap_or_else(|| panic!("run {} took no lock: {ops:?}", run.index))
+            .find(|r| r.op == OpKind::Put && is_exclusive_key(&r.key))
+            .unwrap_or_else(|| panic!("run {} wrote no exclusive marker: {recs:?}", run.index))
             .clone();
-        let released = ops
+        let released = recs
             .iter()
             .find(|r| r.step > put.step && r.op.is_delete() && r.key == put.key)
             .map(|r| r.step);
-        assert_lists_sessions_after_its_confirmed_lock(&sim, a, run.index, &put, released);
+        assert_lists_sessions_after_its_marker(&sim, a, run.index, &put, released);
         assert!(
-            !ops.iter().any(|r| r.step < put.step
-                && OpMatch::AnyList.matches(r.op)
-                && r.key == "sessions/"),
-            "run {} listed sessions/ before its lock PUT: {ops:?}",
+            !recs.iter().any(|r| r.key.starts_with("locks/")),
+            "run {} touched locks/: {recs:?}",
             run.index
         );
     }
@@ -609,8 +611,9 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// A cancel while a lock-free commit waits for a held lock (its marker
-/// flagged) returns `Interrupted` within one sleep slice (500 ms), with no
+/// A cancel while a lock-free commit waits for a live exclusive session
+/// (its marker flagged; its earlier keys reaped by a misjudging reaper, as
+/// in [`a_commit_waits_for_a_live_exclusive_session`]) returns `Interrupted` within one sleep slice (500 ms), with no
 /// further probe. The cancelled backup leaves what any abandoned backup
 /// leaves: its packs and its journal (`sessions/<id>.index`, for the next
 /// run's recovery); its marker keys, the flagged one included, are deleted
@@ -621,9 +624,10 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
     let (f, l) = (sim.client("f"), sim.client("l"));
     sim.backup(l, "l0", &tree("l0")).expect_ok();
-    // F's listings of locks/: its registration probe, the probe after its
-    // mark (finds L's lock), the probe after one backoff.
-    let f_retry = sim.gate(locks_listing(f, 3));
+    // F's listings of sessions/: its registration's, the open's, the
+    // pre-head one after its mark (finds L's session), the one after one
+    // backoff.
+    let f_retry = sim.gate(sessions_listing(f, 4));
     let f_mark = sim.gate(commit_mark(f));
     let cancel = CancelToken::new();
     let rf = sim.spawn(
@@ -635,11 +639,12 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
         },
     );
     sim.expect_paused(f_mark, "f's commit mark");
-    // The holder: a delete under the maintenance lock (a lock-mode backup
-    // until 10-single-protocol step 7).
+    reap_markers_of(&mut sim, f);
+    // The holder: a delete as an exclusive session (under the maintenance
+    // lock until 10-single-protocol step 8, a lock-mode backup until step 7).
     let l_head = sim.gate(snapshot_delete(l));
-    let rl = sim.spawn(l, locked_delete("l0"));
-    sim.expect_paused(l_head, "l's snapshot delete under its lock");
+    let rl = sim.spawn(l, exclusive_delete("l0"));
+    sim.expect_paused(l_head, "l's snapshot delete in its exclusive session");
     sim.resume(f_mark);
     sim.expect_paused(f_retry, "f's second probe");
     // From here f's backoff sleeps until the test advances time.
@@ -670,7 +675,7 @@ fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
         sim.store()
             .log()
             .iter()
-            .filter(|r| r.client == f && OpMatch::AnyList.matches(r.op) && r.key == "locks/")
+            .filter(|r| r.client == f && OpMatch::AnyList.matches(r.op) && r.key == "sessions/")
             .count()
     };
     let before = probes(&sim);

@@ -951,6 +951,55 @@ fn cli_delete_repo_with_flag() {
     assert!(!fx.repo_dir.exists());
 }
 
+/// Plain `break-lock` removes no session marker, but names a live
+/// exclusive session's (`check --repair`, `upgrade`, a pack-map write) on
+/// stderr with the way out, `break-lock --sessions`; a backup's marker is
+/// not named.
+#[test]
+fn cli_break_lock_names_a_live_exclusive_session() {
+    let fx = CliFixture::new();
+    write_test_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+
+    let quiet = fx.run(&["--config", &cfg, "break-lock"]);
+    assert!(quiet.status.success(), "{}", stderr(&quiet));
+    assert!(
+        !stderr(&quiet).contains("exclusive session"),
+        "{}",
+        stderr(&quiet)
+    );
+
+    let sessions = fx.repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let marker = |host: &str, pid: u32| {
+        format!(
+            r#"{{"hostname":"{host}","pid":{pid},"registered_at":"{now}","last_refresh":"{now}","elapsed_secs":0}}"#
+        )
+    };
+    let exclusive = "x-0123456789abcdef0123456789abcdef";
+    let shared = "fedcba9876543210fedcba9876543210";
+    let exclusive_key = sessions.join(format!("{exclusive}.json"));
+    let shared_key = sessions.join(format!("{shared}.json"));
+    std::fs::write(&exclusive_key, marker("repair-host", 4242)).unwrap();
+    std::fs::write(&shared_key, marker("backup-host", 77)).unwrap();
+
+    let output = fx.run(&["--config", &cfg, "break-lock"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains(&format!(
+            "An exclusive session ({exclusive}: host=repair-host, pid=4242"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("`vykar break-lock --sessions`"), "{err}");
+    assert!(!err.contains(shared), "{err}");
+    assert!(!stdout(&output).contains(exclusive), "{}", stdout(&output));
+    assert!(exclusive_key.exists() && shared_key.exists());
+}
+
 #[test]
 fn cli_check_verify_data_detects_tampered_pack() {
     let fx = CliFixture::new();

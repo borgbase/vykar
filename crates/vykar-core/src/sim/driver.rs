@@ -320,6 +320,10 @@ const FIRST_PACK_SHARD: &str = "packs/00/";
 /// clients interact, and the listing of the other shards runs inside the
 /// decision of the first.
 ///
+/// No compact touches `locks/` since 10-single-protocol step 8 (its
+/// registration lists `sessions/`); the rule is kept for the lock until
+/// step 9 deletes it.
+///
 /// The other operations under `locks/` (the acquisition with its pre-check
 /// listing, clock probe, PUT and listing, a reap, the release) run inside a
 /// decision, as a backup's lock attempt is one decision: the checker counts
@@ -374,7 +378,9 @@ pub enum Policy {
 
 /// The label of a backup's protection step that found contention: a
 /// single-writer listing that found another head writer (the backup
-/// waits, unmarked), or a probe of `locks/` that found a live lock.
+/// waits, unmarked), or a pre-head listing of `sessions/` that found a live
+/// exclusive session (10-single-protocol step 8; a probe of `locks/` that
+/// found a live lock before).
 pub const LABEL_LOCKED: &str = "lock (locked)";
 
 /// The label of a backup's commit mark (04 step 9; both modes since
@@ -386,9 +392,11 @@ pub const LABEL_MARK_COMMITTING: &str = "mark-committing";
 /// writer (one that did is [`LABEL_LOCKED`]).
 pub const LABEL_LIST_WRITERS: &str = "list-writers";
 
-/// The label of a backup's probe of `locks/` that found no live lock (one
-/// that did is [`LABEL_LOCKED`]); the suspend rule runs in the same
-/// decision.
+/// The label of a backup's pre-head listing of `sessions/` that found no
+/// live exclusive session (one that did is [`LABEL_LOCKED`]); the suspend
+/// rule runs in the same decision. Named for the probe of `locks/` it
+/// replaced in 10-single-protocol step 8; the label is historical, recorded
+/// in the seeds, and renamed with them in step 10.
 pub const LABEL_PROBE_LOCKS: &str = "probe-locks";
 
 /// Which of `actions` are free under preemption bounding, given the
@@ -1068,7 +1076,7 @@ enum Phase {
     /// Between commands.
     Idle,
     /// Uploaded: the commit protection (the single-writer listings, the
-    /// mark, the probe of `locks/`, the suspend rule).
+    /// mark, the pre-head listing of `sessions/`, the suspend rule).
     Probe(Box<ProbeWait>),
     /// The commit machine runs.
     Commit(Box<Running>),
@@ -1090,25 +1098,29 @@ struct MaintRun {
     /// jumps are offered inside it.
     session: Option<String>,
     /// Its heartbeat thread runs: registered and adopted, not yet ended.
-    /// Adopted is known from the first step op after a passed registration
-    /// probe: the probe's own step ops are a listing of `sessions/` for a
-    /// lock's age, made only while `locks/` holds a lock key; any other
-    /// step op after the registration (the single-writer check's listing
-    /// of `sessions/`, 10-single-protocol step 7, or the listing of the
-    /// first pack shard) follows the adoption. Any delete of its own key (a
-    /// failed registration, or the deregistration, which stops the
-    /// heartbeat before its first delete) ends it.
+    /// Adopted is known from the first step op after the registration's
+    /// listing of `sessions/` (10-single-protocol step 8: the first one
+    /// held after the registration key's PUT; a retry of it, made only
+    /// while an exclusive session's key is listed, is one too) that is not
+    /// a delete of its own key: any other step op after the registration
+    /// (the single-writer check's listing of `sessions/`, sessions #1, or
+    /// the listing of the first pack shard) follows the adoption. Any
+    /// delete of its own key (a failed registration, or the deregistration,
+    /// which stops the heartbeat before its first delete) ends it.
     heartbeat: bool,
     /// A delete of its own marker key was held: no heartbeat from here on.
     ended: bool,
+    /// The registration's listing of `sessions/` was held.
+    listed: bool,
     /// The registration probe passed and the session was adopted.
     adopted: bool,
 }
 
 impl MaintRun {
-    /// Track the run's session from the step op it is held at; `locked`:
-    /// `locks/` holds a lock key.
-    fn observe(&mut self, held: &super::gate::Paused, locked: bool) {
+    /// Track the run's session from the step op it is held at;
+    /// `exclusive_listed`: `sessions/` holds an exclusive session's key (the
+    /// registration may retry its listing).
+    fn observe(&mut self, held: &super::gate::Paused, exclusive_listed: bool) {
         let own_key = |id: &str| {
             held.key
                 .strip_prefix("sessions/")
@@ -1130,9 +1142,13 @@ impl MaintRun {
         {
             self.ended = true;
         }
-        let probe_listing = locked && held.op == OpKind::ListMeta && held.key == "sessions/";
-        if self.session.is_some() && !self.ended && !probe_listing {
-            self.adopted = true;
+        let listing = held.op == OpKind::ListMeta && held.key == "sessions/";
+        if self.session.is_some() && !self.ended {
+            if listing && !self.adopted && (!self.listed || exclusive_listed) {
+                self.listed = true;
+            } else if self.listed {
+                self.adopted = true;
+            }
         }
         self.heartbeat = self.adopted && !self.ended;
     }
@@ -1480,6 +1496,7 @@ impl<'c> Driver<'c> {
             session: None,
             heartbeat: false,
             ended: false,
+            listed: false,
             adopted: false,
         });
         self.await_maint(i, m);
@@ -1539,13 +1556,13 @@ impl<'c> Driver<'c> {
 {}",
                     self.trace_text()
                 );
-                let locked = self
+                let exclusive_listed = self
                     .sim
                     .store()
-                    .keys("locks/")
+                    .keys("sessions/x-")
                     .iter()
-                    .any(|k| KeyMatch::LockKey.matches(k));
-                m.observe(&p, locked);
+                    .any(|k| k.ends_with(".json"));
+                m.observe(&p, exclusive_listed);
                 self.actors[i].phase = Phase::Maint(m);
             }
             None => self.end_maint(*m),

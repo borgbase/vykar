@@ -32,6 +32,32 @@ pub(super) fn probe_deletes_allowed(storage: &dyn StorageBackend) -> bool {
     }
 }
 
+/// The exclusion this run writes under is gone: stop, do not record it as
+/// a repair error (10-single-protocol step 8). `MarkerLostDuringCommit`
+/// from the exclusive session's check, `LockExpired` from a v2/v3
+/// upgrade's legacy key check.
+fn exclusion_lost(e: &VykarError) -> bool {
+    matches!(
+        e,
+        VykarError::MarkerLostDuringCommit | VykarError::LockExpired(_)
+    )
+}
+
+/// `e`, or the exclusion-lost error when the run's exclusion is gone. An
+/// error after a write the exclusive check refused can be another one that
+/// names the refusal only in its text (a write session's "a pack upload of
+/// this write session failed" refusal of every later store). The check is
+/// sticky once lost, so then this sends no request.
+fn lost_or(repo: &RepoWriter<'_>, e: VykarError) -> VykarError {
+    if exclusion_lost(&e) {
+        return e;
+    }
+    match repo.check_fence() {
+        Err(lost) if exclusion_lost(&lost) => lost,
+        _ => e,
+    }
+}
+
 /// In-flight bookkeeping for one snapshot rewrite.
 struct PreparedRewrite {
     /// Index into `plan.actions` of the originating `DropItemsFromSnapshot`,
@@ -60,6 +86,7 @@ fn apply_item_level_rewrites(
     plan: &RepairPlan,
     applied: &mut Vec<RepairAction>,
     repair_errors: &mut Vec<String>,
+    session_id: &str,
 ) -> Result<()> {
     // Bail out early if there's nothing to do.
     let has_drops = plan
@@ -72,7 +99,12 @@ fn apply_item_level_rewrites(
 
     // 1. Begin a write session so store can pack new tree chunks.
     //    Every return below consumes it: saved, or flushed on error.
-    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    //    It journals under the exclusive session's ID, whose marker keeps
+    //    the journal from every reaper while the run lives.
+    let mut ws = repo.begin_write_session(&WriteSessionOptions {
+        session_id: session_id.to_string(),
+        ..WriteSessionOptions::default()
+    });
 
     // 2. Prepare each rewrite (defer all PUT/DELETE until after Step 4 of
     //    this routine, mirroring the backup commit's index write → snapshot
@@ -97,12 +129,26 @@ fn apply_item_level_rewrites(
             action_idx,
         ) {
             Ok(rw) => prepared.push(rw),
+            // The exclusion is gone: stop with nothing more written. The
+            // session's own flush is refused by the same sticky check (its
+            // pack uploads and journal PUT each warn), so it writes nothing.
+            Err(e) if exclusion_lost(&e) => {
+                ws.flush_on_abort(repo);
+                return Err(e);
+            }
             // A pack of the session is lost, and the rewrites prepared so
             // far may name its chunks: publish none. No retry: the storage
             // layer retried the upload already, and nothing is published
             // before this abort, so running the repair again is safe.
             Err(e) if ws.upload_failed() => {
                 ws.flush_on_abort(repo);
+                // An upload the exclusive check refused: the exclusion is
+                // gone, which the session's refusal names only in its text.
+                if let Err(lost) = repo.check_fence()
+                    && exclusion_lost(&lost)
+                {
+                    return Err(lost);
+                }
                 return Err(VykarError::Other(format!(
                     "aborting repair: a pack upload failed while rewriting snapshot \
                      '{snapshot_name}': {e}; no rewritten snapshot was published. \
@@ -123,26 +169,29 @@ fn apply_item_level_rewrites(
         // orphan chunks store may have produced.
         if let Err(e) = ws.flush_packs(repo) {
             ws.flush_on_abort(repo);
-            return Err(e);
+            return Err(lost_or(repo, e));
         }
-        repo.save_session(ws)?;
+        repo.save_session(ws).map_err(|e| lost_or(repo, e))?;
         return Ok(());
     }
 
     // 3. Flush new data/tree packs to storage.
     if let Err(e) = ws.flush_packs(repo) {
         ws.flush_on_abort(repo);
-        return Err(e);
+        return Err(lost_or(repo, e));
     }
 
     // 4. Persist the chunk index so newly-stored chunks are durable BEFORE
     //    any snapshot blob references them.
-    repo.save_session(ws)?;
+    repo.save_session(ws).map_err(|e| lost_or(repo, e))?;
 
     // 5. Publish each rewrite: PUT new blob, swap manifest, DELETE old.
     for rw in &prepared {
         // 5a. PUT new snapshot blob (the new commit point).
         if let Err(e) = repo.storage().put(&rw.new_id.storage_key(), &rw.new_packed) {
+            if exclusion_lost(&e) {
+                return Err(e);
+            }
             repair_errors.push(format!(
                 "failed to publish rewritten snapshot '{}': {e}",
                 rw.new_entry.name
@@ -163,6 +212,21 @@ fn apply_item_level_rewrites(
                         .expect("rw.action_idx was assigned from enumerate(plan.actions)")
                         .clone(),
                 );
+            }
+            // The exclusion is gone: a rollback would be refused too and
+            // read as "duplicate blobs". Both blobs stay, under one name, as
+            // after a crash between the two writes; repair looks snapshots
+            // up by name, so a rerun does not reliably converge on that
+            // (`tests::sim_exclusion::an_item_level_repair_whose_marker_is_lost_writes_nothing_more`).
+            Err(e) if exclusion_lost(&e) => {
+                tracing::warn!(
+                    snapshot = rw.new_entry.name,
+                    old = %rw.old_id,
+                    new = %rw.new_id,
+                    "the repair's exclusion was lost after publishing a rewritten snapshot: \
+                     both blobs stay"
+                );
+                return Err(e);
             }
             Err(e) => {
                 let new_delete = repo.storage().delete(&rw.new_id.storage_key());
@@ -301,7 +365,7 @@ fn restore_key_copies(
     plan: &RepairPlan,
     applied: &mut Vec<RepairAction>,
     repair_errors: &mut Vec<String>,
-) {
+) -> Result<()> {
     for action in &plan.actions {
         let RepairAction::RestoreKeyCopy { to, .. } = action else {
             continue;
@@ -312,6 +376,7 @@ fn restore_key_copies(
                 tracing::info!("restored repository key copy {to}");
                 applied.push(action.clone());
             }
+            Err(e) if exclusion_lost(&e) => return Err(e),
             Err(e) if e.is_write_refusal() => repair_errors.push(format!(
                 "could not write {to}: the backend refused the write: {e}. If the \
                  repository is append-only or read-only, remove {to} there manually or \
@@ -320,6 +385,7 @@ fn restore_key_copies(
             Err(e) => repair_errors.push(format!("failed to restore key copy {to}: {e}")),
         }
     }
+    Ok(())
 }
 
 /// Execute repair actions in the correct order.
@@ -332,6 +398,7 @@ pub(super) fn execute_repair(
     plan: &RepairPlan,
     issues: &[IntegrityIssue],
     _pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
+    session_id: &str,
 ) -> Result<(Vec<RepairAction>, Vec<String>)> {
     // Refuse to proceed if any snapshots had transient I/O failures during
     // the scan — we can't safely sweep the index without enumerating every
@@ -355,7 +422,7 @@ pub(super) fn execute_repair(
     // Step 0: Restore damaged or missing repository key copies. First, because
     // it is the one repair that only ever adds redundancy, and a failure here
     // must not be masked by whatever the snapshot passes do next.
-    restore_key_copies(repo, plan, &mut applied, &mut repair_errors);
+    restore_key_copies(repo, plan, &mut applied, &mut repair_errors)?;
 
     // Step 0.5: re-indexed entries. In the in-memory index already (see
     // above); step 7's index write persists them.
@@ -389,6 +456,7 @@ pub(super) fn execute_repair(
                     }
                     applied.push(action.clone());
                 }
+                Err(e) if exclusion_lost(&e) => return Err(e),
                 Err(e) => {
                     return Err(VykarError::Other(format!(
                         "aborting repair: failed to remove corrupt snapshot \
@@ -406,6 +474,7 @@ pub(super) fn execute_repair(
                 Ok(()) => {
                     applied.push(action.clone());
                 }
+                Err(e) if exclusion_lost(&e) => return Err(e),
                 Err(e) => {
                     repair_errors.push(format!(
                         "failed to remove invalid snapshot key {storage_key}: {e}"
@@ -451,7 +520,7 @@ pub(super) fn execute_repair(
     // garbage-collects any orphan chunks. The publish loop deliberately
     // never short-circuits with `?`: a failed PUT/DELETE must not bypass
     // Step 5 (whole-snapshot deletes) or Step 6 (the index sweep).
-    apply_item_level_rewrites(repo, plan, &mut applied, &mut repair_errors)?;
+    apply_item_level_rewrites(repo, plan, &mut applied, &mut repair_errors, session_id)?;
 
     // Step 5: Delete doomed snapshot blobs FIRST (safe ordering: delete
     // commit-point before sweeping the index, matching delete.rs:46-58).
@@ -469,6 +538,7 @@ pub(super) fn execute_repair(
                     applied.push(action.clone());
                     successfully_deleted_doomed.insert(snapshot_name.clone());
                 }
+                Err(e) if exclusion_lost(&e) => return Err(e),
                 Err(e) => {
                     repair_errors.push(format!(
                         "failed to remove doomed snapshot '{snapshot_name}': {e}"
@@ -498,6 +568,8 @@ pub(super) fn execute_repair(
     // have its references dropped by the sweep.
     let mut names: Vec<String> = Vec::with_capacity(surviving_entries.len());
     let mut ptr_lists: Vec<Vec<ChunkId>> = Vec::with_capacity(surviving_entries.len());
+    // The sweep's mark only reads (reads are not checked), so the wrapped
+    // errors below cannot be the exclusion's.
     for entry in &surviving_entries {
         let meta = match load_snapshot_meta(repo, &entry.name) {
             Ok(m) => m,
@@ -582,6 +654,7 @@ pub(super) fn execute_repair(
                     );
                     applied.push(action.clone());
                 }
+                Err(e) if exclusion_lost(&e) => return Err(e),
                 Err(e) => repair_errors.push(format!("failed to write pack maps: {e}")),
             }
         }
@@ -662,6 +735,7 @@ mod tests {
             &plan,
             &scan.issues,
             &HashMap::new(),
+            "default",
         )
         .unwrap();
         assert!(errors.is_empty(), "{errors:?}");
@@ -728,6 +802,7 @@ mod tests {
             &plan,
             &scan.issues,
             &HashMap::new(),
+            "default",
         )
         .expect_err("the repair aborts");
         let msg = err.to_string();
@@ -1020,6 +1095,7 @@ mod tests {
             &plan,
             &scan.issues,
             &HashMap::new(),
+            "default",
         );
         drop(repo);
 

@@ -26,11 +26,12 @@ pub(crate) struct Fence(FenceKind);
 
 #[derive(Clone)]
 enum FenceKind {
-    /// Lock mode: the repository lock is still this client's
-    /// (`lock::build_lock_fence`).
+    /// The repository lock is still this client's (`lock::build_lock_fence`);
+    /// no command takes the lock since 10-single-protocol step 8.
     Lock(FenceFn),
-    /// A lock-free maintenance run: its session marker is present and its
-    /// record continuous (`commands::util::maintenance_marker_fence`).
+    /// A maintenance session or an exclusive session: its marker is present
+    /// and its record continuous (`commands::util::maintenance_marker_fence`,
+    /// `commands::util::exclusive_write_check`).
     Marker(FenceFn),
     /// A lock-free backup commit: no lock and no marker check here; the
     /// commit machine checks its marker itself (`HeadCheck` at the head
@@ -92,7 +93,7 @@ impl Fence {
 
 /// The one way to write the repository's shared state: a repository
 /// borrowed together with the fence of the exclusion it runs under
-/// (`commands::util::with_maintenance_lock` and its siblings). Reads, and
+/// (`commands::util::with_exclusive_session` and its siblings). Reads, and
 /// the repository's own `&mut self` methods, go through `Deref` and
 /// `DerefMut` to the repository; the persist and index-mutation methods
 /// exist only here.

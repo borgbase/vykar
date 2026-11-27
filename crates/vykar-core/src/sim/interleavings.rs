@@ -233,17 +233,18 @@ fn steps_deleting(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64
         .collect()
 }
 
-/// `c`'s second listing of `sessions/` (the first is the open's), after
-/// every pack is uploaded: on a single-writer repository the listing
-/// before its commit mark (10-single-protocol step 7), unflagged; on a
-/// multi-writer one the probe after its mark.
+/// `c`'s third listing of `sessions/` (the first is its registration's,
+/// 10-single-protocol step 8, the second the open's), after every pack is
+/// uploaded: on a single-writer repository the listing before its commit
+/// mark (step 7), unflagged; on a multi-writer one the pre-head listing
+/// after its mark.
 fn before_commit(c: ClientId) -> GateRule {
     GateRule::new(
         c,
         OpMatch::Kind(OpKind::ListMeta),
         KeyMatch::Exact("sessions/".into()),
     )
-    .nth(2)
+    .nth(3)
 }
 
 /// Steps at which `client`'s run `run` wrote `key`.
@@ -257,6 +258,21 @@ fn steps_writing(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64>
 /// Whether `c` wrote no lock key. Lock-free clients (an encrypted
 /// repository on a store that honours put-if-absent, 04 step 9) take no
 /// lock, so a lock scenario run on them has nothing to build on.
+/// The exclusive session's marker `run` wrote (`sessions/x-*.json`).
+fn exclusive_key_of(sim: &Sim, run: &RunRecord) -> Option<String> {
+    first_write_of(sim, run, |k| {
+        k.starts_with("sessions/x-") && k.ends_with(".json")
+    })
+}
+
+/// `c` wrote no exclusive session marker.
+fn took_no_exclusive(sim: &Sim, c: ClientId) -> bool {
+    !sim.store()
+        .keys_written_by(c, "sessions/x-")
+        .iter()
+        .any(|k| k.ends_with(".json"))
+}
+
 fn took_no_lock(sim: &Sim, c: ClientId) -> bool {
     !sim.store()
         .keys_written_by(c, "locks/")
@@ -264,7 +280,8 @@ fn took_no_lock(sim: &Sim, c: ClientId) -> bool {
         .any(|k| k.ends_with(".json"))
 }
 
-/// The outcome of a lock scenario whose clients took no lock.
+/// The outcome of a lock (or exclusive) scenario whose clients took no lock
+/// (registered no exclusive session).
 fn no_lock_taken(evidence: String) -> HazardOutcome {
     HazardOutcome::PrerequisiteNotReproduced {
         prerequisite: "a lock held by a",
@@ -343,18 +360,19 @@ fn not_reproduced_on(id: &str, hosts: &[Hosts], run: fn(Hosts) -> HazardOutcome)
     out
 }
 
-/// H1: a live maintenance lock reaped by another client that shares the
-/// holder's hostname, whose holder then writes under the reaper's lock.
-/// The clients are placed by `hosts`; since 04 step 1 no placement
-/// reproduces it.
+/// H1: a live exclusive session's marker reaped by another client that
+/// shares the holder's hostname, whose holder then writes under the
+/// reaper's session. The clients are placed by `hosts`; since 04 step 1 no
+/// placement reproduces it.
 ///
-/// A deletes t0 and is held at its snapshot delete, after its fence check.
-/// B deletes t1: its stale-lock sweep reaps A's lock when it shares A's
-/// hostname, and B is held at its own first fence check. Then A resumes.
-/// Both delete under the maintenance lock ([`Call::LockedDelete`]): since
-/// 10-single-protocol step 7 delete runs in a session, and the lock holders
-/// this models are `check --repair`, upgrade and pack maps, which hold the
-/// lock until step 9.
+/// A deletes t0 and is held at its snapshot delete, after its write check.
+/// B deletes t1: its registration's reap removes A's marker when it shares
+/// A's hostname and takes A's process for dead, and B is held at its own
+/// first write check. Then A resumes. Both delete as exclusive sessions
+/// ([`Call::ExclusiveDelete`], 10-single-protocol step 8), as `check
+/// --repair`, upgrade and pack maps run; until step 8 both held the
+/// maintenance lock and the reap was the stale-lock sweep's. A refused B
+/// (`ActiveSessions`, A's marker kept) is the fix.
 pub fn h1_with(hosts: Hosts) -> HazardOutcome {
     settle(h1_scenario(hosts))
 }
@@ -370,25 +388,27 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         OpMatch::AnyDelete,
         KeyMatch::Prefix("snapshots/".into()),
     ));
+    // b's write check (10-single-protocol step 8: the EXISTS of its
+    // exclusive marker; the lock fence's EXISTS of its lock key before).
     let gb = sim.gate(GateRule::new(
         b,
         OpMatch::Kind(OpKind::Exists),
-        KeyMatch::Prefix("locks/".into()),
+        KeyMatch::Prefix("sessions/x-".into()),
     ));
     let sa = sim.spawn(
         a,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t0".into()],
         },
     );
     reach(&sim, ga, "a's snapshot delete")?;
     if boots_late(hosts) {
-        // b boots after a's lock write.
+        // b boots after a's marker write.
         sim.advance(Duration::from_secs(60));
     }
     let sb = sim.spawn(
         b,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t1".into()],
         },
     );
@@ -401,14 +421,14 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         }
         None => {
             let rb = sim.join(sb);
-            if !allowed(&rb, AllowedError::Locked) {
-                if took_no_lock(&sim, a) && took_no_lock(&sim, b) {
+            if !allowed(&rb, AllowedError::ActiveSessions) {
+                if took_no_exclusive(&sim, a) && took_no_exclusive(&sim, b) {
                     sim.resume(ga);
                     let ra = sim.join(sa);
                     return Ok(no_lock_taken(outcomes(&ra, &rb)));
                 }
                 return Err(broken(format!(
-                    "b ended before its fence check, not Locked: {:?}",
+                    "b ended before its write check, not ActiveSessions: {:?}",
                     rb.outcome
                 )));
             }
@@ -418,7 +438,7 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
     };
     let report = sim.check_invariants(CHECKED);
     controls(&report)?;
-    let key = lock_key_of(&sim, &ra);
+    let key = exclusive_key_of(&sim, &ra);
     let reaped: Vec<u64> = key
         .as_deref()
         .map(|k| steps_deleting(&sim, b, rb.index, k))
@@ -427,13 +447,13 @@ fn h1_scenario(hosts: Hosts) -> Scenario {
         .iter()
         .any(|s| (ra.first_step..ra.last_step).contains(s));
     let evidence = format!(
-        "{}\na's lock {key:?} deleted by b at {reaped:?}\n{report}",
+        "{}\na's exclusive marker {key:?} deleted by b at {reaped:?}\n{report}",
         outcomes(&ra, &rb)
     );
     Ok(
         if inside && lock_violation(&report, ra.index, ViolationKind::WriteUnderOtherLock) {
             HazardOutcome::Reproduced { evidence }
-        } else if allowed(&rb, AllowedError::Locked)
+        } else if allowed(&rb, AllowedError::ActiveSessions)
             && ra.is_ok()
             && !report.violated(Invariant::LockExclusion)
         {
@@ -717,11 +737,10 @@ fn h2_marker_scenario(reap: MarkerReap) -> Scenario {
     ok(&sim.backup(c, "t0", &seeded("t0")), "control backup t0")?;
     let (a, b) = (sim.client("a"), sim.client("b"));
     let sessions = || KeyMatch::Prefix("sessions/".into());
-    let g_main = sim.gate(GateRule::new(
-        a,
-        OpMatch::AnyList,
-        KeyMatch::Exact("sessions/".into()),
-    ));
+    // The second listing of `sessions/`: the first is the registration's
+    // (10-single-protocol step 8), before the heartbeat runs.
+    let g_main =
+        sim.gate(GateRule::new(a, OpMatch::AnyList, KeyMatch::Exact("sessions/".into())).nth(2));
     let sa = sim.spawn(
         a,
         Call::Backup {

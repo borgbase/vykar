@@ -80,19 +80,27 @@ delegate_storage_backend! {
         self.inner.begin_staged_put(prefix)
     }
 
+    // The exclusion's own keys pass uncounted: the legacy lock key and the
+    // exclusive session's marker, refreshes and deregistration
+    // (`sessions/x-*.json`, 10-single-protocol step 8).
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        if key.starts_with("locks/") {
+        if key.starts_with("locks/") || is_marker(key) {
             return self.inner.put(key, data);
         }
         self.mutate(format!("put {key}"), || self.inner.put(key, data))
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        if key.starts_with("locks/") {
+        if key.starts_with("locks/") || is_marker(key) {
             return self.inner.delete(key);
         }
         self.mutate(format!("delete {key}"), || self.inner.delete(key))
     }
+}
+
+/// An exclusive session's marker key.
+fn is_marker(key: &str) -> bool {
+    key.starts_with("sessions/x-") && key.ends_with(".json")
 }
 
 /// Run the upgrade of `fx` through an `Interrupt`; its result and log.

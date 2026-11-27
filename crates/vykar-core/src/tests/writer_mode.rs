@@ -249,8 +249,9 @@ fn switch_to_single_and_back() {
     sim.check_invariants(STEP8_WITH_REFUSALS).assert_clean();
 }
 
-/// A switch to the mode the repository already has writes nothing but the
-/// lock's own keys.
+/// A switch to the mode the repository already has writes nothing but its
+/// exclusive session's own marker keys (10-single-protocol step 8; the
+/// lock's keys before).
 #[test]
 fn a_noop_switch_writes_nothing() {
     let (mut sim, ctl, _) = multi_writer_sim();
@@ -261,7 +262,7 @@ fn a_noop_switch_writes_nothing() {
     assert_eq!(report.mode, WriterMode::Multi);
     let stray: Vec<OpRecord> = records(&sim, ctl, run.index)
         .into_iter()
-        .filter(|r| r.op.is_mutation() && !r.key.starts_with("locks/"))
+        .filter(|r| r.op.is_mutation() && !r.key.starts_with("sessions/"))
         .collect();
     assert!(stray.is_empty(), "{stray:?}");
 }

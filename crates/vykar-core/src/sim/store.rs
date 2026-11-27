@@ -166,8 +166,11 @@ struct State {
     /// `committing` ([`SimStore::committed_lock_free_in_run`]).
     committing_runs: BTreeSet<usize>,
     /// Runs that wrote (or attempted) any session marker key
-    /// ([`SimStore::registered_in_run`]).
+    /// ([`SimStore::registered_in_run`]), but an exclusive session's.
     registered_runs: BTreeSet<usize>,
+    /// Runs that wrote (or attempted) an exclusive session's marker key
+    /// ([`SimStore::exclusive_in_run`]).
+    exclusive_runs: BTreeSet<usize>,
 }
 
 /// How [`State::apply`] treats an effect.
@@ -511,6 +514,7 @@ impl SimStore {
                     unconditional_clients: BTreeSet::new(),
                     committing_runs: BTreeSet::new(),
                     registered_runs: BTreeSet::new(),
+                    exclusive_runs: BTreeSet::new(),
                 }),
                 gate_cv: Condvar::new(),
             }),
@@ -895,6 +899,12 @@ impl SimStore {
     /// maintenance registers no session); `RunRecord::lock_free`.
     pub fn registered_in_run(&self, run: usize) -> bool {
         self.state().registered_runs.contains(&run)
+    }
+
+    /// Whether run `run` PUT an exclusive session's marker
+    /// (`sessions/x-*.json`, 10-single-protocol step 8).
+    pub fn exclusive_in_run(&self, run: usize) -> bool {
+        self.state().exclusive_runs.contains(&run)
     }
 
     /// Tag `client`'s operations with `run` until set to None.
@@ -1361,7 +1371,15 @@ impl vykar_storage::StorageBackend for SimClient {
             let committing = is_committing_marker(data);
             let mut st = self.store.state();
             if let Some(run) = st.runs.get(&self.client).copied() {
-                st.registered_runs.insert(run);
+                // An exclusive session's marker is a hold (invariant 7),
+                // not a lock-free registration (10-single-protocol step 8).
+                if crate::repo::lock::parse_session_marker_key(key)
+                    .is_some_and(|(id, _)| crate::repo::lock::is_exclusive_session(id))
+                {
+                    st.exclusive_runs.insert(run);
+                } else {
+                    st.registered_runs.insert(run);
+                }
                 if committing {
                     st.committing_runs.insert(run);
                 }

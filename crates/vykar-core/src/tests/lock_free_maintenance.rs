@@ -8,7 +8,8 @@
 //! compact made; the mark skips a snapshot deleted after its listing; a
 //! backup that adds no chunk creates a head (Q2), also after a taken
 //! generation, and that head conflicts with a concurrent sweep. Repair
-//! stays apart from lock-free maintenance by the marker handshake. Since
+//! stays apart from maintenance as an exclusive session (10-single-protocol
+//! step 8; by the marker handshake before). Since
 //! 10-single-protocol step 7 the tests whose second writer was a lock
 //! client (a lock-mode backup or compact) run on a single-writer repository
 //! instead: compacts refuse each other, a backup waits for a compact, and
@@ -115,14 +116,27 @@ fn plain_head_write(c: ClientId, n: u32) -> GateRule {
 }
 
 /// `c`'s single-writer listing of `sessions/` before its commit mark, its
-/// `n`th attempt (the open lists first).
+/// `n`th attempt (the registration and the open list first,
+/// 10-single-protocol step 8).
 fn before_mark(c: ClientId, n: u32) -> GateRule {
     GateRule::new(
         c,
         OpMatch::Kind(OpKind::ListMeta),
         KeyMatch::Exact("sessions/".into()),
     )
-    .nth(n + 1)
+    .nth(n + 2)
+}
+
+/// `c`'s `n`th listing of `sessions/` with mtimes: for a compact the first
+/// is its registration's (10-single-protocol step 8); then, on a
+/// single-writer repository, its single-writer check; then its sessions #1.
+fn sessions_listing(c: ClientId, n: u32) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::ListMeta),
+        KeyMatch::Exact("sessions/".into()),
+    )
+    .nth(n)
 }
 
 fn expect_class(run: &crate::sim::RunRecord, class: AllowedError) {
@@ -571,25 +585,21 @@ fn a_reuse_only_commit_conflicts_with_a_concurrent_sweep() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// Repair keeps the lock and refuses live sessions: beside a lock-free
-/// compact (registered with `writes_heads`, held) it yields with `Locked`
-/// at its session listing (the lock holder's half of the handshake), and
-/// beside a lock-free delete (an unflagged marker) it refuses with
-/// `ActiveSessions`; a lock-free compact whose registration probe meets
-/// repair's lock fails `Locked`. Each proceeds once the other is done.
+/// Repair runs as an exclusive session (10-single-protocol step 8; under
+/// the lock before) and refuses live sessions: beside a compact (registered
+/// with `writes_heads`, held) and beside a delete (an unflagged marker) it
+/// refuses with `ActiveSessions` (beside the compact it yielded `Locked`
+/// before step 8); a compact whose registration listing meets repair's live
+/// exclusive session fails `Locked`. Each proceeds once the other is done.
 #[test]
 fn repair_and_a_lock_free_compact_exclude_each_other() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, r) = (sim.client("a"), sim.client("r"));
     sim.backup(a, "a1", &tree("a1")).expect_ok();
-    let held = sim.gate(GateRule::new(
-        a,
-        OpMatch::Kind(OpKind::ListMeta),
-        KeyMatch::Exact("sessions/".into()),
-    ));
+    let held = sim.gate(sessions_listing(a, 2));
     let rc = sim.spawn(a, Call::Compact);
     sim.expect_paused(held, "compact's sessions #1");
-    expect_class(&sim.check_repair(r), AllowedError::Locked);
+    expect_class(&sim.check_repair(r), AllowedError::ActiveSessions);
     sim.resume(held);
     sim.join(rc).expect_ok();
 
@@ -611,15 +621,26 @@ fn repair_and_a_lock_free_compact_exclude_each_other() {
     sim.resume(delete_held);
     sim.join(rd).expect_ok();
 
-    // Repair held under its lock (at its session listing, which follows its
-    // confirmed lock): compact fails Locked.
-    let repair_held = sim.gate(GateRule::new(
-        r,
-        OpMatch::Kind(OpKind::ListMeta),
-        KeyMatch::Exact("sessions/".into()),
-    ));
+    // Repair held in its exclusive session, after its registration (at its
+    // re-read of `config`, the open's read being the first): compact fails
+    // Locked.
+    let repair_held = sim.gate(
+        GateRule::new(
+            r,
+            OpMatch::Kind(OpKind::Get),
+            KeyMatch::Exact("config".into()),
+        )
+        .nth(2),
+    );
     let rr = sim.spawn(r, Call::CheckRepair);
-    sim.expect_paused(repair_held, "repair under its lock");
+    sim.expect_paused(repair_held, "repair in its exclusive session");
+    assert!(
+        sim.store()
+            .keys("sessions/x-")
+            .iter()
+            .any(|k| k.ends_with(".json")),
+        "repair registered"
+    );
     expect_class(&sim.compact(a), AllowedError::Locked);
     sim.resume(repair_held);
     sim.join(rr).expect_ok();
@@ -635,11 +656,7 @@ fn a_backup_starts_and_commits_during_a_lock_free_compact() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, b) = (sim.client("a"), sim.client("b"));
     swept_and_aged(&mut sim, a);
-    let held = sim.gate(GateRule::new(
-        a,
-        OpMatch::Kind(OpKind::ListMeta),
-        KeyMatch::Exact("sessions/".into()),
-    ));
+    let held = sim.gate(sessions_listing(a, 2));
     let rc = sim.spawn(a, Call::Compact);
     sim.expect_paused(held, "compact after its pack listing");
     let rb = sim.backup(b, "b1", &tree("b1"));
@@ -665,11 +682,7 @@ fn single_writer_compacts_refuse_each_other() {
     swept_and_aged(&mut sim, f);
     for (first, second) in [(f, l), (l, f)] {
         // The first's single-writer check: registered and flagged.
-        let held = sim.gate(GateRule::new(
-            first,
-            OpMatch::Kind(OpKind::ListMeta),
-            KeyMatch::Exact("sessions/".into()),
-        ));
+        let held = sim.gate(sessions_listing(first, 2));
         let rf = sim.spawn(first, Call::Compact);
         sim.expect_paused(held, "the first compact, registered");
         let rl = sim.compact(second);

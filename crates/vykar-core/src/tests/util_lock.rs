@@ -1,11 +1,18 @@
+//! `with_exclusive_session`'s epilogue (10-single-protocol step 8; the
+//! lock's `with_repo_lock` before): the action's result survives a failed
+//! deregistration, a write session the action began is flushed before the
+//! session ends, the handle's storage and lock state are restored, and a
+//! refused registration runs nothing.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::commands::util::with_repo_lock;
+use crate::commands::util::{with_exclusive_session, with_exclusive_session_as};
 use crate::compress::Compression;
 use crate::repo::ChunkerParams;
 use crate::repo::InitOptions;
+use crate::repo::lock;
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Fence, Repo, WriteSessionOptions};
 use vykar_storage::StorageBackend;
@@ -63,8 +70,8 @@ impl StorageBackend for AdvisoryLockBackend {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        // Track lock release via delete of lock files.
-        if key.starts_with("locks/") {
+        // Track deregistration via deletes of exclusive session markers.
+        if key.starts_with("sessions/x-") && key.ends_with(".json") {
             self.state.release_calls.fetch_add(1, Ordering::SeqCst);
             if self.state.fail_release {
                 return Err(VykarError::Other("forced release failure".into()));
@@ -137,46 +144,13 @@ fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repo {
     .unwrap()
 }
 
-#[test]
-fn with_repo_lock_keeps_original_action_error_if_release_also_fails() {
-    let backend = AdvisoryLockBackend::new(true);
-    let mut repo = init_repo_with_backend(backend.clone());
-
-    let result: Result<()> =
-        with_repo_lock(&mut repo, |_repo| Err(VykarError::Other("boom".into())));
-    assert!(matches!(result, Err(VykarError::Other(msg)) if msg == "boom"));
-    assert_eq!(backend.release_calls(), 1);
-}
-
-#[test]
-fn with_repo_lock_succeeds_when_release_fails_after_successful_action() {
-    // Post-commit policy: if the action succeeded, a lock-release failure is
-    // non-fatal (tracing::warn! only). The operation has already committed to
-    // storage; propagating a release error would incorrectly report a failure.
-    // The leaked lock ages out in 6 hours or can be cleared with `vykar
-    // break-lock` — see commands/util.rs run_under_fence.
-    let backend = AdvisoryLockBackend::new(true);
-    let mut repo = init_repo_with_backend(backend.clone());
-
-    let result: Result<()> = with_repo_lock(&mut repo, |_repo| Ok(()));
-    assert!(
-        result.is_ok(),
-        "release failure must not fail a successful action"
-    );
-    assert_eq!(backend.release_calls(), 1);
-}
-
-#[test]
-fn action_flushes_its_session_before_with_repo_lock_releases() {
-    crate::testutil::init_test_environment();
-
-    let backend = AdvisoryLockBackend::new(false);
+fn small_pack_repo(backend: &AdvisoryLockBackend) -> Repo {
     let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
         ..Default::default()
     };
-    let mut repo = Repo::init(
+    Repo::init(
         Box::new(backend.clone()),
         EncryptionMode::Aes256Gcm,
         ChunkerParams::default(),
@@ -184,69 +158,201 @@ fn action_flushes_its_session_before_with_repo_lock_releases() {
         Some(&small_config),
         None,
     )
-    .unwrap();
+    .unwrap()
+}
 
-    let result: Result<()> = with_repo_lock(&mut repo, |repo| {
+fn exclusive_markers(storage: &dyn StorageBackend) -> Vec<String> {
+    storage
+        .list("sessions/x-")
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .collect()
+}
+
+#[test]
+fn the_action_error_is_kept_when_deregistration_also_fails() {
+    let backend = AdvisoryLockBackend::new(true);
+    let mut repo = init_repo_with_backend(backend.clone());
+
+    let result: Result<()> =
+        with_exclusive_session(&mut repo, |_repo| Err(VykarError::Other("boom".into())));
+    assert!(matches!(result, Err(VykarError::Other(msg)) if msg == "boom"));
+    // Three attempts (`deregister_keys`).
+    assert_eq!(backend.release_calls(), 3);
+}
+
+#[test]
+fn success_is_kept_when_deregistration_fails() {
+    // Post-commit policy: if the action succeeded, a failed deregistration is
+    // non-fatal (`tracing::warn!` only): the work is committed. The marker
+    // left behind stops blocking 45 minutes after its last refresh, or
+    // `vykar break-lock --sessions` removes it.
+    let backend = AdvisoryLockBackend::new(true);
+    let mut repo = init_repo_with_backend(backend.clone());
+
+    let result: Result<()> = with_exclusive_session(&mut repo, |_repo| Ok(()));
+    assert!(
+        result.is_ok(),
+        "a failed deregistration must not fail a successful action"
+    );
+    assert_eq!(backend.release_calls(), 3);
+}
+
+#[test]
+fn the_action_flushes_its_session_before_deregistration() {
+    crate::testutil::init_test_environment();
+
+    let backend = AdvisoryLockBackend::new(false);
+    let mut repo = small_pack_repo(&backend);
+
+    let result: Result<()> = with_exclusive_session(&mut repo, |repo| {
         // Begin a write session, store enough to trigger a pack flush, then
         // fail: the session's owner flushes it on its error path.
         let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
         ws.store_chunk(repo, &vec![0xABu8; 300], Compression::None, PackType::Data)?;
         ws.flush_on_abort(repo);
-        Err(VykarError::Other("simulated backup failure".into()))
+        Err(VykarError::Other("simulated failure".into()))
     });
 
     assert!(result.is_err());
-    // flush_on_abort wrote pending_index before the lock was released.
+    // flush_on_abort wrote pending_index before the session deregistered.
     assert!(
         repo.storage().exists("sessions/default.index").unwrap(),
-        "sessions/default.index should exist after with_repo_lock error path"
+        "sessions/default.index should exist after the error path"
     );
-    assert_eq!(backend.release_calls(), 1, "lock should still be released");
+    assert_eq!(backend.release_calls(), 1, "the session deregistered");
+    assert!(exclusive_markers(repo.storage().as_ref()).is_empty());
 }
 
 /// A failed `save_session` flushes its session before the error returns:
 /// the journal PUT during the session's own flush fails, then the fence
 /// refuses the index write, and only the error arm's rewrite of the journal
-/// (`flush_on_abort`) leaves `sessions/default.index` behind.
+/// (`flush_on_abort`) leaves the journal behind, under the session ID the
+/// write session was given (an exclusive session's for a repair,
+/// `sessions/x-<hex>.index`).
 #[test]
 fn a_failed_save_session_writes_the_journal() {
     crate::testutil::init_test_environment();
 
     let backend = AdvisoryLockBackend::new(false);
-    let small_config = InitOptions {
-        min_pack_size: 256,
-        max_pack_size: 256,
-        ..Default::default()
-    };
-    let mut repo = Repo::init(
-        Box::new(backend.clone()),
-        EncryptionMode::Aes256Gcm,
-        ChunkerParams::default(),
-        Some(crate::testing::TEST_PASSPHRASE),
-        Some(&small_config),
-        None,
-    )
-    .unwrap();
+    let mut repo = small_pack_repo(&backend);
+    let id = format!("x-{:032x}", 7u128);
 
-    let mut ws = repo.begin_write_session(&WriteSessionOptions::default());
+    let mut ws = repo.begin_write_session(&WriteSessionOptions {
+        session_id: id.clone(),
+        ..WriteSessionOptions::default()
+    });
     ws.store_chunk(&repo, &[0xABu8; 300], Compression::None, PackType::Data)
         .unwrap();
     backend.state.fail_journal_puts.store(1, Ordering::SeqCst);
     let err = repo
-        .writer(Fence::lock(Arc::new(|| {
-            Err(VykarError::LockExpired("lost".into()))
+        .writer(Fence::marker(Arc::new(|| {
+            Err(VykarError::MarkerLostDuringCommit)
         })))
         .save_session(ws)
         .unwrap_err();
 
-    assert!(matches!(err, VykarError::LockExpired(_)), "{err}");
+    assert!(matches!(err, VykarError::MarkerLostDuringCommit), "{err}");
     assert_eq!(
         backend.state.fail_journal_puts.load(Ordering::SeqCst),
         0,
         "the session's own flush tried the journal first"
     );
     assert!(
-        repo.storage().exists("sessions/default.index").unwrap(),
-        "the failed save flushed its session"
+        repo.storage()
+            .exists(&format!("sessions/{id}.index"))
+            .unwrap(),
+        "the failed save flushed its session under its ID"
     );
+    assert!(!repo.storage().exists("sessions/default.index").unwrap());
+}
+
+/// After the call the handle's storage is the raw backend again and the
+/// lock state is cleared, whatever the action returned; inside it the
+/// storage is the write-checked wrapper and the session is `x-` + 32 hex.
+#[test]
+fn the_storage_and_lock_state_are_restored() {
+    let backend = AdvisoryLockBackend::new(false);
+    let mut repo = init_repo_with_backend(backend);
+    let raw = Arc::clone(repo.storage());
+    for fail in [false, true] {
+        let result: Result<()> = with_exclusive_session_as(&mut repo, None, |w, session| {
+            assert!(!Arc::ptr_eq(w.storage(), &raw), "the storage is wrapped");
+            let id = session.id();
+            assert!(
+                id.len() == 34
+                    && id.starts_with("x-")
+                    && id[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+                "{id}"
+            );
+            assert!(w.live_sessions().is_empty());
+            if fail {
+                Err(VykarError::Other("boom".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.is_err(), fail);
+        assert!(Arc::ptr_eq(repo.storage(), &raw));
+        assert!(repo.lock_store_time().is_none());
+        assert!(repo.live_sessions().is_empty());
+        assert!(exclusive_markers(raw.as_ref()).is_empty());
+    }
+}
+
+/// A registration that finds another live session refuses
+/// `ActiveSessions`, deletes its own marker and runs no action.
+#[test]
+fn a_refused_registration_runs_nothing_and_leaves_no_marker() {
+    let backend = AdvisoryLockBackend::new(false);
+    let mut repo = init_repo_with_backend(backend);
+    let env = repo.host_env().clone();
+    let shared = lock::register_session(repo.storage().as_ref(), "live-backup", &env).unwrap();
+    let ran = AtomicUsize::new(0);
+    let result: Result<()> = with_exclusive_session(&mut repo, |_| {
+        ran.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(
+        matches!(result, Err(VykarError::ActiveSessions(_))),
+        "{result:?}"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert!(exclusive_markers(repo.storage().as_ref()).is_empty());
+    assert!(repo.live_sessions().is_empty());
+    lock::deregister_session(repo.storage().as_ref(), shared.session_id(), &env);
+}
+
+/// The exclusive check guards the index write (`fence_blocks_persist_index`
+/// of the lock's fence before 10-single-protocol step 8): with its marker
+/// removed and no reuse of an earlier EXISTS, `save_state` fails
+/// `MarkerLostDuringCommit` and no head is written.
+#[test]
+fn a_removed_marker_blocks_the_index_write() {
+    let backend = AdvisoryLockBackend::new(false);
+    let mut repo = init_repo_with_backend(backend);
+    repo.set_exclusive_check_reuse(std::time::Duration::ZERO);
+    let raw = Arc::clone(repo.storage());
+    let heads_before = raw.list("index.h/").unwrap();
+    let result: Result<()> = with_exclusive_session(&mut repo, |w| {
+        for key in exclusive_markers(raw.as_ref()) {
+            raw.delete(&key)?;
+        }
+        // Edit the index so save_state persists it.
+        let pack = vykar_types::pack_id::PackId::from_bytes([8; 32]);
+        w.chunk_index_mut().add(
+            vykar_types::chunk_id::ChunkId::from_bytes([7; 32]),
+            10,
+            pack,
+            0,
+        );
+        w.chunk_index_mut().set_pack_trailer(pack, 0);
+        w.save_state()
+    });
+    assert!(
+        matches!(result, Err(VykarError::MarkerLostDuringCommit)),
+        "{result:?}"
+    );
+    assert_eq!(raw.list("index.h/").unwrap(), heads_before);
 }

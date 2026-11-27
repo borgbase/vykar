@@ -28,9 +28,43 @@ pub(crate) fn run_break_lock(
 
     if sessions {
         clear_sessions(storage.as_ref())?;
+    } else {
+        hint_exclusive_sessions(storage.as_ref());
     }
 
     Ok(())
+}
+
+/// An exclusive session's marker (`check --repair`, `upgrade`, a pack-map
+/// write) blocks writers as the lock did, but plain `break-lock` does not
+/// remove it: name the way out. A failed listing is only a warning.
+fn hint_exclusive_sessions(storage: &dyn vykar_storage::StorageBackend) {
+    let entries = match lock::list_session_entries(storage) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Warning: could not list session markers: {e}");
+            return;
+        }
+    };
+    let now = Utc::now();
+    for (id, entry) in entries
+        .iter()
+        .filter(|(id, _)| lock::is_exclusive_session(id))
+    {
+        let who = match entry {
+            Some(e) => format!(
+                "host={}, pid={}, age={}",
+                e.hostname,
+                e.pid,
+                lock::format_age(&now, &e.last_refresh)
+            ),
+            None => "malformed marker".to_string(),
+        };
+        eprintln!(
+            "An exclusive session ({id}: {who}) blocks writers; if that process is gone, run \
+             `vykar break-lock --sessions`."
+        );
+    }
 }
 
 fn clear_sessions(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> {

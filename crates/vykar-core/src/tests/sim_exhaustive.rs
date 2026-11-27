@@ -710,15 +710,40 @@ impl Contender {
 /// done (or at the start) every held client is free; anything else is a
 /// preemption.
 fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
-    lock_acquisitions_on(&Template::encrypted(), hosts, bound)
+    lock_acquisitions_on(&Template::encrypted(), hosts, bound, false)
 }
 
-/// [`lock_acquisitions`] on `template`.
+/// [`lock_acquisitions`] on `template`; `exclusive`: the two clients
+/// register exclusive sessions instead (`Call::ExclusiveCustom`,
+/// 10-single-protocol step 8): every op of both on `sessions/` (the main
+/// threads only: their PUT, LIST, GETs, EXISTS and DELETE) is gated, a
+/// refusal is `ActiveSessions`, and a hold lasts from the body's entry to
+/// the delete of the session's marker.
 fn lock_acquisitions_on(
     template: &Template,
     hosts: HostPlan,
     bound: Bound,
+    exclusive: bool,
 ) -> (Search, LockPairTally) {
+    let gated = || {
+        if exclusive {
+            KeyMatch::Prefix("sessions/".into())
+        } else {
+            KeyMatch::LockKey
+        }
+    };
+    let holds = |key: &str| {
+        if exclusive {
+            key.starts_with("sessions/x-") && key.ends_with(".json")
+        } else {
+            KeyMatch::LockKey.matches(key)
+        }
+    };
+    let refusal = if exclusive {
+        AllowedError::ActiveSessions
+    } else {
+        AllowedError::Locked
+    };
     let mut tally = LockPairTally::default();
     let search = dfs(bound, |prefix| {
         let mut sim = template.fork();
@@ -733,7 +758,13 @@ fn lock_acquisitions_on(
             .map(|&id| Contender {
                 id,
                 gates: (1..=MAX_LOCK_OPS as u32)
-                    .map(|n| sim.gate(GateRule::new(id, OpMatch::Any, KeyMatch::LockKey).nth(n)))
+                    .map(|n| {
+                        sim.gate(
+                            GateRule::new(id, OpMatch::Any, gated())
+                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .nth(n),
+                        )
+                    })
                     .collect(),
                 next: 0,
                 held: false,
@@ -747,13 +778,21 @@ fn lock_acquisitions_on(
                 inside.lock().unwrap().push((id, store.step()));
                 Ok(())
             });
-            spawned.push(sim.spawn(
-                c.id,
-                Call::Custom {
+            // The advisory lock (`Call::LockedCustom`): no command takes it
+            // since 10-single-protocol step 8 (`Call::Custom` is an
+            // exclusive session); kept until step 9 deletes the lock.
+            let call = if exclusive {
+                Call::ExclusiveCustom {
                     label: "hold".into(),
                     f,
-                },
-            ));
+                }
+            } else {
+                Call::LockedCustom {
+                    label: "hold".into(),
+                    f,
+                }
+            };
+            spawned.push(sim.spawn(c.id, call));
             // Spawning asserts every other run is held or done.
             c.wait(&sim);
         }
@@ -783,12 +822,11 @@ fn lock_acquisitions_on(
         }
 
         let runs: Vec<RunRecord> = spawned.into_iter().map(|s| sim.join(s)).collect();
-        let locked =
-            |r: &RunRecord| r.error_class() == Some(&ErrorClass::Allowed(AllowedError::Locked));
+        let locked = |r: &RunRecord| r.error_class() == Some(&ErrorClass::Allowed(refusal.clone()));
         for r in &runs {
             assert!(
                 r.is_ok() || locked(r),
-                "a raw acquisition ended neither Ok nor Locked: {} / {}",
+                "a raw acquisition ended neither Ok nor refused ({refusal:?}): {} / {}",
                 runs[0].detail(),
                 runs[1].detail()
             );
@@ -803,7 +841,7 @@ fn lock_acquisitions_on(
                     r.client == c
                         && r.step > s
                         && matches!(r.op, OpKind::Delete | OpKind::BatchDelete)
-                        && KeyMatch::LockKey.matches(&r.key)
+                        && holds(&r.key)
                 })
                 .map_or_else(
                     || {
@@ -834,7 +872,7 @@ fn lock_acquisitions_on(
         }
         let wrote = |c: ClientId| {
             log.iter()
-                .any(|r| r.client == c && r.op.is_write() && KeyMatch::LockKey.matches(&r.key))
+                .any(|r| r.client == c && r.op.is_write() && holds(&r.key))
         };
         if ids.iter().all(|&c| wrote(c)) && runs.iter().any(locked) {
             tally.contended_puts += 1;
@@ -876,6 +914,307 @@ fn lock_acquisitions_race() {
             assert!(t.both_backed_off > 0, "{t:?}");
         }
     }
+}
+
+/// 10-single-protocol step 8's successor of [`lock_acquisitions_race`]: two
+/// exclusive registrations, every op of both on `sessions/` held at a gate.
+/// No schedule puts both inside their sessions at once (X1); every run
+/// ends Ok or `ActiveSessions`; at K ≥ 3 both refusing is reached.
+#[test]
+fn exclusive_registrations_race() {
+    let bound = Bound {
+        preemptions: GATE_K,
+        max_runs: PRECOMMIT_MAX_RUNS,
+    };
+    for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
+        let start = Instant::now();
+        let (s, t) = lock_acquisitions_on(&Template::encrypted(), hosts, bound, true);
+        eprintln!(
+            "exclusive registrations, {hosts:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
+            start.elapsed()
+        );
+        assert!(s.complete);
+        assert_eq!(
+            t.double_holds, 0,
+            "two exclusive holders on {hosts:?}: {t:?}"
+        );
+        assert!(t.one_held > 0, "{t:?}");
+        if GATE_K >= 3 {
+            assert!(t.both_backed_off > 0, "{t:?}");
+        }
+    }
+}
+
+/// Most gated ops one client makes in one schedule of
+/// [`exclusive_against_backup_search`] (a dozen or two are expected); one
+/// more is a harness bug.
+const MAX_EXCLUSIVE_BACKUP_OPS: usize = 64;
+
+#[derive(Default, Debug)]
+struct ExclusiveBackupTally {
+    schedules: usize,
+    /// The exclusive run refused `ActiveSessions`.
+    exclusive_refused: usize,
+    /// The backup ended `Locked`.
+    backup_locked: usize,
+    /// Both ran (one after the other).
+    both_ok: usize,
+    /// Schedules in which the backup's `sessions/` keys were written while
+    /// the exclusive run held the repository (the residual: its marker's
+    /// registration PUT and the DELETE of its refusal).
+    residual_marker_writes: usize,
+    first_violation: Option<(Vec<usize>, String)>,
+}
+
+/// The ops [`exclusive_against_backup_search`] holds: every op on
+/// `sessions/` but on journals (PUT, LIST, GET, EXISTS, DELETE:
+/// registrations, the exclusive run's write check, marks, listings,
+/// deregistrations; a backup's journal is written from its upload threads,
+/// whose order is not the search's) and the backup's head and snapshot
+/// writes.
+fn exclusive_backup_gated(op: OpKind, key: &str) -> bool {
+    (key.starts_with("sessions/") && !key.ends_with(".index"))
+        || (op.is_write() && (key.starts_with("index.h/") || key.starts_with("snapshots/")))
+}
+
+/// An exclusive session (client a, `Call::ExclusiveCustom` recording its
+/// entry) against a backup (client b) on a `kind` store, every op of both
+/// in [`exclusive_backup_gated`] (the main threads only) held at a gate,
+/// the search picking which proceeds next (as [`single_writer_search`]:
+/// a client held again at a listing of `sessions/` right after one, or
+/// after a read of a marker, backed off, and continuing it costs a
+/// preemption, so a wait loop is bounded by K). Each schedule: every run
+/// ends Ok, `Locked` or `ActiveSessions`; when the exclusive run entered,
+/// no write of the backup lands between its registration listing and the
+/// DELETE of its marker, except the backup's own marker keys
+/// (`sessions/<id>[.<n>].json`: a registration PUT and its refusal's
+/// DELETE, the residual of two registrations racing); `Invariant::STEP1`
+/// holds.
+fn exclusive_against_backup_search(
+    template: &Template,
+    kind: StoreKind,
+    bound: Bound,
+) -> (Search, ExclusiveBackupTally) {
+    let mut tally = ExclusiveBackupTally::default();
+    let search = dfs(bound, |prefix| {
+        let mut sim = template.fork_as(kind);
+        let (a, b) = (sim.client("a"), sim.client("b"));
+        let mut cs: Vec<Contender> = [a, b]
+            .into_iter()
+            .map(|id| Contender {
+                id,
+                gates: (1..=MAX_EXCLUSIVE_BACKUP_OPS as u32)
+                    .map(|n| {
+                        sim.gate(
+                            GateRule::new(id, OpMatch::Any, KeyMatch::Any)
+                                .filter(exclusive_backup_gated)
+                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .nth(n),
+                        )
+                    })
+                    .collect(),
+                next: 0,
+                held: false,
+                max: MAX_EXCLUSIVE_BACKUP_OPS,
+            })
+            .collect();
+        let entered: Arc<Mutex<Option<u64>>> = Arc::default();
+        let mut spawned = Vec::new();
+        for (i, c) in cs.iter_mut().enumerate() {
+            let call = if i == 0 {
+                let (store, entered) = (sim.store().clone(), Arc::clone(&entered));
+                Call::ExclusiveCustom {
+                    label: "hold".into(),
+                    f: Box::new(move |_| {
+                        *entered.lock().unwrap() = Some(store.step());
+                        Ok(())
+                    }),
+                }
+            } else {
+                Call::Backup {
+                    snapshot: "b1".into(),
+                    tree: crate::sim::SourceTree::seeded("b1", 2, 16 * 1024),
+                }
+            };
+            spawned.push(sim.spawn(c.id, call));
+            c.wait(&sim);
+        }
+
+        let held_at = |c: &Contender| {
+            sim.store()
+                .gate_paused(c.gates[c.next])
+                .map(|p| (p.op, p.key))
+        };
+        let is_sessions_listing =
+            |(op, key): &(OpKind, String)| OpMatch::AnyList.matches(*op) && key == "sessions/";
+        let mut points = Vec::new();
+        let mut last: Option<(usize, bool)> = None;
+        loop {
+            let held: Vec<usize> = (0..cs.len()).filter(|&i| cs[i].held).collect();
+            if held.is_empty() {
+                break;
+            }
+            let costs: Vec<u32> = held
+                .iter()
+                .map(|&i| match last {
+                    Some((l, false)) if cs[l].held => u32::from(i != l),
+                    Some((l, true)) if cs[l].held => u32::from(i == l && held.len() > 1),
+                    _ => 0,
+                })
+                .collect();
+            let taken = prefix
+                .get(points.len())
+                .copied()
+                .unwrap_or_else(|| costs.iter().position(|c| *c == 0).expect("a free option"));
+            let i = held[taken];
+            points.push(Point { costs, taken });
+            let resumed = held_at(&cs[i]).expect("held");
+            sim.resume(cs[i].gates[cs[i].next]);
+            cs[i].next += 1;
+            cs[i].wait(&sim);
+            // A wait (the backup's pre-head listing `Locked`) lists
+            // `sessions/` and reads the holder's marker, then lists again.
+            let backed_off = cs[i].held
+                && held_at(&cs[i]).is_some_and(|at| {
+                    is_sessions_listing(&at)
+                        && (is_sessions_listing(&resumed)
+                            || (resumed.0 == OpKind::Get && resumed.1.starts_with("sessions/")))
+                });
+            last = Some((i, backed_off));
+        }
+
+        let runs: Vec<RunRecord> = spawned.into_iter().map(|s| sim.join(s)).collect();
+        tally.schedules += 1;
+        let ended =
+            |r: &RunRecord, e: AllowedError| r.error_class() == Some(&ErrorClass::Allowed(e));
+        let mut violation = None;
+        for r in &runs {
+            if !(r.is_ok()
+                || ended(r, AllowedError::Locked)
+                || ended(r, AllowedError::ActiveSessions))
+            {
+                violation = Some(format!("a run ended otherwise: {}", r.detail()));
+            }
+        }
+        if ended(&runs[0], AllowedError::ActiveSessions) {
+            tally.exclusive_refused += 1;
+        }
+        if ended(&runs[1], AllowedError::Locked) {
+            tally.backup_locked += 1;
+        }
+        if runs.iter().all(RunRecord::is_ok) {
+            tally.both_ok += 1;
+        }
+        let log = sim.store().log();
+        let entry = *entered.lock().unwrap();
+        if let Some(entry) = entry {
+            let a_run = runs[0].index;
+            let listed = log
+                .iter()
+                .filter(|r| {
+                    r.client == a
+                        && r.run == Some(a_run)
+                        && r.step < entry
+                        && OpMatch::AnyList.matches(r.op)
+                        && r.key == "sessions/"
+                })
+                .map(|r| r.step)
+                .max()
+                .expect("the exclusive run listed sessions/ before it entered");
+            let released = log
+                .iter()
+                .find(|r| {
+                    r.client == a
+                        && r.step > entry
+                        && r.op.is_delete()
+                        && r.key.starts_with("sessions/x-")
+                        && r.key.ends_with(".json")
+                })
+                .map_or(runs[0].last_step, |r| r.step);
+            let own_marker = |key: &str| {
+                crate::repo::lock::parse_session_marker_key(key)
+                    .is_some_and(|(id, _)| !crate::repo::lock::is_exclusive_session(id))
+            };
+            let inside: Vec<String> = log
+                .iter()
+                .filter(|r| {
+                    r.client == b
+                        && r.applied()
+                        && r.op.is_mutation()
+                        && r.step > listed
+                        && r.step < released
+                })
+                .map(|r| format!("{} {:?} {}", r.step, r.op, r.key))
+                .collect();
+            let (marker, other): (Vec<&String>, Vec<&String>) = inside
+                .iter()
+                .partition(|w| w.rsplit(' ').next().is_some_and(own_marker));
+            if !marker.is_empty() {
+                tally.residual_marker_writes += 1;
+            }
+            if !other.is_empty() && violation.is_none() {
+                violation = Some(format!(
+                    "the backup wrote under the exclusive hold (steps {listed}..{released}): \
+                     {other:?}"
+                ));
+            }
+        }
+        let report = sim.check_invariants(Invariant::STEP1);
+        if !report.violations.is_empty() && violation.is_none() {
+            violation = Some(format!("{report}"));
+        }
+        if let Some(v) = violation
+            && tally.first_violation.is_none()
+        {
+            tally.first_violation = Some((points.iter().map(|p| p.taken).collect(), v));
+        }
+        Some(points)
+    });
+    (search, tally)
+}
+
+/// 10-single-protocol step 8: an exclusive session against a backup, every
+/// `sessions/` op of both and the backup's head and snapshot writes one at
+/// a time, at [`GATE_K`], on both store kinds (exclusive sessions exist in
+/// both modes). In every schedule the exclusive run refuses
+/// `ActiveSessions`, or the backup refuses `Locked` (or ran after it):
+/// no shared write lands under a live exclusive hold but the backup's own
+/// marker keys (the residual of racing registrations, see
+/// [`exclusive_against_backup_search`]). The cover of invariant 7's blind
+/// spot (shared runs are exempt from it, `sim::checker`). One test per
+/// kind, so the two run in parallel (about 20 s and 60 s, debug build).
+fn assert_exclusive_against_backup(kind: StoreKind) {
+    let bound = Bound {
+        preemptions: GATE_K,
+        max_runs: PRECOMMIT_MAX_RUNS,
+    };
+    let start = Instant::now();
+    let (s, t) = exclusive_against_backup_search(&Template::encrypted(), kind, bound);
+    eprintln!(
+        "exclusive against backup, {kind:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
+        start.elapsed()
+    );
+    assert!(s.complete, "{kind:?}: {s:?}");
+    assert!(
+        t.first_violation.is_none(),
+        "{kind:?}: {:?}",
+        t.first_violation
+    );
+    assert!(t.exclusive_refused > 0, "{kind:?}: {t:?}");
+    assert!(t.backup_locked > 0, "{kind:?}: {t:?}");
+    assert!(t.both_ok > 0, "{kind:?}: {t:?}");
+}
+
+/// [`assert_exclusive_against_backup`] on a single-writer (plain) store.
+#[test]
+fn exclusive_against_backup_race() {
+    assert_exclusive_against_backup(StoreKind::Plain);
+}
+
+/// [`assert_exclusive_against_backup`] on a store with put-if-absent.
+#[test]
+fn exclusive_against_backup_race_conditional() {
+    assert_exclusive_against_backup(StoreKind::Conditional);
 }
 
 /// Most gated ops one client makes in one schedule of the single-writer
@@ -1003,8 +1342,13 @@ pub(super) fn single_writer_search(
             cs[i].next += 1;
             cs[i].wait(&sim);
             // Held again at a listing of `sessions/` right after one, or
-            // after the unmark that follows one: it backed off.
+            // after the unmark that follows one: it backed off. Not after
+            // the first two gated ops, the registration's PUT and its
+            // listing of `sessions/` (10-single-protocol step 8), which the
+            // open's listing (a backup) or the single-writer check (a
+            // compact) follows at once.
             let backed_off = cs[i].held
+                && cs[i].next > 2
                 && held_at(&cs[i]).is_some_and(|at| {
                     is_sessions_listing(&at)
                         && (is_sessions_listing(&resumed) || resumed.0 == OpKind::Put)
@@ -1164,11 +1508,16 @@ const GAPPED_INVARIANTS: &[Invariant] = &[
 ];
 
 /// The ops [`gapped_backup_search`] holds: every listing of `sessions/`,
-/// every marker PUT, every op on `config`, lock keys' writes and deletes,
-/// and the head writes (EXISTS, PUT, put-if-absent).
+/// every marker PUT, the EXISTS and DELETE of an exclusive session's marker
+/// (its write check and its deregistration, 10-single-protocol step 8),
+/// every op on `config`, lock keys' writes and deletes, and the head
+/// writes (EXISTS, PUT, put-if-absent).
 fn gapped_gated(op: OpKind, key: &str) -> bool {
     (OpMatch::AnyList.matches(op) && key == "sessions/")
         || (op == OpKind::Put && key.starts_with("sessions/") && key.ends_with(".json"))
+        || (matches!(op, OpKind::Exists | OpKind::Delete)
+            && key.starts_with("sessions/x-")
+            && key.ends_with(".json"))
         || key == "config"
         || (KeyMatch::LockKey.matches(key) && key != "locks/" && (op.is_write() || op.is_delete()))
         || (matches!(op, OpKind::Exists | OpKind::Put | OpKind::PutIfAbsent)
@@ -1339,7 +1688,10 @@ pub(super) fn gapped_backup_search(
 
 /// Preemption bound of the pre-commit gapped searches: K = 2 takes about
 /// 4 s each (34 to 88 runs); K = 3 was run when they were added (see the
-/// step's report).
+/// step's report) and again with exclusive rivals (10-single-protocol step
+/// 8): switch to single 110 runs, `check --repair` 198, switch to multi
+/// 198, compact 380, all clean, each committing and re-reading `config`
+/// in every schedule (20 s to 85 s each, debug build).
 const GAPPED_K: u32 = 2;
 
 /// [`gapped_backup_search`] at [`GAPPED_K`] against `rival`: every
@@ -1575,6 +1927,7 @@ fn measure_part_10_searches() {
                 preemptions: GATE_K,
                 max_runs: 100_000,
             },
+            false,
         );
         eprintln!(
             "gate {hosts:?} K = {GATE_K} (encrypted): {s:?} {tally:?} in {:?}",

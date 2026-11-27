@@ -819,22 +819,40 @@ fn is_lock_key(key: &str) -> bool {
     key.starts_with("locks/") && key.ends_with(".json")
 }
 
+/// An exclusive session's marker key (`sessions/x-*.json`, 10-single-protocol
+/// step 8): a hold for invariant 7, as a lock key is.
+fn is_exclusive_marker_key(key: &str) -> bool {
+    crate::repo::lock::parse_session_marker_key(key)
+        .is_some_and(|(id, _)| crate::repo::lock::is_exclusive_session(id))
+}
+
 /// Invariant 7, as the store sees it: replay the op log, tracking which
-/// lock keys exist and which (client, run) last wrote each, and judge every
-/// applied protected write against the keys present just before it. Late
-/// effects count at the step they land. The tamper client, the Init run
+/// holds exist (lock keys and, since 10-single-protocol step 8, exclusive
+/// session marker keys) and which (client, run) last wrote each, and judge
+/// every applied protected write against the distinct holders of the keys
+/// present just before it: none is `WriteWithoutLock`, one other than the
+/// writer `WriteUnderOtherLock`, two or more `WriteUnderSeveralLocks`. One
+/// run's overlapping marker keys (a refresh), or its legacy lock key and its
+/// `x-` marker (a v2/v3 upgrade), count once. Late effects count at the
+/// step they land. The tamper client, the Init run
 /// (`Repo::init` writes `index.h/1` with no lock) and lock-free runs
 /// (`RunRecord::lock_free`, 04 step 9: they write heads with put-if-absent
 /// and no lock) are exempt; every lock-mode run is judged, beside lock-free
 /// ones too.
 ///
+/// What it does not see: shared runs (backups, compacts, prunes, deletes:
+/// `lock_free`) are exempt, so a shared write under an exclusive hold is
+/// visible only to scripted assertions (`tests::sim_exclusion` case (d),
+/// `exclusive_against_backup_race`) until step 10 replaces this invariant.
+///
 /// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
 /// tentative key that can coexist with the holder's until the loser deletes
-/// it, so a protected write by the rightful holder in that window reads as
-/// `WriteUnderSeveralLocks`. No scripted scenario holds a contender there,
-/// and in the driver (`sim::driver`) `acquire_lock` is one step, so a
-/// contender's tentative key never coexists with the holder's across a
-/// decision. A delayed or duplicated lock PUT that lands later is a key
+/// it, and so does a refused exclusive registration (its marker, from its
+/// PUT to its delete), so a protected write by the rightful holder in that
+/// window reads as `WriteUnderSeveralLocks`. No scripted scenario holds a
+/// contender there, and in the driver (`sim::driver`) `acquire_lock` and
+/// an exclusive registration are one step each, so a contender's tentative
+/// key never coexists with the holder's across a decision. A delayed or duplicated lock PUT that lands later is a key
 /// with no holder; the driver names that shape (`OrphanLockKey`).
 fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
     let exempt_runs: BTreeSet<usize> = history
@@ -861,11 +879,10 @@ fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report
             rec.client == store.tamper_id() || rec.run.is_some_and(|r| exempt_runs.contains(&r));
         if protected && !exempt {
             let mine = (rec.client, rec.run);
-            let kind = match held.len() {
+            let holders: BTreeSet<(ClientId, Option<usize>)> = held.values().copied().collect();
+            let kind = match holders.len() {
                 0 => Some(ViolationKind::WriteWithoutLock),
-                1 if held.values().next() != Some(&mine) => {
-                    Some(ViolationKind::WriteUnderOtherLock)
-                }
+                1 if !holders.contains(&mine) => Some(ViolationKind::WriteUnderOtherLock),
                 1 => None,
                 _ => Some(ViolationKind::WriteUnderSeveralLocks),
             };
@@ -891,7 +908,7 @@ fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report
                 );
             }
         }
-        if rec.op.is_write() && is_lock_key(&rec.key) {
+        if rec.op.is_write() && (is_lock_key(&rec.key) || is_exclusive_marker_key(&rec.key)) {
             held.insert(rec.key.clone(), (rec.client, rec.run));
         }
         for k in rec.deleted_keys() {
@@ -1262,6 +1279,7 @@ mod tests {
                 detail: String::new(),
             },
             lock_free: false,
+            exclusive: false,
         }
     }
 

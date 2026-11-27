@@ -259,7 +259,7 @@ fn chunk_missing_from_index_is_damage() {
     let (b_rel, b_chunk) = fx.file_chunk("b.bin");
     {
         let mut repo = open_local_repo(&fx.repo_dir, fx.passphrase);
-        vykar_core::commands::util::with_maintenance_lock(&mut repo, |w| {
+        vykar_core::commands::util::with_exclusive_session(&mut repo, |w| {
             w.chunk_index_mut().remove(&b_chunk).unwrap();
             w.save_state()
         })

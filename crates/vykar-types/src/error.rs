@@ -77,10 +77,12 @@ pub struct LockHolderDetails {
     pub age: String,
 }
 
-/// Identifies whatever holds the repository's advisory lock.
+/// Identifies whatever holds the repository: the advisory lock, or a
+/// session marker (`sessions/x-*.json`: an exclusive session, 10-single-protocol
+/// step 8; another `sessions/*.json`: a committing backup or a compact).
 ///
-/// `details` is `None` when the lock object could not be fetched or parsed —
-/// only its storage key is known.
+/// `details` is `None` when the lock object or marker could not be fetched
+/// or parsed — only its storage key is known.
 #[derive(Debug, Clone)]
 pub struct LockHolder {
     pub key: String,
@@ -92,6 +94,33 @@ impl fmt::Display for LockHolder {
     /// as `FAILED: {e}` (see `vykar-cli`'s `print_summary`), where multi-line
     /// output would break the alignment.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An exclusive session's marker (`sessions/x-*.json`): `check
+        // --repair`, `upgrade` or a pack-map write runs.
+        if self.key.starts_with("sessions/x-") {
+            return match &self.details {
+                Some(d) => write!(
+                    f,
+                    "an exclusive maintenance run (`check --repair`, `upgrade` or a pack-map \
+                     write) on {} (PID {}, started {} ago) holds the repository; nothing else \
+                     writes to it until it ends. Wait for it to finish; if that process is gone, \
+                     its marker stops blocking 45 minutes after its last refresh, or run \
+                     `vykar break-lock --sessions` (it asks for confirmation and removes every \
+                     session marker, those of running backups included).",
+                    d.hostname, d.pid, d.age
+                ),
+                // Malformed, or gone between the listing and the read of it.
+                None => write!(
+                    f,
+                    "an exclusive maintenance run's session marker is unreadable or was just \
+                     removed (key: {}). Run the command again; if it persists and no \
+                     `check --repair`, `upgrade` or pack-map write is running, wait until it is \
+                     45 minutes old, or run `vykar break-lock --sessions` (it asks for \
+                     confirmation and removes every session marker, those of running backups \
+                     included).",
+                    self.key
+                ),
+            };
+        }
         // A session marker (`sessions/*.json`) holds the repository when a
         // lock-free backup is committing or a lock-free compact runs (the
         // marker handshake).
@@ -409,13 +438,15 @@ pub enum VykarError {
     /// another client may have taken the session for ended. A backup checks
     /// between its commit mark and its snapshot write (the index head it
     /// wrote stays without its snapshot; a retry deduplicates against that
-    /// head); a lock-free compact, prune or delete before each index head,
-    /// each batch of deletes and each snapshot delete (what it wrote so far
-    /// is unreferenced debris).
+    /// head); a compact, prune or delete before each index head, each batch
+    /// of deletes and each snapshot delete (what it wrote so far is
+    /// unreferenced debris); an exclusive run (`check --repair`, `upgrade`,
+    /// pack maps) before every write.
     #[error(
         "this run's session marker was reaped, lost, or not refreshed in time while it was writing \
-         (a backup's commit, or a compact's, prune's or delete's index heads and deletes); nothing \
-         more was written: run the command again (a backup reuses the data it uploaded)"
+         (a backup's commit, a maintenance run's index heads and deletes, an exclusive run's \
+         writes); nothing more was written: run the command again (a backup reuses the data it \
+         uploaded)"
     )]
     MarkerLostDuringCommit,
 
@@ -641,6 +672,51 @@ impl VykarError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn holder(key: &str, details: bool) -> String {
+        LockHolder {
+            key: key.to_string(),
+            details: details.then(|| LockHolderDetails {
+                hostname: "host-a".into(),
+                pid: 42,
+                age: "3m".into(),
+            }),
+        }
+        .to_string()
+    }
+
+    /// An exclusive session's marker: one line, naming the commands, what
+    /// clears it and that `break-lock --sessions` removes every marker.
+    #[test]
+    fn exclusive_session_holder_message() {
+        for details in [true, false] {
+            let msg = holder("sessions/x-0123456789abcdef0123456789abcdef.json", details);
+            assert!(!msg.contains('\n'), "{msg}");
+            assert!(msg.contains("exclusive maintenance run"), "{msg}");
+            assert!(msg.contains("check --repair"), "{msg}");
+            assert!(msg.contains("vykar break-lock --sessions"), "{msg}");
+            assert!(msg.contains("45 minutes"), "{msg}");
+            assert!(msg.contains("every session marker"), "{msg}");
+        }
+        let msg = holder("sessions/x-0123456789abcdef0123456789abcdef.json", true);
+        assert!(msg.contains("host-a (PID 42, started 3m ago)"), "{msg}");
+    }
+
+    /// A shared session's marker keeps its text.
+    #[test]
+    fn shared_session_holder_message_is_unchanged() {
+        let msg = holder("sessions/0123456789abcdef0123456789abcdef.json", true);
+        assert!(
+            msg.starts_with("a backup committing or a compact running without the lock on host-a"),
+            "{msg}"
+        );
+        assert!(!msg.contains("exclusive"), "{msg}");
+        let msg = holder("sessions/0123456789abcdef0123456789abcdef.json", false);
+        assert!(
+            msg.starts_with("a session marker that may belong to a committing backup"),
+            "{msg}"
+        );
+    }
 
     /// One line (the cycle summary), naming the command and the way out; a
     /// write refusal like the storage errors it stands in for.

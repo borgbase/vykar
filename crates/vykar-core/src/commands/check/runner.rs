@@ -664,8 +664,9 @@ pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
 }
 
 /// [`run_with_repair`] on a repository opened with
-/// [`repair_open_options`]`(mode)`. PlanOnly takes no lock and registers no
-/// marker; Apply/ApplyShown take the maintenance lock here.
+/// [`repair_open_options`]`(mode)`. PlanOnly registers no session;
+/// Apply/ApplyShown run as an exclusive session here
+/// (`commands::util::with_exclusive_session`).
 pub(crate) fn run_with_repair_on_repo(
     repo: &mut Repo,
     config: &VykarConfig,
@@ -709,14 +710,16 @@ pub(crate) fn run_with_repair_on_repo(
             repair_errors: Vec::new(),
         })
     } else {
-        // Apply: maintenance lock, re-scan under lock, mutate state. A
+        // Apply: an exclusive session, re-scan inside it, mutate state. A
         // multi-writer repository whose storage this client cannot use
-        // refuses first, with nothing written.
+        // refuses first, with nothing written. Repair rebuilds or rewrites
+        // the index and deletes snapshots: it does not run beside any other
+        // session, and the registration refused already when one is live.
         repo.require_writer_mode()?;
-        crate::commands::util::with_maintenance_lock(repo, |repo| {
-            // Repair rebuilds or rewrites the index and deletes snapshots:
-            // it does not run beside a backup.
-            repo.refuse_live_sessions()?;
+        crate::commands::util::with_exclusive_session_as(repo, None, |repo, session| {
+            // The registration read `config` again: decide the mode again
+            // if it changed.
+            repo.commit_mode()?;
             let load = repo.load_chunk_index_for_repair(cancel)?;
             repo.refresh_snapshot_list()?;
 
@@ -755,7 +758,8 @@ pub(crate) fn run_with_repair_on_repo(
             cancel.check()?;
 
             // Execute the repair
-            let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
+            let (applied, repair_errors) =
+                execute_repair(repo, &plan, &scan.issues, &pack_chunks, session.id())?;
             // The repair wrote the index: a compact marks again.
             crate::commands::compact_refusal::clear(repo.cache_dir().as_deref());
 

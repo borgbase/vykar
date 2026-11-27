@@ -8,7 +8,8 @@ use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::control::CancelToken;
 use crate::repo::lock;
-use crate::repo::{Fence, OpenOptions, OpenRequest, Repo, RepoWriter, identity};
+use crate::repo::write_check::WriteChecked;
+use crate::repo::{Fence, FenceFn, OpenOptions, OpenRequest, Repo, RepoWriter, identity};
 use crate::storage;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
@@ -181,10 +182,11 @@ pub(crate) fn refuse_on_append_only_server(
     Ok(())
 }
 
-/// Execute a maintenance operation while holding an advisory lock: used by
-/// `check --repair`, `vykar upgrade` of a v6 repository and pack maps;
-/// compact, prune and delete register a session in both modes
-/// (`with_maintenance_session`).
+/// Execute a maintenance operation while holding an advisory lock. Used by
+/// no command since 10-single-protocol step 8 (`check --repair`, upgrade
+/// and pack maps run as exclusive sessions, [`with_exclusive_session`]);
+/// tests and the simulator's lock hazards only, until step 9 deletes the
+/// lock.
 ///
 /// Acquires the lock, cleans up stale sessions (no marker written for 45 min
 /// by the store's clock), lists the sessions that remain live (for compact's
@@ -346,6 +348,203 @@ fn maintenance_marker_fence(
     })
 }
 
+/// The record shows a lapse no later probe can undo: the marker was found
+/// missing, it went unrefreshed longer than [`lock::MARKER_GAP_LIMIT`], or a
+/// marker PUT was slow. A superseded key whose check failed (`unchecked`)
+/// is not one: the next probe checks it again.
+fn marker_lapsed(report: &lock::MarkerReport) -> bool {
+    report.missing || report.longest_gap > lock::MARKER_GAP_LIMIT || report.slow_puts > 0
+}
+
+/// The check before every write of an exclusive run, as a fence function
+/// shared by the run's `WriteChecked` storage and its writer's
+/// `Fence::marker`. It passes while
+/// - the marker record is [continuous](lock::MarkerReport::continuous) at
+///   this call (no request), and
+/// - an EXISTS of the marker's current key ([`lock::SessionMarker::probe`])
+///   found it, sent at most `reuse` ago measured with
+///   [`lock::MarkerStamp::until`] (suspend included). An older one is
+///   repeated, and so is one whose record is not continuous at this call
+///   (a superseded key whose check failed is checked again by the probe);
+///   one call at a time (a mutex), so concurrent uploads wait for one
+///   EXISTS.
+///
+/// The first lapse is sticky (no further request): the probe found the
+/// current key gone (recorded with `note_missing`), or the record shows the
+/// marker missing, a gap over [`lock::MARKER_GAP_LIMIT`] or a slow marker
+/// PUT; it is warned once, then every call fails `MarkerLostDuringCommit`.
+/// A failed EXISTS (transport) returns its error and is not sticky.
+///
+/// `storage` is the raw backend (the session guard's), never the wrapper.
+pub(crate) fn exclusive_write_check(
+    marker: Arc<lock::SessionMarker>,
+    storage: Arc<dyn StorageBackend>,
+    clock: Arc<dyn crate::repo::host_env::Clock>,
+    reuse: std::time::Duration,
+) -> FenceFn {
+    // (when the last EXISTS that found the marker was sent, lapsed)
+    let state: std::sync::Mutex<(Option<lock::MarkerStamp>, bool)> =
+        std::sync::Mutex::new((None, false));
+    Arc::new(move || {
+        let mut st = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if st.1 {
+            return Err(VykarError::MarkerLostDuringCommit);
+        }
+        if let Some(stamp) = st.0
+            && stamp.until(&lock::MarkerStamp::now(clock.as_ref())) < reuse
+            && marker.report(clock.as_ref()).continuous()
+        {
+            return Ok(());
+        }
+        // A heartbeat refresh may leave a superseded key unchecked between
+        // our probe and our report: probe again, a few times at most.
+        for _ in 0..3 {
+            let sent = lock::MarkerStamp::now(clock.as_ref());
+            let present = marker.probe(storage.as_ref())?;
+            let report = marker.report(clock.as_ref());
+            if present && report.continuous() {
+                st.0 = Some(sent);
+                return Ok(());
+            }
+            if !present || marker_lapsed(&report) {
+                if !present {
+                    marker.note_missing();
+                }
+                st.1 = true;
+                tracing::warn!(
+                    session_id = marker.session_id(),
+                    present,
+                    ?report,
+                    "this exclusive run's session marker was removed, or went unrefreshed for \
+                     a while (machine suspended or storage unreachable?): another client may \
+                     have taken the run for ended; nothing more is written"
+                );
+                return Err(VykarError::MarkerLostDuringCommit);
+            }
+        }
+        Err(VykarError::Other(format!(
+            "session {} marker check undecided: a superseded key stayed unchecked",
+            marker.session_id()
+        )))
+    })
+}
+
+/// `first`, then `second` when `first` passed.
+fn both(first: FenceFn, second: FenceFn) -> FenceFn {
+    Arc::new(move || {
+        first()?;
+        second()
+    })
+}
+
+/// The registered session of an exclusive run (10-single-protocol step 8):
+/// its heartbeat runs until the run ends, then it deregisters.
+pub(crate) struct ExclusiveSession {
+    guard: lock::SessionGuard,
+}
+
+impl ExclusiveSession {
+    pub(crate) fn id(&self) -> &str {
+        self.guard.session_id()
+    }
+}
+
+/// Run `action` as an exclusive session: `check --repair`, `vykar upgrade`
+/// (`--commit-mode` included) and pack maps (10-single-protocol step 8).
+///
+/// Registers `sessions/x-<32 hex>.json` and lists `sessions/` once
+/// (`lock::register_exclusive`: stale sessions reaped, orphan journals
+/// deleted); refuses `ActiveSessions` when any other session is live
+/// (malformed or vanished markers included: fail closed), its own marker
+/// deleted. Then adopts the marker with a heartbeat, reads `config` again on
+/// a v6 handle (`Repo::reread_writer_mode`; no `commit_mode()`: a mode
+/// switch to single-writer must run without put-if-absent), wraps the
+/// handle's storage for the whole action in `WriteChecked` with the
+/// exclusive write check (`exclusive_write_check`) and runs `action` on a
+/// writer fenced by the same check. Every shared registration and a
+/// backup's pre-head listing refuse `Locked` while the marker is live
+/// (`lock::exclusive_listing`). At the end, whatever the result: the lock
+/// state is cleared, the raw storage restored and the session deregistered
+/// (through the raw storage; a failed deregistration is warned only).
+/// "Now" on the store's clock (`Repo::lock_store_time`) is the marker's
+/// mtime in the registration's listing, and `Repo::live_sessions` is empty.
+pub fn with_exclusive_session<T>(
+    repo: &mut Repo,
+    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
+) -> Result<T> {
+    with_exclusive_session_as(repo, None, |w, _| action(w))
+}
+
+/// [`with_exclusive_session`] with the session, and `also` (the v2/v3
+/// upgrade's legacy key check) run after the exclusive check before every
+/// write.
+pub(crate) fn with_exclusive_session_as<T>(
+    repo: &mut Repo,
+    also: Option<FenceFn>,
+    action: impl FnOnce(&mut RepoWriter<'_>, &ExclusiveSession) -> Result<T>,
+) -> Result<T> {
+    let env = repo.host_env().clone();
+    let raw = Arc::clone(repo.storage());
+    // On a v2/v3 upgrade the registration's reap runs on the raw storage:
+    // the legacy key is held already but its check does not run for these
+    // deletes (it did while the lock's listing ran under the upgrade's
+    // checked storage); a reap deletes only stale session objects.
+    let reg = lock::register_exclusive(raw.as_ref(), &env)?;
+    if !reg.cleaned.is_empty() {
+        info!(
+            count = reg.cleaned.len(),
+            sessions = ?reg.cleaned,
+            "cleaned up stale backup sessions"
+        );
+    }
+    let id = reg.registration.session_id().to_string();
+    repo.set_live_sessions(Some(reg.live));
+    if let Err(e) = repo.refuse_live_sessions() {
+        repo.clear_lock_state();
+        lock::deregister_session(raw.as_ref(), &id, &env);
+        return Err(e);
+    }
+    let guard = match lock::SessionGuard::adopt(Arc::clone(&raw), reg.registration, env.clone()) {
+        Ok(g) => g,
+        Err(e) => {
+            repo.clear_lock_state();
+            lock::deregister_session(raw.as_ref(), &id, &env);
+            return Err(e);
+        }
+    };
+    tracing::debug!(session_id = id, "exclusive session registered");
+    let session = ExclusiveSession { guard };
+    if !repo.format().is_upgrade_only()
+        && let Err(e) = repo.reread_writer_mode()
+    {
+        repo.clear_lock_state();
+        drop(session);
+        return Err(e);
+    }
+    let check = exclusive_write_check(
+        session.guard.marker(),
+        Arc::clone(&raw),
+        Arc::clone(&env.clock),
+        repo.exclusive_check_reuse(),
+    );
+    let check = match also {
+        Some(also) => both(check, also),
+        None => check,
+    };
+    let prev = repo.swap_storage(Arc::new(WriteChecked::new(
+        Arc::clone(&raw),
+        Arc::clone(&check),
+    )));
+    repo.set_lock_store_time(reg.now);
+    let result = action(&mut repo.writer(Fence::marker(check)), &session);
+    repo.clear_lock_state();
+    repo.swap_storage(prev);
+    drop(session);
+    result
+}
+
 /// Maintenance in a session (04 step 9; compact, prune and delete in both
 /// modes since 10-single-protocol step 7): register a session marker
 /// carrying `flags`, adopt it with a heartbeat, read `config` again and
@@ -354,16 +553,16 @@ fn maintenance_marker_fence(
 /// `action`, deregister. No lock is taken; the action's writer is fenced by
 /// the marker check ([`maintenance_marker_fence`]) for the whole run.
 ///
-/// The registration probe keeps the lock holders out: the marker is written
-/// before the probe lists `locks/` (a live lock fails `Locked` after the
-/// probe's retries, as a backup's registration does), and every lock holder
-/// lists `sessions/` after its lock is confirmed, so `check --repair` and
-/// `upgrade` refuse beside this session (`refuse_live_sessions`) and a
-/// lock holder yields to a marker that may write heads (`writes_heads`: a
-/// compact). The re-read after the registration closes the window between
-/// open and registration: a mode switch (under the lock, refusing beside
-/// any live session) that ran in it is seen by the read, one that runs
-/// after it refuses beside this session. A changed identity or format
+/// The registration keeps the exclusive sessions out (10-single-protocol
+/// step 8): the marker is written before the registration lists
+/// `sessions/` (a live exclusive session fails `Locked` after the
+/// registration's retries, as a backup's registration does), and every
+/// exclusive session lists `sessions/` after its own marker PUT, so
+/// `check --repair`, `upgrade` and pack maps refuse beside this session
+/// (`ActiveSessions`). The re-read after the registration closes the window
+/// between open and registration: a mode switch (an exclusive session,
+/// refusing beside any live session) that ran in it is seen by the read,
+/// one that runs after it refuses beside this session. A changed identity or format
 /// refuses. Clears the store time, live sessions and segment ages at the
 /// end (`Repo::clear_lock_state`).
 pub(crate) fn with_maintenance_session<T>(

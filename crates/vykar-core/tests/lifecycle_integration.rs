@@ -12,7 +12,7 @@ use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::lock;
-use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repo};
+use vykar_core::repo::{EncryptionMode, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend};
 use vykar_types::error::VykarError;
@@ -449,7 +449,7 @@ fn command_dump_failure_does_not_mutate_repository_state() {
 }
 
 #[test]
-fn backup_fails_when_repository_lock_is_held_by_another_process() {
+fn backup_fails_while_an_exclusive_session_is_live() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_dir = tmp.path().join("source");
@@ -460,8 +460,26 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
     let config = make_test_config(&repo_dir);
     common::init_repo(&config);
 
+    // A live exclusive session (`check --repair`, upgrade, pack maps;
+    // 10-single-protocol step 8; a held lock before): its marker, written
+    // now by another machine.
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
-    let guard = lock::acquire_lock(&storage, &HostEnv::system()).unwrap();
+    let now = chrono::Utc::now();
+    let entry = lock::SessionEntry {
+        hostname: "other-host".into(),
+        pid: 4242,
+        registered_at: now.to_rfc3339(),
+        last_refresh: now.to_rfc3339(),
+        boot_id: None,
+        installation_id: None,
+        pid_ns: None,
+        elapsed_secs: Some(0),
+        committing: false,
+        writes_heads: false,
+    };
+    let marker = format!("sessions/x-{:032x}.json", rand::random::<u128>());
+    vykar_storage::StorageBackend::put(&storage, &marker, &serde_json::to_vec(&entry).unwrap())
+        .unwrap();
 
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
     let exclude_if_present: Vec<String> = Vec::new();
@@ -485,8 +503,17 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
         },
     );
 
-    lock::release_lock(&storage, guard).unwrap();
-    assert!(matches!(blocked, Err(VykarError::Locked(_))));
+    vykar_storage::StorageBackend::delete(&storage, &marker).unwrap();
+    assert!(
+        matches!(
+            &blocked,
+            Err(VykarError::Locked(holder))
+                if holder.key == marker
+                    && holder.to_string().contains("exclusive maintenance run")
+        ),
+        "expected Locked naming {marker}, got {:?}",
+        blocked.err()
+    );
 
     backup_source(
         &config,

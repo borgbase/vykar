@@ -1390,6 +1390,26 @@ mod tests {
         }
     }
 
+    /// An exclusive session's marker, its refresh keys and its journal
+    /// (`sessions/x-<32 hex>…`, vykar-core 10-single-protocol step 8) are
+    /// ephemeral keys an append-only server lets a client create, overwrite
+    /// and delete; so does a server without append-only.
+    #[test]
+    fn exclusive_session_keys_are_ephemeral() {
+        let id = format!("x-{}", "0123456789abcdef".repeat(2));
+        for key in [
+            format!("sessions/{id}.json"),
+            format!("sessions/{id}.7.json"),
+            format!("sessions/{id}.index"),
+        ] {
+            assert!(is_valid_storage_key(&key), "{key}");
+            assert_eq!(key_class(&key), Some(KeyClass::Ephemeral), "{key}");
+            for verb in [Verb::Create, Verb::Overwrite, Verb::Delete] {
+                assert!(append_only_allows(&key, verb), "{key} {verb:?}");
+            }
+        }
+    }
+
     #[test]
     fn index_object_keys() {
         let name = "0123456789abcdef".repeat(4);

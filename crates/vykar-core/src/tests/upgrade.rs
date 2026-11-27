@@ -512,7 +512,8 @@ fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
 
         let mut repo = fx.open_legacy(&fx.cache()).unwrap();
         let outcome =
-            commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).unwrap();
+            commands::util::with_exclusive_session(&mut repo, |r| r.upgrade_index_layout())
+                .unwrap();
         assert!(
             matches!(outcome, UpgradeOutcome::Upgraded { resumed: r, .. } if r == resume),
             "{outcome:?}"
@@ -555,9 +556,7 @@ fn upgrade_without_config_overwrite_changes_nothing() {
     assert!(err.contains("append-only"), "{err}");
     assert!(err.contains("Nothing was changed"), "{err}");
     assert!(
-        ops.iter().all(|o| o == "put config"
-            || o.starts_with("put locks/")
-            || o.starts_with("delete locks/")),
+        ops.iter().all(|o| o == "put config" || is_lock_op(o)),
         "{ops:?}"
     );
     assert_eq!(
@@ -682,8 +681,8 @@ fn upgrade_with_fence(
     fence: Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> Result<UpgradeOutcome> {
     let mut repo = fx.open_legacy(&fx.cache()).unwrap();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
-        repo.replace_fence_for_test(crate::repo::Fence::lock(fence));
+    commands::util::with_exclusive_session(&mut repo, |repo| {
+        repo.replace_fence_for_test(crate::repo::Fence::marker(fence));
         repo.upgrade_index_layout()
     })
 }
@@ -796,12 +795,16 @@ fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
         let config_before = std::fs::read(&config_path).unwrap();
         let legacy = fx.legacy_bytes().unwrap();
 
-        // The fences: before the head PUT, then before the version switch.
+        // The fences, three on a fresh and on a resumed upgrade: before the
+        // head PUT, then (a marker fence, since 10-single-protocol step 8)
+        // before the index garbage collection, which a failed check skips,
+        // then before the version switch, which a failed check refuses.
+        // Every check after the first fails.
         let calls = Arc::new(AtomicUsize::new(0));
         let fence: Arc<dyn Fn() -> Result<()> + Send + Sync> = {
             let calls = Arc::clone(&calls);
             Arc::new(move || {
-                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                if calls.fetch_add(1, Ordering::SeqCst) >= 1 {
                     Err(VykarError::LockExpired("injected".into()))
                 } else {
                     Ok(())
@@ -813,7 +816,7 @@ fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
             matches!(err, VykarError::LockExpired(_)),
             "{resume}: {err:?}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "{resume}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "{resume}");
         assert_eq!(
             std::fs::read(&config_path).unwrap(),
             config_before,
@@ -931,11 +934,11 @@ fn upgrade_probes_the_server_before_writing() {
         (result, ops)
     };
     let only_lock_ops = |ops: &[String]| {
-        assert!(
-            ops.iter()
-                .all(|o| o.starts_with("put locks/") || o.starts_with("delete locks/")),
-            "{ops:?}"
-        );
+        assert!(ops.iter().all(|o| is_lock_op(o)), "{ops:?}");
+        // D10: the legacy key is written before the exclusive marker.
+        let key = ops.iter().position(|o| o.starts_with("put locks/"));
+        let marker = ops.iter().position(|o| o.starts_with("put sessions/x-"));
+        assert!(key.is_some() && marker.is_some() && key < marker, "{ops:?}");
     };
 
     for answer in [
@@ -1300,7 +1303,7 @@ fn upgrade_reads_the_index_with_a_plain_get() {
     )
     .unwrap();
     let outcome =
-        commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).unwrap();
+        commands::util::with_exclusive_session(&mut repo, |r| r.upgrade_index_layout()).unwrap();
     drop(repo);
     assert!(
         matches!(outcome, UpgradeOutcome::Upgraded { resumed: false, .. }),
@@ -1571,7 +1574,7 @@ impl Fixture {
     /// refused) on a handle without put-if-absent.
     fn upgrade_without_conditional(&self, mode: Option<WriterMode>) -> Result<UpgradeOutcome> {
         let mut repo = self.open_without_conditional();
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
+        commands::util::with_exclusive_session(&mut repo, |repo| {
             repo.refuse_live_sessions()?;
             repo.upgrade_index_layout_with(mode)
         })
@@ -1779,8 +1782,10 @@ fn a_client_without_the_condition_switches_to_single_and_backs_up() {
     fx.check_clean();
 }
 
-/// The switch refuses beside a live session, under the lock, with the
-/// config unchanged.
+/// A v6 `upgrade --commit-mode` beside a live backup's session refuses
+/// `ActiveSessions` naming it (its exclusive registration's listing sees
+/// the marker, 10-single-protocol step 8): the config bytes and every other
+/// object are unchanged, and no exclusive marker stays.
 #[test]
 fn the_switch_refuses_beside_a_live_session() {
     let fx = fixture(RepoFormat::V3);
@@ -1788,12 +1793,20 @@ fn the_switch_refuses_beside_a_live_session() {
     fx.backup("s1");
     let config = fx.config_bytes();
     let marker = fx.plant_live_session();
+    let tree = fx.tree();
     let err =
         commands::upgrade::run_with_mode(&fx.config, pass(&fx.config), Some(WriterMode::Single))
             .unwrap_err();
     assert!(matches!(err, VykarError::ActiveSessions(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("deadbeef-1234-5678-9abc-def012345678"),
+        "{err}"
+    );
     assert!(marker.exists());
     assert_eq!(fx.config_bytes(), config);
+    assert_eq!(fx.tree(), tree, "the refusal wrote nothing that stayed");
+    assert!(exclusive_marker_keys(&*fx.storage()).is_empty());
 }
 
 // ── The legacy lock key (10-single-protocol step 6) ─────────────────────
@@ -1907,9 +1920,12 @@ fn the_lock_key(raw: &dyn StorageBackend) -> String {
 }
 
 /// Whether `op` is a write of a lock key.
+/// An op of the upgrade's exclusion: on its legacy lock key (`locks/`) or
+/// on its exclusive session's marker (`sessions/x-`, 10-single-protocol
+/// step 8: registration, refresh, deregistration).
 fn is_lock_op(op: &str) -> bool {
     op.split_once(' ')
-        .is_some_and(|(_, k)| k.starts_with("locks/"))
+        .is_some_and(|(_, k)| k.starts_with("locks/") || k.starts_with("sessions/x-"))
 }
 
 /// `fx` opened as `vykar upgrade` opens it, on `env` when given, then
@@ -2039,15 +2055,32 @@ fn the_upgrade_refuses_beside_a_0_24_lock() {
 #[test]
 fn the_legacy_key_stays_young_across_a_7h_upgrade() {
     let fx = legacy_fixture();
-    let (time, env) = sim_env(None);
+    // Manual time: the exclusive session's heartbeat sleeps until the hook
+    // advances the clock, so it keeps up with every minute.
+    let time = SimTime::new(chrono::Utc::now(), TimeMode::Manual);
+    let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
     let checked = Arc::new(AtomicUsize::new(0));
     let hook: Hook = {
         let time = Arc::clone(&time);
         let checked = Arc::clone(&checked);
         Box::new(move |call, raw| {
-            let step = |minutes: u64| time.advance(std::time::Duration::from_secs(minutes * 60));
+            // One heartbeat poll (30 s) at a time, each time letting the
+            // exclusive session's heartbeat (10-single-protocol step 8) catch
+            // up: it counts polls, not elapsed time, and a stretch over its
+            // gap limit (30 min) reads as a suspended machine and stops the
+            // upgrade.
+            let step = |minutes: u64| {
+                for _ in 0..minutes * 2 {
+                    time.advance(crate::repo::lock::HEARTBEAT_POLL);
+                    time.wait_for_waiters(1, std::time::Duration::from_secs(5));
+                }
+            };
             match call {
-                Call::Read(key) if !key.starts_with("locks/") => step(10),
+                Call::Read(key)
+                    if !key.starts_with("locks/") && !key.starts_with("sessions/x-") =>
+                {
+                    step(10)
+                }
                 Call::Before(op) if !is_lock_op(op) => {
                     let key = the_lock_key(raw);
                     let entry: v024::LockEntry =
@@ -2149,8 +2182,15 @@ fn an_upgrade_whose_key_was_removed_writes_nothing_more() {
         assert!(msg.contains("removed"), "{msg}");
         let ops = hooked.ops();
         let at = removed.lock().unwrap().expect("the key was removed");
-        // The in-flight write (packmaps) completes; nothing after it.
-        assert_eq!(ops.len(), at, "{trigger}: {ops:?}");
+        // The in-flight write (packmaps) completes; nothing after it but the
+        // exclusive session's deregistration (10-single-protocol step 8).
+        assert!(ops.len() >= at, "{trigger}: {ops:?}");
+        assert!(
+            ops[at..]
+                .iter()
+                .all(|o| o.starts_with("delete sessions/x-")),
+            "{trigger}: {ops:?}"
+        );
         if at_config {
             assert!(!ops.iter().any(|o| o == "put config"), "{ops:?}");
         }
@@ -2164,9 +2204,13 @@ fn an_upgrade_whose_key_was_removed_writes_nothing_more() {
     }
 }
 
-/// Done-when 4b: an upgrade that cannot rewrite its key for 5.5 h stops
-/// before switching, deleting its key and writing nothing else. The clock
-/// moves in steps, so the lapse is reached only through failed rewrites.
+/// Done-when 4b: an upgrade that cannot rewrite its key and stalls 3 h
+/// between writes stops before switching, deleting its keys and writing
+/// nothing else. Since 10-single-protocol step 8 the exclusive session's
+/// check runs first, and the 3 h gap breaks its marker record's continuity
+/// (over 30 min): the upgrade stops `MarkerLostDuringCommit` at its second
+/// write, before the legacy key's 5.5 h rule (`tests::legacy_lock` covers
+/// that rule on the key itself).
 #[test]
 fn an_upgrade_that_cannot_rewrite_its_key_stops() {
     let fx = legacy_fixture();
@@ -2202,21 +2246,22 @@ fn an_upgrade_that_cannot_rewrite_its_key_stops() {
     let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
     let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
     drop(repo);
-    assert!(matches!(err, VykarError::LockExpired(_)), "{err:?}");
-    assert!(err.to_string().contains("last rewritten"), "{err}");
+    assert!(matches!(err, VykarError::MarkerLostDuringCommit), "{err:?}");
     let ops = hooked.ops();
     let own_put = ops[0].clone();
     assert!(own_put.starts_with("put locks/"), "{ops:?}");
     let own_key = own_put.strip_prefix("put ").unwrap();
-    // Hooked logs a write before the hook fails it.
-    let failed = |o: &String| *o == own_put;
-    assert!(ops[1..].iter().any(failed), "no failed rewrite: {ops:?}");
     let last_write = ops.iter().rposition(|o| !is_lock_op(o)).unwrap();
-    let after: Vec<_> = ops[last_write + 1..]
-        .iter()
-        .filter(|o| !failed(o))
-        .collect();
-    assert_eq!(after, [&format!("delete {own_key}")], "{ops:?}");
+    // After the last data write: only the exclusion's own requests (marker
+    // refreshes, failed key rewrites), ending with the deletes of the
+    // marker keys and of the legacy key.
+    let after = &ops[last_write + 1..];
+    assert!(after.iter().all(|o| is_lock_op(o)), "{ops:?}");
+    assert_eq!(after.last(), Some(&format!("delete {own_key}")), "{ops:?}");
+    assert!(
+        after.iter().any(|o| o.starts_with("delete sessions/x-")),
+        "{ops:?}"
+    );
     assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
     assert!(fx.heads().is_empty());
     assert!(legacy_lock_keys(&*fx.storage()).is_empty());
@@ -2225,8 +2270,11 @@ fn an_upgrade_that_cannot_rewrite_its_key_stops() {
     assert_eq!(fx.version(), 6);
 }
 
-/// A key removed between acquisition and the stale-session reap's delete
-/// fails the reap with `LockExpired`, the variant kept; nothing is written.
+/// A key removed between acquisition and the stale-session reap's delete:
+/// since 10-single-protocol step 8 the reap is the exclusive registration's
+/// and runs on the raw storage (the legacy key's check does not guard it),
+/// so the stale session is reaped; the upgrade then stops `LockExpired` at
+/// its first write, the variant kept, with no data written.
 #[test]
 fn a_key_removed_before_the_session_reap_is_lock_expired() {
     let fx = legacy_fixture();
@@ -2272,8 +2320,12 @@ fn a_key_removed_before_the_session_reap_is_lock_expired() {
     drop(repo);
     assert!(matches!(err, VykarError::LockExpired(_)), "{err:?}");
     let ops = hooked.ops();
-    assert!(ops.iter().all(|o| is_lock_op(o)), "{ops:?}");
-    assert!(fx.storage().exists(marker).unwrap());
+    assert!(
+        ops.iter()
+            .all(|o| is_lock_op(o) || *o == format!("delete {marker}")),
+        "{ops:?}"
+    );
+    assert!(!fx.storage().exists(marker).unwrap(), "the reap ran");
     assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
     assert!(legacy_lock_keys(&*fx.storage()).is_empty());
 }
@@ -2323,4 +2375,163 @@ fn a_0_24_client_with_this_hostname_reaps_the_key() {
     assert!(reaped.load(Ordering::SeqCst) > 0);
     assert_eq!(fx.version(), 3);
     assert!(fx.heads().is_empty());
+}
+
+/// The legacy key's own `LockExpired` through a whole v2/v3 upgrade (the
+/// legacy arm of the combined check): the exclusive session's heartbeat
+/// keeps its marker fresh (the clock stepped one heartbeat poll at a time,
+/// as in [`the_legacy_key_stays_young_across_a_7h_upgrade`]) while every
+/// rewrite of the legacy key fails; once its last successful write is more
+/// than 5.5 h old the next check stops the upgrade before the switch,
+/// nothing more is written but the exclusion's own deletes, and a rerun
+/// completes.
+#[test]
+fn a_legacy_key_that_cannot_be_rewritten_expires_beside_a_live_marker() {
+    let fx = legacy_fixture();
+    let time = SimTime::new(chrono::Utc::now(), TimeMode::Manual);
+    let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
+    let hook: Hook = {
+        let time = Arc::clone(&time);
+        let own = Mutex::new(None::<String>);
+        Box::new(move |call, _raw| {
+            let step = |minutes: u64| {
+                for _ in 0..minutes * 2 {
+                    time.advance(crate::repo::lock::HEARTBEAT_POLL);
+                    time.wait_for_waiters(1, std::time::Duration::from_secs(5));
+                }
+            };
+            match call {
+                Call::Before(op) if op.starts_with("put locks/") && op.ends_with(".json") => {
+                    let mut own = own.lock().unwrap();
+                    match own.as_deref() {
+                        None => *own = Some(op.to_string()),
+                        Some(first) if first == op => {
+                            return Err(VykarError::Other(format!("injected failure: {op}")));
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Call::Read(key)
+                    if !key.starts_with("locks/") && !key.starts_with("sessions/x-") =>
+                {
+                    step(10)
+                }
+                Call::After(op) if !is_lock_op(op) => step(50),
+                _ => {}
+            }
+            Ok(())
+        })
+    };
+    let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(
+        matches!(&err, VykarError::LockExpired(m) if m.contains("last rewritten")),
+        "{err:?}"
+    );
+    let ops = hooked.ops();
+    let own_put = ops[0].clone();
+    assert!(own_put.starts_with("put locks/"), "{ops:?}");
+    let own_key = own_put.strip_prefix("put ").unwrap();
+    // The heartbeat refreshed the marker (a later generation was PUT): the
+    // stop is the legacy key's, not a lapse of the marker.
+    assert!(
+        ops.iter().any(|o| {
+            o.strip_prefix("put ").is_some_and(|k| {
+                crate::repo::lock::parse_session_marker_key(k)
+                    .is_some_and(|(id, n)| crate::repo::lock::is_exclusive_session(id) && n > 0)
+            })
+        }),
+        "{ops:?}"
+    );
+    assert!(
+        ops.iter().filter(|o| **o == own_put).count() > 1,
+        "the key's rewrites were tried: {ops:?}"
+    );
+    let last_write = ops.iter().rposition(|o| !is_lock_op(o)).unwrap();
+    let after = &ops[last_write + 1..];
+    assert!(after.iter().all(|o| is_lock_op(o)), "{ops:?}");
+    assert_eq!(after.last(), Some(&format!("delete {own_key}")), "{ops:?}");
+    assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+    assert!(
+        exclusive_marker_keys(&*fx.storage()).is_empty(),
+        "the marker was deregistered"
+    );
+
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert_eq!(fx.version(), 6);
+    fx.check_clean();
+}
+
+/// The `sessions/x-*.json` keys on `raw`.
+fn exclusive_marker_keys(raw: &dyn StorageBackend) -> Vec<String> {
+    raw.list("sessions/")
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.starts_with("sessions/x-") && k.ends_with(".json"))
+        .collect()
+}
+
+/// A v2/v3 upgrade whose exclusive marker is deleted mid-run
+/// (`break-lock --sessions`, reuse 0 so the next write checks): the write
+/// in flight lands; the next check stops the upgrade
+/// `MarkerLostDuringCommit`, nothing more is written, the legacy key is
+/// released, the version is not switched, and a rerun completes.
+#[test]
+fn an_upgrade_whose_marker_was_removed_writes_nothing_more() {
+    let fx = legacy_fixture();
+    let index = fx.legacy_bytes();
+    let removed = Arc::new(Mutex::new(None::<usize>));
+    let (mut repo, hooked) = {
+        let removed = Arc::clone(&removed);
+        let ops_seen = Arc::new(AtomicUsize::new(0));
+        hooked_repo(
+            &fx,
+            None,
+            Box::new(move |call, raw| {
+                let Call::Before(op) = call else {
+                    return Ok(());
+                };
+                ops_seen.fetch_add(1, Ordering::SeqCst);
+                let mut removed = removed.lock().unwrap();
+                if op.starts_with("put packmaps/") && removed.is_none() {
+                    let keys = exclusive_marker_keys(raw);
+                    assert!(!keys.is_empty(), "the upgrade's marker");
+                    for key in keys {
+                        raw.delete(&key).unwrap();
+                    }
+                    // Ops logged so far; the write being hooked is in flight.
+                    *removed = Some(ops_seen.load(Ordering::SeqCst));
+                }
+                Ok(())
+            }),
+        )
+    };
+    repo.set_exclusive_check_reuse(std::time::Duration::ZERO);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(matches!(err, VykarError::MarkerLostDuringCommit), "{err:?}");
+    let ops = hooked.ops();
+    let at = removed.lock().unwrap().expect("the marker was removed");
+    let own_key = ops[0].strip_prefix("put ").unwrap().to_string();
+    assert!(own_key.starts_with("locks/"), "{ops:?}");
+    // After the in-flight write: only the exclusion's own deletes (the
+    // deregistration and the legacy key's release, last).
+    assert!(ops.len() > at, "{ops:?}");
+    assert!(
+        ops[at..]
+            .iter()
+            .all(|o| o.starts_with("delete sessions/x-") || o.starts_with("delete locks/")),
+        "{ops:?}"
+    );
+    assert_eq!(ops.last(), Some(&format!("delete {own_key}")), "{ops:?}");
+    assert!(legacy_lock_keys(&*fx.storage()).is_empty());
+    assert_eq!(fx.version(), 3);
+    assert_eq!(fx.legacy_bytes(), index);
+    assert!(fx.heads().is_empty());
+
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert_eq!(fx.version(), 6);
+    fx.check_clean();
 }

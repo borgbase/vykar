@@ -268,61 +268,6 @@ fn build_lock_holder(
     }
 }
 
-/// Fail with `Locked` if any non-stale lock is present. Writes no lock key.
-///
-/// Safe against a concurrent maintenance lock without taking one: the caller
-/// writes its session marker before this LIST, and maintenance writes its lock
-/// before listing sessions, so at least one of the two sees the other.
-///
-/// `marker_key` is the marker the caller has just written: its mtime is
-/// "now" on the store's clock for the lock ages.
-fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv, marker_key: &str) -> Result<()> {
-    let held = cleanup_stale_locks(
-        storage,
-        Duration::seconds(DEFAULT_STALE_LOCK_SECS),
-        env,
-        NowSource::Written(marker_key),
-    )?;
-    match held.first() {
-        Some(key) => Err(VykarError::Locked(build_lock_holder(
-            storage,
-            key,
-            env.clock.as_ref(),
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// [`probe_unlocked`] for a writer whose marker now carries a flag (04
-/// step 9, the marker handshake: the lock-free writer's half, after its
-/// flagged key `marker_key` was written). Lists `sessions/` with mtimes,
-/// "now" being `marker_key`'s mtime there, whether or not a lock is
-/// listed (a lock-free commit's fold needs "now" either way), then reaps
-/// stale locks with that "now". `Ok(now)` when no live lock is left;
-/// `Err(Locked)` naming one. A failed listing is an error.
-pub(crate) fn probe_unlocked_at(
-    storage: &dyn StorageBackend,
-    env: &HostEnv,
-    marker_key: &str,
-) -> Result<Option<StoreNow>> {
-    let listing = storage.list_meta(SESSIONS_PREFIX)?;
-    let now = StoreNow::of_written(&listing, marker_key);
-    let held = cleanup_stale_locks(
-        storage,
-        Duration::seconds(DEFAULT_STALE_LOCK_SECS),
-        env,
-        NowSource::Known(now),
-    )?;
-    match held.first() {
-        Some(key) => Err(VykarError::Locked(build_lock_holder(
-            storage,
-            key,
-            env.clock.as_ref(),
-        ))),
-        None => Ok(now),
-    }
-}
-
 /// The lock holder's half of the marker handshake (04 step 9): right
 /// after a lock is confirmed and before any write. Reaps stale sessions
 /// ("now" = `now`, the lock key's mtime) and lists the live ones, as
@@ -334,11 +279,12 @@ pub(crate) fn probe_unlocked_at(
 /// listed again once, and a session with no key left then has
 /// deregistered. `Ok((cleaned, live))` otherwise.
 ///
-/// Why it is enough: a lock-free writer writes its flagged key before it
-/// lists `locks/` ([`probe_unlocked_at`]), and a lock holder writes its
-/// lock before it lists `sessions/`: by the LIST contract at least one of
-/// the two sees the other, and a lock-free writer's flagged key stays
-/// until its deregistration.
+/// Why it was enough: a lock-free writer wrote its flagged key before it
+/// listed `locks/`, and a lock holder writes its lock before it lists
+/// `sessions/`: by the LIST contract at least one of the two saw the other.
+/// Since 10-single-protocol step 8 no command takes the lock and shared
+/// sessions list `sessions/` instead ([`exclusive_listing`]); this is the
+/// lock's own path, kept for the lock's tests until step 9 deletes it.
 pub(crate) fn yield_to_lock_free_writers(
     storage: &dyn StorageBackend,
     env: &HostEnv,
@@ -526,11 +472,6 @@ pub(crate) fn single_writer_listing(
 /// Where a reaper reads "now" on the store's clock. Resolved only when the
 /// listing it judges reports an mtime for at least one lock key.
 pub(crate) enum NowSource<'a> {
-    /// Read already by the caller (`None`: unknown).
-    Known(Option<StoreNow>),
-    /// `key`, which this client has just written: LIST its directory with
-    /// mtimes and take the key's mtime.
-    Written(&'a str),
     /// The wait's reading of the store's clock, extrapolated or refreshed
     /// by a clock probe (`ages::StoreClock::now`).
     Probe(&'a mut StoreClock),
@@ -547,22 +488,11 @@ impl NowSource<'_> {
         env: &HostEnv,
     ) -> (Option<StoreNow>, Option<Vec<ListedObject>>) {
         match self {
-            Self::Written(key) => {
-                let dir = key.rfind('/').map_or("", |i| &key[..=i]);
-                match storage.list_meta(dir) {
-                    Ok(listing) => (StoreNow::of_written(&listing, key), None),
-                    Err(e) => {
-                        debug!(key, error = %e, "could not read the store's clock; reaping nothing by age");
-                        (None, None)
-                    }
-                }
-            }
             Self::Probe(clock) => {
                 // The fresher listing replaces the reaper's `locks/` one.
                 debug_assert_eq!(clock.prefix, super::ages::LOCK_CLOCK_PROBE_PREFIX);
                 clock.now(storage, env)
             }
-            Self::Known(now) => (now, None),
         }
     }
 }
@@ -930,6 +860,22 @@ pub fn verify_lock_validity(
 /// journal `sessions/<id>.index`. Of a session's markers the newest
 /// generation is the live one.
 pub(crate) const SESSIONS_PREFIX: &str = "sessions/";
+
+/// Prefix of an exclusive session's ID (10-single-protocol step 8): `x-`
+/// followed by 32 hex. A shared session's ID is 32 hex and never starts with
+/// it, so a listing alone tells an exclusive session's markers apart.
+pub(crate) const EXCLUSIVE_ID_PREFIX: &str = "x-";
+
+/// A fresh exclusive session ID: `x-` + 32 lowercase hex.
+pub(crate) fn exclusive_session_id() -> String {
+    format!("{EXCLUSIVE_ID_PREFIX}{:032x}", rand::random::<u128>())
+}
+
+/// Whether `session_id` (as `parse_session_marker_key` returns it) is an
+/// exclusive session's.
+pub fn is_exclusive_session(session_id: &str) -> bool {
+    session_id.starts_with(EXCLUSIVE_ID_PREFIX)
+}
 /// Sessions whose newest marker was last written strictly longer ago than
 /// this (by its mtime on the store's clock; by its `last_refresh` when the
 /// listing reports no mtime) are treated as stale. Shared between maintenance cleanup
@@ -942,7 +888,8 @@ pub(crate) const SESSION_STALE_SECS: i64 = 45 * 60;
 /// Storage key of generation `generation` of a session's marker:
 /// `sessions/<id>.json` for 0 (written at registration, the shape every
 /// released binary writes), `sessions/<id>.<n>.json` for the `n`-th refresh
-/// attempt. Session IDs contain no '.' (callers generate 32 hex digits).
+/// attempt. Session IDs contain no '.' (callers generate 32 hex digits, an
+/// exclusive session `x-` + 32 hex).
 pub(crate) fn session_marker_key_at(session_id: &str, generation: u64) -> String {
     if generation == 0 {
         format!("{SESSIONS_PREFIX}{session_id}.json")
@@ -1129,12 +1076,13 @@ impl Registration {
     }
 }
 
-/// Register a backup session. Writes a session marker, then checks (without
-/// writing a lock key) that no maintenance operation holds the lock.
+/// Register a shared session (a backup). Writes a session marker, then
+/// lists `sessions/` (`exclusive_listing`) for a live exclusive session
+/// (`check --repair`, `upgrade`, pack maps; 10-single-protocol step 8).
 ///
-/// If a lock is held (maintenance or another commit), retries briefly
-/// (another backup's commit phase is typically seconds). If still locked
-/// after retries, deletes the marker and returns `Err(Locked)`.
+/// While one is live, retries briefly (3 attempts, jittered backoff). If
+/// still refused after retries, deletes the marker and returns
+/// `Err(Locked)` naming the exclusive session's key.
 ///
 /// Blocks the calling thread on `env.clock` between attempts. Callers running
 /// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
@@ -1148,11 +1096,10 @@ pub fn register_session(
 }
 
 /// [`register_session`] whose registration key already carries `flags`
-/// (a lock-free maintenance session, 04 step 9: a compact that may create
-/// index heads without the lock registers with `writes_heads`, so the
-/// flag is written before its registration probe lists `locks/`, the
-/// lock-free writer's half of the marker handshake). Every later key of
-/// the session carries the same flags.
+/// (a maintenance session, 04 step 9: a compact that may create index heads
+/// registers with `writes_heads`, so the flag is written before its
+/// registration lists `sessions/`). Every later key of the session carries
+/// the same flags.
 pub(crate) fn register_session_with(
     storage: &dyn StorageBackend,
     session_id: &str,
@@ -1162,6 +1109,10 @@ pub(crate) fn register_session_with(
     register_session_inner(storage, session_id, 3, 2000, env, flags)
 }
 
+/// [`register_session`] with its retry policy: PUT the marker (deleted again
+/// on a failed PUT), then [`exclusive_listing`] under [`retry_while_locked`]
+/// (`max_attempts`, `base_delay_ms`); the marker is deleted on the final
+/// error.
 pub(crate) fn register_session_inner(
     storage: &dyn StorageBackend,
     session_id: &str,
@@ -1188,10 +1139,10 @@ pub(crate) fn register_session_inner(
     let written = MarkerStamp::now(env.clock.as_ref());
 
     match retry_while_locked(max_attempts, base_delay_ms, env.clock.as_ref(), || {
-        probe_unlocked(storage, env, &key)
+        exclusive_listing(storage, env, &key).map(|_| ())
     }) {
         Ok(()) => {
-            debug!(session_id, "session registered, no active lock");
+            debug!(session_id, "session registered, no exclusive session live");
             Ok(Registration {
                 session_id: session_id.to_string(),
                 entry,
@@ -1199,11 +1150,142 @@ pub(crate) fn register_session_inner(
             })
         }
         Err(e) => {
-            // Lock held or unexpected error — clean up and propagate.
+            // An exclusive session live, or an unexpected error: clean up
+            // and propagate.
             let _ = storage.delete(&key);
             Err(e)
         }
     }
+}
+
+/// The shared sessions' check for a live exclusive session (10-single-protocol
+/// step 8): one `list_meta` of `sessions/`; "now" on the store's clock is the
+/// mtime of `own_key` (the caller's marker key it has just written, or its
+/// current key) in it. Every other session whose ID is exclusive is judged
+/// as [`reap_sessions`] judges a session ([`judge_session`]); a stale one is
+/// reaped (its marker keys deleted, best effort, a failed delete logged and
+/// the session still not blocking; its journal kept); a live one, including
+/// one whose newest key is unreadable while young or gone since the LIST
+/// (fail closed), fails `Locked` naming its newest key. Shared sessions are
+/// not judged, not reaped and not read. `Ok(now)` when no exclusive session
+/// is live. A failed listing or GET is an error.
+///
+/// Why it is enough: an exclusive session writes its marker before the
+/// listing it decides on ([`register_exclusive`]), and the caller wrote
+/// `own_key` before this listing; of an exclusive and a shared registration
+/// that both passed, one listing started after the other's PUT completed
+/// and, by the LIST contract, saw it (invariant X1).
+pub(crate) fn exclusive_listing(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+    own_key: &str,
+) -> Result<Option<StoreNow>> {
+    let local_now = env.now_utc();
+    let listing = storage.list_meta(SESSIONS_PREFIX)?;
+    let now = StoreNow::of_written(&listing, own_key);
+    let mtimes: std::collections::HashMap<&str, Option<std::time::SystemTime>> =
+        listing.iter().map(|o| (o.key.as_str(), o.mtime)).collect();
+    let keys: Vec<String> = listing.iter().map(|o| o.key.clone()).collect();
+    let max_age = default_stale_session_duration();
+    for (session_id, markers) in group_session_markers(&keys) {
+        if !is_exclusive_session(session_id) {
+            continue;
+        }
+        let Some(&(_, newest)) = markers.last() else {
+            continue;
+        };
+        match judge_session(
+            storage, session_id, newest, &mtimes, now, env, local_now, max_age,
+        )? {
+            Judged::Stale => {
+                for &(_, key) in &markers {
+                    if let Err(e) = storage.delete(key) {
+                        warn!(session_id, key, error = %e, "could not delete a stale exclusive session's marker");
+                    }
+                }
+                info!(session_id, "reaped a stale exclusive session");
+            }
+            Judged::Live(live) => {
+                return Err(VykarError::Locked(session_holder(
+                    newest.to_string(),
+                    live.entry.as_ref(),
+                    env,
+                )));
+            }
+        }
+    }
+    Ok(now)
+}
+
+/// What an exclusive registration found: the registration, the sessions it
+/// reaped, the other sessions still live (an exclusive run refuses unless
+/// empty), and "now" on the store's clock (its own key's mtime in the
+/// listing).
+pub(crate) struct ExclusiveRegistration {
+    pub(crate) registration: Registration,
+    pub(crate) cleaned: Vec<String>,
+    pub(crate) live: Vec<LiveSession>,
+    pub(crate) now: Option<StoreNow>,
+}
+
+/// Register an exclusive session (10-single-protocol step 8): PUT
+/// `sessions/x-<hex>.json` (a registration body, no flags; a failed PUT
+/// deletes it again and returns the error), then one reap and listing of
+/// `sessions/` ([`reap_sessions`] with [`ReapNow::OwnSession`], orphan
+/// journals deleted as maintenance always did). A failed listing deletes the
+/// marker (best effort, [`deregister_session`]) and returns
+/// `Other("cannot clean up stale backup sessions (storage error: …);
+/// refusing maintenance to avoid data loss")`. No retry: two exclusive
+/// registrations that see each other both refuse. The caller refuses on a
+/// non-empty `live` and deregisters.
+pub(crate) fn register_exclusive(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+) -> Result<ExclusiveRegistration> {
+    let session_id = exclusive_session_id();
+    let key = session_marker_key(&session_id);
+    let now = env.now_utc();
+    let entry = SessionEntry::new(env, now, now);
+    let data = serde_json::to_vec(&entry)
+        .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
+    if let Err(e) = storage.put(&key, &data) {
+        // The PUT may have committed although it failed: do not leave the
+        // marker behind.
+        let _ = storage.delete(&key);
+        return Err(e);
+    }
+    let written = MarkerStamp::now(env.clock.as_ref());
+    let (cleaned, live, now) = match reap_sessions(
+        storage,
+        default_stale_session_duration(),
+        env,
+        ReapNow::OwnSession(&session_id),
+        true,
+    ) {
+        Ok(listed) => listed,
+        Err(e) => {
+            deregister_session(storage, &session_id, env);
+            return Err(VykarError::Other(format!(
+                "cannot clean up stale backup sessions (storage error: {e}); \
+                 refusing maintenance to avoid data loss"
+            )));
+        }
+    };
+    debug!(
+        session_id,
+        live = live.len(),
+        "exclusive session registered"
+    );
+    Ok(ExclusiveRegistration {
+        registration: Registration {
+            session_id,
+            entry,
+            written,
+        },
+        cleaned,
+        live,
+        now,
+    })
 }
 
 /// Deregister a session before a [`SessionGuard`] exists: delete its
@@ -1243,6 +1325,12 @@ fn deregister_keys(storage: &dyn StorageBackend, session_id: &str, keys: &[Strin
 /// tolerates ("not refreshed for more than 30 minutes"): two refresh
 /// intervals, below the 45-minute staleness.
 pub(crate) const MARKER_GAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long one EXISTS of an exclusive session's marker vouches for it
+/// (10-single-protocol step 8, `commands::util::exclusive_write_check`): a
+/// repair or an upgrade writes thousands of objects, and an EXISTS per write
+/// would double their requests.
+pub(crate) const EXCLUSIVE_CHECK_REUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a session knows about its marker; shared by the heartbeat and the
 /// commit, whose writes (the heartbeat's refreshes and rechecks, a lock-free
@@ -2177,6 +2265,102 @@ pub(crate) fn reap_sessions_registered(
     )
 }
 
+/// How one session's newest listed marker key is judged (the body of
+/// [`reap_sessions`]' first pass).
+enum Judged {
+    /// Stale by age, or left on this machine: every listed key of it may be
+    /// deleted.
+    Stale,
+    /// Kept: live, or unreadable while young or without an mtime, or gone
+    /// since the LIST.
+    Live(LiveSession),
+}
+
+/// Judge session `session_id` by its newest listed marker key `newest`, the
+/// listing's `mtimes`, "now" on the store's clock and `local_now`. GETs
+/// `newest` once; a GET that finds nothing is live with no entry (the
+/// session may still be live: a rotation or a deregistration). A malformed
+/// body is judged by its mtime alone; otherwise the session is stale when
+/// older than `max_age` or left on this machine ([`same_host`]).
+#[allow(clippy::too_many_arguments)]
+fn judge_session(
+    storage: &dyn StorageBackend,
+    session_id: &str,
+    newest: &str,
+    mtimes: &std::collections::HashMap<&str, Option<std::time::SystemTime>>,
+    now: Option<StoreNow>,
+    env: &HostEnv,
+    local_now: DateTime<Utc>,
+    max_age: Duration,
+) -> Result<Judged> {
+    let mtime = mtimes.get(newest).copied().flatten();
+    let keep = |entry: Option<SessionEntry>| {
+        Judged::Live(LiveSession {
+            session_id: session_id.to_string(),
+            entry,
+            mtime,
+        })
+    };
+    let Some(data) = storage.get(newest)? else {
+        // Gone since the LIST (a rotation or a deregistration): the
+        // session may still be live, so its journal is kept.
+        return Ok(keep(None));
+    };
+    let entry = serde_json::from_slice::<SessionEntry>(&data).ok();
+    let ts = entry.as_ref().and_then(|entry| {
+        chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at))
+            .ok()
+            .map(|ts| ts.with_timezone(&Utc))
+    });
+    let age = EntryAge::of(mtime, now, env, || {
+        ts.map(|ts| local_now.signed_duration_since(ts))
+    });
+    let (Some(entry), Some(_)) = (entry, ts) else {
+        // Unparseable .json or a bad timestamp: we cannot read who wrote
+        // it. Judged by its mtime alone; while young (or without an
+        // mtime) it is preserved, so compact's horizon is −∞ while it is
+        // young (fail-closed), together with its `.index`.
+        if matches!(age, EntryAge::Store(_)) && age.exceeds(max_age) {
+            debug!(
+                session_id,
+                ?age,
+                "cleaning malformed session marker, stale by its mtime"
+            );
+            return Ok(Judged::Stale);
+        }
+        return Ok(keep(None));
+    };
+
+    let is_stale_by_age = age.exceeds(max_age);
+    let verdict = same_host(
+        &EntryHost {
+            hostname: &entry.hostname,
+            pid: entry.pid,
+            boot_id: entry.boot_id.as_deref(),
+            installation_id: entry.installation_id.as_deref(),
+            pid_ns: entry.pid_ns,
+            age: age.as_std(),
+        },
+        env,
+    );
+    let is_left_local = matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot);
+    if is_stale_by_age {
+        debug!(session_id, ?age, "cleaning stale session");
+        Ok(Judged::Stale)
+    } else if is_left_local {
+        debug!(
+            session_id,
+            pid = entry.pid,
+            ?verdict,
+            "cleaning session left on this machine"
+        );
+        Ok(Judged::Stale)
+    } else {
+        Ok(keep(Some(entry)))
+    }
+}
+
 /// [`cleanup_stale_sessions_keeping`]; `delete_orphan_journals`: whether its
 /// second pass runs (a backup's single-writer listing skips it, so a
 /// crashed session's journal keeps its grace until the next maintenance, as
@@ -2223,85 +2407,20 @@ fn reap_sessions(
         let Some(&(_, newest)) = markers.last() else {
             continue;
         };
-        let mtime = mtimes.get(newest).copied().flatten();
-        let keep = |entry: Option<SessionEntry>| LiveSession {
-            session_id: session_id.to_string(),
-            entry,
-            mtime,
-        };
-        let Some(data) = storage.get(newest)? else {
-            // Gone since the LIST (a rotation or a deregistration): the
-            // session may still be live, so its journal is kept.
-            surviving_markers.insert(session_id.to_string());
-            kept.push(keep(None));
-            continue;
-        };
-        let entry = serde_json::from_slice::<SessionEntry>(&data).ok();
-        let ts = entry.as_ref().and_then(|entry| {
-            chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
-                .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at))
-                .ok()
-                .map(|ts| ts.with_timezone(&Utc))
-        });
-        let age = EntryAge::of(mtime, now, env, || {
-            ts.map(|ts| local_now.signed_duration_since(ts))
-        });
-        let (Some(entry), Some(_)) = (entry, ts) else {
-            // Unparseable .json or a bad timestamp: we cannot read who wrote
-            // it. Judged by its mtime alone; while young (or without an
-            // mtime) it is preserved, so compact's horizon is −∞ while it is
-            // young (fail-closed), together with its `.index`.
-            if matches!(age, EntryAge::Store(_)) && age.exceeds(max_age) {
-                debug!(
-                    session_id,
-                    ?age,
-                    "cleaning malformed session marker, stale by its mtime"
-                );
+        match judge_session(
+            storage, session_id, newest, &mtimes, now, env, local_now, max_age,
+        )? {
+            Judged::Stale => {
                 for &(_, key) in &markers {
                     storage.delete(key)?;
                 }
                 cleaned_ids.insert(session_id.to_string());
                 cleaned.push(session_id.to_string());
-            } else {
+            }
+            Judged::Live(live) => {
                 surviving_markers.insert(session_id.to_string());
-                kept.push(keep(None));
+                kept.push(live);
             }
-            continue;
-        };
-
-        let is_stale_by_age = age.exceeds(max_age);
-        let verdict = same_host(
-            &EntryHost {
-                hostname: &entry.hostname,
-                pid: entry.pid,
-                boot_id: entry.boot_id.as_deref(),
-                installation_id: entry.installation_id.as_deref(),
-                pid_ns: entry.pid_ns,
-                age: age.as_std(),
-            },
-            env,
-        );
-        let is_left_local = matches!(verdict, SameHost::DeadProcess | SameHost::EarlierBoot);
-
-        if is_stale_by_age || is_left_local {
-            if is_stale_by_age {
-                debug!(session_id, ?age, "cleaning stale session");
-            } else {
-                debug!(
-                    session_id,
-                    pid = entry.pid,
-                    ?verdict,
-                    "cleaning session left on this machine"
-                );
-            }
-            for &(_, key) in &markers {
-                storage.delete(key)?;
-            }
-            cleaned_ids.insert(session_id.to_string());
-            cleaned.push(session_id.to_string());
-        } else {
-            surviving_markers.insert(session_id.to_string());
-            kept.push(keep(Some(entry)));
         }
     }
 

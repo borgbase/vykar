@@ -181,28 +181,41 @@ pub enum Call {
     BreakLock {
         sessions: bool,
     },
-    /// Opens like delete and runs `f` under `with_repo_lock`.
+    /// Opens like delete and runs `f` as an exclusive session
+    /// (`util::with_exclusive_session`, 10-single-protocol step 8): a
+    /// maintenance writer.
     Custom {
         label: String,
         f: CustomFn,
     },
     /// [`Call::Delete`]'s delete under the maintenance lock
-    /// (`util::with_maintenance_lock`: its stale-session reap, the lock
-    /// holder's half of the marker handshake): a lock holder that deletes,
-    /// standing in for the commands that hold the lock until
-    /// 10-single-protocol step 9 (`check --repair`, upgrade, pack maps) in
-    /// the lock hazards and tests whose lock holder was a delete before step
-    /// 7 (delete runs in a session since). History op: `ClientOp::Delete`
+    /// (`util::with_maintenance_lock`): a holder of the advisory lock, which
+    /// no command takes since 10-single-protocol step 8; kept for the lock's
+    /// own scenarios (H2, `lock_acquisitions_race`, `tests::lock`) until
+    /// step 9 deletes the lock. History op: `ClientOp::Delete`
     /// (`RunRecord::lock_free` false: no session is registered).
     LockedDelete {
         names: Vec<String>,
     },
     /// [`Call::Custom`] under the maintenance lock
-    /// (`util::with_maintenance_lock`: its stale-session reap and the lock
-    /// holder's half of the marker handshake) instead of `with_repo_lock`:
-    /// a lock holder as `check --repair`, upgrade and pack maps are until
-    /// 10-single-protocol step 9.
+    /// (`util::with_maintenance_lock`): a holder of the advisory lock, which
+    /// no command takes since 10-single-protocol step 8; kept for the lock's
+    /// own scenarios until step 9 deletes the lock.
     LockedCustom {
+        label: String,
+        f: CustomFn,
+    },
+    /// [`Call::Delete`]'s delete as an exclusive session
+    /// (`util::with_exclusive_session`, 10-single-protocol step 8): an
+    /// exclusive writer that deletes, standing in for `check --repair`,
+    /// upgrade and pack maps in the hazards and tests whose exclusive holder
+    /// was a delete. History op: `ClientOp::Delete` (`RunRecord::exclusive`).
+    ExclusiveDelete {
+        names: Vec<String>,
+    },
+    /// [`Call::Custom`]: `f` as an exclusive session. History op:
+    /// `ClientOp::Custom`.
+    ExclusiveCustom {
         label: String,
         f: CustomFn,
     },
@@ -219,7 +232,7 @@ pub enum Call {
     /// `vykar upgrade --commit-mode` on a v6 repository
     /// (`commands::upgrade::upgrade_repo` on a handle opened with
     /// `OpenOptions::legacy_format`, as `run_with_mode` opens it): the
-    /// production switch, under the maintenance lock, refusing beside live
+    /// production switch, as an exclusive session, refusing beside live
     /// sessions. History op: `ClientOp::Custom { label: "switch-mode" }`.
     SwitchMode {
         mode: crate::repo::WriterMode,
@@ -616,8 +629,8 @@ impl Sim {
         self.call(c, Call::BreakLock { sessions })
     }
 
-    /// Opens like prune/delete/compact and runs `f` under `with_repo_lock`,
-    /// on the calling thread (`f` may borrow). [`Call::Custom`] is the
+    /// Opens like prune/delete/compact and runs `f` as an exclusive session
+    /// (`util::with_exclusive_session`), on the calling thread (`f` may borrow). [`Call::Custom`] is the
     /// owned form, for [`Sim::spawn`].
     pub fn custom(
         &mut self,
@@ -634,8 +647,9 @@ impl Sim {
         })
     }
 
-    /// [`Self::custom`] in a lock-free maintenance session
-    /// (`util::with_maintenance_session` with `flags`) instead of the lock:
+    /// [`Self::custom`] in a maintenance session
+    /// (`util::with_maintenance_session` with `flags`) instead of an
+    /// exclusive one:
     /// what a lock-free maintenance writer may do, for scripted tests of
     /// what the checker judges in lock-free runs. The run is
     /// `RunRecord::lock_free`.
@@ -1167,6 +1181,37 @@ impl Sim {
                 );
                 (ClientOp::Custom { label }, body)
             }
+            Call::ExclusiveCustom { label, f } => {
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let mut repo = open_for(store, c, &cfg, env)?;
+                        util::with_exclusive_session(&mut repo, f)?;
+                        Ok((Vec::new(), String::new()))
+                    },
+                );
+                (ClientOp::Custom { label }, body)
+            }
+            Call::ExclusiveDelete { names } => {
+                let op = ClientOp::Delete {
+                    names: names.clone(),
+                };
+                let body: Body = Box::new(
+                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
+                        let mut repo = open_for(store, c, &cfg, env)?;
+                        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                        let result = util::with_exclusive_session(&mut repo, |w| {
+                            delete::delete_on_writer(w, &refs, false, &CancelToken::new())
+                        })?;
+                        let removed = result
+                            .stats
+                            .iter()
+                            .map(|s| s.snapshot_name.clone())
+                            .collect();
+                        Ok((removed, result.warnings.join("; ")))
+                    },
+                );
+                (op, body)
+            }
             Call::LockedDelete { names } => {
                 let op = ClientOp::Delete {
                     names: names.clone(),
@@ -1456,7 +1501,9 @@ impl Sim {
         // `committing` (in both modes since 10-single-protocol step 7). Maintenance
         // (compact, prune, delete, a lock-free custom run) runs lock-free in
         // a registered session (phase F part 10d; in both modes since step
-        // 7), which its marker shows: under the lock it registers none.
+        // 7), which its marker shows: under the lock it registers none. An
+        // exclusive session's marker (`x-`, step 8: repair, a mode switch, a
+        // custom run) is not counted, so such a run is judged.
         let lock_free = match op {
             ClientOp::Backup { .. } => self.store.committed_lock_free_in_run(index),
             ClientOp::Compact
@@ -1473,6 +1520,7 @@ impl Sim {
             last_step: f.last_step,
             outcome: f.outcome,
             lock_free,
+            exclusive: self.store.exclusive_in_run(index),
         };
         let at = self.history.runs.partition_point(|r| r.index < index);
         self.history.runs.insert(at, record.clone());
@@ -1513,7 +1561,7 @@ fn custom_body(
     f: impl FnOnce(&mut RepoWriter<'_>) -> Result<()>,
 ) -> RunResult {
     let mut repo = open_for(store, c, &cfg, env)?;
-    util::with_repo_lock(&mut repo, f)?;
+    util::with_exclusive_session(&mut repo, f)?;
     Ok((Vec::new(), String::new()))
 }
 

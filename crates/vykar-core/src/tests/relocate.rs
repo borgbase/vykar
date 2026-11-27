@@ -375,7 +375,7 @@ fn move_head(config: &crate::config::VykarConfig, pass: Option<&str>) {
     let mut repo =
         commands::util::open_repo(config, pass, OpenOptions::new(), &CancelToken::new()).unwrap();
     let before = repo.index_generation();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         repo.request_full_index_fold();
         repo.mark_index_dirty();

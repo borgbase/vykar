@@ -545,10 +545,12 @@ impl PendingCommit {
     /// another writer" once contended. Each attempt:
     /// - single-writer: unless marked, the listing before the mark
     ///   ([`Self::list_before_mark`]) and the mark; the listing after it
-    ///   ([`Self::list_after_mark`], which unmarks on contention); the probe
-    ///   of `locks/` ([`Self::try_probe`]; a live lock keeps the mark); the
-    ///   suspend rule ([`Self::suspend_rule`]);
-    /// - multi-writer: unless marked, the mark; the probe; the suspend rule.
+    ///   ([`Self::list_after_mark`], which unmarks on contention); the
+    ///   pre-head listing of `sessions/` ([`Self::try_probe`]; a live
+    ///   exclusive session keeps the mark and waits); the suspend rule
+    ///   ([`Self::suspend_rule`]);
+    /// - multi-writer: unless marked, the mark; the pre-head listing; the
+    ///   suspend rule.
     ///
     /// A `Restart` of the suspend rule runs the attempt again at once in the
     /// new mode. `cancel` is checked before every attempt and during the
@@ -665,14 +667,16 @@ impl PendingCommit {
         Ok(())
     }
 
-    /// One probe of `locks/` after the mark ([`lock::probe_unlocked_at`]
-    /// with the marker's current key), both modes: `Ok` records "now" (the
-    /// key's mtime, for the fold's segment ages); `Err(Locked)` while a live
-    /// lock is held (the mark stays).
+    /// The pre-head listing of `sessions/` after the mark
+    /// ([`lock::exclusive_listing`] with the marker's current key; named for
+    /// the probe of `locks/` it replaced in 10-single-protocol step 8), both
+    /// modes: `Ok` records "now" (the key's mtime, for the fold's segment
+    /// ages); `Err(Locked)` while an exclusive session is live (the mark
+    /// stays, the commit waits).
     pub(crate) fn try_probe(&mut self) -> Result<()> {
         let (_, key) = self.marker()?.current();
         let now =
-            lock::probe_unlocked_at(self.repo.storage().as_ref(), self.repo.host_env(), &key)?;
+            lock::exclusive_listing(self.repo.storage().as_ref(), self.repo.host_env(), &key)?;
         self.repo.set_lock_store_time(now);
         Ok(())
     }

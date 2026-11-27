@@ -152,8 +152,9 @@ fn check_guard(name: &str, o: &Outcome) {
                     context()
                 ),
                 // The commit protection (10-single-protocol step 7): the
-                // single-writer listings, the mark, the probe of `locks/`,
-                // and the suspend rule's re-read of `config`.
+                // single-writer listings, the mark, the pre-head listing of
+                // `sessions/` (the probe of `locks/` before step 8), and
+                // the suspend rule's re-read of `config`.
                 "list-writers" | "mark-committing" | "probe-locks" => assert!(
                     r.key.starts_with("locks/")
                         || r.key.starts_with("sessions/")
@@ -1157,10 +1158,12 @@ const STEPPED_COMPACT_LABELS: &[&str] = &[
     "compact List snapshots/",
     "compact List index.h/",
     "compact Get index.h/",
-    // the registration (flagged `writes_heads`; its probe of `locks/` and
-    // the re-read of `config` are no steps), then the single-writer check
-    // (10-single-protocol step 7)
+    // the registration (flagged `writes_heads`) and its listing of
+    // `sessions/` for a live exclusive session (10-single-protocol step 8;
+    // a probe of `locks/`, no step, before), the re-read of `config` (no
+    // step), then the single-writer check (step 7)
     "compact Put sessions/",
+    "compact ListMeta sessions/",
     "compact ListMeta sessions/",
     // the pack listing first (04 "Compact" 1; the first shard, the rest in
     // the same decision), then sessions #1, whose listing also gives the

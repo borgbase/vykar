@@ -1,12 +1,13 @@
 use crate::repo::ages::StoreClock;
 use crate::repo::host_env::{Clock, StopSignal};
+use crate::repo::lock;
 use crate::repo::lock::{
     HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, NowSource, RefreshOutcome,
     SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, acquire_lock, break_lock,
     cleanup_stale_locks, cleanup_stale_sessions, cleanup_stale_sessions_keeping,
     clear_all_sessions, commit_marker_check, default_stale_session_duration, format_age,
-    format_age_since, parse_session_marker_key, probe_unlocked_at, register_session, release_lock,
-    session_marker_key, session_marker_key_at, yield_to_lock_free_writers,
+    format_age_since, parse_session_marker_key, register_session, release_lock, session_marker_key,
+    session_marker_key_at, yield_to_lock_free_writers,
 };
 use crate::repo::lock::{HeadWriter, head_landing_check, single_writer_listing};
 use crate::repo::{HostEnv, HostIdentity, SystemClock};
@@ -2766,9 +2767,10 @@ mod exclusion {
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
     }
 
-    /// No lock PUT by a registration; on a real backend the probe reads
-    /// "now" from the marker it just wrote, so it writes no clock probe
-    /// either.
+    /// No lock PUT by a registration (10-single-protocol step 8: it lists
+    /// `sessions/`, not `locks/`); a live exclusive
+    /// session refuses it `Locked` naming the exclusive marker, and its own
+    /// marker is deleted.
     #[test]
     fn register_session_probe_issues_no_lock_put() {
         let (storage, log) = RecordingBackend::new();
@@ -2784,7 +2786,7 @@ mod exclusion {
         assert!(storage.exists(&session_marker_key("free")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
 
-        let held = acquire_lock(&storage, &HostEnv::system()).unwrap();
+        let held = crate::repo::lock::register_exclusive(&storage, &HostEnv::system()).unwrap();
         log.clear();
         let err = register_session_inner(
             &storage,
@@ -2795,10 +2797,12 @@ mod exclusion {
             Default::default(),
         )
         .unwrap_err();
-        assert_eq!(locked_key(err), held.key());
+        assert_eq!(
+            locked_key(err),
+            session_marker_key(held.registration.session_id())
+        );
         assert!(!storage.exists(&session_marker_key("blocked")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
-        release_lock(&storage, held).unwrap();
     }
 
     /// Unforced smoke test: mutual exclusion and liveness under contention.
@@ -3590,10 +3594,10 @@ fn a_lock_holder_does_not_yield_to_a_stale_one() {
     assert!(!storage.exists(&key).unwrap());
 }
 
-/// The lock-free writer's probe reads "now" (its flagged key's mtime) even
-/// when `locks/` is empty, and fails `Locked` on a live lock.
+/// The pre-head listing reads "now" (the caller's key's mtime) and fails
+/// `Locked` on a live exclusive session.
 #[test]
-fn probe_unlocked_at_reads_now_without_a_lock_listed() {
+fn exclusive_listing_reads_now_and_refuses_beside_a_live_exclusive() {
     let storage = MemoryBackend::with_mtimes();
     let env = HostEnv::system().with_host(me());
     let m = registered(&storage, "probe", &env);
@@ -3601,15 +3605,105 @@ fn probe_unlocked_at_reads_now_without_a_lock_listed() {
     let written = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
     storage.set_mtime(&key, written);
     assert_eq!(
-        probe_unlocked_at(&storage, &env, &key).unwrap(),
+        lock::exclusive_listing(&storage, &env, &key).unwrap(),
         Some(vykar_storage::StoreNow::at(written))
     );
-    let held = acquire_lock(&storage, &elsewhere()).unwrap();
-    assert!(matches!(
-        probe_unlocked_at(&storage, &env, &key),
-        Err(VykarError::Locked(_))
-    ));
-    release_lock(&storage, held).unwrap();
+    let other = lock::register_exclusive(&storage, &elsewhere()).unwrap();
+    let err = lock::exclusive_listing(&storage, &env, &key).unwrap_err();
+    let VykarError::Locked(holder) = err else {
+        panic!("{err}");
+    };
+    assert!(holder.key.starts_with("sessions/x-"), "{}", holder.key);
+    assert!(holder.details.is_some());
+    lock::deregister_session(&storage, other.registration.session_id(), &env);
+}
+
+/// The pre-head listing judges only exclusive sessions: a young malformed
+/// shared marker (which a reaper would keep and count) does not refuse.
+#[test]
+fn exclusive_listing_ignores_shared_sessions() {
+    let storage = MemoryBackend::with_mtimes();
+    let env = HostEnv::system().with_host(me());
+    let m = registered(&storage, "own", &env);
+    let (_, key) = m.current();
+    storage.put("sessions/shared.json", b"not json").unwrap();
+    registered(&storage, "other", &elsewhere());
+    assert!(lock::exclusive_listing(&storage, &env, &key).is_ok());
+    assert!(storage.exists("sessions/shared.json").unwrap());
+}
+
+/// A young malformed exclusive marker refuses (fail closed); one older than
+/// 45 min by its mtime is reaped, its journal kept, and "now" is the
+/// caller's key's mtime.
+#[test]
+fn exclusive_listing_judges_exclusive_markers_by_age() {
+    let storage = MemoryBackend::with_mtimes();
+    let env = HostEnv::system().with_host(me());
+    let m = registered(&storage, "own", &env);
+    let (_, key) = m.current();
+    let own_mtime = std::time::SystemTime::now();
+    storage.set_mtime(&key, own_mtime);
+    let x = format!("sessions/x-{:032x}", 9u128);
+    storage.put(&format!("{x}.json"), b"not json").unwrap();
+    storage.put(&format!("{x}.index"), b"journal").unwrap();
+    let err = lock::exclusive_listing(&storage, &env, &key).unwrap_err();
+    let VykarError::Locked(holder) = err else {
+        panic!("{err}");
+    };
+    assert_eq!(holder.key, format!("{x}.json"));
+    assert!(holder.details.is_none());
+
+    storage.set_mtime(
+        &format!("{x}.json"),
+        own_mtime - std::time::Duration::from_secs(46 * 60),
+    );
+    assert_eq!(
+        lock::exclusive_listing(&storage, &env, &key).unwrap(),
+        Some(vykar_storage::StoreNow::at(own_mtime))
+    );
+    assert!(!storage.exists(&format!("{x}.json")).unwrap(), "reaped");
+    assert!(
+        storage.exists(&format!("{x}.index")).unwrap(),
+        "journal kept"
+    );
+}
+
+/// An exclusive registration: an `x-` + 32 hex ID, the other live sessions
+/// returned, stale ones reaped and orphan journals deleted as maintenance
+/// does, "now" from its own key.
+#[test]
+fn register_exclusive_lists_reaps_and_names_itself() {
+    let storage = MemoryBackend::with_mtimes();
+    let env = HostEnv::system().with_host(me());
+    let live = registered(&storage, "live", &elsewhere());
+    let (_, live_key) = live.current();
+    storage.put("sessions/stale.json", br#"{"hostname":"gone","pid":1,"registered_at":"2026-01-01T00:00:00Z","last_refresh":"2026-01-01T00:00:00Z"}"#).unwrap();
+    storage.set_mtime(
+        "sessions/stale.json",
+        std::time::SystemTime::now() - std::time::Duration::from_secs(46 * 60),
+    );
+    storage.put("sessions/orphan.index", b"journal").unwrap();
+    let reg = lock::register_exclusive(&storage, &env).unwrap();
+    let id = reg.registration.session_id();
+    assert!(
+        id.len() == 34 && id.starts_with("x-") && id[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+        "{id}"
+    );
+    assert!(lock::is_exclusive_session(id));
+    assert!(storage.exists(&session_marker_key(id)).unwrap());
+    assert_eq!(reg.cleaned, vec!["stale".to_string()]);
+    assert_eq!(
+        reg.live
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["live"]
+    );
+    assert!(reg.now.is_some());
+    assert!(!storage.exists("sessions/orphan.index").unwrap());
+    assert!(storage.exists(&live_key).unwrap());
+    lock::deregister_session(&storage, id, &env);
+    assert!(!storage.exists(&session_marker_key(id)).unwrap());
 }
 
 // ── 10-single-protocol step 7: the record's restart, the single-writer listing ──

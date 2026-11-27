@@ -423,6 +423,10 @@ pub(crate) fn delete_dead_pack_maps(
         cancel.check()?;
         match storage.delete(&key) {
             Ok(()) => deleted += 1,
+            // The exclusion of the run is gone: stop, nothing more is written.
+            Err(e @ (VykarError::MarkerLostDuringCommit | VykarError::LockExpired(_))) => {
+                return Err(e);
+            }
             Err(e) if e.is_write_refusal() => debug!("pack map {key} not deleted (refused): {e}"),
             Err(e) => warn!("failed to delete pack map {key}: {e}"),
         }

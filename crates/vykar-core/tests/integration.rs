@@ -115,7 +115,7 @@ fn init_store_reopen_read() {
             .store_chunk(&repo, data2, Compression::Lz4, PackType::Data)
             .unwrap();
         // No cfg(test) writer outside the crate: save under the lock.
-        commands::util::with_maintenance_lock(&mut repo, |w| w.save_session(ws)).unwrap();
+        commands::util::with_exclusive_session(&mut repo, |w| w.save_session(ws)).unwrap();
         (id1, id2)
     };
 
@@ -3010,12 +3010,14 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2, since 04 step 7: maintenance runs beside a live SessionGuard
+// Bug 2: an exclusive session (`check --repair`, upgrade, pack maps) refuses
+// beside a live SessionGuard (10-single-protocol step 8; maintenance under
+// the lock ran beside it since 04 step 7)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn maintenance_runs_beside_a_live_session_guard() {
-    use vykar_core::commands::util::with_maintenance_lock;
+fn maintenance_refuses_beside_a_live_session_guard() {
+    use vykar_core::commands::util::with_exclusive_session;
     use vykar_core::repo::lock;
 
     init_test_environment();
@@ -3023,7 +3025,7 @@ fn maintenance_runs_beside_a_live_session_guard() {
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
 
-    // Init a repo so with_maintenance_lock can open it
+    // Init a repo so with_exclusive_session can open it
     let repo = common::init_local_repo(&repo_dir);
     drop(repo);
 
@@ -3040,10 +3042,14 @@ fn maintenance_runs_beside_a_live_session_guard() {
     )
     .unwrap();
 
-    // Since 04 step 7 maintenance proceeds while the session is live, and
-    // leaves its marker.
+    // An exclusive session refuses while the session is live, and leaves
+    // its marker.
     let mut repo2 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
-    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
+    let refused = with_exclusive_session(&mut repo2, |_| Ok(()));
+    assert!(
+        matches!(refused, Err(VykarError::ActiveSessions(_))),
+        "{refused:?}"
+    );
     let live = lock::list_session_entries(storage.as_ref()).unwrap();
     assert_eq!(live.len(), 1, "the live session's marker is kept");
     assert_eq!(live[0].0, session_id);
@@ -3054,7 +3060,7 @@ fn maintenance_runs_beside_a_live_session_guard() {
     assert!(lock::list_sessions(storage.as_ref()).unwrap().is_empty());
 
     let mut repo3 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
-    with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
+    with_exclusive_session(&mut repo3, |_| Ok(())).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -3063,7 +3069,7 @@ fn maintenance_runs_beside_a_live_session_guard() {
 
 #[test]
 fn maintenance_reaps_session_older_than_45_minutes() {
-    use vykar_core::commands::util::with_maintenance_lock;
+    use vykar_core::commands::util::with_exclusive_session;
     use vykar_core::repo::lock;
 
     init_test_environment();
@@ -3095,9 +3101,10 @@ fn maintenance_reaps_session_older_than_45_minutes() {
         .unwrap();
     assert!(marker_path.exists());
 
-    // Maintenance should clean the stale marker and succeed.
+    // An exclusive session's registration should clean the stale marker and
+    // succeed.
     let mut repo2 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
-    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
+    with_exclusive_session(&mut repo2, |_| Ok(())).unwrap();
 
     assert!(
         !marker_path.exists(),
@@ -3109,12 +3116,13 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     assert!(remaining.is_empty(), "no sessions should remain");
 }
 
-/// The lock holder's half of the marker handshake counts a young
-/// malformed marker as flagged (fail closed): maintenance yields with
-/// `Locked` naming it, and the marker stays.
+/// An exclusive registration counts a young malformed marker as a live
+/// session (fail closed): it refuses with `ActiveSessions` listing it as
+/// malformed, and the marker stays (the lock holder yielded `Locked` before
+/// 10-single-protocol step 8).
 #[test]
-fn maintenance_yields_to_a_young_malformed_session_marker() {
-    use vykar_core::commands::util::with_maintenance_lock;
+fn maintenance_refuses_beside_a_young_malformed_session_marker() {
+    use vykar_core::commands::util::with_exclusive_session;
 
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
@@ -3128,11 +3136,12 @@ fn maintenance_yields_to_a_young_malformed_session_marker() {
     std::fs::write(&marker_path, b"this is not json at all").unwrap();
 
     let mut repo2 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
-    match with_maintenance_lock(&mut repo2, |_| Ok(())) {
-        Err(VykarError::Locked(holder)) => {
-            assert_eq!(holder.key, "sessions/corrupt-session.json");
+    match with_exclusive_session(&mut repo2, |_| Ok(())) {
+        Err(VykarError::ActiveSessions(list)) => {
+            assert!(list.has_malformed(), "{list}");
+            assert!(list.to_string().contains("corrupt-session"), "{list}");
         }
-        other => panic!("expected Locked, got {:?}", other.err()),
+        other => panic!("expected ActiveSessions, got {:?}", other.err()),
     }
 
     // Marker must still be on disk — cleanup does not delete it.

@@ -559,7 +559,7 @@ fn fence_failure_publishes_nothing() {
     let before = sorted_entries(repo.chunk_index());
     toggle_an_entry(&mut repo, &mut None);
     let err = repo
-        .writer(Fence::lock(Arc::new(|| {
+        .writer(Fence::marker(Arc::new(|| {
             Err(VykarError::Other("lock lost".into()))
         })))
         .save_state()
@@ -1047,7 +1047,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     let mut repo = fx
         .open_with(storage, &fx.cache(), OpenOptions::new())
         .unwrap();
-    let stats = commands::util::with_maintenance_lock(&mut repo, |repo| {
+    let stats = commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         ops.lock().unwrap().clear();
         commands::compact::compact_repo(repo, 0.0, None, false, 2, &CancelToken::new())
@@ -1161,7 +1161,7 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
             if let Failure::SecondFence = failure {
                 let probe: Arc<dyn StorageBackend> = Arc::from(fx.storage());
                 let known = before.clone();
-                fence = Fence::lock(Arc::new(move || {
+                fence = Fence::marker(Arc::new(move || {
                     if probe
                         .list(INDEX_OBJECT_DIR)?
                         .iter()
@@ -2337,7 +2337,7 @@ fn a_full_fold_folds_young_segments() {
     fx.backup(&fx.config, "s2");
     let before = fx.head();
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         repo.request_full_index_fold();
         repo.mark_index_dirty();
@@ -2364,7 +2364,7 @@ fn a_partial_fold_fetches_what_the_cache_lacks() {
     let before = fx.head();
     age_segment(&fx, &before.segments[0].name);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         let dir = repo.cache_dir().unwrap();
         for e in std::fs::read_dir(&dir).unwrap() {
@@ -2404,7 +2404,7 @@ fn a_partial_fold_refetches_a_damaged_cached_segment() {
     let before = fx.head();
     age_segment(&fx, &before.segments[0].name);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         let dir = repo.cache_dir().unwrap();
         for r in &before.segments {

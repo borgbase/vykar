@@ -2474,7 +2474,7 @@ fn exclusive_marker_keys(raw: &dyn StorageBackend) -> Vec<String> {
 }
 
 /// A v2/v3 upgrade whose exclusive marker is deleted mid-run
-/// (`break-lock --sessions`, reuse 0 so the next write checks): the write
+/// (`vykar break-lock`, reuse 0 so the next write checks): the write
 /// in flight lands; the next check stops the upgrade
 /// `MarkerLostDuringCommit`, nothing more is written, the legacy key is
 /// released, the version is not switched, and a rerun completes.

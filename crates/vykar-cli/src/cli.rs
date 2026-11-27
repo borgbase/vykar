@@ -311,7 +311,7 @@ pub(crate) enum Commands {
         #[arg(long)]
         yes: bool,
 
-        /// Switch the repository's commit mode (multi: lock-free commits, needs put-if-absent; single: one writer at a time, best-effort check, no lock)
+        /// Switch the repository's commit mode (multi: backups commit side by side, needs put-if-absent; single: one writer at a time, best-effort check)
         #[arg(long, value_enum)]
         commit_mode: Option<CommitModeArg>,
     },

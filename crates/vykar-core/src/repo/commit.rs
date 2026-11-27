@@ -79,7 +79,7 @@ impl Repo {
             generation = self.index_generation,
             entries = self.chunk_index.len(),
             elapsed_ms = start.elapsed().as_millis() as u64,
-            "index loaded under maintenance lock"
+            "index loaded at the latest head"
         );
         Ok(())
     }

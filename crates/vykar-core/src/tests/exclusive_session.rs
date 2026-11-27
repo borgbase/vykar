@@ -187,7 +187,7 @@ fn success_is_kept_when_deregistration_fails() {
     // Post-commit policy: if the action succeeded, a failed deregistration is
     // non-fatal (`tracing::warn!` only): the work is committed. The marker
     // left behind stops blocking 45 minutes after its last refresh, or
-    // `vykar break-lock --sessions` removes it.
+    // `vykar break-lock` removes it.
     let backend = MarkerBackend::new(true);
     let mut repo = init_repo_with_backend(backend.clone());
 

@@ -87,7 +87,7 @@ pub fn installation_id() -> Option<String> {
             #[cfg(not(test))]
             {
                 let Some(dir) = paths::config_dir().map(|d| d.join("vykar")) else {
-                    tracing::warn!("no config directory; same-host lock reaping is off");
+                    tracing::warn!("no config directory; same-host reaping is off");
                     return None;
                 };
                 load_or_create_installation_id(&dir)
@@ -108,7 +108,7 @@ pub(crate) fn load_or_create_installation_id(dir: &std::path::Path) -> Option<St
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             tracing::warn!(
-                "could not read installation ID file {}: {e}; same-host lock reaping is off \
+                "could not read installation ID file {}: {e}; same-host reaping is off \
                  until it is readable (fix its permissions or remove it)",
                 path.display()
             );
@@ -125,8 +125,8 @@ pub(crate) fn load_or_create_installation_id(dir: &std::path::Path) -> Option<St
                     Ok(id) => return id,
                     Err(e) => {
                         tracing::warn!(
-                            "could not read installation ID file {}: {e}; same-host lock \
-                             reaping is off",
+                            "could not read installation ID file {}: {e}; same-host reaping \
+                             is off",
                             path.display()
                         );
                         return None;
@@ -134,7 +134,7 @@ pub(crate) fn load_or_create_installation_id(dir: &std::path::Path) -> Option<St
                 }
             }
             tracing::warn!(
-                "could not create {}: {e}; same-host lock reaping is off",
+                "could not create {}: {e}; same-host reaping is off",
                 path.display()
             );
             None
@@ -151,7 +151,7 @@ fn read_installation_id(path: &std::path::Path) -> std::io::Result<Option<String
         Ok(Some(id.to_string()))
     } else {
         tracing::warn!(
-            "installation ID file {} is malformed; same-host lock reaping is off until it is \
+            "installation ID file {} is malformed; same-host reaping is off until it is \
              removed",
             path.display()
         );

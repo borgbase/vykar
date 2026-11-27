@@ -2100,7 +2100,7 @@ pub(crate) fn retry_while_contended<T>(
                         max_attempts,
                         holder = %describe_holder(&holder),
                         delay_ms = delay,
-                        "lock contention, retrying"
+                        "another session holds the repository, retrying"
                     );
                     clock.sleep(std::time::Duration::from_millis(delay));
                 } else {
@@ -2217,7 +2217,7 @@ pub fn format_age(now: &chrono::DateTime<Utc>, timestamp: &str) -> String {
 
 /// Same as [`format_age`] but for an already-parsed timestamp.
 ///
-/// Sub-minute ages render in seconds: for lock contention the difference
+/// Sub-minute ages render in seconds: for session contention the difference
 /// between a few-second commit and a minutes-long compact is the whole signal,
 /// and flooring both to `"0m"` would erase it.
 pub fn format_age_since(now: &chrono::DateTime<Utc>, then: &chrono::DateTime<Utc>) -> String {

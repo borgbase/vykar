@@ -79,7 +79,9 @@ fn with_legacy_upgrade_lock<T>(
                  repository anyway; `vykar break-lock` removes it."
             );
         } else {
-            tracing::warn!("failed to release repository lock: {release_err}");
+            tracing::warn!(
+                "failed to release the upgrade's legacy lock key `{key}`: {release_err}"
+            );
         }
     }
     result

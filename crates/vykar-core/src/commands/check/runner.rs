@@ -276,7 +276,7 @@ pub fn run_with_progress(
 
     // Pre-open early exit: if max_percent=0 and no full_every configured,
     // skip without opening the repo at all.
-    if max_percent == 0 && config.check.full_every_duration().is_none() {
+    if skips_without_open(config, max_percent) {
         return Ok(skipped_result());
     }
 
@@ -309,6 +309,8 @@ pub(crate) fn run_on_repo(
     record_state: bool,
     cancel: &CancelToken,
 ) -> Result<CheckResult> {
+    // The entry guard of `run_with_progress`, for callers that opened.
+    cancel.check()?;
     let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
     let full_every_dur = config.check.full_every_duration();
 
@@ -607,7 +609,14 @@ fn check_pass(
     Ok(result)
 }
 
-fn skipped_result() -> CheckResult {
+/// Whether a check with `max_percent` returns [`skipped_result`] without
+/// opening the repository: no sampling and no `check.full_every`.
+pub(crate) fn skips_without_open(config: &VykarConfig, max_percent: u8) -> bool {
+    max_percent == 0 && config.check.full_every_duration().is_none()
+}
+
+/// The result of a check that did not run.
+pub(crate) fn skipped_result() -> CheckResult {
     CheckResult {
         snapshots_checked: 0,
         key_files_checked: 0,

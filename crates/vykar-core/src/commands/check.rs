@@ -10,8 +10,9 @@ mod types;
 #[cfg(test)]
 pub(crate) use runner::{PINNED_SAMPLE, SampleOf};
 #[cfg(any(test, feature = "sim"))]
-pub(crate) use runner::{repair_open_options, run_on_repo, run_with_repair_on_repo};
+pub(crate) use runner::{repair_open_options, run_with_repair_on_repo};
 pub use runner::{run, run_with_progress, run_with_repair};
+pub(crate) use runner::{run_on_repo, skipped_result, skips_without_open};
 pub use types::{
     CheckError, CheckProgressEvent, CheckResult, IndexLoss, IndexRecovery, IntegrityIssue,
     ItemImpact, RebuildCounts, RepairAction, RepairIndexLoad, RepairMode, RepairPlan, RepairResult,

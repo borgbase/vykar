@@ -921,6 +921,12 @@ impl Repo {
     pub fn index_generation(&self) -> u64 {
         self.index_generation
     }
+
+    /// Tests: whether the chunk index has edits not yet persisted.
+    #[cfg(test)]
+    pub(crate) fn index_dirty(&self) -> bool {
+        self.index_dirty
+    }
     /// Read-only access to the manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest

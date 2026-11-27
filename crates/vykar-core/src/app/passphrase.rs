@@ -441,6 +441,28 @@ impl<'a> RepoPassphrase<'a> {
         result
     }
 
+    /// Open this scope's repository with its passphrase and accept the value
+    /// right after the open: resolved on first use, a value the repository
+    /// refuses replaced and only the open run again (as in [`Self::with`]).
+    /// From then on a decryption failure is the caller's error (damage), not a
+    /// refusal. `cancel` is the token the storage backend's retry waits observe.
+    pub fn open<E>(
+        &mut self,
+        opts: crate::repo::OpenOptions,
+        cancel: &crate::repo::control::CancelToken,
+    ) -> std::result::Result<crate::repo::Repo, E>
+    where
+        E: From<OpsError> + PassphraseFailure,
+    {
+        let config = self.config;
+        let repo = self.run(|pass| {
+            crate::commands::util::open_repo(config, pass, opts.clone(), cancel)
+                .map_err(|e| E::from(OpsError::from(e)))
+        })?;
+        self.accept();
+        Ok(repo)
+    }
+
     /// The resolved value, if resolution succeeded (mount hands it to a thread).
     pub fn value(&self) -> Option<Zeroizing<String>> {
         match &self.state {

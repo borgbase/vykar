@@ -1430,3 +1430,55 @@ fn init_refuses_a_server_without_the_v6_key_dirs() {
     );
     assert!(storage.list("").unwrap().is_empty(), "nothing written");
 }
+
+/// A handle reset for the next command sees what another client wrote since
+/// it opened, as a fresh open would, and keeps nothing of the previous run.
+#[test]
+fn reset_for_next_command_sees_other_writers() {
+    use crate::tests::helpers::{backup_single_source, init_repo, open_local_repo, set_store_now};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a").unwrap();
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &src, "src", "first");
+
+    // Handle A with its index loaded and the state a run leaves behind.
+    let mut a = open_local_repo(&repo_dir);
+    assert!(!a.chunk_index().is_empty());
+    a.unchecked_writer().mark_index_dirty();
+    set_store_now(&mut a);
+    a.set_live_sessions(Some(vec![crate::repo::sessions::LiveSession {
+        session_id: "other".into(),
+        entry: None,
+        mtime: None,
+    }]));
+
+    // Another client backs up.
+    std::fs::write(src.join("b.txt"), b"b").unwrap();
+    backup_single_source(&config, &src, "src", "second");
+
+    a.reset_for_next_command().unwrap();
+
+    let names: Vec<&str> = a
+        .manifest()
+        .snapshots
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"second"), "{names:?}");
+    let fresh = open_local_repo(&repo_dir);
+    assert_eq!(
+        a.index_head().unwrap().generation,
+        fresh.index_head().unwrap().generation
+    );
+    assert_eq!(a.index_generation(), fresh.index_generation());
+    assert!(a.chunk_index().is_empty());
+    assert!(!a.index_dirty());
+    assert!(a.store_time().is_none());
+    assert!(a.live_sessions().is_empty());
+}

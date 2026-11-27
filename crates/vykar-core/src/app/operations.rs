@@ -17,8 +17,8 @@ use crate::app::preflight::{self, UnavailableRepo};
 use crate::app::{HookError, OpsError, OpsResult};
 use crate::commands;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
-use crate::repo::HostEnv;
 use crate::repo::control::CancelToken;
+use crate::repo::{HostEnv, OpenOptions, Repo};
 use vykar_types::error::VykarError;
 
 #[derive(Debug, Clone)]
@@ -598,8 +598,11 @@ pub(crate) fn run_full_cycle_for_repo(
 /// inside the first step that needs one, after that step's `before` hooks
 /// pass, and at most once per cycle; a resolve failure is not retried, and a
 /// dismissed prompt skips the step without reporting an error. A value the
-/// repository refuses is replaced by the scope in the same step (see
-/// [`RepoPassphrase`]), as long as no step has opened the repository with it.
+/// repository refuses is replaced by the scope (see [`RepoPassphrase`]) only
+/// at an open, as long as no step has opened the repository with it: at the
+/// backup's per-source opens and at the session's open. One session (one
+/// open repository) serves prune, compact and check; a step whose action
+/// fails drops it and the next step opens again.
 /// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
 /// once the backup step's `before` hooks have run is skipped like a hook skip:
 /// only `finally` hooks run and nothing is resolved or opened.
@@ -621,6 +624,17 @@ pub(crate) fn run_full_cycle(
     let mut compact_stats: Option<commands::compact::CompactStats> = None;
     let mut check_result: Option<commands::check::CheckResult> = None;
     let mut repo_unavailable = false;
+    // The cycle's open repository from prune onward: opened by the first
+    // maintenance step that runs its action, after that step's `before`
+    // hooks; reset and reused by the later steps; dropped after a step whose
+    // action failed, and by the last step that uses it before its `after`
+    // hooks run. One exception: when `before_check` fails or skips, check's
+    // action never runs, so a session kept for it stays open through
+    // `failed_check` and `finally_check`.
+    let mut session: Option<Repo> = None;
+    // Whether check opens (or reuses) the session, so compact keeps it.
+    let check_needs_session =
+        !commands::check::skips_without_open(config, config.check.max_percent);
 
     // 1. Backup
     if !cancel.is_cancelled() {
@@ -739,10 +753,10 @@ pub(crate) fn run_full_cycle(
                 on_event,
                 &mut steps,
                 |evt| {
-                    let stats = passphrase.run(|pass| {
-                        commands::prune::run(
+                    let r = cycle_session(&mut session, passphrase, cancel).and_then(|repo| {
+                        commands::prune::run_on_repo(
+                            repo,
                             config,
-                            pass,
                             false,
                             false,
                             sources,
@@ -751,8 +765,12 @@ pub(crate) fn run_full_cycle(
                         )
                         .map(|(stats, _)| stats)
                         .map_err(OpsError::from)
-                    })?;
-                    passphrase.accept();
+                    });
+                    // Compact always follows a prune that ran, unless cancelled.
+                    if r.is_err() || cancel.is_cancelled() {
+                        session = None;
+                    }
+                    let stats = r?;
                     // Surface post-commit warnings as cycle events so GUI/CLI
                     // consumers can log them as persistent entries. tracing
                     // already fired inside commands::prune::run.
@@ -792,10 +810,10 @@ pub(crate) fn run_full_cycle(
                 on_event,
                 &mut steps,
                 |_evt| {
-                    let stats = passphrase.run(|pass| {
-                        match commands::compact::run(
-                            config,
-                            pass,
+                    let r = cycle_session(&mut session, passphrase, cancel).and_then(|repo| {
+                        // The config threshold is normalised at load.
+                        match commands::compact::run_on_repo(
+                            repo,
                             config.compact.threshold,
                             None,
                             false,
@@ -809,9 +827,12 @@ pub(crate) fn run_full_cycle(
                             )),
                             other => other.map_err(OpsError::from),
                         }
-                    })?;
-                    passphrase.accept();
-                    Ok(stats)
+                    });
+                    // An append-only skip is an `Err` too: check opens again.
+                    if r.is_err() || !check_needs_session || cancel.is_cancelled() {
+                        session = None;
+                    }
+                    r
                 },
                 |_| StepOutcome::Ok,
             );
@@ -843,24 +864,29 @@ pub(crate) fn run_full_cycle(
                 on_event,
                 &mut steps,
                 |evt| {
-                    let result = passphrase.run(|pass| {
-                        commands::check::run_with_progress(
-                            config,
-                            pass,
-                            false,
-                            false,
-                            Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
-                            check_max_percent,
-                            true, // record_state: daemon/GUI updates the full_every timer
-                            cancel,
-                        )
-                        .map_err(OpsError::from)
-                    })?;
+                    // First, as the opener does: a cancel during the `before`
+                    // hooks interrupts the step before the skip test and the open.
+                    cancel.check().map_err(OpsError::from)?;
                     // A check that is not configured returns without opening.
-                    if !result.skipped {
-                        passphrase.accept();
+                    if commands::check::skips_without_open(config, check_max_percent) {
+                        session = None;
+                        return Ok(commands::check::skipped_result());
                     }
-                    Ok(result)
+                    cycle_session(&mut session, passphrase, cancel)?;
+                    // The last step: taken, so no handle is open while its
+                    // `after`, `failed` and `finally` hooks run.
+                    let mut repo = session.take().expect("cycle_session opened it");
+                    commands::check::run_on_repo(
+                        &mut repo,
+                        config,
+                        false,
+                        false,
+                        Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
+                        check_max_percent,
+                        true, // record_state: daemon/GUI updates the full_every timer
+                        cancel,
+                    )
+                    .map_err(OpsError::from)
                 },
                 |result| {
                     if result.skipped {
@@ -885,6 +911,7 @@ pub(crate) fn run_full_cycle(
         }
     }
 
+    drop(session);
     FullCycleResult {
         backup_report,
         prune_stats,
@@ -893,6 +920,26 @@ pub(crate) fn run_full_cycle(
         steps,
         repo_unavailable,
     }
+}
+
+/// The cycle's session for the next maintenance step: opened with
+/// `passphrase` (accepted right after the open) when there is none, else
+/// reset for the next command ([`Repo::reset_for_next_command`]). A failed
+/// reset drops the session.
+fn cycle_session<'s>(
+    session: &'s mut Option<Repo>,
+    passphrase: &mut RepoPassphrase<'_>,
+    cancel: &CancelToken,
+) -> OpsResult<&'s mut Repo> {
+    if session.is_none() {
+        *session = Some(passphrase.open::<OpsError>(OpenOptions::new(), cancel)?);
+    } else if let Some(repo) = session.as_mut()
+        && let Err(e) = repo.reset_for_next_command()
+    {
+        *session = None;
+        return Err(OpsError::from(e));
+    }
+    Ok(session.as_mut().expect("opened or kept above"))
 }
 
 /// Run a single cycle step with the full hook lifecycle.

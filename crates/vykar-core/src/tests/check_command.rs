@@ -2753,3 +2753,23 @@ fn a_repair_whose_delete_of_the_rewrite_fails_writes_nothing_and_a_rerun_converg
         fx.assert_converged();
     }
 }
+
+/// `run_on_repo` has the entry guard of `run_with_progress`: a cancel set
+/// after the open is `Interrupted`, not a clean result.
+#[test]
+fn run_on_repo_with_a_cancelled_token_is_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
+    let mut repo = crate::commands::util::open_repo(
+        &config,
+        pass(&config),
+        crate::repo::OpenOptions::new(),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    assert_interrupted(commands::check::run_on_repo(
+        &mut repo, &config, false, false, None, 100, false, &cancel,
+    ));
+}

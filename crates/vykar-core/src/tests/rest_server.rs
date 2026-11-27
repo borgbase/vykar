@@ -676,19 +676,23 @@ fn the_cycle_skips_compact_on_an_append_only_server() {
         let server = Server::start(append_only);
         let c = Client::init(&server);
         c.write("a", "alpha");
-        let repo = super::helpers::resolved_repo(
+        let mut repo = super::helpers::resolved_repo(
             c.config.clone(),
             vec![super::helpers::source_entry(&c.source, "src")],
         );
-        let result = run_full_cycle_for_repo(
-            &repo,
-            Some(crate::testing::TEST_PASSPHRASE),
-            &CancelToken::new(),
-            false,
-            &[],
-            crate::app::preflight::UnavailableRepo::Skip,
-            &mut |_| {},
-        );
+        // A check that opens, so the open count shows whether it reopened.
+        repo.config.check.max_percent = 100;
+        let (result, opens) = crate::repo::count_repo_opens(|| {
+            run_full_cycle_for_repo(
+                &repo,
+                Some(crate::testing::TEST_PASSPHRASE),
+                &CancelToken::new(),
+                false,
+                &[],
+                crate::app::preflight::UnavailableRepo::Skip,
+                &mut |_| {},
+            )
+        });
         let outcome = |step: CycleStep| {
             result
                 .steps
@@ -717,6 +721,11 @@ fn the_cycle_skips_compact_on_an_append_only_server() {
             "{:?}",
             result.steps
         );
+        // The backup's open and the session compact opened. A compact that
+        // fails (the append-only skip is an `Err`) drops the session, so
+        // check opens again.
+        let check_reopens = usize::from(append_only);
+        assert_eq!(opens, 2 + check_reopens, "append_only={append_only}");
     }
 }
 

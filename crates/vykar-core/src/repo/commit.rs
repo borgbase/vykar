@@ -311,6 +311,50 @@ impl Repo {
         Ok(())
     }
 
+    /// Bring a handle that ran a command back to the state an open leaves,
+    /// for the next command on the same handle (the cycle's session, 07
+    /// step 6): index edits discarded and the index unloaded, the per-run
+    /// write state reset, the snapshot list re-read resiliently (as an open:
+    /// an unreadable snapshot is skipped into `skipped_snapshots`), then the
+    /// head read again (after the listing, as an open) for `index_head` and
+    /// `index_generation`. Not for a handle opened for an upgrade.
+    ///
+    /// Kept as the open set them: storage, crypto, `config` and `format`
+    /// (each maintenance session re-reads `config` and refuses a changed
+    /// identity or format), `key_blob` (re-reading it would need the
+    /// passphrase; a key rewrapped meanwhile makes a later check report the
+    /// stored copies as foreign, as it would within one long check),
+    /// `repo_url`, `cache_dir_override`, `tree_cache`, `commit_mode` (each
+    /// maintenance session re-reads the mode and drops a changed one),
+    /// `single_writer_reason` (set only by init), the file cache and its
+    /// bookkeeping (not loaded by a maintenance open, and only a backup
+    /// writes it), and the test and policy knobs (`fold_policy`,
+    /// `index_gc_grace`, `exclusive_check_reuse`, `pack_grace`,
+    /// `segment_grace`).
+    pub(crate) fn reset_for_next_command(&mut self) -> Result<()> {
+        debug_assert!(!self.format.is_upgrade_only());
+        self.discard_index_edits();
+        // Frees the previous command's index before the next one loads its own.
+        self.clear_chunk_index();
+        self.clear_session_state();
+        self.fold_requested = super::index_write::FoldRequest::None;
+        self.created_head = None;
+        self.pending_sweep = None;
+        self.host_env = self.host_env.for_new_run();
+        let refresh = snapshot_cache::refresh_snapshot_cache(
+            self.storage.as_ref(),
+            self.crypto.as_ref(),
+            &self.config.id,
+            self.cache_dir_override.as_deref(),
+            false, // strict_io: false — resilient, as an open
+        )?;
+        self.apply_snapshot_refresh(refresh);
+        let head = index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?;
+        self.index_generation = head.generation;
+        self.index_head = Some(head);
+        Ok(())
+    }
+
     /// Replace the in-memory manifest with a fresh snapshot listing.
     pub(super) fn apply_snapshot_refresh(&mut self, refresh: snapshot_cache::SnapshotRefresh) {
         self.skipped_snapshots = refresh.skipped;

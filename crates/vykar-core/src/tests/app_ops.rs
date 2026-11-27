@@ -1206,3 +1206,64 @@ fn unknown_source_filter_is_a_config_failure() {
         result.steps
     );
 }
+
+// ── One repository handle from prune onward ─────────────────────────────────
+
+/// `local_repo` with `keep_last: 1` and a full check, backed up once.
+fn maintained_repo(tmp: &tempfile::TempDir, labels: &[&str]) -> ResolvedRepo {
+    let mut repo = local_repo(tmp, labels);
+    repo.config.retention.keep_last = Some(1);
+    repo.config.check.max_percent = 100;
+    let first = run_cycle(&repo);
+    assert!(!first.has_failures(), "{:?}", first.steps);
+    repo
+}
+
+#[test]
+fn cycle_opens_once_from_prune_on() {
+    for labels in [&["src"][..], &["a", "b"][..]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = maintained_repo(&tmp, labels);
+
+        let (result, opens) = crate::repo::count_repo_opens(|| run_cycle(&repo));
+
+        // One open per backup source, one for prune, compact and check.
+        assert_eq!(opens, labels.len() + 1, "{labels:?}");
+        for step in [
+            CycleStep::Backup,
+            CycleStep::Prune,
+            CycleStep::Compact,
+            CycleStep::Check,
+        ] {
+            assert!(
+                matches!(outcome(&result, step), StepOutcome::Ok),
+                "{:?}",
+                result.steps
+            );
+        }
+        assert_eq!(result.prune_stats.as_ref().unwrap().pruned, labels.len());
+        let check = result.check_result.as_ref().unwrap();
+        assert!(!check.skipped);
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+        assert_eq!(check.snapshots_checked, labels.len());
+    }
+}
+
+#[test]
+fn cycle_session_opens_at_compact_when_prune_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.config.check.max_percent = 100;
+
+    let (result, opens) = crate::repo::count_repo_opens(|| run_cycle(&repo));
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Prune), StepOutcome::Skipped(r) if r == "no retention rules"),
+        "{:?}",
+        result.steps
+    );
+    assert!(!result.has_failures(), "{:?}", result.steps);
+    assert!(!result.check_result.as_ref().unwrap().skipped);
+    // The backup's open, then one session opened by compact and reused by check.
+    assert_eq!(opens, 2);
+}

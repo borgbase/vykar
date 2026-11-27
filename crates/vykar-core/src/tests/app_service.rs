@@ -380,3 +380,34 @@ fn passphrase_scope_unused_engine_error_is_returned() {
         Err(OpsError::Engine(VykarError::Interrupted))
     ));
 }
+
+/// `RepoPassphrase::open` replaces a refused value at the open and accepts
+/// the one that opened: a later decryption failure is the caller's error.
+#[test]
+fn open_accepts_right_after_the_open() {
+    use crate::app::passphrase::{PassphraseCache, RepoPassphrase};
+    use crate::repo::OpenOptions;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, "r");
+    let _env = prompt_only(&mut repo.config);
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value("wrong"), Reply::Value(TEST_PASSPHRASE)]);
+    let mut cache = PassphraseCache::default();
+    let mut scope = RepoPassphrase::new(&mut cache, &mut prompt, &repo.config, None);
+
+    let opened = scope.open::<OpsError>(OpenOptions::new(), &CancelToken::new());
+    assert!(opened.is_ok(), "{:?}", opened.err());
+    drop(opened);
+    let after = scope.run(|_| Err::<(), _>(OpsError::from(VykarError::DecryptionFailed)));
+    assert!(
+        matches!(after, Err(OpsError::Engine(VykarError::DecryptionFailed))),
+        "{after:?}"
+    );
+    drop(scope);
+
+    assert_eq!(prompt.asks(), 2);
+    assert_eq!(
+        cache.get(&repo.config).as_deref().map(String::as_str),
+        Some(TEST_PASSPHRASE)
+    );
+}

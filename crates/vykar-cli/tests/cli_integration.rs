@@ -1040,6 +1040,150 @@ fn cli_clear_sessions_lists_sessions_and_refuses_without_a_terminal() {
     assert!(exclusive_key.exists() && shared_key.exists());
 }
 
+/// `clear-sessions --stale` without a terminal: (i) with no marker it
+/// removes nothing and succeeds; (ii) leftover lock files go first, then
+/// markers stale on the storage's clock (shared and exclusive) and, on
+/// Linux, a fresh one of a process gone on this machine, exit 0; (iii, iv)
+/// beside a stale marker, a live shared and a live exclusive marker are
+/// kept, listed, counted, and it still succeeds. The plain command's
+/// refusal then names `--stale`.
+#[test]
+fn cli_clear_sessions_stale_removes_only_stale_markers_without_a_terminal() {
+    let fx = CliFixture::new();
+    write_test_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+    let stale_args = ["--config", cfg.as_str(), "clear-sessions", "--stale"];
+
+    // (i) Nothing there.
+    let none = fx.run(&stale_args);
+    assert!(none.status.success(), "{}", stderr(&none));
+    assert!(
+        stdout(&none).contains("Removed 0 stale session(s); 0 live session(s) left."),
+        "{}",
+        stdout(&none)
+    );
+
+    let sessions = fx.repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let marker = |host: &str, pid: u32| {
+        format!(
+            r#"{{"hostname":"{host}","pid":{pid},"registered_at":"{now}","last_refresh":"{now}","elapsed_secs":0}}"#
+        )
+    };
+    let put = |id: &str, body: &str| {
+        let path = sessions.join(format!("{id}.json"));
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let age = |path: &std::path::Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(46 * 60))
+            .unwrap();
+    };
+
+    // (ii) Only stale or dead markers, and a leftover lock file.
+    let locks = fx.repo_dir.join("locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    std::fs::write(locks.join("old.json"), br#"{"hostname":"h","pid":1}"#).unwrap();
+    let stale_shared = put("00000000000000000000000000000001", &marker("gone-host", 5));
+    let stale_exclusive = put(
+        "x-00000000000000000000000000000002",
+        &marker("gone-host", 6),
+    );
+    age(&stale_shared);
+    age(&stale_exclusive);
+    let mut expected = 2;
+    #[cfg(target_os = "linux")]
+    let dead = {
+        // A fresh marker of this machine whose process is gone. The CLI's
+        // installation ID was created by the first run, in the fixture's
+        // config directory.
+        let installation = std::fs::read_to_string(fx.config_home.join("vykar/installation-id"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let json = |v: Option<String>| v.map_or("null".to_string(), |s| format!("\"{s}\""));
+        let body = format!(
+            r#"{{"hostname":"{}","pid":{pid},"registered_at":"{now}","last_refresh":"{now}","boot_id":{},"installation_id":"{installation}","pid_ns":{},"elapsed_secs":0}}"#,
+            vykar_core::platform::hostname(),
+            json(vykar_core::platform::boot_id()),
+            vykar_core::platform::pid_namespace().map_or("null".to_string(), |n| n.to_string()),
+        );
+        expected += 1;
+        put("00000000000000000000000000000003", &body)
+    };
+    let removed = fx.run(&stale_args);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let out = stdout(&removed);
+    assert!(out.contains("Removed 1 leftover lock file(s)"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "Removed {expected} stale session(s); 0 live session(s) left."
+        )),
+        "{out}"
+    );
+    assert_eq!(std::fs::read_dir(&locks).unwrap().count(), 0);
+    assert!(!stale_shared.exists() && !stale_exclusive.exists());
+    #[cfg(target_os = "linux")]
+    assert!(!dead.exists(), "{out}");
+
+    // (iii, iv) Live shared and live exclusive markers beside a stale one.
+    let live_shared = put(
+        "fedcba9876543210fedcba9876543210",
+        &marker("backup-host", 77),
+    );
+    let live_exclusive = "x-0123456789abcdef0123456789abcdef";
+    let live_exclusive_key = put(live_exclusive, &marker("repair-host", 4242));
+    let stale = put("00000000000000000000000000000004", &marker("gone-host", 8));
+    age(&stale);
+    let mixed = fx.run(&stale_args);
+    assert!(mixed.status.success(), "{}", stderr(&mixed));
+    let out = stdout(&mixed);
+    assert!(
+        out.contains("Removed stale session 00000000000000000000000000000004."),
+        "{out}"
+    );
+    assert!(
+        out.contains("Removed 1 stale session(s); 2 live session(s) left."),
+        "{out}"
+    );
+    assert!(!stale.exists());
+    assert!(live_shared.exists() && live_exclusive_key.exists());
+    let err = stderr(&mixed);
+    let exclusive_line = err
+        .lines()
+        .find(|l| l.contains(&format!("{live_exclusive}: host=repair-host, pid=4242")))
+        .unwrap_or_else(|| panic!("no line for the live exclusive session: {err}"));
+    assert!(exclusive_line.ends_with("(exclusive: check --repair, upgrade or a pack-map write)"));
+
+    // Run again: nothing stale left, the live markers stay.
+    let again = fx.run(&stale_args);
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert!(
+        stdout(&again).contains("Removed 0 stale session(s); 2 live session(s) left."),
+        "{}",
+        stdout(&again)
+    );
+
+    // The plain command still refuses without a terminal, and names --stale.
+    let plain = fx.run(&["--config", &cfg, "clear-sessions"]);
+    assert!(!plain.status.success(), "{}", stdout(&plain));
+    assert!(
+        stderr(&plain).contains("`vykar clear-sessions --stale` removes only the stale markers"),
+        "{}",
+        stderr(&plain)
+    );
+    assert!(live_shared.exists() && live_exclusive_key.exists());
+}
+
 /// The command was `break-lock` until it became `clear-sessions`, with no
 /// alias: the old name is an unknown subcommand, and `--sessions`, which
 /// `break-lock` accepted and ignored, is an unknown argument.

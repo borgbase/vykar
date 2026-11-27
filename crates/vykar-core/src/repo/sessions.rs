@@ -2064,6 +2064,57 @@ pub fn clear_all_sessions(storage: &dyn StorageBackend) -> Result<usize> {
     Ok(removed)
 }
 
+/// What [`clear_stale_sessions`] did.
+#[derive(Debug)]
+pub struct StaleSessionsCleared {
+    /// The sessions whose listed marker keys were deleted, ascending.
+    pub removed: Vec<String>,
+    /// The sessions kept, ascending: live, or not provably stale (an
+    /// unreadable marker while young or listed without an mtime, a newest
+    /// key gone since the listing).
+    pub live: Vec<LiveSession>,
+    /// Whether "now" on the store's clock was read. `false`: the clock
+    /// probe failed or was listed without an mtime; no marker listed with an
+    /// mtime is then stale by age, only markers of this machine whose
+    /// process is provably gone are removed.
+    pub store_now_known: bool,
+}
+
+/// `vykar clear-sessions --stale`: remove exactly the session markers the
+/// reaping of every backup and maintenance run would remove, and no other.
+/// "Now" on the store's clock is read with a clock probe under `sessions/`
+/// (`StoreClock::in_sessions`, the existing-pack check's: the mtime the
+/// store gives an object this call writes), since this caller has no
+/// marker of its own; a failed probe is "now unknown" (fail closed). Then
+/// `cleanup_stale_sessions_keeping` judges every session as the reapers do
+/// (`judge_session`: stale past `SESSION_STALE_SECS` on that clock, or left
+/// on this machine by a process that is provably gone, `same_host`) and
+/// deletes only the
+/// listed keys of the sessions it judged stale. A heartbeat that writes a
+/// session's next key after the listing is not deleted (no key is ever
+/// written twice) and its writer sees its superseded key gone. A live
+/// marker, committing, compacting or exclusive alike, is never touched.
+/// Journals and probe debris are handled as maintenance's reap handles
+/// them (a cleaned session's journal kept for recovery, older orphans and
+/// old probes removed). Needs no passphrase and no registration.
+///
+/// # Errors
+///
+/// A failed listing, GET or DELETE of a stale marker key.
+pub fn clear_stale_sessions(
+    storage: &dyn StorageBackend,
+    env: &HostEnv,
+) -> Result<StaleSessionsCleared> {
+    let now = super::ages::StoreClock::in_sessions().now(storage, env).0;
+    let (removed, live) =
+        cleanup_stale_sessions_keeping(storage, default_stale_session_duration(), env, now)?;
+    Ok(StaleSessionsCleared {
+        removed,
+        live,
+        store_now_known: now.is_some(),
+    })
+}
+
 /// Exponential backoff (cap 2^5 × base) with ±25 % jitter, minimum 100 ms.
 fn backoff_delay(attempt: usize, base_delay_ms: u64) -> u64 {
     let delay = base_delay_ms * (1 << attempt.min(5));

@@ -3153,3 +3153,243 @@ fn single_writer_listing_finds_head_writers() {
     assert!(!s.exists("sessions/gone.json").unwrap());
     assert!(s.exists("sessions/orphan.index").unwrap(), "journals stay");
 }
+
+/// `vykar clear-sessions --stale` (`sessions::clear_stale_sessions`): it
+/// removes exactly what the reapers remove, on the store's clock read with
+/// a probe, and never a live marker. On a real `LocalBackend`, mtimes set
+/// by hand.
+mod clear_stale {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use chrono::Utc;
+    use vykar_storage::local_backend::LocalBackend;
+    use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
+    use vykar_types::error::Result;
+
+    use super::me;
+    use crate::repo::HostEnv;
+    use crate::repo::sessions::{SessionEntry, clear_stale_sessions};
+
+    const STALE: Duration = Duration::from_secs(46 * 60);
+
+    fn local() -> (tempfile::TempDir, LocalBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        (dir, backend)
+    }
+
+    /// Set `key`'s mtime `age` before now.
+    fn age(dir: &Path, key: &str, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(key))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// A marker of another machine (judged by age alone), fresh by its JSON.
+    fn other_host() -> SessionEntry {
+        let now = Utc::now().to_rfc3339();
+        SessionEntry {
+            hostname: "otherhost".into(),
+            pid: 4242,
+            registered_at: now.clone(),
+            last_refresh: now,
+            boot_id: None,
+            installation_id: None,
+            pid_ns: None,
+            elapsed_secs: Some(0),
+            committing: false,
+            writes_heads: false,
+        }
+    }
+
+    /// A marker of this machine (`me()`) and boot, written by `pid`.
+    fn this_host(pid: u32) -> SessionEntry {
+        let me = me();
+        SessionEntry {
+            hostname: me.hostname,
+            pid,
+            boot_id: me.boot_id,
+            installation_id: me.installation_id,
+            pid_ns: me.pid_ns,
+            ..other_host()
+        }
+    }
+
+    fn put(storage: &dyn StorageBackend, key: &str, entry: &SessionEntry) {
+        storage
+            .put(key, &serde_json::to_vec(entry).unwrap())
+            .unwrap();
+    }
+
+    /// Running as `me()`, where only PID 1 (this process) and 77 are alive.
+    fn env() -> HostEnv {
+        HostEnv::system()
+            .with_host(me())
+            .with_pid_alive(Arc::new(|_, pid| pid == 1 || pid == 77))
+    }
+
+    /// Stale by age on the store's clock (a shared marker, an exclusive one,
+    /// a committing one, a malformed one): removed with every listed key; a
+    /// session's journal is kept. Live by mtime although old by its JSON, a
+    /// live committing mark and a live exclusive marker: kept, unread
+    /// beyond their GET.
+    #[test]
+    fn removes_markers_stale_on_the_store_clock_and_keeps_live_ones() {
+        let (dir, s) = local();
+        let committing = SessionEntry {
+            committing: true,
+            ..other_host()
+        };
+        put(&s, "sessions/old.json", &other_host());
+        put(&s, "sessions/old.3.json", &other_host());
+        s.put("sessions/old.index", b"journal").unwrap();
+        put(&s, "sessions/x-old.json", &other_host());
+        put(&s, "sessions/oldcommit.json", &committing);
+        s.put("sessions/bad.json", b"{").unwrap();
+        for key in [
+            "sessions/old.json",
+            "sessions/old.3.json",
+            "sessions/x-old.json",
+            "sessions/oldcommit.json",
+            "sessions/bad.json",
+        ] {
+            age(dir.path(), key, STALE);
+        }
+        let ancient = SessionEntry {
+            last_refresh: (Utc::now() - chrono::Duration::hours(5)).to_rfc3339(),
+            ..other_host()
+        };
+        put(&s, "sessions/fresh.json", &ancient);
+        put(&s, "sessions/commit.json", &committing);
+        put(&s, "sessions/x-live.json", &other_host());
+
+        let out = clear_stale_sessions(&s, &env()).unwrap();
+        assert!(out.store_now_known);
+        assert_eq!(out.removed, ["bad", "old", "oldcommit", "x-old"]);
+        let live: Vec<_> = out.live.iter().map(|l| l.session_id.as_str()).collect();
+        assert_eq!(live, ["commit", "fresh", "x-live"]);
+        for gone in [
+            "sessions/old.json",
+            "sessions/old.3.json",
+            "sessions/x-old.json",
+            "sessions/oldcommit.json",
+            "sessions/bad.json",
+        ] {
+            assert!(!s.exists(gone).unwrap(), "{gone}");
+        }
+        for kept in [
+            "sessions/old.index",
+            "sessions/fresh.json",
+            "sessions/commit.json",
+            "sessions/x-live.json",
+        ] {
+            assert!(s.exists(kept).unwrap(), "{kept}");
+        }
+        // The clock probe left nothing behind.
+        let mut left = s.list("sessions/").unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "sessions/commit.json",
+                "sessions/fresh.json",
+                "sessions/old.index",
+                "sessions/x-live.json",
+            ]
+        );
+    }
+
+    /// The same-host rule: a fresh marker of this machine and boot whose
+    /// process is gone is removed at once, an exclusive one included; one
+    /// whose process lives, and a fresh one of another machine, are kept.
+    #[test]
+    fn removes_markers_of_a_process_gone_on_this_machine_at_once() {
+        let (_dir, s) = local();
+        put(&s, "sessions/dead.json", &this_host(9));
+        put(&s, "sessions/x-dead.json", &this_host(10));
+        put(&s, "sessions/alive.json", &this_host(77));
+        put(&s, "sessions/x-alive.json", &this_host(77));
+        put(&s, "sessions/remote.json", &other_host());
+
+        let out = clear_stale_sessions(&s, &env()).unwrap();
+        assert_eq!(out.removed, ["dead", "x-dead"]);
+        let live: Vec<_> = out.live.iter().map(|l| l.session_id.as_str()).collect();
+        assert_eq!(live, ["alive", "remote", "x-alive"]);
+    }
+
+    /// Without a reading of the store's clock (the probe is not listed) nothing
+    /// listed with an mtime is stale by age; a process gone on this machine
+    /// is still proven gone.
+    #[test]
+    fn without_the_store_clock_only_same_host_markers_go() {
+        struct NoProbe(LocalBackend);
+        impl InnerBackend for NoProbe {
+            fn inner_backend(&self) -> &dyn StorageBackend {
+                &self.0
+            }
+        }
+        delegate_storage_backend! {
+            for NoProbe;
+            except [list_meta];
+
+            fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+                let mut listing = self.0.list_meta(prefix)?;
+                listing.retain(|o| !o.key.starts_with("sessions/vykar-clock-"));
+                Ok(listing)
+            }
+        }
+        let (dir, s) = local();
+        put(&s, "sessions/old.json", &other_host());
+        age(dir.path(), "sessions/old.json", STALE);
+        put(&s, "sessions/dead.json", &this_host(9));
+        let s = NoProbe(s);
+
+        let out = clear_stale_sessions(&s, &env()).unwrap();
+        assert!(!out.store_now_known);
+        assert_eq!(out.removed, ["dead"]);
+        assert!(s.exists("sessions/old.json").unwrap());
+    }
+
+    /// The race with a heartbeat: a session listed stale whose next key is
+    /// written between the listing and the deletes keeps that key: only the
+    /// keys the listing showed are deleted.
+    #[test]
+    fn a_key_written_after_the_listing_is_not_deleted() {
+        struct Heartbeat(LocalBackend);
+        impl InnerBackend for Heartbeat {
+            fn inner_backend(&self) -> &dyn StorageBackend {
+                &self.0
+            }
+        }
+        delegate_storage_backend! {
+            for Heartbeat;
+            except [get];
+
+            // The judge's GET of the newest listed key: the session's
+            // heartbeat writes its next key now.
+            fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+                if key == "sessions/beat.json" {
+                    self.0.put(
+                        "sessions/beat.1.json",
+                        &serde_json::to_vec(&other_host()).unwrap(),
+                    )?;
+                }
+                self.0.get(key)
+            }
+        }
+        let (dir, s) = local();
+        put(&s, "sessions/beat.json", &other_host());
+        age(dir.path(), "sessions/beat.json", STALE);
+        let s = Heartbeat(s);
+
+        let out = clear_stale_sessions(&s, &env()).unwrap();
+        assert_eq!(out.removed, ["beat"]);
+        assert!(!s.exists("sessions/beat.json").unwrap());
+        assert!(s.exists("sessions/beat.1.json").unwrap());
+    }
+}

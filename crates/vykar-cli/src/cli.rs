@@ -256,11 +256,18 @@ pub(crate) enum Commands {
     },
 
     /// Remove lock files left by vykar 0.24 or an interrupted upgrade (without
-    /// asking), then list all session markers and remove them (asks first)
+    /// asking), then list all session markers and remove them (asks first;
+    /// --stale removes only stale ones, without asking)
     ClearSessions {
         /// Select repository by label or path
         #[arg(short = 'R', long = "repo")]
         repo: Option<String>,
+
+        /// Remove only stale markers (45 minutes old on the storage's clock,
+        /// or of a process gone on this machine), without asking; for
+        /// unattended use
+        #[arg(long)]
+        stale: bool,
     },
 
     /// Run scheduled backups as a foreground daemon

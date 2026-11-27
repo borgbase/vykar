@@ -1,7 +1,8 @@
 use std::io::{IsTerminal, Write};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::HostEnv;
 use vykar_core::repo::sessions;
 
 use crate::error::{CliError, CliResult};
@@ -12,7 +13,15 @@ use crate::error::{CliError, CliResult};
 /// session marker and remove them all after confirmation on a terminal.
 /// Without a terminal it refuses (an error) whenever a marker exists, after
 /// the lock files were removed.
-pub(crate) fn run_clear_sessions(config: &VykarConfig, _label: Option<&str>) -> CliResult<()> {
+///
+/// `stale` (`--stale`): after the lock files, remove only the markers the
+/// reapers would remove (`sessions::clear_stale_sessions`), without asking
+/// and without a terminal, and succeed whatever live markers remain.
+pub(crate) fn run_clear_sessions(
+    config: &VykarConfig,
+    _label: Option<&str>,
+    stale: bool,
+) -> CliResult<()> {
     let storage = vykar_core::storage::backend_from_config(
         &config
             .repository
@@ -27,7 +36,55 @@ pub(crate) fn run_clear_sessions(config: &VykarConfig, _label: Option<&str>) -> 
         );
     }
 
+    if stale {
+        return clear_stale(storage.as_ref());
+    }
     clear_sessions(storage.as_ref(), removed)
+}
+
+/// Remove the stale markers and report what was removed and what was left.
+fn clear_stale(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> {
+    let cleared = sessions::clear_stale_sessions(storage, &HostEnv::system())?;
+    if !cleared.store_now_known {
+        eprintln!(
+            "Warning: the storage's clock could not be read; markers were judged stale only \
+             when their process is provably gone on this machine."
+        );
+    }
+    for id in &cleared.removed {
+        println!("Removed stale session {id}.");
+    }
+    println!(
+        "Removed {} stale session(s); {} live session(s) left.",
+        cleared.removed.len(),
+        cleared.live.len()
+    );
+    if !cleared.live.is_empty() {
+        let now = Utc::now();
+        eprintln!("Live session(s) kept:");
+        for live in &cleared.live {
+            print_session(&now, &live.session_id, live.entry.as_ref());
+        }
+    }
+    Ok(())
+}
+
+/// One line of a session listing on stderr.
+fn print_session(now: &DateTime<Utc>, id: &str, entry: Option<&sessions::SessionEntry>) {
+    let exclusive = if sessions::is_exclusive_session(id) {
+        " (exclusive: check --repair, upgrade or a pack-map write)"
+    } else {
+        ""
+    };
+    if let Some(e) = entry {
+        let age = sessions::format_age(now, &e.last_refresh);
+        eprintln!(
+            "  - {id}: host={}, pid={}, age={age}{exclusive}",
+            e.hostname, e.pid
+        );
+    } else {
+        eprintln!("  - {id}: (malformed marker){exclusive}");
+    }
 }
 
 /// List the session markers and remove them all after confirmation.
@@ -46,20 +103,7 @@ fn clear_sessions(
     let now = Utc::now();
     eprintln!("Found {} active session(s):", entries.len());
     for (id, entry) in &entries {
-        let exclusive = if sessions::is_exclusive_session(id) {
-            " (exclusive: check --repair, upgrade or a pack-map write)"
-        } else {
-            ""
-        };
-        if let Some(e) = entry {
-            let age = sessions::format_age(&now, &e.last_refresh);
-            eprintln!(
-                "  - {id}: host={}, pid={}, age={age}{exclusive}",
-                e.hostname, e.pid
-            );
-        } else {
-            eprintln!("  - {id}: (malformed marker){exclusive}");
-        }
+        print_session(&now, id, entry.as_ref());
     }
 
     eprintln!();
@@ -71,7 +115,8 @@ fn clear_sessions(
         return Err(CliError::from(format!(
             "refusing to remove sessions without confirmation in non-interactive mode \
              ({locks_removed} leftover lock file(s) were removed; removing session markers \
-             needs a terminal)"
+             needs a terminal). `vykar clear-sessions --stale` removes only the stale markers \
+             (45 minutes old, or of a process gone on this machine) without asking"
         )));
     }
 

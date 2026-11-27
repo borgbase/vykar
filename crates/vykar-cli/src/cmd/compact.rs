@@ -6,6 +6,7 @@ use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
+use crate::json::{CompactJson, JsonResult, Output};
 use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_compact(
@@ -15,6 +16,7 @@ pub(crate) fn run_compact(
     dry_run: bool,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
@@ -26,6 +28,13 @@ pub(crate) fn run_compact(
     let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
     let stats = commands::compact::run_on_repo(&mut repo, &req, cancel)?;
     drop(repo);
+
+    if out.is_json() {
+        // Only the stderr part of the summary.
+        print_compact_warnings(&stats);
+        out.keep(JsonResult::Compact(CompactJson { dry_run, stats }));
+        return Ok(());
+    }
 
     if dry_run {
         println!(

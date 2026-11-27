@@ -14,14 +14,20 @@ use crate::repo::{OpenOptions, Repo};
 /// Prune only deletes `snapshots/<id>` objects (the commit point of each
 /// removal); it does not read or write the index. The space the pruned
 /// snapshots alone used is reclaimed by the next `vykar compact`.
+///
+/// Serialized in `vykar prune --json` (schema 1): the field names are JSON
+/// names, so only add fields.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PruneStats {
     pub kept: usize,
     pub pruned: usize,
     pub warnings: Vec<String>,
 }
 
-/// Formatted list entry for --list output.
+/// Formatted list entry for --list output (and `vykar prune --json`).
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PruneListEntry {
+    /// "keep" or "prune".
     pub action: String,
     pub snapshot_name: String,
     pub reasons: Vec<String>,

@@ -8,6 +8,7 @@ use crate::cli::{Commands, KeyCommand};
 use crate::cmd;
 use crate::cmd::backup::BackupRunOpts;
 use crate::error::{CliError, CliResult};
+use crate::json::Output;
 
 pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) {
     let Ok(parsed) = parse_repo_url(&config.repository.url) else {
@@ -33,6 +34,7 @@ pub(crate) fn dispatch_backup(
     service: &mut AppService,
     cancel: &CancelToken,
     verbose: u8,
+    out: Output<'_>,
 ) -> CliResult<bool> {
     let Commands::Backup {
         label: user_label,
@@ -59,17 +61,20 @@ pub(crate) fn dispatch_backup(
             cancel,
             verbose,
         },
+        out,
     )
 }
 
 /// Every other per-repository command. `passphrase` is lazy: commands that
 /// need none (init, delete, clear-sessions) never resolve it. Returns
-/// `Ok(had_partial)`.
+/// `Ok(had_partial)`. `out` reaches list, info, prune, compact and check;
+/// the other commands never see `Output::Json` (`--json` refuses them).
 pub(crate) fn dispatch_command(
     command: &Commands,
     repo: &ResolvedRepo,
     passphrase: &mut RepoPassphrase<'_>,
     cancel: &CancelToken,
+    out: Output<'_>,
 ) -> CliResult<bool> {
     let cfg = &repo.config;
     let label = repo.label.as_deref();
@@ -81,7 +86,7 @@ pub(crate) fn dispatch_command(
             "'backup' is dispatched through the app service",
         )),
         Commands::List { source, last, .. } => {
-            cmd::list::run_list(source, *last, cancel, passphrase).map(|()| false)
+            cmd::list::run_list(source, *last, cancel, passphrase, out).map(|()| false)
         }
         Commands::Snapshot { command, .. } => {
             cmd::snapshot::run_snapshot_command(command, cancel, passphrase).map(|()| false)
@@ -112,8 +117,10 @@ pub(crate) fn dispatch_command(
             list,
             source,
             ..
-        } => cmd::prune::run_prune(cfg, *dry_run, *list, sources, source, cancel, passphrase)
-            .map(|()| false),
+        } => cmd::prune::run_prune(
+            cfg, *dry_run, *list, sources, source, cancel, passphrase, out,
+        )
+        .map(|()| false),
         Commands::Check {
             verify_data,
             distrust_server,
@@ -130,9 +137,10 @@ pub(crate) fn dispatch_command(
             *yes,
             cancel,
             passphrase,
+            out,
         )
         .map(|()| false),
-        Commands::Info { .. } => cmd::info::run_info(cfg, label, passphrase).map(|()| false),
+        Commands::Info { .. } => cmd::info::run_info(cfg, label, passphrase, out).map(|()| false),
         Commands::Key { command, .. } => match command {
             KeyCommand::Export { output, .. } => {
                 cmd::key::run_key_export(cfg, output.as_deref(), passphrase).map(|()| false)
@@ -177,6 +185,7 @@ pub(crate) fn dispatch_command(
                 *dry_run,
                 cancel,
                 passphrase,
+                out,
             )
             .map(|()| false)
         }

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::app::{OpsError, PassphraseFailure};
+use crate::app::{OpsError, PassphraseFailure, SkipKind, SkipReason};
 use crate::config::{ResolvedRepo, VykarConfig};
 use crate::platform::shell;
 use vykar_types::error::{Result, VykarError};
@@ -633,7 +633,10 @@ impl<'a> RepoPassphrase<'a> {
 }
 
 fn canceled<E: From<OpsError>>() -> E {
-    E::from(OpsError::Skipped(PASSPHRASE_PROMPT_CANCELED.into()))
+    E::from(OpsError::Skipped(SkipReason::new(
+        SkipKind::PassphrasePromptCanceled,
+        PASSPHRASE_PROMPT_CANCELED,
+    )))
 }
 
 #[cfg(test)]
@@ -758,7 +761,11 @@ mod scope_tests {
         let err = scope
             .with(|_| -> OpsResultUnit { unreachable!("the action must not run") })
             .unwrap_err();
-        assert!(matches!(err, OpsError::Skipped(r) if r == PASSPHRASE_PROMPT_CANCELED));
+        assert!(matches!(
+            err,
+            OpsError::Skipped(r)
+                if r.kind == SkipKind::PassphrasePromptCanceled && r.message == PASSPHRASE_PROMPT_CANCELED
+        ));
         assert!(scope.failed());
         drop(scope);
         assert!(!cache.contains(&config));
@@ -892,10 +899,10 @@ mod scope_tests {
         let err = scope
             .with(|_| -> OpsResultUnit {
                 runs.set(runs.get() + 1);
-                Err(OpsError::Skipped("hook".into()))
+                Err(OpsError::Skipped(SkipReason::new(SkipKind::Hook, "hook")))
             })
             .unwrap_err();
-        assert!(matches!(err, OpsError::Skipped(r) if r == "hook"));
+        assert!(matches!(err, OpsError::Skipped(r) if r.message == "hook"));
         drop(scope);
         assert_eq!(runs.get(), 1);
         assert_eq!(prompt.asks(), 1);

@@ -251,7 +251,7 @@ fn run_cycle_selection() {
     let [only] = report.repos.as_slice() else {
         panic!("one repository");
     };
-    assert!(!only.result.repo_unavailable);
+    assert!(!only.result.repo_unavailable());
     assert!(
         matches!(
             only.result.steps.first(),
@@ -269,8 +269,11 @@ fn run_cycle_selection() {
     let [only] = report.repos.as_slice() else {
         panic!("one repository");
     };
-    assert!(only.result.repo_unavailable);
-    assert!(only.skipped().is_some());
+    assert!(only.result.repo_unavailable());
+    assert_eq!(
+        only.skipped().map(|r| r.kind),
+        Some(crate::app::SkipKind::RepoUnavailable)
+    );
     assert!(report.all_skipped());
     assert!(!report.has_failures());
 }

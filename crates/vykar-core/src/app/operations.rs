@@ -11,6 +11,7 @@ use std::borrow::Cow;
 
 use rand::Rng;
 
+use crate::app::error::{SkipKind, SkipReason};
 pub use crate::app::error::{StepError, StepErrorKind};
 use crate::app::passphrase::{NoPrompt, PassphraseCache, RepoPassphrase};
 use crate::app::preflight::{self, UnavailableRepo};
@@ -24,7 +25,7 @@ use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::{HostEnv, OpenOptions, Repo};
 use vykar_types::error::VykarError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSourceResult {
     pub source_label: String,
     pub snapshot_name: String,
@@ -39,32 +40,35 @@ pub struct BackupSourceResult {
 }
 
 /// A source whose `before` hook asked for a skip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SkippedSource {
+    #[serde(rename = "source_label")]
     pub label: String,
-    pub reason: String,
+    pub reason: SkipReason,
 }
 
 /// A source that failed on its own (e.g. its path is missing) while the run
 /// went on to the next source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FailedSource {
+    #[serde(rename = "source_label")]
     pub label: String,
-    pub error: String,
+    pub error: StepError,
 }
 
 /// A repository-level failure or interrupt that stopped the run after at
 /// least one snapshot had been created.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AbortedRun {
+    #[serde(rename = "source_label")]
     pub label: String,
-    pub error: String,
+    pub error: StepError,
     pub interrupted: bool,
     /// Sources after `label` that were never started.
     pub not_attempted: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BackupRunReport {
     pub created: Vec<BackupSourceResult>,
     pub skipped: Vec<SkippedSource>,
@@ -79,8 +83,8 @@ impl BackupRunReport {
         let parts: Vec<String> = self
             .failed
             .iter()
-            .map(|f| (&f.label, &f.error))
-            .chain(self.aborted.iter().map(|a| (&a.label, &a.error)))
+            .map(|f| (&f.label, &f.error.message))
+            .chain(self.aborted.iter().map(|a| (&a.label, &a.error.message)))
             .map(|(label, error)| format!("source '{label}': {error}"))
             .collect();
         (!parts.is_empty()).then(|| parts.join("; "))
@@ -109,7 +113,8 @@ pub enum BackupRunEvent {
 
 // ── Full-cycle types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CycleStep {
     Backup,
     Prune,
@@ -128,12 +133,17 @@ impl CycleStep {
     }
 }
 
-#[derive(Debug, Clone)]
+/// The outcome of a cycle step, and of a command in `vykar --json`. As JSON
+/// (schema 1): `{"status": "ok"}`, `{"status": "partial"}`,
+/// `{"status": "skipped", "kind": …, "message": …}` and
+/// `{"status": "failed", "kind": …, "message": …}`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepOutcome {
     Ok,
     /// Backup completed but some sources had soft errors.
     Partial,
-    Skipped(String),
+    Skipped(SkipReason),
     Failed(StepError),
 }
 
@@ -178,9 +188,6 @@ pub struct FullCycleResult {
     pub compact_stats: Option<commands::compact::CompactStats>,
     pub check_result: Option<commands::check::CheckResult>,
     pub steps: Vec<(CycleStep, StepOutcome)>,
-    /// The backup step was skipped because the local repository was missing
-    /// after its `before` hooks; `backup_skipped()` holds the reason.
-    pub repo_unavailable: bool,
 }
 
 impl FullCycleResult {
@@ -201,11 +208,18 @@ impl FullCycleResult {
     /// Why the backup step was skipped, if it was. Only a hook, a dismissed
     /// passphrase prompt or an unavailable local repository does this, and the
     /// rest of the cycle is skipped with it.
-    pub fn backup_skipped(&self) -> Option<&str> {
+    pub fn backup_skipped(&self) -> Option<&SkipReason> {
         self.steps.iter().find_map(|(step, o)| match (step, o) {
-            (CycleStep::Backup, StepOutcome::Skipped(reason)) => Some(reason.as_str()),
+            (CycleStep::Backup, StepOutcome::Skipped(reason)) => Some(reason),
             _ => None,
         })
+    }
+
+    /// The backup step was skipped because the local repository was missing
+    /// after its `before` hooks; `backup_skipped()` holds the reason.
+    pub fn repo_unavailable(&self) -> bool {
+        self.backup_skipped()
+            .is_some_and(|r| r.kind == SkipKind::RepoUnavailable)
     }
 }
 
@@ -329,12 +343,12 @@ fn run_backup_sources(
                 continue;
             }
             Err((FailureScope::Source, e)) => {
-                let error = e.to_string();
+                let error = StepError::from(&e);
                 tracing::error!("backup of source '{}' failed: {error}", source.label);
                 if let Some(sink) = events {
                     sink.emit(BackupRunEvent::SourceFailed {
                         label: source.label.clone(),
-                        error: error.clone(),
+                        error: error.message.clone(),
                     });
                 }
                 report.failed.push(FailedSource {
@@ -350,7 +364,7 @@ fn run_backup_sources(
                 if report.created.is_empty() {
                     return Err(e);
                 }
-                let error = e.to_string();
+                let error = StepError::from(&e);
                 tracing::error!("backup stopped at source '{}': {error}", source.label);
                 report.aborted = Some(AbortedRun {
                     label: source.label.clone(),
@@ -407,7 +421,7 @@ fn run_backup_sources(
         .map(|s| format!("source '{}': {}", s.label, s.reason))
         .collect::<Vec<_>>()
         .join("; ");
-    Err(OpsError::Skipped(reasons))
+    Err(OpsError::Skipped(SkipReason::new(SkipKind::Hook, reasons)))
 }
 
 /// Drain accumulated warnings from HookContext into BackupRunEvent.
@@ -623,7 +637,6 @@ pub(crate) fn run_full_cycle(
     let mut prune_stats: Option<commands::prune::PruneStats> = None;
     let mut compact_stats: Option<commands::compact::CompactStats> = None;
     let mut check_result: Option<commands::check::CheckResult> = None;
-    let mut repo_unavailable = false;
     // The cycle's open repository from prune onward: opened by the first
     // maintenance step that runs its action, after that step's `before`
     // hooks; reset and reused by the later steps; dropped after a step whose
@@ -658,7 +671,6 @@ pub(crate) fn run_full_cycle(
                         if unavailable == UnavailableRepo::Skip
                             && let Some(reason) = preflight::availability(repo).unavailable_reason()
                         {
-                            repo_unavailable = true;
                             return Err(OpsError::Skipped(reason));
                         }
                         let report = passphrase.run(|pass| {
@@ -716,7 +728,10 @@ pub(crate) fn run_full_cycle(
 
     // A skipped backup must not connect at all: the skip usually means the
     // repository is unreachable, so the later steps would only produce errors.
-    let backup_skip_outcome = || StepOutcome::Skipped("backup skipped".into());
+    let backup_skip_outcome =
+        || StepOutcome::Skipped(SkipReason::new(SkipKind::BackupSkipped, "backup skipped"));
+    let backup_failed_outcome =
+        || StepOutcome::Skipped(SkipReason::new(SkipKind::BackupFailed, "backup failed"));
 
     // 2. Prune
     if !cancel.is_cancelled() {
@@ -730,14 +745,17 @@ pub(crate) fn run_full_cycle(
         } else if !has_retention {
             emit_terminal(
                 CycleStep::Prune,
-                StepOutcome::Skipped("no retention rules".into()),
+                StepOutcome::Skipped(SkipReason::new(
+                    SkipKind::NoRetentionRules,
+                    "no retention rules",
+                )),
                 events,
                 &mut steps,
             );
         } else if !backup_ok {
             emit_terminal(
                 CycleStep::Prune,
-                StepOutcome::Skipped("backup failed".into()),
+                backup_failed_outcome(),
                 events,
                 &mut steps,
             );
@@ -796,7 +814,7 @@ pub(crate) fn run_full_cycle(
         } else if !backup_ok {
             emit_terminal(
                 CycleStep::Compact,
-                StepOutcome::Skipped("backup failed".into()),
+                backup_failed_outcome(),
                 events,
                 &mut steps,
             );
@@ -816,10 +834,12 @@ pub(crate) fn run_full_cycle(
                         ) {
                             // Compact runs in every cycle; on an append-only server it
                             // belongs to the maintenance window, so the cycle skips it.
-                            Err(VykarError::AppendOnlyServer { .. }) => Err(OpsError::Skipped(
-                                "the server is append-only; compact runs in a maintenance window"
-                                    .into(),
-                            )),
+                            Err(VykarError::AppendOnlyServer { .. }) => {
+                                Err(OpsError::Skipped(SkipReason::new(
+                                    SkipKind::AppendOnlyServer,
+                                    "the server is append-only; compact runs in a maintenance window",
+                                )))
+                            }
                             other => other.map_err(OpsError::from),
                         }
                     });
@@ -843,7 +863,7 @@ pub(crate) fn run_full_cycle(
             // The backup step already reported why; don't repeat the same error.
             emit_terminal(
                 CycleStep::Check,
-                StepOutcome::Skipped("backup failed".into()),
+                backup_failed_outcome(),
                 events,
                 &mut steps,
             );
@@ -886,11 +906,11 @@ pub(crate) fn run_full_cycle(
                         let reason = if check_max_percent == 0
                             && config.check.full_every_duration().is_none()
                         {
-                            "check not configured"
+                            SkipReason::new(SkipKind::CheckNotConfigured, "check not configured")
                         } else {
-                            "check not due"
+                            SkipReason::new(SkipKind::CheckNotDue, "check not due")
                         };
-                        StepOutcome::Skipped(reason.into())
+                        StepOutcome::Skipped(reason)
                     } else if result.errors.is_empty() {
                         StepOutcome::Ok
                     } else {
@@ -911,7 +931,6 @@ pub(crate) fn run_full_cycle(
         compact_stats,
         check_result,
         steps,
-        repo_unavailable,
     }
 }
 

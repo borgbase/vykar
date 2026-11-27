@@ -18,14 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use chrono::Local;
-
 use vykar_core::config::ResolvedRepo;
 use vykar_types::error::Result;
 
 use super::poll;
 use super::release_malloc_arenas;
-use super::status::{self, RepoInfo, SharedStatus, SnapshotRow};
+use super::status::{self, RepoInfo, RepoState, SharedStatus, SnapshotRow};
 
 /// How often `Ok` repos are polled for out-of-band snapshot changes (#159).
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -58,25 +56,6 @@ impl StatusIo for RepoStatusIo {
 
     fn fetch(&self, repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
         status::fetch_repo(repo)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepoState {
-    Pending,
-    Ok,
-    Skipped,
-    Error,
-}
-
-impl RepoState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Ok => "ok",
-            Self::Skipped => "skipped",
-            Self::Error => "error",
-        }
     }
 }
 
@@ -182,7 +161,7 @@ impl<I: StatusIo> Worker<I> {
             .iter()
             .map(|e| {
                 let mut row = e.info.clone();
-                row.state = e.state.as_str().to_string();
+                row.state = e.state;
                 row
             })
             .collect();
@@ -252,7 +231,7 @@ impl<I: StatusIo> Worker<I> {
                 };
                 match result {
                     Ok((ids, (mut info, snapshots))) => {
-                        info.refreshed_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                        info.refreshed_at = Some(status::now());
                         entry.info = info;
                         entry.snapshots = snapshots;
                         entry.baseline = Some(ids);
@@ -436,16 +415,19 @@ mod tests {
             };
             self.check(repo)?;
             let mut info = RepoInfo::placeholder(repo);
-            info.snapshots = n.to_string();
-            let snap = SnapshotRow {
-                id: format!("{url}-{n}"),
-                time: format!("2026-01-01 00:0{n}"),
-                hostname: String::new(),
+            info.snapshot_count = Some(n);
+            let entry = vykar_core::repo::manifest::SnapshotEntry {
+                name: format!("{url}-{n}"),
+                id: vykar_types::snapshot_id::SnapshotId::from_bytes([0; 32]),
+                time: chrono::DateTime::from_timestamp(i64::try_from(n).unwrap() * 60, 0).unwrap(),
+                source_label: String::new(),
                 label: String::new(),
-                files: String::new(),
-                size: String::new(),
-                added: String::new(),
+                source_paths: Vec::new(),
+                hostname: String::new(),
+            };
+            let snap = SnapshotRow {
                 repo_name: repo.label_or_url().to_string(),
+                snapshot: vykar_core::app::views::SnapshotRecord::new(&entry, None),
             };
             Ok((info, vec![snap]))
         }
@@ -502,7 +484,7 @@ mod tests {
 
         let s = w.status.read().unwrap();
         assert_eq!(s.repos.len(), 2);
-        assert!(s.repos.iter().all(|r| r.state == "pending"));
+        assert!(s.repos.iter().all(|r| r.state == RepoState::Pending));
         assert_eq!(io.lists("/a") + io.fetches("/a"), 0);
     }
 
@@ -520,8 +502,8 @@ mod tests {
         w.work(t);
 
         assert_eq!(io.lists("/dead") + io.fetches("/dead"), 0);
-        assert_eq!(row(&w, "dead").state, "skipped");
-        assert_eq!(row(&w, "ok").state, "ok");
+        assert_eq!(row(&w, "dead").state, RepoState::Skipped);
+        assert_eq!(row(&w, "ok").state, RepoState::Ok);
         assert_eq!(io.fetches("/ok"), 1);
     }
 
@@ -531,15 +513,15 @@ mod tests {
         let (mut w, _) = worker(&io);
         configure(&mut w, vec![repo("r", "/r")]);
         w.work(Instant::now());
-        assert_eq!(row(&w, "r").snapshots, "1");
+        assert_eq!(row(&w, "r").snapshot_count, Some(1));
 
         io.fail("/r", true);
         cycle_done(&mut w, &["r"], &[]);
         w.work(Instant::now());
         let r = row(&w, "r");
-        assert_eq!(r.state, "error");
-        assert_eq!(r.snapshots, "1");
-        assert_ne!(r.refreshed_at, "—");
+        assert_eq!(r.state, RepoState::Error);
+        assert_eq!(r.snapshot_count, Some(1));
+        assert!(r.refreshed_at.is_some());
         assert_eq!(w.status.read().unwrap().recent_snapshots.len(), 1);
 
         let calls = io.lists("/r") + io.fetches("/r");
@@ -551,7 +533,7 @@ mod tests {
         io.fail("/r", false);
         cycle_done(&mut w, &["r"], &[]);
         w.work(Instant::now());
-        assert_eq!(row(&w, "r").state, "ok");
+        assert_eq!(row(&w, "r").state, RepoState::Ok);
     }
 
     #[test]
@@ -564,7 +546,7 @@ mod tests {
         io.fail("/r", true);
         let t = later(&w);
         w.work(t);
-        assert_eq!(row(&w, "r").state, "error");
+        assert_eq!(row(&w, "r").state, RepoState::Error);
 
         let lists = io.lists("/r");
         let t = later(&w);
@@ -624,7 +606,7 @@ mod tests {
         running.store(false, Ordering::SeqCst);
         io.fail("/err", true);
         w.work(Instant::now());
-        assert_eq!(row(&w, "err").state, "error");
+        assert_eq!(row(&w, "err").state, RepoState::Error);
 
         io.fail("/err", false);
         configure(
@@ -635,15 +617,15 @@ mod tests {
                 repo("moved", "/moved-new"),
             ],
         );
-        assert_eq!(row(&w, "skip").state, "skipped");
-        assert_eq!(row(&w, "err").state, "pending");
-        assert_eq!(row(&w, "moved").state, "pending");
+        assert_eq!(row(&w, "skip").state, RepoState::Skipped);
+        assert_eq!(row(&w, "err").state, RepoState::Pending);
+        assert_eq!(row(&w, "moved").state, RepoState::Pending);
         assert_eq!(row(&w, "moved").url, "/moved-new");
         assert_eq!(w.status.read().unwrap().repos.len(), 3);
 
         w.work(Instant::now());
         assert_eq!(io.lists("/skip"), 0);
-        assert_eq!(row(&w, "err").state, "ok");
+        assert_eq!(row(&w, "err").state, RepoState::Ok);
         assert_eq!(io.fetches("/moved-new"), 1);
     }
 

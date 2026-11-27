@@ -5,8 +5,10 @@ use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
+use crate::json::{JsonResult, Output, PruneJson};
 use vykar_core::app::passphrase::RepoPassphrase;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_prune(
     config: &VykarConfig,
     dry_run: bool,
@@ -15,6 +17,7 @@ pub(crate) fn run_prune(
     source_filter: &[String],
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<()> {
     let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
     let (stats, list_entries) = commands::prune::run_on_repo(
@@ -22,7 +25,8 @@ pub(crate) fn run_prune(
         config,
         &PruneRequest {
             dry_run,
-            list,
+            // The document always lists every decision.
+            list: list || out.is_json(),
             sources,
             source_filter,
         },
@@ -30,6 +34,20 @@ pub(crate) fn run_prune(
     )?;
     // Closed before the summary, so no handle is open while `after` hooks run.
     drop(repo);
+
+    if out.is_json() {
+        for w in &stats.warnings {
+            eprintln!("warning: {w}");
+        }
+        out.keep(JsonResult::Prune(PruneJson {
+            dry_run,
+            stats,
+            entries: list_entries,
+            compact_stats: None,
+            compact_outcome: None,
+        }));
+        return Ok(());
+    }
 
     if list || dry_run {
         for entry in &list_entries {

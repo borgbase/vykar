@@ -1,5 +1,5 @@
 use vykar_core::app::OpsError;
-use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::app::SkipKind;
 use vykar_core::commands::mount::{self, MountProgressEvent, MountRequest};
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::Repo;
@@ -101,7 +101,7 @@ pub(super) fn handle_start_mount(
                 .open::<OpsError>(mount::open_options(), &mount_cancel);
             match outcome {
                 Ok(opened) => MountSource::Opened(Box::new(opened)),
-                Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+                Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
                     send_log(
                         &ctx.ui_tx,
                         format!("[{repo_name}] passphrase prompt canceled; mount skipped."),

@@ -26,6 +26,7 @@ mod index;
 mod index_rebuild;
 mod info;
 mod item;
+mod json_schema;
 mod lazy_item_stream;
 mod legacy_lock;
 pub(crate) mod listing_index;

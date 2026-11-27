@@ -9,7 +9,7 @@ use crate::app::passphrase::{
     INCORRECT_PASSPHRASE, PASSPHRASE_PROMPT_CANCELED, PassphraseCache, RepoPassphrase,
 };
 use crate::app::preflight::UnavailableRepo;
-use crate::app::{HookError, OpsError, OpsResult, StepError};
+use crate::app::{HookError, OpsError, OpsResult, SkipKind, SkipReason, StepError};
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
 use crate::repo::control::{CancelToken, FnMutSink};
 use crate::testutil::{cmd_append, cmd_rename, env_word};
@@ -159,7 +159,7 @@ fn hooked_step_skipped_fires_after_hooks() {
         &|_| {},
         &mut steps,
         |_| Ok(()),
-        |_| StepOutcome::Skipped("check not due".into()),
+        |_| StepOutcome::Skipped(SkipReason::new(SkipKind::CheckNotDue, "check not due")),
     );
 
     assert!(matches!(
@@ -288,7 +288,18 @@ fn cycle_before_backup_skip_skips_every_step() {
             .all(|(_, o)| matches!(o, StepOutcome::Skipped(_)))
     );
     assert!(!result.has_failures());
-    assert!(result.backup_skipped().is_some());
+    assert_eq!(
+        result.backup_skipped().map(|r| r.kind),
+        Some(SkipKind::Hook)
+    );
+    for step in [CycleStep::Prune, CycleStep::Compact, CycleStep::Check] {
+        assert!(
+            matches!(outcome(&result, step), StepOutcome::Skipped(r)
+                if r.kind == SkipKind::BackupSkipped && r.message == "backup skipped"),
+            "{:?}",
+            result.steps
+        );
+    }
     assert!(result.backup_report.is_none());
     assert!(
         log_lines(&log).is_empty(),
@@ -318,7 +329,8 @@ fn cycle_before_prune_skip_only_skips_prune() {
     ));
     assert!(matches!(
         outcome(&result, CycleStep::Prune),
-        StepOutcome::Skipped(reason) if reason.contains("requested skip")
+        StepOutcome::Skipped(reason)
+            if reason.kind == SkipKind::Hook && reason.message.contains("requested skip")
     ));
     assert!(matches!(
         outcome(&result, CycleStep::Compact),
@@ -392,8 +404,9 @@ fn all_sources_skipped_is_a_repo_level_skip() {
 
     match err {
         OpsError::Skipped(reason) => {
+            assert_eq!(reason.kind, SkipKind::Hook);
             assert!(
-                reason.contains("'one'") && reason.contains("'two'"),
+                reason.message.contains("'one'") && reason.message.contains("'two'"),
                 "{reason}"
             );
         }
@@ -505,7 +518,13 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
     let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
     assert!(!result.has_failures());
-    assert_eq!(result.backup_skipped(), Some(PASSPHRASE_PROMPT_CANCELED));
+    assert_eq!(
+        result.backup_skipped(),
+        Some(&SkipReason::new(
+            SkipKind::PassphrasePromptCanceled,
+            PASSPHRASE_PROMPT_CANCELED
+        ))
+    );
     assert_eq!(log_lines(&log), vec!["finally"]);
 }
 
@@ -569,10 +588,11 @@ fn cycle_skips_unavailable_repo_after_before_hooks() {
     let result = run_counting(&repo, UnavailableRepo::Skip, &calls);
 
     assert_eq!(calls.get(), 0, "no passphrase for a missing repository");
-    assert!(result.repo_unavailable);
+    assert!(result.repo_unavailable());
     let reason = result.backup_skipped().expect("backup skipped");
+    assert_eq!(reason.kind, SkipKind::RepoUnavailable);
     assert!(
-        reason.contains("repository not found at") && reason.contains("vykar init"),
+        reason.message.contains("repository not found at") && reason.message.contains("vykar init"),
         "{reason}"
     );
     assert_eq!(result.steps.len(), 4);
@@ -602,7 +622,7 @@ fn cycle_with_attempt_fails_on_unavailable_repo() {
         outcome(&result, CycleStep::Backup),
         StepOutcome::Failed(_)
     ));
-    assert!(!result.repo_unavailable);
+    assert!(!result.repo_unavailable());
     let lines = log_lines(&log);
     assert!(lines.iter().any(|l| l == "failed_backup"), "{lines:?}");
     assert!(lines.iter().any(|l| l == "finally_backup"), "{lines:?}");
@@ -640,7 +660,7 @@ fn before_hook_that_mounts_the_repository_lets_the_backup_run() {
     );
     let report = result.backup_report.as_ref().expect("backup report");
     assert_eq!(report.created.len(), 1);
-    assert!(!result.repo_unavailable);
+    assert!(!result.repo_unavailable());
     assert_eq!(log_lines(&log), vec!["after_backup"]);
 }
 
@@ -654,9 +674,10 @@ fn before_hook_skip_wins_over_unavailability() {
 
     let result = run_counting(&repo, UnavailableRepo::Skip, &calls);
 
-    assert!(!result.repo_unavailable);
+    assert!(!result.repo_unavailable());
     let reason = result.backup_skipped().expect("backup skipped");
-    assert!(reason.contains("requested skip"), "{reason}");
+    assert_eq!(reason.kind, SkipKind::Hook);
+    assert!(reason.message.contains("requested skip"), "{reason}");
 }
 
 // ── Continuing past a failing source ────────────────────────────────────────
@@ -715,6 +736,29 @@ fn missing_source_does_not_stop_the_next_one() {
             .is_some_and(|s| s.starts_with("source 'gone': "))
     );
     assert_eq!(source_failed_labels(&events), vec!["gone"]);
+}
+
+#[test]
+fn failed_source_keeps_its_error_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["gone", "ok"]);
+    break_source(&mut repo, 0);
+
+    let (result, _) = run_collecting(&repo);
+    let report = result.unwrap();
+
+    let error = &report.failed[0].error;
+    // A missing source path is a configuration error.
+    assert_eq!(error.kind, StepErrorKind::Config);
+    // The path is the test's own; the OS error text is std's for it.
+    let path = &repo.sources[0].paths[0];
+    let os_error = std::fs::metadata(path).unwrap_err();
+    assert_eq!(
+        report.failure_summary(),
+        Some(format!(
+            "source 'gone': configuration error: source does not exist: {path}: {os_error}"
+        ))
+    );
 }
 
 #[test]
@@ -940,14 +984,14 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
     assert_eq!(report.created[0].source_label, "ok");
     for step in [CycleStep::Prune, CycleStep::Compact] {
         assert!(
-            matches!(outcome(&result, step), StepOutcome::Skipped(r) if r == "backup failed"),
+            matches!(outcome(&result, step), StepOutcome::Skipped(r) if r.kind == SkipKind::BackupFailed && r.message == "backup failed"),
             "{:?}",
             result.steps
         );
     }
     assert!(!matches!(
         outcome(&result, CycleStep::Check),
-        StepOutcome::Skipped(r) if r == "backup failed"
+        StepOutcome::Skipped(r) if r.kind == SkipKind::BackupFailed && r.message == "backup failed"
     ));
     assert!(result.has_failures());
     assert!(
@@ -1138,7 +1182,7 @@ fn source_that_gives_up_skips_check() {
         result.steps
     );
     assert!(
-        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r == "backup failed"),
+        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r.kind == SkipKind::BackupFailed && r.message == "backup failed"),
         "{:?}",
         result.steps
     );
@@ -1157,7 +1201,13 @@ fn retry_cancel_skips_the_step() {
     let result = run_prompted(&repo, &mut prompt, &mut PassphraseCache::default());
 
     assert!(!result.has_failures(), "{:?}", result.steps);
-    assert_eq!(result.backup_skipped(), Some(PASSPHRASE_PROMPT_CANCELED));
+    assert_eq!(
+        result.backup_skipped(),
+        Some(&SkipReason::new(
+            SkipKind::PassphrasePromptCanceled,
+            PASSPHRASE_PROMPT_CANCELED
+        ))
+    );
     assert_eq!(log_lines(&log), vec!["before_backup", "finally_backup"]);
 }
 
@@ -1178,7 +1228,7 @@ fn passphrase_is_not_accepted_without_an_open() {
         result.steps
     );
     assert!(
-        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r == "check not configured"),
+        matches!(outcome(&result, CycleStep::Check), StepOutcome::Skipped(r) if r.kind == SkipKind::CheckNotConfigured && r.message == "check not configured"),
         "{:?}",
         result.steps
     );
@@ -1258,7 +1308,7 @@ fn cycle_session_opens_at_compact_when_prune_skips() {
     let (result, opens) = crate::repo::count_repo_opens(|| run_cycle(&repo));
 
     assert!(
-        matches!(outcome(&result, CycleStep::Prune), StepOutcome::Skipped(r) if r == "no retention rules"),
+        matches!(outcome(&result, CycleStep::Prune), StepOutcome::Skipped(r) if r.kind == SkipKind::NoRetentionRules && r.message == "no retention rules"),
         "{:?}",
         result.steps
     );

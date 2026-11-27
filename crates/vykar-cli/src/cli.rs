@@ -39,6 +39,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub trust_repo: bool,
 
+    /// Print the result as one JSON document on stdout (list, info, backup,
+    /// prune, compact, check); messages stay on stderr
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Select repository by label or path (bare command only)
     #[arg(short = 'R', long = "repo")]
     pub repo: Option<String>,

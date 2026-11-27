@@ -5,6 +5,7 @@ use vykar_core::config::VykarConfig;
 
 use crate::error::CliResult;
 use crate::format::{format_bytes, format_size_with_savings};
+use crate::json::{JsonResult, Output};
 use crate::table::{CliTableTheme, add_kv_row};
 use vykar_core::app::passphrase::RepoPassphrase;
 
@@ -12,9 +13,14 @@ pub(crate) fn run_info(
     config: &VykarConfig,
     label: Option<&str>,
     passphrase: &mut RepoPassphrase<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<()> {
     let stats = passphrase
         .with(|passphrase| -> CliResult<_> { Ok(commands::info::run(config, passphrase)?) })?;
+    if out.is_json() {
+        out.keep(JsonResult::Info(stats));
+        return Ok(());
+    }
 
     let theme = CliTableTheme::detect();
 
@@ -73,18 +79,23 @@ pub(crate) fn run_info(
         })
         .unwrap_or_else(|| "-".to_string());
     add_kv_row(&mut t2, theme, "Last snapshot", last_snapshot);
-    add_kv_row(&mut t2, theme, "Raw size", format_bytes(stats.raw_size));
+    add_kv_row(
+        &mut t2,
+        theme,
+        "Raw size",
+        format_bytes(stats.original_size),
+    );
     add_kv_row(
         &mut t2,
         theme,
         "Compressed",
-        format_size_with_savings(stats.compressed_size, stats.raw_size, "ratio"),
+        format_size_with_savings(stats.compressed_size, stats.original_size, "ratio"),
     );
     add_kv_row(
         &mut t2,
         theme,
         "Deduplicated",
-        format_size_with_savings(stats.deduplicated_size, stats.raw_size, "savings"),
+        format_size_with_savings(stats.deduplicated_size, stats.original_size, "savings"),
     );
     add_kv_row(
         &mut t2,

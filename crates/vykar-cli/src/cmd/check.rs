@@ -9,6 +9,7 @@ use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::{CancelToken, FnMutSink};
 
 use crate::error::{CliError, CliResult};
+use crate::json::{JsonResult, Output};
 use vykar_core::app::passphrase::RepoPassphrase;
 
 #[allow(clippy::too_many_arguments)]
@@ -21,6 +22,7 @@ pub(crate) fn run_check(
     yes: bool,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
+    out: Output<'_>,
 ) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
@@ -28,7 +30,14 @@ pub(crate) fn run_check(
                 "--distrust-server requires --verify-data (flag is meaningless without data verification)",
             ));
         }
-        return run_check_readonly(config, verify_data, distrust_server, cancel, passphrase);
+        return run_check_readonly(
+            config,
+            verify_data,
+            distrust_server,
+            cancel,
+            passphrase,
+            out,
+        );
     }
 
     // --repair mode
@@ -149,6 +158,7 @@ fn run_check_readonly(
     distrust_server: bool,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<()> {
     // Before the open, as `run_with_progress` does.
     cancel.check()?;
@@ -169,13 +179,15 @@ fn run_check_readonly(
     )?;
     drop(repo);
 
-    print_check_summary(&result);
+    let errors = result.errors.len();
+    if out.is_json() {
+        out.keep(JsonResult::Check(result));
+    } else {
+        print_check_summary(&result);
+    }
 
-    if !result.errors.is_empty() {
-        return Err(CliError::from(format!(
-            "check found {} error(s)",
-            result.errors.len()
-        )));
+    if errors > 0 {
+        return Err(CliError::from(format!("check found {errors} error(s)")));
     }
 
     Ok(())

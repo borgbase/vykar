@@ -11,8 +11,13 @@ pub mod scheduler;
 pub mod service;
 pub mod views;
 
-pub use error::{HookError, OpsError, OpsResult, PassphraseFailure, StepError, StepErrorKind};
+pub use error::{
+    HookError, OpsError, OpsResult, PassphraseFailure, SkipKind, SkipReason, StepError,
+    StepErrorKind,
+};
 pub use service::AppService;
+
+pub use crate::hooks::set_hook_stdout_to_stderr;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

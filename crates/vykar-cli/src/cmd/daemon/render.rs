@@ -4,8 +4,13 @@
 //! hand-written stylesheet so the page is one self-contained response.
 
 use std::fmt::Write;
+use std::time::Duration;
 
-use super::status::DaemonStatus;
+use chrono::{DateTime, Local, Utc};
+use vykar_common::display::format_bytes;
+use vykar_core::app::views::{SnapshotRowView, format_last_snapshot};
+
+use super::status::{CycleOutcome, DaemonStatus, RepoState};
 
 const STYLE: &str = r#"
 :root {
@@ -112,6 +117,26 @@ fn render_detail_list(out: &mut String, label: &str, items: &[String]) {
     out.push_str("</dd>");
 }
 
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else if s < 86_400 {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}d {}h", s / 86_400, (s % 86_400) / 3600)
+    }
+}
+
+/// Local `%Y-%m-%d %H:%M:%S`, as the page has always shown times.
+fn local_time(t: DateTime<Utc>) -> String {
+    t.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -130,24 +155,21 @@ fn esc(s: &str) -> String {
 pub(crate) fn render_html(status: &DaemonStatus) -> String {
     let mut out = String::with_capacity(8 * 1024);
 
-    let total_snapshots: u64 = status
+    let total_snapshots: usize = status
         .repos
         .iter()
-        .map(|r| r.snapshots.parse::<u64>().unwrap_or(0))
+        .map(|r| r.snapshot_count.unwrap_or(0))
         .sum();
 
-    let last_outcome = if status.last_cycle.outcome.is_empty() {
-        "n/a"
-    } else {
-        status.last_cycle.outcome.as_str()
+    let last_outcome = status.last_cycle.state.map_or("n/a", CycleOutcome::as_str);
+    let outcome_class = match status.last_cycle.state {
+        Some(CycleOutcome::Ok) => "outcome-ok",
+        Some(CycleOutcome::Partial) => "outcome-partial",
+        Some(CycleOutcome::Errors) => "outcome-errors",
+        Some(CycleOutcome::Skipped) => "outcome-skipped",
+        Some(CycleOutcome::Running) | None => "",
     };
-    let outcome_class = match last_outcome {
-        "ok" => "outcome-ok",
-        "partial" => "outcome-partial",
-        "errors" => "outcome-errors",
-        "skipped" => "outcome-skipped",
-        _ => "",
-    };
+    let uptime = format_duration(Duration::from_secs(status.process.uptime_seconds));
 
     let _ = write!(
         out,
@@ -166,13 +188,22 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         host = esc(&status.process.hostname),
         pid = status.process.pid,
         version = esc(&status.process.version),
-        uptime = esc(&status.process.uptime),
+        uptime = esc(&uptime),
     );
 
     // Metric cards
-    let next_run = status.process.next_run.as_deref().unwrap_or("—");
-    let last_started = status.last_cycle.started_at.as_deref().unwrap_or("—");
-    let last_duration = status.last_cycle.duration.as_deref().unwrap_or("—");
+    let next_run = status
+        .process
+        .next_run
+        .map_or_else(|| "—".to_string(), local_time);
+    let last_started = status
+        .last_cycle
+        .started_at
+        .map_or_else(|| "—".to_string(), local_time);
+    let last_duration = status.last_cycle.duration_seconds.map_or_else(
+        || "—".to_string(),
+        |s| format_duration(Duration::from_secs(s)),
+    );
 
     let _ = write!(
         out,
@@ -193,11 +224,11 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         nrepos = status.repos.len(),
         nsnap = total_snapshots,
         schedule = esc(&status.schedule_brief),
-        next = esc(next_run),
+        next = esc(&next_run),
         oc = outcome_class,
         outcome = esc(last_outcome),
-        started = esc(last_started),
-        dur = esc(last_duration),
+        started = esc(&last_started),
+        dur = esc(&last_duration),
         nsources = status.sources.len(),
     );
 
@@ -213,32 +244,37 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
              </tr></thead><tbody>",
         );
         for r in &status.repos {
-            let state_class = match r.state.as_str() {
-                "ok" => "state-ok",
-                "error" => "state-error",
-                "skipped" => "state-skipped",
-                _ => "state-pending",
+            let state_class = match r.state {
+                RepoState::Ok => "state-ok",
+                RepoState::Error => "state-error",
+                RepoState::Skipped => "state-skipped",
+                RepoState::Pending => "state-pending",
             };
-            let asof = if r.refreshed_at == "—" {
-                String::new()
-            } else {
-                format!(
-                    " <span class=\"asof\">as of {}</span>",
-                    esc(&r.refreshed_at)
-                )
+            let asof = r.refreshed_at.map_or_else(String::new, |t| {
+                format!(" <span class=\"asof\">as of {}</span>", esc(&local_time(t)))
+            });
+            let (snapshots, last_snapshot, size) = match r.snapshot_count {
+                None => ("—".to_string(), "—".to_string(), "—".to_string()),
+                Some(n) => (
+                    n.to_string(),
+                    format_last_snapshot(r.last_snapshot_time),
+                    r.unique_stored_size
+                        .map_or_else(|| "—".to_string(), format_bytes),
+                ),
             };
+            let next_run = r.next_run.map_or_else(|| "Off".to_string(), local_time);
             let _ = write!(
                 out,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
                  <td><span class=\"{}\">{}</span>{}</td></tr>",
                 esc(&r.name),
                 esc(&r.url),
-                esc(&r.snapshots),
-                esc(&r.last_snapshot),
-                esc(&r.size),
-                esc(&r.next_run),
+                esc(&snapshots),
+                esc(&last_snapshot),
+                esc(&size),
+                esc(&next_run),
                 state_class,
-                esc(&r.state),
+                esc(r.state.as_str()),
                 asof,
             );
         }
@@ -258,17 +294,18 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
              </tr></thead><tbody>",
         );
         for s in &status.recent_snapshots {
+            let row = SnapshotRowView::from_record(&s.snapshot);
             let _ = write!(
                 out,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                esc(&s.time),
+                esc(&row.time),
                 esc(&s.repo_name),
-                esc(&s.id),
-                esc(&s.hostname),
-                esc(&s.label),
-                esc(&s.files),
-                esc(&s.size),
-                esc(&s.added),
+                esc(&row.id),
+                esc(&row.hostname),
+                esc(&row.label),
+                esc(&row.files),
+                esc(&row.size),
+                esc(&row.added),
             );
         }
         out.push_str("</tbody></table>");
@@ -282,6 +319,13 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
     } else {
         out.push_str("<div class=\"sources-list\">");
         for s in &status.sources {
+            let target_repos = if s.target_repos.is_empty() {
+                "(all)".to_string()
+            } else {
+                s.target_repos.join(", ")
+            };
+            let options = s.options.join(", ");
+            let retention = s.retention.join(", ");
             let _ = write!(
                 out,
                 "<details><summary>\
@@ -291,25 +335,25 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
                   </summary>\
                   <dl class=\"detail\">",
                 label = esc(&s.label),
-                paths = esc(&s.paths_summary),
-                target = esc(&s.target_repos),
+                paths = esc(&s.paths.join(", ")),
+                target = esc(&target_repos),
             );
 
-            render_detail_list(&mut out, "Folders", &s.folders);
-            render_detail_list(&mut out, "Exclusions", &s.exclusions);
+            render_detail_list(&mut out, "Folders", &s.paths);
+            render_detail_list(&mut out, "Exclusions", &s.exclude);
             render_detail_list(&mut out, "Exclude if present", &s.exclude_if_present);
-            if !s.options.is_empty() {
-                let _ = write!(out, "<dt>Options</dt><dd>{}</dd>", esc(&s.options),);
+            if !options.is_empty() {
+                let _ = write!(out, "<dt>Options</dt><dd>{}</dd>", esc(&options),);
             }
             render_detail_list(&mut out, "Hooks", &s.hooks);
-            if !s.retention.is_empty() {
-                let _ = write!(out, "<dt>Retention</dt><dd>{}</dd>", esc(&s.retention),);
+            if !retention.is_empty() {
+                let _ = write!(out, "<dt>Retention</dt><dd>{}</dd>", esc(&retention),);
             }
             render_detail_list(&mut out, "Command dumps", &s.command_dumps);
             let _ = write!(
                 out,
                 "<dt>Target repositories</dt><dd>{}</dd>",
-                esc(&s.target_repos),
+                esc(&target_repos),
             );
 
             out.push_str("</dl></details>");
@@ -329,58 +373,80 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+    use vykar_core::app::views::SnapshotRecord;
+    use vykar_core::repo::manifest::SnapshotEntry;
+    use vykar_core::snapshot::SnapshotStats;
+    use vykar_types::snapshot_id::SnapshotId;
+
     use super::*;
     use crate::cmd::daemon::status::*;
 
+    fn at(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 27, h, m, s).unwrap()
+    }
+
     fn fixture() -> DaemonStatus {
+        let entry = SnapshotEntry {
+            name: "snap-xyz".into(),
+            id: SnapshotId::from_bytes([0; 32]),
+            time: at(10, 0, 0),
+            source_label: "home".into(),
+            label: String::new(),
+            source_paths: vec!["/home/user".into()],
+            hostname: "src".into(),
+        };
+        let stats = SnapshotStats {
+            nfiles: 1234,
+            original_size: 500_000_000,
+            compressed_size: 0,
+            deduplicated_size: 20_000_000,
+            errors: 0,
+        };
         DaemonStatus {
+            schema: crate::json::SCHEMA,
             process: ProcessInfo {
                 hostname: "host1".into(),
                 pid: 1234,
                 version: "0.14.0".into(),
-                uptime: "1h 5m".into(),
-                next_run: Some("2026-04-27 12:00:00".into()),
+                started_at: Some(at(8, 0, 0)),
+                uptime_seconds: 3900,
+                next_run: Some(at(12, 0, 0)),
             },
             schedule_brief: "0 * * * *".into(),
             repos: vec![RepoInfo {
                 name: "repo-a".into(),
                 url: "rest:https://example.com/repo".into(),
-                snapshots: "3".into(),
-                last_snapshot: "5m ago".into(),
-                size: "1.2 GB".into(),
-                next_run: "2026-04-27 12:00:00".into(),
-                state: "error".into(),
-                refreshed_at: "2026-04-27 09:58:31".into(),
+                snapshot_count: Some(3),
+                last_snapshot_time: Some(at(9, 55, 0)),
+                unique_stored_size: Some(1_200_000_000),
+                next_run: Some(at(12, 0, 0)),
+                state: RepoState::Error,
+                refreshed_at: Some(at(9, 58, 31)),
             }],
             recent_snapshots: vec![SnapshotRow {
-                id: "snap-xyz".into(),
-                time: "2026-04-27 10:00".into(),
-                hostname: "src".into(),
-                label: "home".into(),
-                files: "1234".into(),
-                size: "500 MB".into(),
-                added: "20 MB".into(),
                 repo_name: "repo-a".into(),
+                snapshot: SnapshotRecord::new(&entry, Some(&stats)),
             }],
             sources: vec![SourceInfo {
                 label: "home".into(),
-                paths_summary: "/home/user".into(),
-                target_repos: "(all)".into(),
-                folders: vec!["/home/user".into()],
-                exclusions: vec![".cache".into(), "*.tmp".into()],
+                paths: vec!["/home/user".into()],
+                exclude: vec![".cache".into(), "*.tmp".into()],
                 exclude_if_present: vec![".nobackup".into()],
-                options: "git_ignore".into(),
+                target_repos: vec![],
+                options: vec!["git_ignore".into()],
                 hooks: vec!["before: echo hi".into()],
-                retention: "keep_last: 7".into(),
+                retention: vec!["keep_last: 7".into()],
                 command_dumps: vec![],
             }],
             last_cycle: CycleSummary {
-                started_at: Some("2026-04-27 09:55:00".into()),
-                finished_at: Some("2026-04-27 09:58:30".into()),
-                outcome: "ok".into(),
-                duration: Some("3m 30s".into()),
+                started_at: Some(at(9, 55, 0)),
+                finished_at: Some(at(9, 58, 30)),
+                state: Some(CycleOutcome::Ok),
+                duration_seconds: Some(210),
                 had_error: false,
                 had_partial: false,
+                repos: vec![],
             },
         }
     }
@@ -396,14 +462,50 @@ mod tests {
     }
 
     #[test]
+    fn formats_raw_values_at_render_time() {
+        let s = fixture();
+        let html = render_html(&s);
+        assert!(html.contains("up 1h 5m"), "uptime from uptime_seconds");
+        assert!(html.contains(&format_bytes(1_200_000_000)));
+        assert!(html.contains("3 snapshots total"));
+        assert!(html.contains(&format!("next: {}", local_time(at(12, 0, 0)))));
+        assert!(html.contains("3m 30s"));
+        assert!(html.contains(&local_time(at(9, 55, 0))));
+        assert!(html.contains("(all)"));
+        // The recent-snapshot row is the formatted row of its record.
+        let row = SnapshotRowView::from_record(&s.recent_snapshots[0].snapshot);
+        for cell in [&row.time, &row.files, &row.size, &row.added] {
+            assert!(html.contains(&format!("<td>{}</td>", esc(cell))), "{cell}");
+        }
+    }
+
+    #[test]
+    fn placeholders_for_absent_values() {
+        let mut s = fixture();
+        s.repos[0].snapshot_count = None;
+        s.repos[0].unique_stored_size = None;
+        s.repos[0].next_run = None;
+        s.process.next_run = None;
+        s.last_cycle = CycleSummary::default();
+        let html = render_html(&s);
+        assert!(
+            html.contains("<td>—</td><td>—</td><td>—</td><td>Off</td>"),
+            "{html}"
+        );
+        assert!(html.contains("next: —"));
+        assert!(html.contains(">n/a<"));
+        assert!(html.contains("0 snapshots total"));
+    }
+
+    #[test]
     fn repo_row_shows_state_and_freshness() {
         let html = render_html(&fixture());
         assert!(html.contains("<span class=\"state-error\">error</span>"));
-        assert!(html.contains("as of 2026-04-27 09:58:31"));
+        assert!(html.contains(&format!("as of {}", local_time(at(9, 58, 31)))));
 
         let mut s = fixture();
-        s.repos[0].state = "pending".into();
-        s.repos[0].refreshed_at = "—".into();
+        s.repos[0].state = RepoState::Pending;
+        s.repos[0].refreshed_at = None;
         let html = render_html(&s);
         assert!(html.contains("<span class=\"state-pending\">pending</span>"));
         assert!(!html.contains("as of"));

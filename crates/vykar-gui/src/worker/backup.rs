@@ -1,4 +1,4 @@
-use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::app::SkipKind;
 use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::app::{OpsError, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
@@ -248,7 +248,7 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
                 guard.fail(format!("[{rn}] backup failed: {summary}"));
             }
         }
-        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+        Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
             send_log(
                 &ctx.ui_tx,
                 format!("[{rn}] passphrase prompt canceled; skipping."),
@@ -330,7 +330,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
                     failures.push((repo_name.clone(), summary));
                 }
             }
-            Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+            Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
                 send_log(
                     &ctx.ui_tx,
                     format!("[{repo_name}] passphrase prompt canceled; skipping."),
@@ -705,7 +705,10 @@ mod tests {
             created: Vec::new(),
             skipped: vec![operations::SkippedSource {
                 label: "src".to_string(),
-                reason: "not home".to_string(),
+                reason: vykar_core::app::SkipReason::new(
+                    vykar_core::app::SkipKind::Hook,
+                    "not home",
+                ),
             }],
             ..Default::default()
         };

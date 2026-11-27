@@ -1,8 +1,6 @@
 use crossbeam_channel::Sender;
-use vykar_core::app::passphrase::{
-    PASSPHRASE_PROMPT_CANCELED, PassphrasePrompt, PromptContext, PromptReply,
-};
-use vykar_core::app::{AppService, OpsError, operations};
+use vykar_core::app::passphrase::{PassphrasePrompt, PromptContext, PromptReply};
+use vykar_core::app::{AppService, OpsError, SkipKind, operations};
 use vykar_core::commands;
 use vykar_core::config::{self, ResolvedRepo};
 use vykar_types::error::VykarError;
@@ -99,7 +97,9 @@ fn run_with_prompt<T>(
     let mut pass = service.passphrase(&repo.config, repo.label.as_deref(), prompt);
     match pass.with(|p| f(p).map_err(OpsError::from)) {
         Ok(v) => Ok(PassphraseRun::Ran((v, pass.value()))),
-        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => Ok(PassphraseRun::Canceled),
+        Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
+            Ok(PassphraseRun::Canceled)
+        }
         Err(OpsError::Engine(e)) => Err(e),
         // Unreachable without hooks; kept as an error rather than a panic.
         Err(e) => Err(VykarError::Other(e.to_string())),

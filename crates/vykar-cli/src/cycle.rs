@@ -123,7 +123,7 @@ pub(crate) fn run_bare_cycle(
             AppEvent::Cycle { event, .. } => renderer.on_cycle_event(&event),
             AppEvent::RepoFinished { repo, report } => {
                 renderer.repo_finished(&report.result);
-                if report.result.repo_unavailable
+                if report.result.repo_unavailable()
                     && let Some(reason) = report.skipped()
                 {
                     eprintln!("Warning: skipping '{}' — {reason}", repo.label_or_url());

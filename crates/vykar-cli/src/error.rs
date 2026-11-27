@@ -62,6 +62,7 @@ impl vykar_core::app::PassphraseFailure for CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vykar_core::app::{SkipKind, SkipReason};
 
     #[test]
     fn ops_errors_keep_engine_errors_typed() {
@@ -70,15 +71,15 @@ mod tests {
             CliError::Vykar(VykarError::Interrupted)
         ));
         assert!(matches!(
-            CliError::from(OpsError::Skipped("r".into())),
-            CliError::Ops(OpsError::Skipped(r)) if r == "r"
+            CliError::from(OpsError::Skipped(SkipReason::new(SkipKind::Hook, "r"))),
+            CliError::Ops(OpsError::Skipped(r)) if r.message == "r"
         ));
     }
 
     #[test]
     fn only_an_ops_skip_is_a_hook_skip() {
         use vykar_core::app::HookError;
-        assert!(CliError::Ops(OpsError::Skipped("r".into())).is_skip());
+        assert!(CliError::Ops(OpsError::Skipped(SkipReason::new(SkipKind::Hook, "r"))).is_skip());
         assert!(!CliError::Ops(OpsError::Hook("h".into())).is_skip());
         assert!(!CliError::Vykar(VykarError::Interrupted).is_skip());
         assert!(!CliError::Msg("m".into()).is_skip());

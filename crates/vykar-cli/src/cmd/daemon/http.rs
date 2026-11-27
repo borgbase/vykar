@@ -99,7 +99,7 @@ fn respond_text(req: tiny_http::Request, code: u16, body: &str) -> CliResult<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::daemon::status::{DaemonStatus, ProcessInfo, RepoInfo, new_shared};
+    use crate::cmd::daemon::status::{DaemonStatus, ProcessInfo, RepoInfo, RepoState, new_shared};
     use std::net::TcpListener;
     use std::sync::OnceLock;
 
@@ -118,23 +118,25 @@ mod tests {
     fn populate(status: &SharedStatus) {
         let mut s = status.write().unwrap();
         *s = DaemonStatus {
+            schema: crate::json::SCHEMA,
             process: ProcessInfo {
                 hostname: "h".into(),
                 pid: 1,
                 version: "0.0.0".into(),
-                uptime: "0s".into(),
+                started_at: None,
+                uptime_seconds: 0,
                 next_run: None,
             },
             schedule_brief: "1h".into(),
             repos: vec![RepoInfo {
                 name: "rA".into(),
                 url: "u".into(),
-                snapshots: "0".into(),
-                last_snapshot: "N/A".into(),
-                size: "0 B".into(),
-                next_run: "2026-04-27 12:00:00".into(),
-                state: "ok".into(),
-                refreshed_at: "2026-04-27 11:00:00".into(),
+                snapshot_count: Some(0),
+                last_snapshot_time: None,
+                unique_stored_size: Some(0),
+                next_run: None,
+                state: RepoState::Ok,
+                refreshed_at: None,
             }],
             recent_snapshots: vec![],
             sources: vec![],
@@ -202,6 +204,7 @@ mod tests {
         );
         let body = json.body_mut().read_to_string().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["schema"], 1);
         assert_eq!(parsed["repos"][0]["name"], "rA");
 
         let nope = ureq::get(&format!("{base}/nope")).call();

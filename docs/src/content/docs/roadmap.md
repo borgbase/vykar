@@ -11,7 +11,7 @@ title: "Roadmap"
 | **Windows GUI packaging** | MSI installer and/or winget package for first-class Windows support | High |
 | **Snapshot filtering** | By host, tag, path, date ranges | Medium |
 | **Async I/O** | Non-blocking storage operations | Medium |
-| **JSON output mode** | Structured JSON output for all CLI commands to enable scripting and integration with monitoring tools | Medium |
+| **JSON output mode** | `--json` covers `list`, `info`, `backup`, `prune`, `compact` and `check`; the remaining commands, the bare `vykar` cycle and `check --repair` still print text only | Medium |
 | **Per-token permissions** | Expand permissions from full/append-only to also limit reading and maintenance | Medium |
 | **Special file support** | Extend `ItemType` with `BlockDevice`, `CharDevice`, `Fifo`, `Socket`; `mknod` during restore. Hard links are already backed up and restored | Medium |
 | **macOS dataless file modes** | Per-source `dataless: skip\|hydrate\|hydrate-evict` to control whether cloud-only files (iCloud Drive, Dropbox, OneDrive, etc.) are skipped, hydrated for backup, or hydrated then evicted via `NSFileProviderManager`. The *skip* side has landed — skip-with-parent-reuse is the hardcoded default, unlistable cloud-only directories are non-fatal, and both are tallied and reported at the end of a run. The configurable modes (and hydration itself) have not. | Medium |

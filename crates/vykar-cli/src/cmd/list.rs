@@ -1,11 +1,12 @@
 use comfy_table::{Cell, CellAlignment};
 
-use vykar_core::app::views::SnapshotRowView;
+use vykar_core::app::views::{SnapshotRecord, SnapshotRowView};
 use vykar_core::commands;
 use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
+use crate::json::{HiddenSnapshot, JsonResult, ListJson, Output};
 use crate::table::CliTableTheme;
 use vykar_core::app::passphrase::RepoPassphrase;
 
@@ -14,6 +15,7 @@ pub(crate) fn run_list(
     last: Option<usize>,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<()> {
     let repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
     let listing = commands::list::list_snapshots_with_stats_on_repo(&repo);
@@ -41,6 +43,16 @@ pub(crate) fn run_list(
         if n < len {
             snapshots.drain(..len - n);
         }
+    }
+    if out.is_json() {
+        out.keep(JsonResult::List(ListJson {
+            snapshots: snapshots
+                .iter()
+                .map(|(e, s)| SnapshotRecord::new(e, s.as_ref()))
+                .collect(),
+            hidden: listing.hidden.iter().map(HiddenSnapshot::new).collect(),
+        }));
+        return Ok(());
     }
     if snapshots.is_empty() {
         println!("No snapshots found.");

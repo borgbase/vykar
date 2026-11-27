@@ -1871,7 +1871,7 @@ fn info_reports_repository_statistics() {
     let empty = commands::info::run(&config, common::pass(&config)).unwrap();
     assert_eq!(empty.snapshot_count, 0);
     assert!(empty.last_snapshot_time.is_none());
-    assert_eq!(empty.raw_size, 0);
+    assert_eq!(empty.original_size, 0);
     assert_eq!(empty.compressed_size, 0);
     assert_eq!(empty.deduplicated_size, 0);
     assert_eq!(empty.unique_stored_size, 0);
@@ -1904,7 +1904,7 @@ fn info_reports_repository_statistics() {
     let info = commands::info::run(&config, common::pass(&config)).unwrap();
     assert_eq!(info.snapshot_count, 1);
     assert!(info.last_snapshot_time.is_some());
-    assert_eq!(info.raw_size, backup_stats.original_size);
+    assert_eq!(info.original_size, backup_stats.original_size);
     assert_eq!(info.compressed_size, backup_stats.compressed_size);
     assert_eq!(info.deduplicated_size, backup_stats.deduplicated_size);
     assert!(info.unique_chunks > 0);

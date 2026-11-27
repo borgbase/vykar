@@ -62,6 +62,7 @@ See [Maintain the Repository](/maintenance).
 | `-R`, `--repo <label or path>` | Select one repository. See below for what happens without it |
 | `-S`, `--source <label>` | Filter by source label, on the commands that work per source (`backup`, `list`, `prune`, `mount`, `snapshot find`) |
 | `-v`, `-vv`, `-vvv` | Increase verbosity |
+| `--json` | Print the result as one JSON document on stdout (`list`, `info`, `backup`, `prune`, `compact`, `check`). See [JSON output](#json-output) |
 
 With several repositories configured and no `-R`:
 
@@ -69,6 +70,73 @@ With several repositories configured and no `-R`:
 - Commands that name one snapshot (`restore`, `snapshot list`, `snapshot info`, `snapshot diff`, `snapshot delete`) probe the repositories and run in the one that holds it. If several hold a snapshot of that name, the command stops and asks for `-R`.
 - `latest` is ambiguous across repositories and requires `-R`, as does deleting several snapshots in one command.
 - `key export` and `key import` require `-R`: a key belongs to exactly one repository.
+
+## JSON output
+
+`list`, `info`, `backup`, `prune` (also with `--compact`), `compact` and `check` take `--json`. The command then prints exactly one JSON document on stdout, pretty-printed, after every repository has run. Progress, warnings, prompts, the `--- Repository: … ---` lines and errors stay on stderr, and the output of hooks goes to stderr too, so `vykar backup --json | jq` works with hooks that print. Exit codes are the same as without `--json`.
+
+`--json` is refused, with exit code `1` and nothing on stdout, for every other command, for the bare `vykar` cycle, for `check --repair` and for `compact --report-unreferenced`. No document is printed either when the command fails before any repository runs (a configuration error, an unknown `-R`). An interrupt before the first repository starts is different: it prints a document with an empty `repos` array and exits `130`.
+
+The document:
+
+```json
+{
+  "schema": 1,
+  "command": "list",
+  "repos": [
+    {
+      "repository": { "name": "nas", "label": "nas", "url": "/mnt/nas/vykar" },
+      "outcome": { "status": "ok" },
+      "result": {
+        "snapshots": [
+          {
+            "name": "a1b2c3d4",
+            "time": "2026-11-27T10:00:00Z",
+            "hostname": "laptop",
+            "source_label": "docs",
+            "source_paths": ["/home/user/docs"],
+            "stats": { "nfiles": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }
+          }
+        ],
+        "hidden": []
+      }
+    }
+  ]
+}
+```
+
+- `repos` has one entry per repository the command ran in, in order, also when only one is configured or `-R` selects one. After an interrupt it holds the repositories reached so far.
+- `repository` is `name` (the label when there is one, else the url), `label` (`null` without one) and `url`. `name` is the same value as `repos[].name` in the daemon's [`/api/status.json`](/daemon#read-only-status-page), and is what joins the two.
+- `outcome` is `{"status": "ok"}`, `{"status": "partial"}` (a backup with unreadable files, exit code `3`), `{"status": "skipped", "kind": …, "message": …}` or `{"status": "failed", "kind": …, "message": …}`. `message` is the text vykar prints; `kind` is meant for scripts:
+  - error kinds: `passphrase` (a wrong passphrase; once the repository has opened, the same error means a damaged object), `repo_not_found`, `interrupted`, `hook` (a `before` hook failed or could not run), `config`, `other` (also a backup with failed sources and a check that found errors);
+  - skip kinds: `hook` (a `before` hook exited `75`, or every source of a backup was skipped by its hooks), `passphrase_prompt_canceled`, `repo_unavailable`, `append_only_server`, `no_retention_rules`, `backup_failed`, `backup_skipped`, `check_not_configured`, `check_not_due`.
+- `result` is the command's result, or `null` when it produced none. It can be present with any `outcome.status`: a backup with failed sources still lists the snapshots it created, a check that found errors lists them, and a `prune --compact` whose compact was skipped holds the prune's result.
+- `backup`: `created` (one entry per snapshot: `source_label`, `snapshot_name`, `source_paths`, `stats`), `skipped` (`source_label`, `reason`) and `failed` (`source_label`, `error`) sources, and `aborted` (`source_label`, `error`, `interrupted`, `not_attempted`) when a repository failure stopped the run after a snapshot had been created.
+- `prune`: `dry_run`, `stats` (`kept`, `pruned`, `warnings`) and `entries` (every keep/prune decision, with or without `--list`). With `--compact`, `compact_outcome` is the outcome of the compact half (`null` when the prune did not succeed and compact did not run) and `compact_stats` its statistics (`null` unless the compact produced them); the entry's `outcome` is the outcome of the whole command. When the command is interrupted between the prune and the compact, `compact_outcome` is `null` although `--compact` was given.
+- `compact`: `dry_run` and `stats`. `info` and `check` give their statistics directly.
+
+Timestamps are RFC 3339 in UTC, sizes are in bytes, and absent values are `null`: every document of a schema version has the same keys, except in `outcome`, where `kind` and `message` are present only with status `skipped` or `failed`. Within a schema version fields are only added, never renamed or removed; a change that is not additive raises `schema`. Scripts should ignore fields and `kind` values they do not know.
+
+A backup, as an example of a failed outcome with a result:
+
+```json
+{
+  "schema": 1,
+  "command": "backup",
+  "repos": [
+    {
+      "repository": { "name": "/backups/repo", "label": null, "url": "/backups/repo" },
+      "outcome": { "status": "failed", "kind": "other", "message": "1 of 2 source(s) failed" },
+      "result": {
+        "created": [ { "source_label": "docs", "snapshot_name": "a1b2c3d4", "source_paths": ["/home/user/docs"], "stats": { "nfiles": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }, "dataless_files_skipped": 0, "dataless_dirs_skipped": 0 } ],
+        "skipped": [],
+        "failed": [ { "source_label": "photos", "error": { "kind": "config", "message": "…" } } ],
+        "aborted": null
+      }
+    }
+  ]
+}
+```
 
 ## Exit codes
 

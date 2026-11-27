@@ -9,6 +9,7 @@ use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::{print_backup_stats, print_dataless_summary};
+use crate::json::{JsonResult, Output};
 use crate::passphrase::TtyPrompt;
 use crate::progress::BackupProgressRenderer;
 
@@ -31,6 +32,7 @@ pub(crate) fn run_backup(
     service: &mut AppService,
     repo: &ResolvedRepo,
     opts: BackupRunOpts<'_>,
+    mut out: Output<'_>,
 ) -> CliResult<bool> {
     let BackupRunOpts {
         user_label,
@@ -156,6 +158,9 @@ pub(crate) fn run_backup(
                 stats.errors
             );
         }
+        if out.is_json() {
+            continue;
+        }
         let paths_display = created.source_paths.join(", ");
         println!("Snapshot created: {}", created.snapshot_name);
         println!(
@@ -175,13 +180,18 @@ pub(crate) fn run_backup(
     }
     if let Some(aborted) = &report.aborted {
         crate::format::print_aborted_run(aborted);
-        if aborted.interrupted {
-            return Err(VykarError::Interrupted.into());
-        }
     }
+    let interrupted = report.aborted.as_ref().is_some_and(|a| a.interrupted);
+    let failed = report
+        .failure_summary()
+        .is_some()
+        .then(|| report.failed.len() + usize::from(report.aborted.is_some()));
+    out.keep(JsonResult::Backup(report));
 
-    if report.failure_summary().is_some() {
-        let failed = report.failed.len() + usize::from(report.aborted.is_some());
+    if interrupted {
+        return Err(VykarError::Interrupted.into());
+    }
+    if let Some(failed) = failed {
         return Err(CliError::from(format!(
             "{failed} of {} source(s) failed",
             sources.len()

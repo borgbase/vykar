@@ -16,6 +16,7 @@ mod cycle;
 mod dispatch;
 mod error;
 mod format;
+mod json;
 mod passphrase;
 mod progress;
 mod prompt;
@@ -37,6 +38,7 @@ use crate::cli::{Cli, Commands};
 use crate::config_gen::run_config_generate;
 use crate::dispatch::{dispatch_backup, dispatch_command, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
+use crate::json::{JsonResult, Output};
 use crate::passphrase::TtyPrompt;
 use crate::resolve::{
     DiffDispatch, SnapshotDispatch, classify_diff_target, classify_snapshot_target, repo_name_at,
@@ -58,6 +60,23 @@ pub fn run() -> ExitCode {
 pub(crate) fn run_cli(cli: Cli) -> ExitCode {
     signal::install_signal_handlers();
     init_logging(&cli);
+
+    // Refused before any config is read, so a refused run has no side effects.
+    let json_command = if cli.json {
+        match json::json_command(cli.command.as_ref()) {
+            Ok(name) => {
+                // Stdout carries the document: hook output goes to stderr.
+                vykar_core::app::set_hook_stdout_to_stderr();
+                Some(name)
+            }
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return ExitCode::from(EXIT_ERROR);
+            }
+        }
+    } else {
+        None
+    };
 
     let source = match resolve_config_source(&cli) {
         Ok(s) => s,
@@ -117,7 +136,7 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
         return cycle::exit_code(&report);
     }
 
-    run_all_repos(&cli, &repos, &mut service)
+    run_all_repos(&cli, &repos, &mut service, json_command)
 }
 
 /// Point the per-user config and cache directories at a per-process temp
@@ -459,7 +478,12 @@ fn dispatch_diff(
                 eprintln!("Internal error: diff target repo index out of range");
                 return ExitCode::from(EXIT_ERROR);
             };
-            finish(run_repo_command(cli, repo, service))
+            finish(swallow_skip(run_repo_command(
+                cli,
+                repo,
+                service,
+                Output::Human,
+            )))
         }
     }
 }
@@ -494,7 +518,12 @@ fn dispatch_snapshot(
                 eprintln!("Internal error: snapshot dispatch index out of range");
                 return ExitCode::from(EXIT_ERROR);
             };
-            finish(run_repo_command(cli, repo, service))
+            finish(swallow_skip(run_repo_command(
+                cli,
+                repo,
+                service,
+                Output::Human,
+            )))
         }
         SnapshotDispatch::Ambiguous(indices) => {
             eprintln!(
@@ -520,7 +549,33 @@ fn dispatch_snapshot(
 
 /// Run the subcommand against every selected repository, aggregating the
 /// outcome: any hard error wins over a partial, which wins over success.
-fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], service: &mut AppService) -> ExitCode {
+/// With `json_command`, every repository's result is collected and printed
+/// as one document before the exit code is returned.
+fn run_all_repos(
+    cli: &Cli,
+    repos: &[&ResolvedRepo],
+    service: &mut AppService,
+    json_command: Option<&str>,
+) -> ExitCode {
+    let mut entries: Vec<json::RepoEntry> = Vec::new();
+    let code = run_each_repo(cli, repos, service, json_command.map(|_| &mut entries));
+    let Some(command) = json_command else {
+        return code;
+    };
+    if !json::print_document(command, &entries) && code == ExitCode::SUCCESS {
+        return ExitCode::from(EXIT_ERROR);
+    }
+    code
+}
+
+/// The loop of [`run_all_repos`]: `entries` collects one entry per
+/// repository that ran, in JSON mode.
+fn run_each_repo(
+    cli: &Cli,
+    repos: &[&ResolvedRepo],
+    service: &mut AppService,
+    mut entries: Option<&mut Vec<json::RepoEntry>>,
+) -> ExitCode {
     let multi = repos.len() > 1;
     let mut had_error = false;
     let mut had_partial = false;
@@ -534,7 +589,21 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], service: &mut AppService) -
             eprintln!("--- Repository: {} ---", repo.label_or_url());
         }
 
-        let result = run_repo_command(cli, repo, service);
+        let mut slot = None;
+        let out = Output::from_slot(entries.is_some().then_some(&mut slot));
+        let result = run_repo_command(cli, repo, service, out);
+        if let Some(entries) = entries.as_deref_mut() {
+            entries.push(json::RepoEntry {
+                repository: json::RepoRef {
+                    name: repo.label_or_url().to_string(),
+                    label: repo.label.clone(),
+                    url: repo.config.repository.url.clone(),
+                },
+                outcome: json::outcome_of(&result),
+                result: slot,
+            });
+        }
+        let result = swallow_skip(result);
         if signal::SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("Interrupted");
             return ExitCode::from(EXIT_INTERRUPTED);
@@ -569,10 +638,28 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], service: &mut AppService) -
     ExitCode::SUCCESS
 }
 
+/// A skip requested by a hook, or a dismissed passphrase prompt, is reported
+/// and counts as success.
+fn swallow_skip(result: CliResult<bool>) -> CliResult<bool> {
+    match result {
+        Err(CliError::Ops(vykar_core::app::OpsError::Skipped(reason))) => {
+            eprintln!("Skipped: {reason}");
+            Ok(false)
+        }
+        other => other,
+    }
+}
+
 /// Execute a subcommand against one repo. Returns `Ok(had_partial)` where
-/// `true` means backup had soft errors. A skip requested by a hook, or a
-/// dismissed passphrase prompt, is reported here and counts as success.
-fn run_repo_command(cli: &Cli, repo: &ResolvedRepo, service: &mut AppService) -> CliResult<bool> {
+/// `true` means backup had soft errors. A skip (a hook's, or a dismissed
+/// passphrase prompt) is returned as `OpsError::Skipped`: callers pass the
+/// result through [`swallow_skip`]. In JSON mode `out` receives the result.
+fn run_repo_command(
+    cli: &Cli,
+    repo: &ResolvedRepo,
+    service: &mut AppService,
+    out: Output<'_>,
+) -> CliResult<bool> {
     warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
     let shutdown = signal::shutdown_token();
@@ -580,12 +667,29 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo, service: &mut AppService) ->
         return Err(CliError::from("the bare command runs through the cycle"));
     };
     let mut prompt = TtyPrompt;
-    let result = if matches!(cmd, Commands::Backup { .. }) {
+    let mut slot = match out {
+        Output::Human => None,
+        Output::Json(slot) => Some(slot),
+    };
+    if matches!(cmd, Commands::Backup { .. }) {
         // Repo and source hooks run inside the service's backup.
-        dispatch_backup(cmd, repo, service, shutdown, cli.verbose)
+        dispatch_backup(
+            cmd,
+            repo,
+            service,
+            shutdown,
+            cli.verbose,
+            Output::from_slot(slot),
+        )
     } else if let Some((hooked, dry_run)) = cmd.hooked() {
         let result = service.run_hooked(repo, hooked, dry_run, &mut prompt, &mut |_| {}, |pass| {
-            dispatch_command(cmd, repo, pass, shutdown)
+            dispatch_command(
+                cmd,
+                repo,
+                pass,
+                shutdown,
+                Output::from_slot(slot.as_deref_mut()),
+            )
         });
         match (result, cmd) {
             // Compact runs as its own hooked command once prune's lifecycle
@@ -598,37 +702,42 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo, service: &mut AppService) ->
                     dry_run,
                     ..
                 },
-            ) if !signal::SHUTDOWN.load(Ordering::SeqCst) => service.run_hooked(
-                repo,
-                HookedCommand::Compact,
-                *dry_run,
-                &mut prompt,
-                &mut |_| {},
-                |pass| {
-                    crate::cmd::compact::run_compact(
-                        &repo.config,
-                        repo.config.compact.threshold,
-                        None,
-                        *dry_run,
-                        shutdown,
-                        pass,
-                    )
-                    .map(|()| partial)
-                },
-            ),
+            ) if !signal::SHUTDOWN.load(Ordering::SeqCst) => {
+                let mut compact_slot = None;
+                let compact_out = Output::from_slot(slot.is_some().then_some(&mut compact_slot));
+                let result = service.run_hooked(
+                    repo,
+                    HookedCommand::Compact,
+                    *dry_run,
+                    &mut prompt,
+                    &mut |_| {},
+                    |pass| {
+                        crate::cmd::compact::run_compact(
+                            &repo.config,
+                            repo.config.compact.threshold,
+                            None,
+                            *dry_run,
+                            shutdown,
+                            pass,
+                            compact_out,
+                        )
+                        .map(|()| partial)
+                    },
+                );
+                // Both halves land in the prune's entry.
+                if let Some(Some(JsonResult::Prune(p))) = slot.as_deref_mut() {
+                    p.compact_outcome = Some(json::outcome_of(&result));
+                    if let Some(JsonResult::Compact(c)) = compact_slot {
+                        p.compact_stats = Some(c.stats);
+                    }
+                }
+                result
+            }
             (other, _) => other,
         }
     } else {
         let mut pass = service.passphrase(&repo.config, repo.label.as_deref(), &mut prompt);
-        dispatch_command(cmd, repo, &mut pass, shutdown)
-    };
-
-    match result {
-        Err(CliError::Ops(vykar_core::app::OpsError::Skipped(reason))) => {
-            eprintln!("Skipped: {reason}");
-            Ok(false)
-        }
-        other => other,
+        dispatch_command(cmd, repo, &mut pass, shutdown, Output::from_slot(slot))
     }
 }
 

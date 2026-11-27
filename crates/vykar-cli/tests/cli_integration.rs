@@ -4235,3 +4235,245 @@ fn cli_wrong_piped_passphrase_is_read_once() {
     // The failure is the refused passphrase, not the setup.
     assert!(err.contains("passphrase"), "{err}");
 }
+
+// ── --json ───────────────────────────────────────────────────────────────────
+
+/// The whole of stdout as one JSON document (trailing whitespace only).
+fn json_doc(output: &Output) -> serde_json::Value {
+    let out = stdout(output);
+    serde_json::from_str(&out).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not one JSON document ({e}):\n{out}\nstderr:\n{}",
+            stderr(output)
+        )
+    })
+}
+
+/// A document of `command` with exactly one repository entry; that entry.
+fn single_entry(doc: &serde_json::Value, command: &str) -> serde_json::Value {
+    assert_eq!(doc["schema"], 1, "{doc}");
+    assert_eq!(doc["command"], command, "{doc}");
+    let repos = doc["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1, "{doc}");
+    repos[0].clone()
+}
+
+fn json_ok(fx: &CliFixture, args: &[&str], command: &str) -> serde_json::Value {
+    let output = fx.run(args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let entry = single_entry(&json_doc(&output), command);
+    assert_eq!(entry["outcome"]["status"], "ok", "{entry}");
+    entry["result"].clone()
+}
+
+#[test]
+fn cli_json_documents() {
+    let fx = CliFixture::new();
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    std::fs::write(fx.source_a.join("a.txt"), b"a").unwrap();
+    std::fs::write(fx.source_b.join("b.txt"), b"b").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+
+    let backup = json_ok(&fx, &["--config", &cfg, "backup", "--json"], "backup");
+    let mut created: Vec<String> = backup["created"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["snapshot_name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(created.len(), 2, "{backup}");
+    assert_eq!(backup["created"][0]["stats"]["nfiles"], 1, "{backup}");
+
+    // `--json` is global: before the subcommand works too.
+    let list = json_ok(&fx, &["--config", &cfg, "--json", "list"], "list");
+    let mut listed: Vec<String> = list["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    created.sort();
+    listed.sort();
+    assert_eq!(listed, created, "{list}");
+    assert_eq!(list["hidden"], serde_json::json!([]));
+
+    let info = json_ok(&fx, &["--config", &cfg, "info", "--json"], "info");
+    assert_eq!(info["snapshot_count"], 2, "{info}");
+    assert_eq!(info["encryption"], "aes256gcm", "{info}");
+    assert_eq!(info["format"]["version"], 6, "{info}");
+
+    let prune = json_ok(
+        &fx,
+        &["--config", &cfg, "prune", "--json", "--dry-run"],
+        "prune",
+    );
+    assert_eq!(prune["dry_run"], true, "{prune}");
+    assert!(!prune["entries"].as_array().unwrap().is_empty(), "{prune}");
+    assert!(prune["compact_stats"].is_null() && prune["compact_outcome"].is_null());
+
+    let compact = json_ok(
+        &fx,
+        &["--config", &cfg, "compact", "--json", "--dry-run"],
+        "compact",
+    );
+    assert_eq!(compact["dry_run"], true, "{compact}");
+    assert!(
+        compact["stats"]["packs_total"].as_u64().unwrap() > 0,
+        "{compact}"
+    );
+
+    let check = json_ok(&fx, &["--config", &cfg, "check", "--json"], "check");
+    assert_eq!(check["errors"], serde_json::json!([]), "{check}");
+    assert!(check.get("item_impacts").is_none(), "{check}");
+}
+
+#[test]
+fn cli_json_prune_compact_carries_both_halves() {
+    let fx = CliFixture::new();
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    std::fs::write(fx.source_a.join("a.txt"), b"a-v1").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+    fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
+    std::fs::write(fx.source_a.join("a.txt"), b"a-v2").unwrap();
+    fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
+
+    let prune = json_ok(
+        &fx,
+        &["--config", &cfg, "prune", "--compact", "--json"],
+        "prune",
+    );
+    assert_eq!(prune["stats"]["pruned"], 1, "{prune}");
+    assert!(!prune["entries"].as_array().unwrap().is_empty(), "{prune}");
+    assert!(prune["compact_stats"].is_object(), "{prune}");
+    assert_eq!(prune["compact_outcome"]["status"], "ok", "{prune}");
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_json_prune_compact_with_a_skipped_compact() {
+    let fx = CliFixture::new();
+    write_hooked_sources_config(&fx, &[("before_compact", "exit 75".to_string())]);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+
+    let output = fx.run(&["--config", &cfg, "prune", "--compact", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let entry = single_entry(&json_doc(&output), "prune");
+    assert_eq!(entry["outcome"]["status"], "skipped", "{entry}");
+    assert_eq!(entry["outcome"]["kind"], "hook", "{entry}");
+    let result = &entry["result"];
+    assert!(result["stats"].is_object(), "{entry}");
+    assert!(result["compact_stats"].is_null(), "{entry}");
+    assert_eq!(result["compact_outcome"]["status"], "skipped", "{entry}");
+    assert_eq!(result["compact_outcome"]["kind"], "hook", "{entry}");
+    assert!(stderr(&output).contains("Skipped:"), "{}", stderr(&output));
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_json_hook_stdout_goes_to_stderr() {
+    let fx = CliFixture::new();
+    write_hooked_sources_config(&fx, &[("before_backup", "echo HOOK-MARKER".to_string())]);
+    std::fs::write(fx.source_a.join("a.txt"), b"a").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+
+    let output = fx.run(&["--config", &cfg, "backup", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    single_entry(&json_doc(&output), "backup");
+    assert!(!stdout(&output).contains("HOOK-MARKER"));
+    assert!(
+        stderr(&output).contains("HOOK-MARKER"),
+        "{}",
+        stderr(&output)
+    );
+
+    let human = fx.run_ok(&["--config", &cfg, "backup"]);
+    assert!(human.contains("HOOK-MARKER"), "{human}");
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_json_refused_and_failures() {
+    let fx = CliFixture::new();
+    // Refused before any config is read: nothing on stdout, exit 1.
+    for args in [
+        &["--json"][..],
+        &["restore", "--json", "latest", "/tmp/vykar-json-restore"],
+        &["check", "--repair", "--json"],
+        &["compact", "--report-unreferenced", "--json"],
+    ] {
+        let output = fx.run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}: {}", stdout(&output));
+        assert!(
+            stderr(&output).contains("--json"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    write_hooked_sources_config(&fx, &[("before_backup", "exit 75".to_string())]);
+    std::fs::write(fx.source_a.join("a.txt"), b"a").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repos(&cfg);
+    let output = fx.run(&["--config", &cfg, "backup", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let entry = single_entry(&json_doc(&output), "backup");
+    assert_eq!(entry["outcome"]["status"], "skipped", "{entry}");
+    assert_eq!(entry["outcome"]["kind"], "hook", "{entry}");
+    assert!(entry["result"].is_null(), "{entry}");
+
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    fx.run_ok(&["--config", &cfg, "backup"]);
+    delete_pack_for_first_chunk(&fx.repo_dir);
+    let output = fx.run(&["--config", &cfg, "check", "--verify-data", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let entry = single_entry(&json_doc(&output), "check");
+    assert_eq!(entry["outcome"]["status"], "failed", "{entry}");
+    assert_eq!(entry["outcome"]["kind"], "other", "{entry}");
+    assert!(
+        !entry["result"]["errors"].as_array().unwrap().is_empty(),
+        "{entry}"
+    );
+}
+
+#[test]
+fn cli_json_reports_every_repository() {
+    let fx = CliFixture::new();
+    let missing = fx._tmp.path().join("never-initialised");
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\n{}sources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&missing),
+        enc_yaml()
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.init_repo_labelled(&cfg, "repo-a");
+
+    let human = fx.run(&["--config", &cfg, "list"]);
+    let output = fx.run(&["--config", &cfg, "list", "--json"]);
+    assert_eq!(output.status.code(), human.status.code());
+    assert_eq!(output.status.code(), Some(1));
+    let doc = json_doc(&output);
+    assert_eq!(doc["command"], "list");
+    let repos = doc["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 2, "{doc}");
+    assert_eq!(repos[0]["repository"]["label"], "repo-a");
+    assert_eq!(repos[0]["repository"]["name"], "repo-a");
+    assert_eq!(repos[0]["outcome"]["status"], "ok", "{doc}");
+    assert_eq!(repos[0]["result"]["snapshots"], serde_json::json!([]));
+    assert_eq!(repos[1]["outcome"]["status"], "failed", "{doc}");
+    assert_eq!(repos[1]["outcome"]["kind"], "repo_not_found", "{doc}");
+    assert!(repos[1]["result"].is_null(), "{doc}");
+    assert!(!stdout(&output).contains("--- Repository"));
+    assert!(stderr(&output).contains("--- Repository: repo-b ---"));
+}

@@ -129,6 +129,38 @@ pub fn collect_source_summaries(repos: &[ResolvedRepo]) -> Vec<SourceSummary> {
     items
 }
 
+/// A snapshot as `vykar list --json` and the daemon's status.json show it:
+/// raw values, no placeholders. Schema 1: only add fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SnapshotRecord {
+    /// The snapshot name (the "ID" column).
+    pub name: String,
+    /// UTC, RFC 3339.
+    pub time: DateTime<Utc>,
+    /// Empty when the snapshot did not record one.
+    pub hostname: String,
+    /// [`SnapshotRowView::effective_label`]; empty when there is none.
+    pub source_label: String,
+    /// As recorded (no fallback to the label).
+    pub source_paths: Vec<String>,
+    /// `None` when the snapshot's metadata could not be read.
+    pub stats: Option<SnapshotStats>,
+}
+
+impl SnapshotRecord {
+    #[must_use]
+    pub fn new(entry: &SnapshotEntry, stats: Option<&SnapshotStats>) -> Self {
+        Self {
+            name: entry.name.clone(),
+            time: entry.time,
+            hostname: entry.hostname.clone(),
+            source_label: SnapshotRowView::effective_label(entry).to_string(),
+            source_paths: entry.source_paths.clone(),
+            stats: stats.cloned(),
+        }
+    }
+}
+
 /// One row of a snapshot table, formatted once for every front end.
 ///
 /// The `Option<u64>` twins of the formatted size/count columns exist for the
@@ -182,6 +214,13 @@ impl SnapshotRowView {
 
     #[must_use]
     pub fn new(entry: &SnapshotEntry, stats: Option<&SnapshotStats>) -> Self {
+        Self::from_record(&SnapshotRecord::new(entry, stats))
+    }
+
+    /// The formatted row of a record (the daemon page renders from records).
+    #[must_use]
+    pub fn from_record(record: &SnapshotRecord) -> Self {
+        let stats = record.stats.as_ref();
         let dash_if_empty = |s: &str| {
             if s.is_empty() {
                 MISSING.to_string()
@@ -190,25 +229,25 @@ impl SnapshotRowView {
             }
         };
 
-        let source_paths = if entry.source_paths.is_empty() {
-            match Self::effective_label(entry) {
+        let source_paths = if record.source_paths.is_empty() {
+            match record.source_label.as_str() {
                 "" => Vec::new(),
                 label => vec![label.to_string()],
             }
         } else {
-            entry.source_paths.clone()
+            record.source_paths.clone()
         };
 
         Self {
-            id: entry.name.clone(),
-            time: entry
+            id: record.name.clone(),
+            time: record
                 .time
                 .with_timezone(&Local)
                 .format(SNAPSHOT_TIME_FORMAT)
                 .to_string(),
-            time_epoch: entry.time.timestamp(),
-            hostname: dash_if_empty(&entry.hostname),
-            label: dash_if_empty(Self::effective_label(entry)),
+            time_epoch: record.time.timestamp(),
+            hostname: dash_if_empty(&record.hostname),
+            label: dash_if_empty(&record.source_label),
             source_paths,
             files: stats.map_or_else(|| MISSING.to_string(), |s| format_count(s.nfiles)),
             size: stats.map_or_else(|| MISSING.to_string(), |s| format_bytes(s.original_size)),

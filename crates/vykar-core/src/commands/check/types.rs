@@ -6,14 +6,15 @@ use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
 
 /// A single integrity issue found during check.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct CheckError {
     pub context: String,
     pub message: String,
 }
 
-/// Summary of a check run.
-#[derive(Debug)]
+/// Summary of a check run. Serialized in `vykar check --json` (schema 1):
+/// the field names are JSON names, so only add fields.
+#[derive(Debug, serde::Serialize)]
 pub struct CheckResult {
     pub snapshots_checked: usize,
     /// Repository key copies read back and compared. Reported even on a clean
@@ -25,7 +26,10 @@ pub struct CheckResult {
     pub chunks_data_verified: usize,
     pub errors: Vec<CheckError>,
     /// Per-item impact records for snapshot items whose chunks live in a pack
-    /// the existence check confirmed missing. Empty on healthy repos.
+    /// the existence check confirmed missing. Empty on healthy repos. Not in
+    /// the JSON: it is repair input with binary IDs, and `errors` holds the
+    /// same facts as text.
+    #[serde(skip)]
     pub item_impacts: Vec<ItemImpact>,
     /// True when the check was skipped entirely (e.g. max_percent=0 and full_every not due).
     pub skipped: bool,

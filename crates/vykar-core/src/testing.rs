@@ -143,7 +143,7 @@ pub mod conformance {
                 };
                 lines.push(format!("{label} {} {word}", step_name(*step)));
             }
-            if r.result.repo_unavailable {
+            if r.result.repo_unavailable() {
                 lines.push(format!("{label} unavailable"));
             }
         }

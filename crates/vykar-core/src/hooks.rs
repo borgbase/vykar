@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use crate::app::{OpsError, OpsResult};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::app::{OpsError, OpsResult, SkipKind, SkipReason};
 use crate::config::{HOOK_COMMANDS, HooksConfig, SourceHooksConfig};
 use crate::platform::shell;
 
@@ -13,6 +15,20 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Not 3 (vykar's own partial-success code, and curl's "URL malformed"); 75 is
 /// also what borgmatic uses for this.
 const HOOK_SKIP_EXIT_CODE: i32 = 75;
+
+/// Set by [`set_hook_stdout_to_stderr`]; read only in `execute_hook_command`.
+static HOOK_STDOUT_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// From now on, for the rest of the process, send hook stdout to this
+/// process's stderr, for a frontend whose stdout carries a machine-readable
+/// document (`vykar --json`). Hooks still inherit stderr.
+///
+/// One-way and process-wide: meant for a process that runs one command. There
+/// is no way to switch it back, and a library user that runs several
+/// operations should not call it.
+pub fn set_hook_stdout_to_stderr() {
+    HOOK_STDOUT_TO_STDERR.store(true, Ordering::Relaxed);
+}
 
 /// Context passed to hook commands via environment variables.
 pub(crate) struct HookContext {
@@ -201,6 +217,12 @@ fn run_hook_list(cmds: &[String], ctx: &HookContext) -> OpsResult<()> {
 }
 
 fn execute_hook_command(cmd: &str, ctx: &HookContext) -> OpsResult<()> {
+    spawn_hook(cmd, ctx, HOOK_STDOUT_TO_STDERR.load(Ordering::Relaxed))
+}
+
+/// Run one hook command; `stdout_to_stderr` points its stdout at this
+/// process's stderr instead of inheriting stdout.
+fn spawn_hook(cmd: &str, ctx: &HookContext, stdout_to_stderr: bool) -> OpsResult<()> {
     tracing::info!("Running hook: {cmd}");
 
     // Values reach the hook through the environment only, never through the
@@ -209,14 +231,19 @@ fn execute_hook_command(cmd: &str, ctx: &HookContext) -> OpsResult<()> {
     child.env_remove("VYKAR_PASSPHRASE");
     child.envs(hook_env(ctx));
 
-    // Use the non-capturing variant: hooks inherit stdout/stderr so output
-    // goes directly to the user's terminal (better UX than capturing).
+    // Use the non-capturing variant: hooks inherit stderr, and stdout unless
+    // it carries a document, so output goes directly to the user's terminal
+    // (better UX than capturing).
+    if stdout_to_stderr {
+        child.stdout(std::io::stderr());
+    }
     let status = shell::run_command_status_with_timeout(&mut child, HOOK_TIMEOUT)
         .map_err(|e| OpsError::Hook(format!("failed to execute hook '{cmd}': {e}")))?;
 
     if status.code() == Some(HOOK_SKIP_EXIT_CODE) {
-        return Err(OpsError::Skipped(format!(
-            "hook '{cmd}' requested skip (exit {HOOK_SKIP_EXIT_CODE})"
+        return Err(OpsError::Skipped(SkipReason::new(
+            SkipKind::Hook,
+            format!("hook '{cmd}' requested skip (exit {HOOK_SKIP_EXIT_CODE})"),
         )));
     }
 
@@ -809,6 +836,27 @@ mod tests {
         assert_eq!(lines[0], "finally::", "VYKAR_ERROR is empty: {lines:?}");
     }
 
+    /// The redirect of `set_hook_stdout_to_stderr`, through the helper's
+    /// parameter so the process-wide switch stays unset for other tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_hook_can_send_stdout_to_stderr() {
+        use std::os::unix::fs::MetadataExt;
+        let id = |fd: u32| {
+            std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        };
+        let (Some(out), Some(err)) = (id(1), id(2)) else {
+            return;
+        };
+        // Exits 0 exactly when the hook's stdout is the same file as its stderr.
+        let cmd = "[ /dev/stdout -ef /dev/stderr ]";
+        let ctx = make_ctx("backup");
+        assert!(spawn_hook(cmd, &ctx, true).is_ok());
+        assert_eq!(spawn_hook(cmd, &ctx, false).is_ok(), out == err);
+    }
+
     #[test]
     fn test_before_skip_stops_later_before_hooks() {
         let dir = tempfile::tempdir().unwrap();
@@ -894,7 +942,10 @@ mod tests {
         let mut ctx = make_ctx("backup");
 
         let result: OpsResult<()> = run_with_hooks(&global, &repo, &mut ctx, || {
-            Err(OpsError::Skipped("nothing to do".into()))
+            Err(OpsError::Skipped(SkipReason::new(
+                SkipKind::Hook,
+                "nothing to do",
+            )))
         });
 
         assert!(matches!(result, Err(OpsError::Skipped(_))));

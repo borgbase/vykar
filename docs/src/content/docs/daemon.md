@@ -90,9 +90,16 @@ The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag
 Endpoints:
 - `GET /` — HTML overview
 - `GET /healthz` — `200 OK` plain text, suitable for Docker / Kubernetes liveness probes
-- `GET /api/status.json` — same data as `/`, JSON-serialized
+- `GET /api/status.json` — the data of `/` as raw values, JSON-serialized
 
-In the JSON, `schedule_brief` carries the cadence shared by all repositories, `"Off"`, or the literal `"per-repo"` when they differ; each entry in `repos` has its own `next_run` string (or `"Off"`), a `state` (`pending` / `ok` / `skipped` / `error`) and `refreshed_at` (`"—"` until the first successful fetch).
+The JSON carries `"schema": 1`, the same version as [`--json`](/commands#json-output), with the same rules: RFC 3339 UTC timestamps, sizes in bytes, `null` for absent values, and fields only added within a version. Its field set changed with schema 1; earlier versions served formatted strings.
+
+- `process`: `hostname`, `pid`, `version`, `started_at`, `uptime_seconds` and `next_run` (the earliest scheduled run, `null` when nothing is scheduled).
+- `schedule_brief`: the cadence shared by all repositories, `"Off"`, or the literal `"per-repo"` when they differ.
+- `repos`: one entry per repository with `name` (the label when there is one, else the url; the same value as `repository.name` in `--json`), `url`, `snapshot_count`, `last_snapshot_time`, `unique_stored_size` (the three are `null` until the first fetch), its own `next_run` (`null` when it is not scheduled), a `state` (`pending` / `ok` / `skipped` / `failed`) and `refreshed_at` (`null` until the first successful fetch).
+- `recent_snapshots`: the newest snapshots across repositories, each with `repo_name` and the fields of a snapshot in `vykar list --json`.
+- `sources`: each configured source with its `paths`, `exclude`, `exclude_if_present`, `target_repos` (empty: all repositories), `options`, `hooks`, `retention` and `command_dumps`.
+- `last_cycle`: `started_at`, `finished_at`, `state` (`running` / `ok` / `partial` / `failed` / `skipped`, `null` before the first cycle), `duration_seconds`, `had_error`, `had_partial`, and `repos`: the repositories the last finished cycle reached, each with `name`, `url` and `steps` such as `{"step": "backup", "status": "failed", "kind": "hook"}`. `status` and `kind` are the names of [`--json`](/commands#json-output), and `kind` is always present: `null` for `ok` and `partial`; the step's message is not included, because it can hold hook command lines (often ping URLs with tokens) and error text, which stay in the daemon's log. While a cycle runs, `repos` still shows the previous cycle's steps.
 
 There are no write actions: no "Run Backup" button, no config edits, no authentication. The page is purely an inspection surface.
 

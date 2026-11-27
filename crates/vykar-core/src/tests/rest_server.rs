@@ -766,12 +766,16 @@ fn the_cycle_skips_compact_on_an_append_only_server() {
             result.steps
         );
         assert!(
-            matches!(outcome(CycleStep::Prune), StepOutcome::Skipped(r) if r.contains("no retention")),
+            matches!(outcome(CycleStep::Prune), StepOutcome::Skipped(r)
+                if r.kind == crate::app::SkipKind::NoRetentionRules && r.message.contains("no retention")),
             "{:?}",
             result.steps
         );
         match outcome(CycleStep::Compact) {
-            StepOutcome::Skipped(r) if append_only => assert!(r.contains("append-only"), "{r}"),
+            StepOutcome::Skipped(r) if append_only => {
+                assert_eq!(r.kind, crate::app::SkipKind::AppendOnlyServer);
+                assert!(r.message.contains("append-only"), "{r}");
+            }
             StepOutcome::Ok if !append_only => {}
             other => panic!("append_only={append_only}: {other:?}"),
         }

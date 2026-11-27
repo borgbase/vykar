@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
-use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::app::SkipKind;
 use vykar_core::app::service::HookedCommand;
 use vykar_core::app::{AppService, OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
@@ -208,7 +208,7 @@ pub(super) fn with_open_repo_op<T>(
         Ok(value) => Ok(value),
         // A dismissed prompt is the user's choice, not a failure: log it and
         // leave the status bar clean.
-        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+        Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
             send_log(&ctx.ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
             Err("passphrase required".to_string())
         }
@@ -260,7 +260,7 @@ pub(super) fn with_hooked_repo_op<T>(
 
     match outcome {
         Ok(value) => Ok(value),
-        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+        Err(OpsError::Skipped(r)) if r.kind == SkipKind::PassphrasePromptCanceled => {
             send_log(ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
             Err("passphrase required".to_string())
         }
@@ -269,7 +269,7 @@ pub(super) fn with_hooked_repo_op<T>(
                 ui_tx,
                 format!("[{repo_name}] {command_name} skipped: {reason}"),
             );
-            Err(reason)
+            Err(reason.message)
         }
         Err(e) => {
             guard.fail(format!("[{repo_name}] {command_name} failed: {e}"));

@@ -39,8 +39,9 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-/// Statistics returned by the compact command.
-#[derive(Debug, Default)]
+/// Statistics returned by the compact command. Serialized in `vykar compact
+/// --json` (schema 1): the field names are JSON names, so only add fields.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct CompactStats {
     pub packs_total: u64,
     pub packs_repacked: u64,
@@ -97,7 +98,8 @@ pub struct CompactStats {
 }
 
 /// Why a compact removed no index entry (04 step 9).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SweepSkipped {
     /// A backup was committing (its session marker says so, or cannot be
     /// read): its snapshot may not be listed yet, so this run's mark would

@@ -14,7 +14,7 @@ fn info_empty_repo_reports_zero_sizes_and_no_last_snapshot() {
     let stats = commands::info::run(&config, pass(&config)).unwrap();
     assert_eq!(stats.snapshot_count, 0);
     assert!(stats.last_snapshot_time.is_none());
-    assert_eq!(stats.raw_size, 0);
+    assert_eq!(stats.original_size, 0);
     assert_eq!(stats.compressed_size, 0);
     assert_eq!(stats.deduplicated_size, 0);
     assert_eq!(stats.unique_stored_size, 0);

@@ -421,7 +421,9 @@ fn run_backup_cycle_report(
                     tracing::warn!(repo = name, "backup cycle partial: some files were skipped");
                 }
                 if let Some(reason) = report.skipped() {
-                    if report.result.repo_unavailable {
+                    // A `&str` field, so the log text stays as it was.
+                    let reason = reason.message.as_str();
+                    if report.result.repo_unavailable() {
                         tracing::warn!(repo = name, reason, "skipping unavailable repository");
                     } else {
                         tracing::info!(repo = name, reason, "backup cycle skipped");
@@ -451,13 +453,12 @@ fn run_backup_cycle_report(
     }
 
     let elapsed = cycle_start.elapsed();
-    let had_error = report.has_failures();
     // Partial counts only for repositories that did not fail.
-    let had_partial = report
-        .repos
-        .iter()
-        .any(|r| !r.result.has_failures() && r.result.had_partial());
-    let all_skipped = report.all_skipped();
+    let status::CycleFlags {
+        had_error,
+        had_partial,
+        all_skipped,
+    } = status::cycle_flags(&report);
     if had_error {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with errors");
     } else if had_partial {
@@ -468,7 +469,7 @@ fn run_backup_cycle_report(
         tracing::info!(duration = ?elapsed, "backup cycle finished successfully");
     }
 
-    status::record_cycle_end(status, elapsed, had_error, had_partial, all_skipped);
+    status::record_cycle_end(status, elapsed, &report, all);
 
     // All Repository instances are dropped. Ask glibc to return freed pages.
     if !SHUTDOWN.load(Ordering::SeqCst) {

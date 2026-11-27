@@ -94,6 +94,9 @@ impl SnapshotMeta {
 /// (e.g. the macOS dataless file/directory tallies) therefore live on
 /// `BackupOutcome`, not here. Anything that genuinely must be persisted goes in
 /// `SnapshotMeta::ext`.
+///
+/// The field names are also the JSON names of `--json` and the daemon's
+/// status.json (schema 1): do not rename them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotStats {
     pub nfiles: u64,

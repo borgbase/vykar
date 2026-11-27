@@ -8,12 +8,13 @@ use super::list::load_snapshot_meta;
 use super::util::open_repo;
 use crate::repo::OpenOptions;
 
-/// Repository statistics for the `info` command.
-#[derive(Debug, Clone)]
+/// Repository statistics for the `info` command. Serialized in `vykar info
+/// --json` (schema 1): the field names are JSON names, so only add fields.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InfoStats {
     pub snapshot_count: usize,
     pub last_snapshot_time: Option<DateTime<Utc>>,
-    pub raw_size: u64,
+    pub original_size: u64,
     pub compressed_size: u64,
     pub deduplicated_size: u64,
     /// Stored bytes of every index entry, including entries no snapshot
@@ -26,9 +27,13 @@ pub struct InfoStats {
     pub last_sweep_time: Option<DateTime<Utc>>,
     pub unique_chunks: usize,
     pub repo_created: DateTime<Utc>,
+    /// JSON: `EncryptionMode::as_str`, not the repository config's encoding.
+    #[serde(serialize_with = "ser_encryption")]
     pub encryption: EncryptionMode,
     /// Layout version. Worth showing because users will hold a mix of v2 and
     /// v3 repositories, and the format determines which binaries can read one.
+    /// JSON: `{"version": 6, "chunk_hash": "blake3"}`.
+    #[serde(serialize_with = "ser_format")]
     pub format: RepoFormat,
     /// Shape of the index (absent on a handle without a head).
     pub index: Option<IndexLayoutStats>,
@@ -36,7 +41,9 @@ pub struct InfoStats {
     /// lacks a chunk a live snapshot needs, and no compact has marked since
     /// (nor a repair applied): [`crate::commands::compact_refusal`].
     pub compact_refused: Option<crate::commands::compact_refusal::CompactRefusal>,
-    /// As `config` records it.
+    /// As `config` records it. JSON: "single" or "multi" (the
+    /// `--commit-mode` values).
+    #[serde(serialize_with = "ser_writer_mode")]
     pub writer_mode: WriterMode,
     /// The repository is single-writer and this handle's storage offers
     /// put-if-absent (as far as it knows without a request): `vykar upgrade
@@ -44,8 +51,39 @@ pub struct InfoStats {
     pub put_if_absent_offered: bool,
 }
 
+fn ser_encryption<S: serde::Serializer>(
+    mode: &EncryptionMode,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(mode.as_str())
+}
+
+// `serialize_with` passes a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn ser_format<S: serde::Serializer>(
+    format: &RepoFormat,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let mut st = s.serialize_struct("RepoFormat", 2)?;
+    st.serialize_field("version", &format.version())?;
+    st.serialize_field("chunk_hash", format.chunk_hash().as_str())?;
+    st.end()
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn ser_writer_mode<S: serde::Serializer>(
+    mode: &WriterMode,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(match mode {
+        WriterMode::Single => "single",
+        WriterMode::Multi => "multi",
+    })
+}
+
 /// Shape of a segmented index: its base and the segments written since.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct IndexLayoutStats {
     pub base_bytes: u64,
     pub segments: usize,
@@ -61,7 +99,7 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         &crate::repo::control::CancelToken::new(),
     )?;
 
-    let mut raw_size = 0u64;
+    let mut original_size = 0u64;
     let mut compressed_size = 0u64;
     let mut deduplicated_size = 0u64;
     let mut last_snapshot_time = None;
@@ -72,7 +110,7 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         }
 
         let meta = load_snapshot_meta(&repo, &entry.name)?;
-        raw_size = raw_size.saturating_add(meta.stats.original_size);
+        original_size = original_size.saturating_add(meta.stats.original_size);
         compressed_size = compressed_size.saturating_add(meta.stats.compressed_size);
         deduplicated_size = deduplicated_size.saturating_add(meta.stats.deduplicated_size);
     }
@@ -97,7 +135,7 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
     Ok(InfoStats {
         snapshot_count: repo.manifest().snapshots.len(),
         last_snapshot_time,
-        raw_size,
+        original_size,
         compressed_size,
         deduplicated_size,
         unique_stored_size,

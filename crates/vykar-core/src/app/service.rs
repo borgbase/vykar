@@ -63,7 +63,7 @@ pub struct RepoCycleReport {
 impl RepoCycleReport {
     /// The backup step was skipped and nothing failed: a hook skip, a
     /// dismissed prompt or an unavailable repository.
-    pub fn skipped(&self) -> Option<&str> {
+    pub fn skipped(&self) -> Option<&crate::app::SkipReason> {
         if self.result.has_failures() {
             return None;
         }

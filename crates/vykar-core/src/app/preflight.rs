@@ -1,5 +1,6 @@
 //! Whether a cycle can reach a local repository.
 
+use crate::app::{SkipKind, SkipReason};
 use crate::config::ResolvedRepo;
 use crate::storage::{ParsedUrl, parse_repo_url};
 
@@ -24,10 +25,13 @@ pub enum Availability {
 
 impl Availability {
     /// Why a cycle skips this repository; `None` unless it is missing.
-    pub fn unavailable_reason(&self) -> Option<String> {
+    pub fn unavailable_reason(&self) -> Option<SkipReason> {
         match self {
-            Self::LocalMissing(path) => Some(format!(
-                "repository not found at '{path}' (not mounted, or not initialized: run `vykar init`)"
+            Self::LocalMissing(path) => Some(SkipReason::new(
+                SkipKind::RepoUnavailable,
+                format!(
+                    "repository not found at '{path}' (not mounted, or not initialized: run `vykar init`)"
+                ),
             )),
             Self::Available | Self::Unknown => None,
         }
@@ -65,13 +69,13 @@ mod tests {
         let state = availability(&repo_at(&missing_url));
         assert_eq!(state, Availability::LocalMissing(missing_url.clone()));
         assert_eq!(
-            state.unavailable_reason().as_deref(),
-            Some(
+            state.unavailable_reason(),
+            Some(SkipReason::new(
+                SkipKind::RepoUnavailable,
                 format!(
                     "repository not found at '{missing_url}' (not mounted, or not initialized: run `vykar init`)"
                 )
-                .as_str()
-            )
+            ))
         );
 
         let empty = tmp.path().join("empty");

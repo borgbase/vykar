@@ -114,7 +114,8 @@ publishing any rewritten snapshot and changes nothing it had not already
 applied; run it again.
 
 A repair interrupted between publishing a rewritten snapshot and deleting the
-original leaves two snapshot objects of one name; the next repair removes the
+original leaves two snapshot objects of one name (`vykar check` reports a name
+carried by more than one object); the next repair removes the
 rewrite (it holds nothing the original lacks) and rewrites the original again.
 Of several objects of one name, repair also removes one whose listing cannot
 be read when another can be (data loss, as for a lone snapshot), and refuses,

@@ -550,6 +550,9 @@ pub(super) enum Judge {
 pub(super) struct Reconciled {
     /// The removals, by ID, first after the key copies in the plan.
     pub(super) actions: Vec<RepairAction>,
+    /// One [`IntegrityIssue::DuplicateSnapshotName`] per name decided, for
+    /// the check result: the scan runs without the removed objects.
+    pub(super) issues: Vec<IntegrityIssue>,
     /// A name was left undecided ([`Judge::DeferUnindexed`]).
     pub(super) deferred: bool,
 }
@@ -557,6 +560,7 @@ pub(super) struct Reconciled {
 impl Reconciled {
     pub(super) fn extend(&mut self, later: Reconciled) {
         self.actions.extend(later.actions);
+        self.issues.extend(later.issues);
         self.deferred = later.deferred;
     }
 }
@@ -614,6 +618,10 @@ pub(super) fn reconcile_duplicate_names(
         if entries.len() < 2 {
             continue;
         }
+        let issue = IntegrityIssue::DuplicateSnapshotName {
+            snapshot_name: name.clone(),
+            snapshot_ids: entries.iter().map(|e| e.id).collect(),
+        };
         let mut readable: Vec<ReadObject> = Vec::new();
         let mut unreadable: Vec<(SnapshotId, String)> = Vec::new();
         let mut unindexed = false;
@@ -683,6 +691,7 @@ pub(super) fn reconcile_duplicate_names(
         repo.manifest_mut()
             .snapshots
             .retain(|e| !removed.contains(&e.id));
+        out.issues.push(issue);
     }
     Ok(out)
 }

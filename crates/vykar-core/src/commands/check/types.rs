@@ -131,6 +131,15 @@ pub enum IntegrityIssue {
         item_path: String,
         reason: String,
     },
+    /// More than one snapshot object carries one name (an interrupted
+    /// `check --repair` rewrite, or two backups given one name). A lookup by
+    /// name (restore, delete, mount, the scan before this was fixed) finds
+    /// only the first listed. `snapshot_ids` in listing order (by time,
+    /// then ID).
+    DuplicateSnapshotName {
+        snapshot_name: String,
+        snapshot_ids: Vec<SnapshotId>,
+    },
 }
 
 impl IntegrityIssue {
@@ -285,6 +294,21 @@ impl IntegrityIssue {
                 CheckError {
                     context: ctx,
                     message: reason.clone(),
+                }
+            }
+            IntegrityIssue::DuplicateSnapshotName {
+                snapshot_name,
+                snapshot_ids,
+            } => {
+                let ids: Vec<String> = snapshot_ids.iter().map(|id| id.to_hex()).collect();
+                CheckError {
+                    context: format!("snapshot '{snapshot_name}'"),
+                    message: format!(
+                        "{} snapshot objects carry this name ({}); a lookup by name finds only \
+                         the first — run `vykar check --repair`",
+                        snapshot_ids.len(),
+                        ids.join(", ")
+                    ),
                 }
             }
         }

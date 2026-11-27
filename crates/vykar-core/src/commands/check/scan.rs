@@ -440,6 +440,24 @@ pub(crate) fn scan_for_test(
     })
 }
 
+/// An [`IntegrityIssue::DuplicateSnapshotName`] for each name more than one
+/// of `entries` carries, by name; the IDs in the order of `entries`.
+pub(super) fn duplicate_names(entries: &[SnapshotEntry]) -> Vec<IntegrityIssue> {
+    let mut by_name: std::collections::BTreeMap<&str, Vec<SnapshotId>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        by_name.entry(&entry.name).or_default().push(entry.id);
+    }
+    by_name
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(name, ids)| IntegrityIssue::DuplicateSnapshotName {
+            snapshot_name: name.to_string(),
+            snapshot_ids: ids,
+        })
+        .collect()
+}
+
 /// Run the integrity scan, producing structured issues.
 ///
 /// `ScanOptions` controls which phases run and which packs are skipped.
@@ -550,6 +568,10 @@ pub(super) fn integrity_scan(
             }
         }
     }
+
+    // A name more than one object carries: a lookup by name finds only the
+    // first. Every object is checked below, by its own ID.
+    issues.extend(duplicate_names(&repo.manifest().snapshots));
 
     // Phase 1: Check each snapshot in manifest
     let all_snapshot_entries = repo.manifest().snapshots.clone();

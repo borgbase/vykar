@@ -2598,6 +2598,53 @@ fn a_repair_judges_two_objects_of_one_name_after_the_reindex() {
     });
 }
 
+/// Plain `check` reports a name two objects carry, pointing to repair, and
+/// checks each object by its own ID: the rewrite, listed after the original
+/// (a lookup by name finds the original), is the one whose listing is lost.
+/// The repair's check result reports the name too.
+#[test]
+fn check_reports_two_objects_of_one_name_and_checks_each() {
+    let mut fx = interrupted_item_repair();
+    fx.rekey_rewrite_with(id_after(), lost_listing);
+    let check = commands::check::run(&fx.config, pass(&fx.config), false, false).unwrap();
+    let duplicate = |errors: &[CheckError]| {
+        errors.iter().any(|e| {
+            e.context == "snapshot 'snap-drop'"
+                && e.message.starts_with(&format!(
+                    "2 snapshot objects carry this name ({}, {})",
+                    fx.original.to_hex(),
+                    fx.rewrite.to_hex()
+                ))
+                && e.message.contains("run `vykar check --repair`")
+        })
+    };
+    assert!(duplicate(&check.errors), "{:?}", check.errors);
+    let lost = ChunkId::from_bytes([0xab; 32]).to_string();
+    assert!(
+        check.errors.iter().any(|e| e.message.contains(&lost)),
+        "the rewrite was checked: {:?}",
+        check.errors
+    );
+
+    let shown = fx.repair(RepairMode::PlanOnly).unwrap();
+    assert!(
+        duplicate(&shown.check_result.errors),
+        "{:?}",
+        shown.check_result.errors
+    );
+    assert_eq!(
+        shown
+            .check_result
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("snapshot objects carry this name"))
+            .count(),
+        1,
+        "reported once: {:?}",
+        shown.check_result.errors
+    );
+}
+
 /// Refuses every DELETE under `snapshots/` (the delete probe's too) as an
 /// append-only server does.
 struct RefuseSnapshotDeletes {

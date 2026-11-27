@@ -732,11 +732,12 @@ pub(crate) fn run_with_repair_on_repo(
         repo.refresh_snapshot_list()?;
 
         let RepairScan {
-            scan,
+            mut scan,
             reindexed,
             found,
             reconciled,
         } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+        scan.issues.extend(reconciled.issues);
 
         let plan = plan_repair(
             repo,
@@ -773,11 +774,12 @@ pub(crate) fn run_with_repair_on_repo(
             repo.refresh_snapshot_list()?;
 
             let RepairScan {
-                scan,
+                mut scan,
                 reindexed,
                 found,
                 reconciled,
             } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+            scan.issues.extend(reconciled.issues);
 
             let pack_chunks = group_by_pack(repo.chunk_index());
             let plan = plan_repair(

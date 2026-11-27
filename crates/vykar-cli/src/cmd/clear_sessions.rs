@@ -6,13 +6,13 @@ use vykar_core::repo::sessions;
 
 use crate::error::{CliError, CliResult};
 
-/// `vykar break-lock` (`--sessions` is accepted and changes nothing): first
+/// `vykar clear-sessions` (until 10-single-protocol: `break-lock`): first
 /// remove everything under `locks/` without asking (vykar 0.24 locks, the
 /// legacy key of an interrupted v2/v3 upgrade, probe debris), then list every
 /// session marker and remove them all after confirmation on a terminal.
 /// Without a terminal it refuses (an error) whenever a marker exists, after
 /// the lock files were removed.
-pub(crate) fn run_break_lock(config: &VykarConfig, _label: Option<&str>) -> CliResult<()> {
+pub(crate) fn run_clear_sessions(config: &VykarConfig, _label: Option<&str>) -> CliResult<()> {
     let storage = vykar_core::storage::backend_from_config(
         &config
             .repository

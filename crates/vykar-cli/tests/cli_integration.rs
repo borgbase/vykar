@@ -951,20 +951,20 @@ fn cli_delete_repo_with_flag() {
     assert!(!fx.repo_dir.exists());
 }
 
-/// `break-lock` (10-single-protocol step 9): on a fresh repository it
+/// `clear-sessions` (10-single-protocol step 9): on a fresh repository it
 /// finds nothing; with leftover lock files and session markers it removes
 /// everything under `locks/` without asking, lists every marker on stderr
 /// (the exclusive one labelled), and without a terminal refuses to remove
-/// them, naming the lock files it removed; `--sessions` is accepted and
-/// does the same.
+/// them, naming the lock files it removed; run again, it refuses the same
+/// way and has no lock file left to remove.
 #[test]
-fn cli_break_lock_lists_sessions_and_refuses_without_a_terminal() {
+fn cli_clear_sessions_lists_sessions_and_refuses_without_a_terminal() {
     let fx = CliFixture::new();
     write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
     fx.init_repos(&cfg);
 
-    let quiet = fx.run(&["--config", &cfg, "break-lock"]);
+    let quiet = fx.run(&["--config", &cfg, "clear-sessions"]);
     assert!(quiet.status.success(), "{}", stderr(&quiet));
     assert!(
         stdout(&quiet).contains("No active sessions found."),
@@ -991,7 +991,7 @@ fn cli_break_lock_lists_sessions_and_refuses_without_a_terminal() {
     std::fs::write(&exclusive_key, marker("repair-host", 4242)).unwrap();
     std::fs::write(&shared_key, marker("backup-host", 77)).unwrap();
 
-    let output = fx.run(&["--config", &cfg, "break-lock"]);
+    let output = fx.run(&["--config", &cfg, "clear-sessions"]);
     assert!(!output.status.success(), "{}", stdout(&output));
     assert!(
         stdout(&output).contains("Removed 1 leftover lock file(s)"),
@@ -1026,9 +1026,9 @@ fn cli_break_lock_lists_sessions_and_refuses_without_a_terminal() {
     );
     assert!(exclusive_key.exists() && shared_key.exists());
 
-    let flagged = fx.run(&["--config", &cfg, "break-lock", "--sessions"]);
-    assert!(!flagged.status.success(), "{}", stdout(&flagged));
-    let err = stderr(&flagged);
+    let again = fx.run(&["--config", &cfg, "clear-sessions"]);
+    assert!(!again.status.success(), "{}", stdout(&again));
+    let err = stderr(&again);
     assert!(
         err.contains("refusing to remove sessions without confirmation"),
         "{err}"
@@ -1038,6 +1038,32 @@ fn cli_break_lock_lists_sessions_and_refuses_without_a_terminal() {
         "{err}"
     );
     assert!(exclusive_key.exists() && shared_key.exists());
+}
+
+/// The command was `break-lock` until it became `clear-sessions`, with no
+/// alias: the old name is an unknown subcommand, and `--sessions`, which
+/// `break-lock` accepted and ignored, is an unknown argument.
+#[test]
+fn cli_break_lock_is_no_longer_a_command() {
+    let fx = CliFixture::new();
+    write_test_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let old = fx.run(&["--config", &cfg, "break-lock"]);
+    assert_eq!(old.status.code(), Some(2), "{}", stderr(&old));
+    assert!(
+        stderr(&old).contains("unrecognized subcommand 'break-lock'"),
+        "{}",
+        stderr(&old)
+    );
+
+    let flag = fx.run(&["--config", &cfg, "clear-sessions", "--sessions"]);
+    assert_eq!(flag.status.code(), Some(2), "{}", stderr(&flag));
+    assert!(
+        stderr(&flag).contains("unexpected argument '--sessions'"),
+        "{}",
+        stderr(&flag)
+    );
 }
 
 #[test]

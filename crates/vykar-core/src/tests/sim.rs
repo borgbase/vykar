@@ -370,7 +370,7 @@ fn allowed_and_disallowed_errors() {
 }
 
 #[test]
-fn crash_then_break_lock_then_backup() {
+fn crash_then_clear_sessions_then_backup() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
@@ -429,7 +429,7 @@ fn crash_then_break_lock_then_backup() {
         real.elapsed()
     );
 
-    sim.break_lock(b).expect_ok();
+    sim.clear_sessions(b).expect_ok();
     assert!(exclusive_keys(&sim).is_empty());
     // The failed backup used up its name.
     sim.backup(b, "t2", &tree("t2")).expect_ok();
@@ -1333,7 +1333,7 @@ fn step3_clean_on_sequential_flows() {
         compact.detail()
     );
     sim.check_repair(c).expect_ok();
-    sim.break_lock(d).expect_ok();
+    sim.clear_sessions(d).expect_ok();
     sim.check_invariants(Invariant::STEP3).assert_clean();
 }
 

@@ -59,7 +59,7 @@ pub fn upgrade_repo(repo: &mut Repo, mode: Option<WriterMode>) -> Result<Upgrade
 /// A failed release is `tracing::warn!`-only and never changes the
 /// action's outcome: after a failed action the action's error is the one
 /// that matters; after a successful one the work is committed, and the
-/// warning names the leaked key and `vykar break-lock`.
+/// warning names the leaked key and `vykar clear-sessions`.
 fn with_legacy_upgrade_lock<T>(
     repo: &mut Repo,
     action: impl FnOnce(&mut RepoWriter<'_>, &ExclusiveSession) -> Result<T>,
@@ -76,7 +76,7 @@ fn with_legacy_upgrade_lock<T>(
                 "the upgrade completed successfully, but releasing its legacy lock key \
                  `{key}` failed: {release_err}. The leftover key does not affect this vykar, \
                  which no longer reads `locks/`, and vykar 0.24 cannot open the upgraded \
-                 repository anyway; `vykar break-lock` removes it."
+                 repository anyway; `vykar clear-sessions` removes it."
             );
         } else {
             tracing::warn!(

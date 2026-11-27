@@ -566,7 +566,7 @@ mod tests {
 
         let rendered = format!("{list}");
         assert!(
-            rendered.contains("vykar break-lock"),
+            rendered.contains("vykar clear-sessions"),
             "display must mention the remediation command, got: {rendered}"
         );
         assert!(rendered.contains("host=h"));

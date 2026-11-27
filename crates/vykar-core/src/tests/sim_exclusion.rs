@@ -7,7 +7,7 @@
 //! (`ActiveSessions`); a backup whose marker vanished stops before its head
 //! at its pre-head listing; an exclusive run whose marker is lost writes
 //! nothing more; a crashed exclusive session stops blocking after 45 min, at
-//! once on its own machine, or after `break-lock`. The
+//! once on its own machine, or after `clear-sessions`. The
 //! interleavings of the advisory lock these tests covered before step 8 are
 //! the lock's own, deleted with it in step 9.
 
@@ -718,16 +718,16 @@ fn a_crashed_exclusive_stops_blocking_after_45_minutes() {
 // machine (same hostname, installation and boot; its PID dead), is
 // `tests::sim::same_machine_reaps_dead_exclusive_holder_at_once`.
 
-/// (f3) `break-lock` removes a crashed exclusive session's marker at once
+/// (f3) `clear-sessions` removes a crashed exclusive session's marker at once
 /// (since 10-single-protocol step 9 it always clears session markers).
 #[test]
-fn a_crashed_exclusive_stops_blocking_after_break_lock() {
+fn a_crashed_exclusive_stops_blocking_after_clear_sessions() {
     let mut sim = Sim::new();
     let (c, b) = (sim.client("c"), sim.client("b"));
     sim.backup(b, "b0", &tree("b0")).expect_ok();
     crashed_exclusive(&mut sim, c);
     assert_allowed(&sim.backup(b, "b1", &tree("b1")), AllowedError::Locked);
-    sim.break_lock(b).expect_ok();
+    sim.clear_sessions(b).expect_ok();
     assert!(exclusive_keys(&sim).is_empty());
     sim.backup(b, "b2", &tree("b2")).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();

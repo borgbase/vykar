@@ -48,7 +48,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `GET` | `/?list` | List all keys in the repository |
 | `GET` | `/health` | Unauthenticated liveness endpoint returning `status`, `version` and the capabilities below |
 
-There are no dedicated endpoints for sessions. Clients store session markers through the normal object API (`sessions/*`). `locks/*` is written only by vykar 0.24 clients and by the legacy lock key of a v2/v3 upgrade, and emptied by `vykar break-lock`.
+There are no dedicated endpoints for sessions. Clients store session markers through the normal object API (`sessions/*`). `locks/*` is written only by vykar 0.24 clients and by the legacy lock key of a v2/v3 upgrade, and emptied by `vykar clear-sessions`.
 
 ## Authentication
 

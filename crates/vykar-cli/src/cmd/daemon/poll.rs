@@ -12,7 +12,7 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 
 /// List the `<id>` portion of every `snapshots/<id>` key for a repo, using a
-/// bare storage backend (no passphrase/KDF — same pattern as `break_lock`).
+/// bare storage backend (no passphrase/KDF — same pattern as `clear_sessions`).
 pub(super) fn list_snapshot_ids(repo: &ResolvedRepo) -> Result<HashSet<String>> {
     let storage = vykar_core::storage::backend_from_config(
         &repo

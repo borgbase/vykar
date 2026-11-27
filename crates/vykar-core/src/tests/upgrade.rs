@@ -2307,7 +2307,7 @@ fn a_key_removed_before_the_session_reap_is_lock_expired() {
         .with_host(host)
         .with_pid_alive(Arc::new(|_, pid| pid == 4242));
     let hook: Hook = Box::new(move |call, raw| {
-        // The reap's GET of the marker, before its delete: break-lock.
+        // The reap's GET of the marker, before its delete: `vykar clear-sessions`.
         if let Call::Read(key) = call
             && key == marker
         {
@@ -2474,7 +2474,7 @@ fn exclusive_marker_keys(raw: &dyn StorageBackend) -> Vec<String> {
 }
 
 /// A v2/v3 upgrade whose exclusive marker is deleted mid-run
-/// (`vykar break-lock`, reuse 0 so the next write checks): the write
+/// (`vykar clear-sessions`, reuse 0 so the next write checks): the write
 /// in flight lands; the next check stops the upgrade
 /// `MarkerLostDuringCommit`, nothing more is written, the legacy key is
 /// released, the version is not switched, and a rerun completes.

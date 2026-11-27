@@ -21,7 +21,7 @@ pub struct ActiveSessionDetails {
 /// `details` is `None` when the marker's JSON could not be parsed — such
 /// markers are preserved on storage while younger than the session
 /// staleness by their mtime, so maintenance fails closed; after that they
-/// are reaped like stale markers, and `vykar break-lock` removes
+/// are reaped like stale markers, and `vykar clear-sessions` removes
 /// them at once.
 #[derive(Debug, Clone)]
 pub struct ActiveSessionInfo {
@@ -60,7 +60,7 @@ impl fmt::Display for ActiveSessionList {
         }
         write!(
             f,
-            "Wait for in-progress backups to finish, or run `vykar break-lock` to force-clear."
+            "Wait for in-progress backups to finish, or run `vykar clear-sessions` to force-clear."
         )
     }
 }
@@ -105,7 +105,7 @@ impl fmt::Display for LockHolder {
                      write) on {} (PID {}, started {} ago) holds the repository; nothing else \
                      writes to it until it ends. Wait for it to finish; if that process is gone, \
                      its marker stops blocking 45 minutes after its last refresh, or run \
-                     `vykar break-lock` (it asks for confirmation and removes every \
+                     `vykar clear-sessions` (it asks for confirmation and removes every \
                      session marker, those of running backups included).",
                     d.hostname, d.pid, d.age
                 ),
@@ -115,7 +115,7 @@ impl fmt::Display for LockHolder {
                     "an exclusive maintenance run's session marker is unreadable or was just \
                      removed (key: {}). Run the command again; if it persists and no \
                      `check --repair`, `upgrade` or pack-map write is running, wait until it is \
-                     45 minutes old, or run `vykar break-lock` (it asks for \
+                     45 minutes old, or run `vykar clear-sessions` (it asks for \
                      confirmation and removes every session marker, those of running backups \
                      included).",
                     self.key
@@ -130,7 +130,7 @@ impl fmt::Display for LockHolder {
                     f,
                     "a backup committing or a compact running on {} (PID {}, started {} \
                      ago) holds the repository. Wait for it to finish, or run \
-                     `vykar break-lock` if that process is gone.",
+                     `vykar clear-sessions` if that process is gone.",
                     d.hostname, d.pid, d.age
                 ),
                 // Malformed, or gone between the listing and the read of it.
@@ -138,7 +138,7 @@ impl fmt::Display for LockHolder {
                     f,
                     "a session marker that may belong to a committing backup is unreadable or \
                      was just removed (key: {}). Run the command again; if it persists and no \
-                     backup is running, run `vykar break-lock` (an unreadable marker \
+                     backup is running, run `vykar clear-sessions` (an unreadable marker \
                      blocks exclusive runs and, on a single-writer repository, other head \
                      writers until it is 45 minutes old by its modification time, and for good \
                      where the storage reports none).",
@@ -151,14 +151,14 @@ impl fmt::Display for LockHolder {
                 f,
                 "repository is locked by {} (PID {}), held for {}. \
                  Another machine may be running prune/compact, or the lock is stale. \
-                 Wait for it to finish, or run `vykar break-lock` if that process is gone.",
+                 Wait for it to finish, or run `vykar clear-sessions` if that process is gone.",
                 d.hostname, d.pid, d.age
             ),
             None => write!(
                 f,
                 "repository is locked by another process (lock: {}, holder details unreadable). \
                  Another machine may be running prune/compact, or the lock is stale. \
-                 Wait for it to finish, or run `vykar break-lock` if that process is gone.",
+                 Wait for it to finish, or run `vykar clear-sessions` if that process is gone.",
                 self.key
             ),
         }
@@ -688,7 +688,7 @@ mod tests {
     }
 
     /// An exclusive session's marker: one line, naming the commands, what
-    /// clears it and that `vykar break-lock` removes every marker.
+    /// clears it and that `vykar clear-sessions` removes every marker.
     #[test]
     fn exclusive_session_holder_message() {
         for details in [true, false] {
@@ -696,7 +696,7 @@ mod tests {
             assert!(!msg.contains('\n'), "{msg}");
             assert!(msg.contains("exclusive maintenance run"), "{msg}");
             assert!(msg.contains("check --repair"), "{msg}");
-            assert!(msg.contains("vykar break-lock"), "{msg}");
+            assert!(msg.contains("vykar clear-sessions"), "{msg}");
             assert!(!msg.contains("--sessions"), "{msg}");
             assert!(msg.contains("45 minutes"), "{msg}");
             assert!(msg.contains("every session marker"), "{msg}");

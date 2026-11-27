@@ -625,7 +625,7 @@ impl LegacyUpgradeLock {
         for object in listing.iter().filter(|o| o.key != key) {
             let other = object.key.as_str();
             // Not a lock (probe debris of development builds, say):
-            // nothing to judge; `vykar break-lock` removes it.
+            // nothing to judge; `vykar clear-sessions` removes it.
             if !(other.starts_with(LEGACY_LOCKS_PREFIX) && other.ends_with(".json")) {
                 continue;
             }
@@ -721,7 +721,7 @@ impl LegacyKey {
 
     fn lost_error(&self) -> VykarError {
         VykarError::LockExpired(format!(
-            "the upgrade's lock key {} was removed (`vykar break-lock`, or a vykar 0.24 \
+            "the upgrade's lock key {} was removed (`vykar clear-sessions`, or a vykar 0.24 \
              client on a machine with this hostname took it for stale); nothing more is \
              written. Run `vykar upgrade` again",
             self.key

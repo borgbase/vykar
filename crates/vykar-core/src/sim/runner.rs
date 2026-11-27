@@ -183,11 +183,11 @@ pub enum Call {
     Restore {
         snapshot: String,
     },
-    /// `vykar break-lock` without its confirmation: everything under the
+    /// `vykar clear-sessions` without its confirmation: everything under the
     /// legacy lock directory (`sessions::LEGACY_LOCKS_PREFIX`,
     /// `sessions::clear_legacy_locks`), then every session object
     /// (`sessions::clear_all_sessions`).
-    BreakLock,
+    ClearSessions,
     /// Opens like delete and runs `f` as an exclusive session
     /// (`util::with_exclusive_session`, 10-single-protocol step 8): a
     /// maintenance writer.
@@ -609,8 +609,8 @@ impl Sim {
         )
     }
 
-    pub fn break_lock(&mut self, c: ClientId) -> RunRecord {
-        self.call(c, Call::BreakLock)
+    pub fn clear_sessions(&mut self, c: ClientId) -> RunRecord {
+        self.call(c, Call::ClearSessions)
     }
 
     /// Opens like prune/delete/compact and runs `f` as an exclusive session
@@ -1241,7 +1241,7 @@ impl Sim {
                 );
                 (op, body)
             }
-            Call::BreakLock => {
+            Call::ClearSessions => {
                 let body: Body = Box::new(
                     move |store: &SimStore, _: VykarConfig, _: &Path, _: usize, _: HostEnv| {
                         let handle = store.handle(c);
@@ -1250,7 +1250,7 @@ impl Sim {
                         Ok((Vec::new(), format!("locks {locks}, sessions {cleared}")))
                     },
                 );
-                (ClientOp::BreakLock, body)
+                (ClientOp::ClearSessions, body)
             }
             Call::Custom { label, f } => {
                 let body: Body = Box::new(

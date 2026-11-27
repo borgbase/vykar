@@ -1,6 +1,6 @@
 pub(crate) mod backup;
-pub(crate) mod break_lock;
 pub(crate) mod check;
+pub(crate) mod clear_sessions;
 pub(crate) mod compact;
 pub(crate) mod daemon;
 pub(crate) mod delete;

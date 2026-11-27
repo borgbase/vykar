@@ -639,7 +639,7 @@ fn fold_and_save(repo: &mut RepoWriter<'_>) -> Result<()> {
 }
 
 /// Delete this handle's exclusive session's marker keys (a reaper, or
-/// `vykar break-lock`).
+/// `vykar clear-sessions`).
 fn delete_markers(repo: &Repo) {
     for key in repo.storage().list("sessions/").unwrap() {
         if key.starts_with("sessions/x-") && key.ends_with(".json") {

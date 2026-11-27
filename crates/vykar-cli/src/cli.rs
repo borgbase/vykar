@@ -257,14 +257,10 @@ pub(crate) enum Commands {
 
     /// Remove lock files left by vykar 0.24 or an interrupted upgrade (without
     /// asking), then list all session markers and remove them (asks first)
-    BreakLock {
+    ClearSessions {
         /// Select repository by label or path
         #[arg(short = 'R', long = "repo")]
         repo: Option<String>,
-
-        /// Accepted for compatibility: break-lock always removes session markers
-        #[arg(long)]
-        sessions: bool,
     },
 
     /// Run scheduled backups as a foreground daemon
@@ -493,7 +489,7 @@ impl Commands {
             | Self::Check { repo, .. }
             | Self::Info { repo, .. }
             | Self::Mount { repo, .. }
-            | Self::BreakLock { repo, .. }
+            | Self::ClearSessions { repo, .. }
             | Self::Compact { repo, .. }
             | Self::Upgrade { repo, .. } => repo.as_deref(),
             Self::Snapshot { command, .. } => command.repo(),
@@ -534,7 +530,7 @@ impl Commands {
             Self::Check { .. } => "check",
             Self::Info { .. } => "info",
             Self::Mount { .. } => "mount",
-            Self::BreakLock { .. } => "break-lock",
+            Self::ClearSessions { .. } => "clear-sessions",
             Self::Compact { .. } => "compact",
             Self::Upgrade { .. } => "upgrade",
             Self::Snapshot { .. } => "snapshot",

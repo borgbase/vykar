@@ -1,8 +1,10 @@
 use vykar_core::commands;
+use vykar_core::commands::compact::CompactRequest;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
 use vykar_core::app::passphrase::RepoPassphrase;
 
@@ -16,11 +18,14 @@ pub(crate) fn run_compact(
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
-    let stats = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::compact::run(
-            config, passphrase, threshold, max_bytes, dry_run, cancel,
-        )?)
-    })?;
+    let req = CompactRequest {
+        threshold: commands::compact::checked_threshold(threshold, config.compact.threshold),
+        max_repack_size: max_bytes,
+        dry_run,
+    };
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let stats = commands::compact::run_on_repo(&mut repo, &req, cancel)?;
+    drop(repo);
 
     if dry_run {
         println!(
@@ -51,15 +56,12 @@ pub(crate) fn run_compact(
 
 /// `vykar compact --report-unreferenced`: the counts of a mark, on stdout.
 pub(crate) fn run_report_unreferenced(
-    config: &VykarConfig,
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let report = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::compact::report_unreferenced(
-            config, passphrase, cancel,
-        )?)
-    })?;
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let report = commands::compact::report_unreferenced_on_repo(&mut repo, cancel)?;
+    drop(repo);
     println!(
         "Snapshots: {} ({} distinct tree chunks, {} stored)",
         report.snapshots,

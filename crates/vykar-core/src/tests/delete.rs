@@ -8,7 +8,17 @@ use super::helpers::{
 };
 
 fn compact(config: &crate::config::VykarConfig) -> commands::compact::CompactStats {
-    commands::compact::run(config, pass(config), 10.0, None, false, &CancelToken::new()).unwrap()
+    commands::compact::run(
+        config,
+        pass(config),
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap()
 }
 
 #[test]

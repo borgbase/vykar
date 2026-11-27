@@ -200,7 +200,15 @@ fn check_detects_corruption_ok_path(corruption: Corruption) {
     let (repo_dir, config) = setup_repo(tmp.path());
 
     // Healthy check should pass
-    let healthy = commands::check::run(&config, pass(&config), true, false).unwrap();
+    let healthy = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(
         healthy.errors.is_empty(),
         "repo should be healthy before corruption, got errors: {:?}",
@@ -209,7 +217,15 @@ fn check_detects_corruption_ok_path(corruption: Corruption) {
 
     apply_corruption(corruption, &repo_dir);
 
-    let result = commands::check::run(&config, pass(&config), true, false).unwrap();
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(
         !result.errors.is_empty(),
         "{corruption:?}: check should detect corruption but returned no errors"
@@ -228,7 +244,14 @@ fn check_detects_corruption_err_path(corruption: Corruption) {
 
     apply_corruption(corruption, &repo_dir);
 
-    let result = commands::check::run(&config, pass(&config), true, false);
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    );
     assert!(
         result.is_err(),
         "{corruption:?}: check should return Err, got Ok({:?})",
@@ -248,8 +271,15 @@ fn check_with_deleted_index_head_fails() {
     apply_delete_index(&repo_dir);
 
     // A segmented repository always has a head; without one the open fails.
-    let err = commands::check::run(&config, pass(&config), true, false)
-        .expect_err("deleted index head: check must fail");
+    let err = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("deleted index head: check must fail");
     assert!(err.to_string().contains("index head missing"), "{err}");
 }
 
@@ -330,7 +360,15 @@ fn repair_fixes_corruption(corruption: Corruption) {
     );
 
     // Verify repo is actually clean with a read-only check
-    let check = commands::check::run(&config, pass(&config), true, false).unwrap();
+    let check = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(
         check.errors.is_empty(),
         "{corruption:?}: post-repair check should report 0 errors, got: {:?}",

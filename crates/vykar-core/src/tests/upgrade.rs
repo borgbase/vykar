@@ -179,7 +179,15 @@ impl Fixture {
     }
 
     fn check_clean(&self) {
-        let result = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
+        let result = commands::check::run(
+            &self.config,
+            pass(&self.config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
@@ -732,17 +740,23 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
     assert_legacy_refusal(&fx.open(&fx.tmp.path().join("reader"), true).err().unwrap());
     assert_legacy_refusal(&fx.open(&fx.cache(), true).err().unwrap());
     assert_legacy_refusal(
-        &commands::check::run(&fx.config, pass(&fx.config), false, false)
-            .err()
-            .unwrap(),
+        &commands::check::run(
+            &fx.config,
+            pass(&fx.config),
+            &commands::check::CheckRequest::default(),
+        )
+        .err()
+        .unwrap(),
     );
     assert_legacy_refusal(
         &commands::compact::run(
             &fx.config,
             pass(&fx.config),
-            0.0,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
         .err()
@@ -1152,9 +1166,13 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
         ("open with index", fx.open(&fx.cache(), true).err().unwrap()),
         (
             "check",
-            commands::check::run(config, pass(config), false, false)
-                .err()
-                .unwrap(),
+            commands::check::run(
+                config,
+                pass(config),
+                &commands::check::CheckRequest::default(),
+            )
+            .err()
+            .unwrap(),
         ),
         (
             "check --repair --dry-run",
@@ -1172,19 +1190,25 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
         ),
         (
             "compact",
-            commands::compact::run(config, pass(config), 0.0, None, false, &CancelToken::new())
-                .err()
-                .unwrap(),
+            commands::compact::run(
+                config,
+                pass(config),
+                &commands::compact::CompactRequest {
+                    threshold: 0.0,
+                    max_repack_size: None,
+                    dry_run: false,
+                },
+                &CancelToken::new(),
+            )
+            .err()
+            .unwrap(),
         ),
         (
             "prune",
             commands::prune::run(
                 config,
                 pass(config),
-                false,
-                false,
-                &[],
-                &[],
+                &commands::prune::PruneRequest::default(),
                 &CancelToken::new(),
             )
             .err()
@@ -1445,9 +1469,11 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
     let first = commands::compact::run(
         &fx.config,
         pass(&fx.config),
-        1.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 1.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -1456,9 +1482,11 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
     let second = commands::compact::run(
         &fx.config,
         pass(&fx.config),
-        1.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 1.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();

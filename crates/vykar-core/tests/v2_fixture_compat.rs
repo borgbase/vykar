@@ -133,7 +133,15 @@ fn v2_fixtures_restore_byte_identical() {
 fn v2_fixtures_verify_data_is_clean() {
     for mode in MODES {
         let fx = extract_upgraded(mode);
-        let result = commands::check::run(&fx.config(), fx.passphrase(), true, false).unwrap();
+        let result = commands::check::run(
+            &fx.config(),
+            fx.passphrase(),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             result.errors.is_empty(),
             "{mode}: check --verify-data reported {:?}",
@@ -194,7 +202,15 @@ fn v2_fixtures_upgrade_to_v6_with_blake2b() {
         );
         drop(repo);
 
-        let result = commands::check::run(&config, fx.passphrase(), true, false).unwrap();
+        let result = commands::check::run(
+            &config,
+            fx.passphrase(),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{mode}: {:?}", result.errors);
 
         let dest = fx.root.join("restore-upgraded");
@@ -304,10 +320,7 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
         commands::prune::run(
             &prune_config,
             fx.passphrase(),
-            false,
-            false,
-            &[],
-            &[],
+            &commands::prune::PruneRequest::default(),
             &CancelToken::new(),
         )
         .unwrap();
@@ -316,9 +329,11 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
         commands::compact::run(
             &config,
             fx.passphrase(),
-            0.0,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -341,7 +356,15 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
             "{mode}: restore after delete/prune/compact is not byte-identical"
         );
 
-        let result = commands::check::run(&config, fx.passphrase(), true, false).unwrap();
+        let result = commands::check::run(
+            &config,
+            fx.passphrase(),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             result.errors.is_empty(),
             "{mode}: check --verify-data after maintenance reported {:?}",
@@ -403,9 +426,16 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
             "{mode}: unexpected restore message: {err}"
         );
 
-        let err = commands::check::run(&config, wrong, true, false)
-            .err()
-            .unwrap_or_else(|| panic!("{mode}: check with a wrong passphrase must fail"));
+        let err = commands::check::run(
+            &config,
+            wrong,
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{mode}: check with a wrong passphrase must fail"));
         assert!(
             err.to_string().contains("vykar upgrade"),
             "{mode}: unexpected check message: {err}"

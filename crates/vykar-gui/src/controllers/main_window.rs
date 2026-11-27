@@ -350,7 +350,7 @@ fn wire_snapshots(ui: &MainWindow, app_tx: &Sender<AppCommand>, ui_tx: &Sender<U
     let tx = app_tx.clone();
     ui.on_delete_selected_snapshots_clicked(move || {
         // Group by repo so each repo's delete runs as a single batch in
-        // one session (`commands::delete::run`).
+        // one session (`commands::delete::run_on_repo`).
         for (repo_name, snapshot_names) in ui_state::selected_snapshots_by_repo() {
             let _ = tx.send(AppCommand::DeleteSnapshots {
                 repo_name,

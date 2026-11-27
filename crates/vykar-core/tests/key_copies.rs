@@ -466,7 +466,12 @@ fn a_corrupt_copy_does_not_stop_the_open_and_check_reports_it() {
 
     fx.open().expect("the good copy must carry the open");
 
-    let result = commands::check::run(&fx.config, Some(PASS), false, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        Some(PASS),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert_eq!(result.key_files_checked, 2);
     assert!(
         result
@@ -514,7 +519,12 @@ fn divergent_but_resolvable_opens_off_the_real_key_and_repairs_the_other() {
         .expect("the genuine key is provable, so this opens");
     assert_eq!(repo.manifest().snapshots.len(), 1);
 
-    let result = commands::check::run(&fx.config, Some(PASS), false, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        Some(PASS),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(
         result
             .errors
@@ -568,7 +578,14 @@ fn divergent_and_unresolvable_fails_at_open_and_changes_nothing() {
     assert!(msg.contains("Refusing to guess"), "{msg}");
 
     // `check` and `check --repair` cannot get past the same open.
-    assert!(commands::check::run(&fx.config, Some(PASS), false, false).is_err());
+    assert!(
+        commands::check::run(
+            &fx.config,
+            Some(PASS),
+            &commands::check::CheckRequest::default()
+        )
+        .is_err()
+    );
     assert!(
         commands::check::run_with_repair(
             &fx.config,
@@ -1143,7 +1160,12 @@ fn check_reports_an_unreadable_copy_without_promising_a_rewrite() {
     let fx = Fixture::new();
     make_unreadable_via_fs(&fx.secondary());
 
-    let result = commands::check::run(&fx.config, Some(PASS), false, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        Some(PASS),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert_eq!(result.key_files_checked, 1);
     let issue = result
         .errors

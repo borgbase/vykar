@@ -2066,9 +2066,16 @@ fn a_pack_uploaded_during_the_mark_is_not_analysed() {
     mem.set_mtime(&early, old);
     wrapped.armed.store(true, Ordering::SeqCst);
 
-    let stats =
-        crate::commands::compact::run_on_repo(&mut repo, 0.1, None, false, &CancelToken::new())
-            .unwrap();
+    let stats = crate::commands::compact::run_on_repo(
+        &mut repo,
+        &crate::commands::compact::CompactRequest {
+            threshold: 0.1,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(
         !wrapped.armed.load(Ordering::SeqCst),
         "the mark listed snapshots"
@@ -2080,4 +2087,16 @@ fn a_pack_uploaded_during_the_mark_is_not_analysed() {
         mem.exists(&late).unwrap(),
         "the pack PUT during the mark stays"
     );
+}
+
+/// An out-of-range or non-finite threshold falls back; one in 0–100 is kept.
+#[test]
+fn checked_threshold_falls_back_outside_0_to_100() {
+    use crate::commands::compact::checked_threshold;
+    for bad in [-1.0, 101.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(checked_threshold(bad, 20.0), 20.0, "{bad}");
+    }
+    for good in [0.0, 50.0, 100.0] {
+        assert_eq!(checked_threshold(good, 20.0), good);
+    }
 }

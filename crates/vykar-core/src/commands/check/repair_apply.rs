@@ -749,8 +749,7 @@ mod tests {
             skip_packs: None,
             snapshot_sample: None,
         };
-        let scan =
-            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let scan = integrity_scan(&mut repo, &config, &opts, None, &CancelToken::new()).unwrap();
         let plan = build_repair_plan(&scan, &HashMap::new(), &HashMap::new());
         assert!(
             plan.actions.iter().any(|a| matches!(
@@ -822,8 +821,7 @@ mod tests {
             skip_packs: None,
             snapshot_sample: None,
         };
-        let scan =
-            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let scan = integrity_scan(&mut repo, &config, &opts, None, &CancelToken::new()).unwrap();
         let plan = build_repair_plan(&scan, &HashMap::new(), &HashMap::new());
         assert!(
             matches!(
@@ -1090,8 +1088,7 @@ mod tests {
             skip_packs: None,
             snapshot_sample: None,
         };
-        let scan =
-            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let scan = integrity_scan(&mut repo, &config, &opts, None, &CancelToken::new()).unwrap();
         let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
         for (chunk_id, entry) in repo.chunk_index().iter() {
             pack_chunks
@@ -1194,7 +1191,15 @@ mod tests {
             "{:?}",
             repaired.applied
         );
-        let check = crate::commands::check::run(&config, pass(&config), true, false).unwrap();
+        let check = crate::commands::check::run(
+            &config,
+            pass(&config),
+            &crate::commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(check.errors.is_empty(), "{:?}", check.errors);
         let mut repo = open_local_repo(&repo_dir);
         for (name, old) in [("snap-a", id_a), ("snap-b", id_b)] {

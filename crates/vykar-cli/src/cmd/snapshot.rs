@@ -100,7 +100,7 @@ pub(crate) fn run_snapshot_command(
         }
         SnapshotCommand::Delete {
             snapshots, dry_run, ..
-        } => super::delete::run_delete(config, snapshots, *dry_run, cancel, passphrase),
+        } => super::delete::run_delete(snapshots, *dry_run, cancel, passphrase),
         SnapshotCommand::Diff {
             snapshot_a,
             snapshot_b,

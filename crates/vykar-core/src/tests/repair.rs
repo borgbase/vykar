@@ -555,7 +555,15 @@ fn deleted_index_is_rebuilt_from_the_packs() {
         "Apply with deleted index should remove nothing, got: {:?}",
         apply_result.applied
     );
-    let check = commands::check::run(&config, pass(&config), true, false).unwrap();
+    let check = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty(), "{:?}", check.errors);
 }
 

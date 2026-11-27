@@ -5,7 +5,7 @@ use super::types::{
     CheckError, CheckProgressEvent, ProcessedVerifyResult, ServerVerifyOutcome, emit_progress,
 };
 use crate::index::ChunkIndexEntry;
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use vykar_protocol::{
     PACK_HEADER_SIZE, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
@@ -44,7 +44,7 @@ pub(crate) fn try_server_verify(
     pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
     verify_data: bool,
     hash: HashAlgorithm,
-    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> ServerVerifyOutcome {
     let total_packs = pack_chunks.len();
@@ -125,7 +125,7 @@ pub(crate) fn try_server_verify(
             Ok(resp) => {
                 if is_first_batch {
                     emit_progress(
-                        progress,
+                        events,
                         CheckProgressEvent::ServerVerifyPhaseStarted { total_packs },
                     );
                 }
@@ -153,7 +153,7 @@ pub(crate) fn try_server_verify(
                     end = offset + packs_covered.max(1);
                 }
                 emit_progress(
-                    progress,
+                    events,
                     CheckProgressEvent::ServerVerifyProgress {
                         verified: end,
                         total_packs,

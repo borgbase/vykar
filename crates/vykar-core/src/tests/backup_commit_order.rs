@@ -885,19 +885,41 @@ fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn assert_check_clean(config: &crate::config::VykarConfig) {
-    let result = crate::commands::check::run(config, pass(config), false, false).unwrap();
+    let result = crate::commands::check::run(
+        config,
+        pass(config),
+        &crate::commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 /// [`assert_check_clean`] with data verification on.
 fn assert_check_clean_verified(config: &crate::config::VykarConfig) {
-    let result = crate::commands::check::run(config, pass(config), true, false).unwrap();
+    let result = crate::commands::check::run(
+        config,
+        pass(config),
+        &crate::commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
 fn compact(config: &crate::config::VykarConfig) {
-    crate::commands::compact::run(config, pass(config), 0.0, None, false, &CancelToken::new())
-        .unwrap();
+    crate::commands::compact::run(
+        config,
+        pass(config),
+        &crate::commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
 }
 
 fn assert_superset(packs: &[String], config: &crate::config::VykarConfig) {
@@ -987,9 +1009,11 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     let err = crate::commands::compact::run(
         &config,
         pass(&config),
-        0.0,
-        None,
-        false,
+        &crate::commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap_err()
@@ -1228,9 +1252,11 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 let swept = crate::commands::compact::run(
                     &other,
                     pass(&other),
-                    10.0,
-                    None,
-                    false,
+                    &crate::commands::compact::CompactRequest {
+                        threshold: 10.0,
+                        max_repack_size: None,
+                        dry_run: false,
+                    },
                     &CancelToken::new(),
                 )
                 .unwrap();

@@ -87,13 +87,26 @@ fn check_verify_data_flag_controls_data_verification_counters() {
     let config = init_repo(&repo_dir);
     backup_single_source(&config, &source_dir, "src-a", "snap-check-verify");
 
-    let without_verify = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let without_verify = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(without_verify.errors.is_empty());
     assert_eq!(without_verify.chunks_data_verified, 0);
     assert!(without_verify.chunks_existence_checked > 0);
     assert!(without_verify.packs_existence_checked > 0);
 
-    let with_verify = commands::check::run(&config, pass(&config), true, false).unwrap();
+    let with_verify = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(with_verify.errors.is_empty());
     assert!(with_verify.chunks_data_verified > 0);
     assert!(with_verify.chunks_existence_checked > 0);
@@ -127,11 +140,13 @@ fn sampled_check_preserves_local_fallback_counters() {
             let result = commands::check::run_with_progress(
                 &config,
                 pass(&config),
-                verify_data,
-                distrust_server,
+                &commands::check::CheckRequest {
+                    verify_data,
+                    distrust_server,
+                    max_percent: 50,
+                    ..Default::default()
+                },
                 None,
-                50,
-                false,
                 &CancelToken::new(),
             )
             .unwrap();
@@ -170,7 +185,12 @@ fn check_reports_missing_pack_file_in_storage() {
     assert!(pack_path.exists());
     std::fs::remove_file(pack_path).unwrap();
 
-    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(result.chunks_existence_checked > 0);
     assert!(result.packs_existence_checked > 0);
     assert!(
@@ -206,7 +226,12 @@ fn check_reports_snapshot_metadata_load_failures() {
     // Corrupt the snapshot blob so it's still listed but fails to decrypt/deserialize.
     std::fs::write(&snapshot_path, b"corrupted-snapshot-data").unwrap();
 
-    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert_eq!(result.snapshots_checked, 0);
     assert!(
         result
@@ -240,11 +265,8 @@ fn check_with_progress_emits_phase_events() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
-        Some(&mut on_progress),
-        100,
-        false,
+        &commands::check::CheckRequest::default(),
+        Some(&crate::repo::control::FnMutSink::new(&mut on_progress)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -280,7 +302,12 @@ fn check_deduplicates_pack_existence_checks() {
     let config = init_repo(&repo_dir);
     backup_single_source(&config, &source_dir, "src-dedup", "snap-dedup");
 
-    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(result.errors.is_empty());
     assert!(result.chunks_existence_checked > 0);
     assert!(result.packs_existence_checked > 0);
@@ -428,14 +455,12 @@ fn test_server_fallback_no_stale_errors() {
     let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
     pack_chunks.insert(pack_id, vec![(chunk_id, entry)]);
 
-    let mut progress: Option<&mut dyn FnMut(commands::check::CheckProgressEvent)> = None;
-
     let outcome = try_server_verify(
         &storage,
         &pack_chunks,
         true,
         vykar_types::hash::HashAlgorithm::Blake2b,
-        &mut progress,
+        None,
         &CancelToken::new(),
     );
 
@@ -638,7 +663,12 @@ fn check_reports_items_affected_by_missing_pack() {
         "test setup picked a pack with no referencing items"
     );
 
-    let result = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let result = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
 
     // Pack-level error from Phase 2 must still be present (existing behavior).
     assert!(
@@ -1128,7 +1158,12 @@ fn check_flags_unsupported_version_and_repair_refuses() {
     bump_snapshot_version_on_disk(&repo_dir, "snap-future", 999);
 
     // Plain check: reports it as unsupported, never as corrupt.
-    let res = commands::check::run(&config, pass(&config), false, false).unwrap();
+    let res = commands::check::run(
+        &config,
+        pass(&config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(
         res.errors
             .iter()
@@ -1616,11 +1651,8 @@ fn check_cancelled_mid_scan_returns_interrupted() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
-        Some(&mut cb),
-        100,
-        false,
+        &commands::check::CheckRequest::default(),
+        Some(&crate::repo::control::FnMutSink::new(&mut cb)),
         &flag,
     );
     assert_interrupted(result);
@@ -1648,11 +1680,8 @@ fn check_cancelled_on_late_callback_returns_interrupted() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
-        Some(&mut cb),
-        100,
-        false,
+        &commands::check::CheckRequest::default(),
+        Some(&crate::repo::control::FnMutSink::new(&mut cb)),
         &flag, // verify_data = false: no later phase polls the flag
     );
     assert_interrupted(result);
@@ -1673,11 +1702,11 @@ fn interrupted_check_does_not_record_full_check() {
     let control = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
+        &commands::check::CheckRequest {
+            record_state: true,
+            ..Default::default()
+        },
         None,
-        100,
-        true,
         &CancelToken::new(),
     )
     .unwrap();
@@ -1705,11 +1734,11 @@ fn interrupted_check_does_not_record_full_check() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
-        Some(&mut cb),
-        100,
-        true,
+        &commands::check::CheckRequest {
+            record_state: true,
+            ..Default::default()
+        },
+        Some(&crate::repo::control::FnMutSink::new(&mut cb)),
         &flag,
     );
     assert_interrupted(result);
@@ -1751,11 +1780,11 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
+        &commands::check::CheckRequest {
+            record_state: true,
+            ..Default::default()
+        },
         None,
-        100,
-        true,
         &flag,
     );
     assert_interrupted(result);
@@ -1769,11 +1798,12 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
+        &commands::check::CheckRequest {
+            max_percent: 0,
+            record_state: true,
+            ..Default::default()
+        },
         None,
-        0,
-        true,
         &flag,
     );
     assert_interrupted(result);
@@ -1814,11 +1844,8 @@ fn missing_pack_rescan_is_cancellable() {
     let result = commands::check::run_with_progress(
         &config,
         pass(&config),
-        false,
-        false,
-        Some(&mut cb),
-        100,
-        false,
+        &commands::check::CheckRequest::default(),
+        Some(&crate::repo::control::FnMutSink::new(&mut cb)),
         &flag,
     );
     assert_interrupted(result);
@@ -2177,7 +2204,15 @@ impl InterruptedRewrite {
         );
         drop(repo);
 
-        let check = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
+        let check = commands::check::run(
+            &self.config,
+            pass(&self.config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(check.errors.is_empty(), "{:?}", check.errors);
 
         for (name, dir, files) in [
@@ -2606,7 +2641,12 @@ fn a_repair_judges_two_objects_of_one_name_after_the_reindex() {
 fn check_reports_two_objects_of_one_name_and_checks_each() {
     let mut fx = interrupted_item_repair();
     fx.rekey_rewrite_with(id_after(), lost_listing);
-    let check = commands::check::run(&fx.config, pass(&fx.config), false, false).unwrap();
+    let check = commands::check::run(
+        &fx.config,
+        pass(&fx.config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     let duplicate = |errors: &[CheckError]| {
         errors.iter().any(|e| {
             e.context == "snapshot 'snap-drop'"
@@ -2770,6 +2810,10 @@ fn run_on_repo_with_a_cancelled_token_is_interrupted() {
     let cancel = CancelToken::new();
     cancel.cancel();
     assert_interrupted(commands::check::run_on_repo(
-        &mut repo, &config, false, false, None, 100, false, &cancel,
+        &mut repo,
+        &config,
+        &commands::check::CheckRequest::default(),
+        None,
+        &cancel,
     ));
 }

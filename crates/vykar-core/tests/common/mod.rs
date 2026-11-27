@@ -295,8 +295,17 @@ pub fn exercise_pack_naming(
     // pn-a's backup segment and packs are old, so the sweep takes its
     // entries (compact keeps those of segments younger than T_pack).
     age_repo_objects(repo_dir, &["index.d", "packs"], PAST_T_PACK);
-    let compact =
-        commands::compact::run(config, passphrase, 0.0, None, false, &CancelToken::new()).unwrap();
+    let compact = commands::compact::run(
+        config,
+        passphrase,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(
         compact.packs_repacked > 0,
         "compaction repacked nothing, so repack pack names went unchecked: {compact:?}"

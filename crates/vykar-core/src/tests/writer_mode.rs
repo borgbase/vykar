@@ -141,8 +141,16 @@ fn compact_report_and_dry_run_refuse_on_a_multi_writer_repository() {
     let cancel = crate::repo::control::CancelToken::new();
     let report = crate::commands::compact::report_unreferenced_on_repo(&mut repo, &cancel)
         .expect_err("the report refused");
-    let dry = crate::commands::compact::run_on_repo(&mut repo, 10.0, None, true, &cancel)
-        .expect_err("the dry run refused");
+    let dry = crate::commands::compact::run_on_repo(
+        &mut repo,
+        &crate::commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: true,
+        },
+        &cancel,
+    )
+    .expect_err("the dry run refused");
     for err in [report, dry] {
         assert!(
             matches!(err, VykarError::MultiWriterUnsupported { .. }),

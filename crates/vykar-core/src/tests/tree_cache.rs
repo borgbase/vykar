@@ -600,7 +600,12 @@ fn check_reads_tree_chunks_from_storage() {
     pack[e.pack_offset as usize + e.stored_size as usize / 2] ^= 0x01;
     std::fs::write(&path, pack).unwrap();
 
-    let result = commands::check::run(&host.config, pass(&host.config), false, false).unwrap();
+    let result = commands::check::run(
+        &host.config,
+        pass(&host.config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     let messages: Vec<String> = result.errors.iter().map(|e| e.message.clone()).collect();
     assert!(
         messages.iter().any(|m| m.contains("load item stream")),
@@ -613,12 +618,27 @@ fn check_reads_tree_chunks_from_storage() {
 
     // Check does not fill the cache either.
     std::fs::remove_dir_all(host.cache_root()).unwrap();
-    commands::check::run(&host.config, pass(&host.config), false, false).unwrap();
+    commands::check::run(
+        &host.config,
+        pass(&host.config),
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert!(host.cached().is_empty());
 }
 
 fn compact(config: &crate::config::VykarConfig, pass: Option<&str>) {
-    commands::compact::run(config, pass, 10.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run(
+        config,
+        pass,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
 }
 
 /// CP-5: prune keeps the cache (it reads nothing); the compact after it
@@ -641,10 +661,10 @@ fn compact_after_prune_drops_the_pruned_snapshots_unique_tree_chunks() {
     let (stats, _) = commands::prune::run_on_repo(
         &mut repo,
         &host.config,
-        false,
-        false,
-        &host.sources(),
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &host.sources(),
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -675,10 +695,10 @@ fn prune_with_nothing_to_prune_keeps_the_cache() {
     let (stats, _) = commands::prune::run(
         &host.config,
         pass(&host.config),
-        false,
-        false,
-        &host.sources(),
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &host.sources(),
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -752,10 +772,10 @@ fn only_compact_drops_chunks_another_host_pruned() {
     let (stats, _) = commands::prune::run_on_repo(
         &mut other,
         &keep_one,
-        false,
-        false,
-        &host.sources(),
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &host.sources(),
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();

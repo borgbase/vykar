@@ -411,3 +411,40 @@ fn open_accepts_right_after_the_open() {
         Some(TEST_PASSPHRASE)
     );
 }
+
+/// A hooked command that opened first: a decryption failure after the open
+/// is damage, the command's error. It neither re-prompts nor re-runs, and the
+/// value that opened stays cached.
+#[test]
+fn hooked_prune_damage_after_open_does_not_reprompt() {
+    use crate::repo::OpenOptions;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, "r");
+    let _env = prompt_only(&mut repo.config);
+    let mut service = AppService::new();
+    let mut prompt = ScriptedPrompt::new(&[Reply::Value(TEST_PASSPHRASE)]);
+    let runs = Cell::new(0);
+
+    let result = service.run_hooked(
+        &repo,
+        HookedCommand::Prune,
+        false,
+        &mut prompt,
+        &mut |_| {},
+        |pass| -> Result<(), OpsError> {
+            let _repo = pass.open::<OpsError>(OpenOptions::new(), &CancelToken::new())?;
+            runs.set(runs.get() + 1);
+            // What a damaged object read after the open returns.
+            Err(OpsError::from(VykarError::DecryptionFailed))
+        },
+    );
+
+    assert!(
+        matches!(result, Err(OpsError::Engine(VykarError::DecryptionFailed))),
+        "{result:?}"
+    );
+    assert_eq!(prompt.asks(), 1);
+    assert_eq!(runs.get(), 1);
+    assert!(service.is_cached(&repo.config));
+}

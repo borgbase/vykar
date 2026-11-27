@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::repo::control::EventSink;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
@@ -547,11 +548,11 @@ pub enum CheckProgressEvent {
 }
 
 pub(super) fn emit_progress(
-    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     event: CheckProgressEvent,
 ) {
-    if let Some(callback) = progress.as_deref_mut() {
-        callback(event);
+    if let Some(sink) = events {
+        sink.emit(event);
     }
 }
 

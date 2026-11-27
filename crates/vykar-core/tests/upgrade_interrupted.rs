@@ -161,7 +161,15 @@ fn assert_upgraded(fx: &Fixture, legacy: &[String], hash: &str, label: &str) {
     )
     .unwrap();
     assert_eq!(maps.packs_mapped, 0, "{label}: every pack is mapped");
-    let check = commands::check::run(&fx.config(), fx.passphrase(), true, false).unwrap();
+    let check = commands::check::run(
+        &fx.config(),
+        fx.passphrase(),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty(), "{label}: {:?}", check.errors);
 }
 

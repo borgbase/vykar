@@ -194,11 +194,11 @@ fn readers_work_against_storage_that_refuses_writes() {
     let result = commands::check::run_on_repo(
         &mut repo,
         &fx.config,
-        false,
-        true,
+        &commands::check::CheckRequest {
+            distrust_server: true,
+            ..Default::default()
+        },
         None,
-        100,
-        false,
         &CancelToken::new(),
     )
     .unwrap();

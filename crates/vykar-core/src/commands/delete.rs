@@ -36,10 +36,10 @@ pub fn run(
     run_on_repo(&mut repo, snapshot_names, dry_run, cancel)
 }
 
-/// [`run`] on an already opened repository, in a registered session in
-/// both modes (`with_snapshot_removal_session`). A dry run only resolves
-/// the names.
-pub(crate) fn run_on_repo(
+/// [`run`] on a repository opened with `OpenOptions::new()`, in a
+/// registered session in both modes (`with_snapshot_removal_session`). A
+/// dry run only resolves the names.
+pub fn run_on_repo(
     repo: &mut Repo,
     snapshot_names: &[&str],
     dry_run: bool,

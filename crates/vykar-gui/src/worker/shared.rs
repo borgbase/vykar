@@ -7,6 +7,7 @@ use vykar_core::app::{AppService, OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
 use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::{OpenOptions, Repo};
 use vykar_types::error::Result;
 
 use crate::cancel::CancelSlot;
@@ -155,7 +156,8 @@ pub(super) fn select_repo_or_fail<'r>(
 const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 
 /// Guard + repo-select + passphrase-retry scaffold shared by the conventional
-/// worker handlers (delete, diff, prune, find).
+/// worker handlers (diff, find). Delete uses [`with_open_repo_op`] and prune
+/// [`with_hooked_repo_op`].
 ///
 /// The guard lives for the duration of `run`, so a repo miss, a dismissed
 /// prompt, and a failed run are all reported here — exactly once each. On
@@ -206,16 +208,64 @@ pub(super) fn with_repo_op<T>(
     }
 }
 
-/// [`with_repo_op`] for a hookable command: the repo-level hooks for `command`
-/// enclose the passphrase step and `run`, so a prompt appears only after the
-/// `before` hooks pass and a re-prompt does not re-run them. A hook skip or a
+/// [`with_repo_op`] over an open repository: the repository is opened with
+/// the passphrase (`OpenOptions::new()`, observing the operation's cancel
+/// token), the passphrase is accepted right after the open, and `run` gets
+/// the handle. A decryption failure inside `run` is the command's error, not
+/// a refused passphrase: it does not re-prompt.
+pub(super) fn with_open_repo_op<T>(
+    ctx: &mut WorkerContext,
+    repo_name: &str,
+    status: impl Into<String>,
+    label: &str,
+    mut run: impl FnMut(&ResolvedRepo, &mut Repo, &CancelToken) -> Result<T>,
+) -> std::result::Result<T, String> {
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        status,
+    );
+
+    let Some(repo) = select_repo_or_fail(&mut guard, &ctx.runtime.repos, repo_name) else {
+        return Err("repository not found".to_string());
+    };
+
+    let cancel = ctx.cancel_requested.current();
+    let mut prompt = DialogPrompt;
+    let mut pass = ctx
+        .service
+        .passphrase(&repo.config, repo.label.as_deref(), &mut prompt);
+    let outcome = pass
+        .open::<OpsError>(OpenOptions::new(), &cancel)
+        .and_then(|mut r| run(repo, &mut r, &cancel).map_err(OpsError::from));
+
+    match outcome {
+        Ok(value) => Ok(value),
+        // A dismissed prompt is the user's choice, not a failure: log it and
+        // leave the status bar clean.
+        Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
+            Err("passphrase required".to_string())
+        }
+        Err(e) => {
+            guard.fail(format!("[{repo_name}] {label} failed: {e}"));
+            Err(e.to_string())
+        }
+    }
+}
+
+/// [`with_open_repo_op`] for a hookable command: the repo-level hooks for
+/// `command` enclose the passphrase step, the open and `run`, so a prompt
+/// appears only after the `before` hooks pass and a re-prompt does not re-run
+/// them. The handle is closed before the `after` hooks run. A hook skip or a
 /// dismissed prompt is logged and is not a failure; hook warnings are logged.
 pub(super) fn with_hooked_repo_op<T>(
     ctx: &mut WorkerContext,
     repo_name: &str,
     status: impl Into<String>,
     command: HookedCommand,
-    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &CancelToken) -> Result<T>,
+    mut run: impl FnMut(&ResolvedRepo, &mut Repo, &CancelToken) -> Result<T>,
 ) -> std::result::Result<T, String> {
     let mut guard = OpGuard::ui(
         &ctx.ui_tx,
@@ -238,7 +288,10 @@ pub(super) fn with_hooked_repo_op<T>(
         false,
         &mut DialogPrompt,
         &mut |w| send_log(ui_tx, format!("[{repo_name}] hook warning: {w}")),
-        |pass| pass.with(|p| run(repo, p, &cancel).map_err(OpsError::from)),
+        |pass| {
+            let mut r = pass.open::<OpsError>(OpenOptions::new(), &cancel)?;
+            run(repo, &mut r, &cancel).map_err(OpsError::from)
+        },
     );
 
     match outcome {

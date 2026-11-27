@@ -296,7 +296,15 @@ impl Env {
     }
 
     fn assert_check_clean(&self) {
-        let result = commands::check::run(&self.config, pass(&self.config), true, false).unwrap();
+        let result = commands::check::run(
+            &self.config,
+            pass(&self.config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             result.errors.is_empty(),
             "check errors: {:?}",
@@ -365,10 +373,10 @@ fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast(
         let (stats, _) = commands::prune::run(
             &env.config,
             pass(&env.config),
-            false,
-            false,
-            &env.sources(&["a"]),
-            &[],
+            &commands::prune::PruneRequest {
+                sources: &env.sources(&["a"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -378,9 +386,11 @@ fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast(
         commands::compact::run(
             &env.config,
             pass(&env.config),
-            100.0,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: 100.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -428,9 +438,11 @@ fn compact_leaves_the_table_at_the_new_state() {
         let stats = commands::compact::run(
             &env.config,
             pass(&env.config),
-            0.0,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -463,10 +475,10 @@ fn maintenance_on_a_host_without_caches_segmented() {
     let (stats, _) = commands::prune::run(
         &env.config,
         pass(&env.config),
-        false,
-        false,
-        &env.sources(&["a"]),
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &env.sources(&["a"]),
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -482,9 +494,11 @@ fn maintenance_on_a_host_without_caches_segmented() {
     let swept = commands::compact::run(
         &config,
         pass(&config),
-        100.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 100.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -515,10 +529,10 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         let (stats, _) = commands::prune::run(
             &env.config,
             pass(&env.config),
-            false,
-            false,
-            &env.sources(&["a"]),
-            &[],
+            &commands::prune::PruneRequest {
+                sources: &env.sources(&["a"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -537,10 +551,17 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
             Box::new(FailIndexPut { inner: env.local() }),
             OpenOptions::new(),
         );
-        let err =
-            commands::compact::run_on_repo(&mut repo, 100.0, None, false, &CancelToken::new())
-                .unwrap_err()
-                .to_string();
+        let err = commands::compact::run_on_repo(
+            &mut repo,
+            &commands::compact::CompactRequest {
+                threshold: 100.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("injected index PUT failure"), "{err}");
         drop(repo);
 
@@ -580,9 +601,11 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
         commands::compact::run(
             &env.config,
             pass(&env.config),
-            100.0,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: 100.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -761,10 +784,10 @@ fn prune_uses_index_current_at_session_time() {
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
-            false,
-            false,
-            &env.sources(&["a", "b"]),
-            &[],
+            &commands::prune::PruneRequest {
+                sources: &env.sources(&["a", "b"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -819,9 +842,16 @@ fn compact_does_not_delete_packs_committed_after_open() {
         let src_b = env.source("b", &[("other.bin", 0x55)]);
         let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
 
-        let stats =
-            commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
-                .unwrap();
+        let stats = commands::compact::run_on_repo(
+            &mut repo,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap();
         drop(repo);
         assert_eq!(stats.packs_orphan, 0, "{stats:?}");
 
@@ -877,10 +907,10 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &keep_all,
-            false,
-            false,
-            &env.sources(&["a"]),
-            &[],
+            &commands::prune::PruneRequest {
+                sources: &env.sources(&["a"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -894,10 +924,11 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
-            true,
-            false,
-            &env.sources(&["a"]),
-            &[],
+            &commands::prune::PruneRequest {
+                dry_run: true,
+                sources: &env.sources(&["a"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();
@@ -931,10 +962,10 @@ fn prune_runs_beside_a_live_session() {
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
-            false,
-            false,
-            &env.sources(&["a"]),
-            &[],
+            &commands::prune::PruneRequest {
+                sources: &env.sources(&["a"]),
+                ..Default::default()
+            },
             &CancelToken::new(),
         )
         .unwrap();

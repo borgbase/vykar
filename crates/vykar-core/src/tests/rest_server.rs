@@ -156,7 +156,16 @@ fn entries(config: &VykarConfig) -> Vec<String> {
 
 fn check_clean(config: &VykarConfig) {
     for distrust_server in [false, true] {
-        let result = commands::check::run(config, pass(config), true, distrust_server).unwrap();
+        let result = commands::check::run(
+            config,
+            pass(config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                distrust_server,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 }
@@ -228,7 +237,16 @@ fn v6_backup_sweep_fold_and_compact_through_the_server() {
         policy.soft.segments = 2;
         repo.set_fold_policy(policy);
         repo.set_index_gc_grace(std::time::Duration::ZERO);
-        commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
+        commands::compact::run_on_repo(
+            &mut repo,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap();
     };
     let named_on_server = |h: &crate::index::head::IndexHead| {
         h.named_objects().all(|n| {
@@ -583,8 +601,17 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
 
     // compact: refused before its session, so nothing is written at all.
     server.take_requests();
-    let err =
-        commands::compact::run(&c.config, pass(&c.config), 0.0, None, false, &cancel).unwrap_err();
+    let err = commands::compact::run(
+        &c.config,
+        pass(&c.config),
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &cancel,
+    )
+    .unwrap_err();
     assert!(is_append_only_refusal(&err, "vykar compact"), "{err:?}");
     let reqs = assert_refused_cleanly(&server, &c.config, &before, "compact");
     let puts: Vec<_> = reqs
@@ -592,23 +619,51 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
         .filter(|r| r.0 == axum::http::Method::PUT)
         .collect();
     assert!(puts.is_empty(), "{puts:?}");
-    commands::compact::run(&c.config, pass(&c.config), 0.0, None, true, &cancel).unwrap();
+    commands::compact::run(
+        &c.config,
+        pass(&c.config),
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: true,
+        },
+        &cancel,
+    )
+    .unwrap();
     server.take_requests();
 
     // prune: refused only when it would remove a snapshot.
     let mut pruning = c.config.clone();
     pruning.retention.keep_last = Some(1);
-    let err = commands::prune::run(&pruning, pass(&pruning), false, false, &[], &[], &cancel)
-        .err()
-        .unwrap();
+    let err = commands::prune::run(
+        &pruning,
+        pass(&pruning),
+        &commands::prune::PruneRequest::default(),
+        &cancel,
+    )
+    .err()
+    .unwrap();
     assert!(is_append_only_refusal(&err, "vykar prune"), "{err:?}");
     assert_refused_cleanly(&server, &c.config, &before, "prune");
-    let (stats, _) =
-        commands::prune::run(&pruning, pass(&pruning), true, false, &[], &[], &cancel).unwrap();
+    let (stats, _) = commands::prune::run(
+        &pruning,
+        pass(&pruning),
+        &commands::prune::PruneRequest {
+            dry_run: true,
+            ..Default::default()
+        },
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(stats.pruned, 1);
     pruning.retention.keep_last = Some(5);
-    let (stats, _) =
-        commands::prune::run(&pruning, pass(&pruning), false, false, &[], &[], &cancel).unwrap();
+    let (stats, _) = commands::prune::run(
+        &pruning,
+        pass(&pruning),
+        &commands::prune::PruneRequest::default(),
+        &cancel,
+    )
+    .unwrap();
     assert_eq!(stats.pruned, 0);
     server.take_requests();
 
@@ -1001,8 +1056,16 @@ fn trailer_packs_through_the_server() {
     .unwrap();
     age_repo_objects(server.data.path(), &["index.d", "packs"], PAST_T_PACK);
     let mut repo = open(&c.config);
-    let stats =
-        commands::compact::run_on_repo(&mut repo, 1.0, None, false, &CancelToken::new()).unwrap();
+    let stats = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 1.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     drop(repo);
     assert!(stats.packs_repacked > 0, "{stats:?}");
 
@@ -1065,9 +1128,11 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     commands::compact::run(
         &c.config,
         pass(&c.config),
-        0.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();

@@ -14,7 +14,7 @@ use super::types::{
 use crate::config::VykarConfig;
 use crate::index::table::IndexState;
 use crate::index::{ChunkIndexEntry, LiveIndex};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::index_store;
 use crate::repo::{OpenOptions, Repo, needs_recheck};
 use tracing::info;
@@ -157,12 +157,12 @@ fn scan_for_repair(
     repo: &mut Repo,
     config: &VykarConfig,
     scan_opts: &ScanOptions,
-    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     load: &RepairIndexLoad,
     cancel: &CancelToken,
 ) -> Result<RepairScan> {
     let mut reconciled = reconcile_duplicate_names(repo, Judge::DeferUnindexed, cancel)?;
-    let first = integrity_scan(repo, config, scan_opts, progress, cancel)?;
+    let first = integrity_scan(repo, config, scan_opts, events, cancel)?;
     // Refuse before building the plan so a dry-run never presents a
     // misleading executable plan for a too-new repo, and in Apply before
     // the delete probe and execute_repair, so not even the probe object is
@@ -182,7 +182,7 @@ fn scan_for_repair(
         });
     }
     let found = CheckResult::from(first);
-    let scan = integrity_scan(repo, config, scan_opts, progress, cancel)?;
+    let scan = integrity_scan(repo, config, scan_opts, events, cancel)?;
     refuse_repair_if_unreadable_snapshots(&scan)?;
     Ok(RepairScan {
         scan,
@@ -234,39 +234,51 @@ impl From<ScanResult> for CheckResult {
     }
 }
 
+/// One check run's knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckRequest {
+    pub verify_data: bool,
+    /// Verify data on the client even when the server could (needs
+    /// `verify_data`).
+    pub distrust_server: bool,
+    /// Percentage of packs and snapshots to check (0–100); `check.full_every`
+    /// can raise it to 100.
+    pub max_percent: u8,
+    /// Record a successful full (100%) check in the local check state file,
+    /// for `check.full_every` (the cycle; the standalone CLI does not).
+    pub record_state: bool,
+}
+
+impl Default for CheckRequest {
+    /// The standalone `vykar check`: metadata only, a full check, nothing
+    /// recorded.
+    fn default() -> Self {
+        Self {
+            verify_data: false,
+            distrust_server: false,
+            max_percent: 100,
+            record_state: false,
+        }
+    }
+}
+
 /// Run `vykar check`.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    verify_data: bool,
-    distrust_server: bool,
+    req: &CheckRequest,
 ) -> Result<CheckResult> {
-    run_with_progress(
-        config,
-        passphrase,
-        verify_data,
-        distrust_server,
-        None,
-        100,
-        false,
-        &CancelToken::new(),
-    )
+    run_with_progress(config, passphrase, req, None, &CancelToken::new())
 }
 
-/// Run check with progress reporting.
-///
-/// `max_percent`: percentage of packs/snapshots to check (0–100). 100 = full check.
-/// `record_state`: if true and a full (100%) check succeeds, record the timestamp
-///   in the local check state file. Standalone CLI passes false; daemon/GUI passes true.
-#[allow(clippy::too_many_arguments)]
+/// Open the repository and run [`run_on_repo`]. A check with
+/// `max_percent == 0` and no `check.full_every` returns a skipped result
+/// without opening.
 pub fn run_with_progress(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    verify_data: bool,
-    distrust_server: bool,
-    progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    max_percent: u8,
-    record_state: bool,
+    req: &CheckRequest,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<CheckResult> {
     // Entry guard: on an empty repository every loop below runs zero
@@ -276,7 +288,7 @@ pub fn run_with_progress(
 
     // Pre-open early exit: if max_percent=0 and no full_every configured,
     // skip without opening the repo at all.
-    if skips_without_open(config, max_percent) {
+    if skips_without_open(config, req.max_percent) {
         return Ok(skipped_result());
     }
 
@@ -284,33 +296,24 @@ pub fn run_with_progress(
     let mut repo =
         crate::commands::util::open_repo(config, passphrase, OpenOptions::new(), cancel)?;
 
-    run_on_repo(
-        &mut repo,
-        config,
-        verify_data,
-        distrust_server,
-        progress,
-        max_percent,
-        record_state,
-        cancel,
-    )
+    run_on_repo(&mut repo, config, req, events, cancel)
 }
 
-/// [`run_with_progress`] on an already opened repository (opened with
-/// `OpenOptions::new()`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_on_repo(
+/// [`run_with_progress`] on a repository opened with `OpenOptions::new()`.
+pub fn run_on_repo(
     repo: &mut Repo,
     config: &VykarConfig,
-    verify_data: bool,
-    distrust_server: bool,
-    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    max_percent: u8,
-    record_state: bool,
+    req: &CheckRequest,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<CheckResult> {
     // The entry guard of `run_with_progress`, for callers that opened.
     cancel.check()?;
+    let CheckRequest {
+        max_percent,
+        record_state,
+        ..
+    } = *req;
     let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
     let full_every_dur = config.check.full_every_duration();
 
@@ -347,16 +350,7 @@ pub(crate) fn run_on_repo(
     // and snapshots, so a finding is not lost to a new draw.
     let mut sample = None;
     let mut passes = 1;
-    let mut result = check_pass(
-        repo,
-        config,
-        verify_data,
-        distrust_server,
-        &mut progress,
-        effective,
-        &mut sample,
-        cancel,
-    )?;
+    let mut result = check_pass(repo, config, *req, events, effective, &mut sample, cancel)?;
     while !result.errors.is_empty() {
         let latest = index_store::fetch_head(repo.storage().as_ref(), repo.crypto().as_ref())?;
         let Some(head) = repo.index_head() else {
@@ -389,16 +383,7 @@ pub(crate) fn run_on_repo(
         cancel.check()?;
         repo.refresh_snapshot_list()?;
         passes += 1;
-        result = check_pass(
-            repo,
-            config,
-            verify_data,
-            distrust_server,
-            &mut progress,
-            effective,
-            &mut sample,
-            cancel,
-        )?;
+        result = check_pass(repo, config, *req, events, effective, &mut sample, cancel)?;
     }
 
     // Completion guard, before the success timestamp *and* before the result
@@ -497,17 +482,20 @@ fn sample_indices(of: SampleOf, total: usize, percent: u8) -> HashSet<usize> {
 /// One pass of [`run_on_repo`] at the latest head: index load, server
 /// verify and the integrity scan. A sampled pass (`effective < 100`) draws
 /// `sample` when it is `None`, and checks what it names otherwise.
-#[allow(clippy::too_many_arguments)]
 fn check_pass(
     repo: &mut Repo,
     config: &VykarConfig,
-    verify_data: bool,
-    distrust_server: bool,
-    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    req: CheckRequest,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     effective: u8,
     sample: &mut Option<CheckSample>,
     cancel: &CancelToken,
 ) -> Result<CheckResult> {
+    let CheckRequest {
+        verify_data,
+        distrust_server,
+        ..
+    } = req;
     repo.load_chunk_index_uncached()?;
 
     // Build per-pack grouping from chunk index (needed for server verify).
@@ -542,7 +530,7 @@ fn check_pass(
             &pack_chunks,
             verify_data,
             repo.content_hash(),
-            progress,
+            events,
             cancel,
         )
     } else {
@@ -593,7 +581,7 @@ fn check_pass(
             skip_packs: skip,
             snapshot_sample: sample.map(|s| &s.snapshots),
         },
-        progress,
+        events,
         cancel,
     )?;
 
@@ -682,27 +670,34 @@ pub fn run_with_repair(
     passphrase: Option<&str>,
     verify_data: bool,
     mode: RepairMode,
-    progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<RepairResult> {
     cancel.check()?;
 
-    let opts = repair_open_options(mode);
+    let mut repo = crate::commands::util::open_repo(
+        config,
+        passphrase,
+        repair_open_options(mode),
+        &repair_storage_token(mode, cancel),
+    )?;
+    run_with_repair_on_repo(&mut repo, config, verify_data, mode, events, cancel)
+}
+
+/// The token a repair's storage observes: `cancel` for PlanOnly. Otherwise
+/// a token nothing cancels: past its mutation boundary a repair must not be
+/// cut short, and the read path beneath `execute_repair` does not poll
+/// `cancel` either. The scan stays cancellable by polling.
+pub fn repair_storage_token(mode: RepairMode, cancel: &CancelToken) -> CancelToken {
     if mode == RepairMode::PlanOnly {
-        let mut repo = crate::commands::util::open_repo(config, passphrase, opts, cancel)?;
-        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, cancel)
+        cancel.clone()
     } else {
-        // A token nothing cancels: past its mutation boundary a repair must
-        // not be cut short, and the read path beneath `execute_repair` does
-        // not poll `cancel` either. The scan stays cancellable by polling.
-        let mut repo =
-            crate::commands::util::open_repo(config, passphrase, opts, &CancelToken::new())?;
-        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, cancel)
+        CancelToken::new()
     }
 }
 
 /// Open options `run_with_repair` uses for `mode`.
-pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
+pub fn repair_open_options(mode: RepairMode) -> OpenOptions {
     if mode == RepairMode::PlanOnly {
         // PlanOnly: no session marker, purely read-only. `skip_key_backfill`
         // is what keeps that promise: the dry run prints "no changes applied",
@@ -717,17 +712,18 @@ pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
 }
 
 /// [`run_with_repair`] on a repository opened with
-/// [`repair_open_options`]`(mode)`. PlanOnly registers no session;
-/// Apply/ApplyShown run as an exclusive session here
-/// (`commands::util::with_exclusive_session`).
-pub(crate) fn run_with_repair_on_repo(
+/// [`repair_open_options`]`(mode)` and [`repair_storage_token`]`(mode,
+/// cancel)`. PlanOnly registers no session; Apply/ApplyShown run as an
+/// exclusive session here (`commands::util::with_exclusive_session`).
+pub fn run_with_repair_on_repo(
     repo: &mut Repo,
     config: &VykarConfig,
     verify_data: bool,
     mode: RepairMode,
-    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<RepairResult> {
+    cancel.check()?;
     let scan_opts = ScanOptions {
         collect_chunk_refs: true,
         detect_orphans: true,
@@ -745,7 +741,7 @@ pub(crate) fn run_with_repair_on_repo(
             reindexed,
             found,
             reconciled,
-        } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+        } = scan_for_repair(repo, config, &scan_opts, events, &load, cancel)?;
         scan.issues.extend(reconciled.issues);
 
         let plan = plan_repair(
@@ -787,7 +783,7 @@ pub(crate) fn run_with_repair_on_repo(
                 reindexed,
                 found,
                 reconciled,
-            } = scan_for_repair(repo, config, &scan_opts, &mut progress, &load, cancel)?;
+            } = scan_for_repair(repo, config, &scan_opts, events, &load, cancel)?;
             scan.issues.extend(reconciled.issues);
 
             let pack_chunks = group_by_pack(repo.chunk_index());
@@ -912,8 +908,7 @@ mod tests {
             skip_packs: None,
             snapshot_sample: None,
         };
-        let scan =
-            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let scan = integrity_scan(&mut repo, &config, &opts, None, &CancelToken::new()).unwrap();
         repo.set_storage_for_test(Arc::new(Server {
             inner: MemoryBackend::new(),
             caps,

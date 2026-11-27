@@ -176,23 +176,53 @@ struct PackAnalysis {
     dead_bytes: u64,
 }
 
+/// One compact run's knobs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactRequest {
+    /// Repack packs with at least this percentage of unused space (0–100).
+    pub threshold: f64,
+    pub max_repack_size: Option<u64>,
+    pub dry_run: bool,
+}
+
+impl CompactRequest {
+    /// `config.compact.threshold`, no repack cap, not a dry run (the cycle's
+    /// compact).
+    pub fn from_config(config: &VykarConfig) -> Self {
+        Self {
+            threshold: config.compact.threshold,
+            max_repack_size: None,
+            dry_run: false,
+        }
+    }
+}
+
+/// `threshold` when it is a finite percentage in 0–100, else `fallback`
+/// (warned).
+pub fn checked_threshold(threshold: f64, fallback: f64) -> f64 {
+    if !threshold.is_finite() || !(0.0..=100.0).contains(&threshold) {
+        warn!(
+            value = threshold,
+            default = fallback,
+            "compact threshold out of range (0–100), using config default"
+        );
+        fallback
+    } else {
+        threshold
+    }
+}
+
+/// Open the repository and run [`run_on_repo`], with `req.threshold` passed
+/// through [`checked_threshold`] against `config.compact.threshold`.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    threshold: f64,
-    max_repack_size: Option<u64>,
-    dry_run: bool,
+    req: &CompactRequest,
     cancel: &CancelToken,
 ) -> Result<CompactStats> {
-    let threshold = if !threshold.is_finite() || !(0.0..=100.0).contains(&threshold) {
-        let default = config.compact.threshold;
-        warn!(
-            value = threshold,
-            default, "compact threshold out of range (0–100), using config default"
-        );
-        default
-    } else {
-        threshold
+    let req = CompactRequest {
+        threshold: checked_threshold(req.threshold, config.compact.threshold),
+        ..*req
     };
 
     // The backend observes `cancel` in its retry waits. `persist_and_delete`
@@ -200,7 +230,7 @@ pub fn run(
     // and no retries, and on SFTP a read in flight is abandoned; it is
     // crash-safe by design.
     let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
-    run_on_repo(&mut repo, threshold, max_repack_size, dry_run, cancel)
+    run_on_repo(&mut repo, &req, cancel)
 }
 
 /// What a mark found in the index (`vykar compact --report-unreferenced`).
@@ -248,7 +278,7 @@ pub fn report_unreferenced(
 /// 7): it writes nothing a writer depends on. A mark that fails because a backup
 /// committed between the head read and the snapshot listing (a moved head)
 /// is retried on the latest head, at most [`COMPACT_MARK_ATTEMPTS`] times.
-pub(crate) fn report_unreferenced_on_repo(
+pub fn report_unreferenced_on_repo(
     repo: &mut Repo,
     cancel: &CancelToken,
 ) -> Result<UnreferencedReport> {
@@ -353,7 +383,8 @@ fn report_marked(repo: &mut Repo, cancel: &CancelToken) -> Result<UnreferencedRe
     Ok(report)
 }
 
-/// [`run`] on an already opened repository, with a sanitised `threshold`.
+/// [`run`] on a repository opened with `OpenOptions::new()`;
+/// `req.threshold` is used as given.
 /// The chunk index is loaded in the run's session, so any index loaded at
 /// open is replaced. On an append-only server a non-dry run is refused
 /// before the registration.
@@ -380,12 +411,12 @@ fn report_marked(repo: &mut Repo, cancel: &CancelToken) -> Result<UnreferencedRe
 /// session whose marker was reaped while it still commits left to the
 /// post-PUT pack-age check (I8) and to the commit's marker probe before its
 /// snapshot PUT. Other writers may move the head while compact works:
-/// [`mark_and_sweep`] (the second session listing, the re-read head, the
-/// incremental re-mark) and [`persist_batch`] (the relocation rebase)
+/// `mark_and_sweep` (the second session listing, the re-read head, the
+/// incremental re-mark) and `persist_batch` (the relocation rebase)
 /// handle that.
 ///
 /// On a single-writer repository (10-single-protocol step 7) it first
-/// makes the single-writer check ([`single_writer_compact_check`]): it
+/// makes the single-writer check (`single_writer_compact_check`): it
 /// never waits, and refuses beside a committing backup or another compact,
 /// so that only one writer writes heads at a time.
 ///
@@ -393,14 +424,12 @@ fn report_marked(repo: &mut Repo, cancel: &CancelToken) -> Result<UnreferencedRe
 /// ([`VykarError::MarkRefused`] of [`VykarError::LiveChunkNotInIndex`]) is
 /// recorded in this machine's repository cache dir, and a compact whose
 /// mark completed clears the record ([`compact_refusal`]).
-pub(crate) fn run_on_repo(
+pub fn run_on_repo(
     repo: &mut Repo,
-    threshold: f64,
-    max_repack_size: Option<u64>,
-    dry_run: bool,
+    req: &CompactRequest,
     cancel: &CancelToken,
 ) -> Result<CompactStats> {
-    let result = run_on_repo_inner(repo, threshold, max_repack_size, dry_run, cancel);
+    let result = run_on_repo_inner(repo, req, cancel);
     let dir = repo.cache_dir();
     match &result {
         Err(e @ VykarError::MarkRefused(cause))
@@ -416,11 +445,14 @@ pub(crate) fn run_on_repo(
 
 fn run_on_repo_inner(
     repo: &mut Repo,
-    threshold: f64,
-    max_repack_size: Option<u64>,
-    dry_run: bool,
+    req: &CompactRequest,
     cancel: &CancelToken,
 ) -> Result<CompactStats> {
+    let CompactRequest {
+        threshold,
+        max_repack_size,
+        dry_run,
+    } = *req;
     if !dry_run {
         refuse_on_append_only_server(repo.storage().as_ref(), "vykar compact")?;
     }

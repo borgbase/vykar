@@ -263,7 +263,15 @@ pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, v
         "{label}: {:?}",
         result.repair_errors
     );
-    let check = commands::check::run(&cold, fx.passphrase(), true, false).unwrap();
+    let check = commands::check::run(
+        &cold,
+        fx.passphrase(),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty(), "{label}: {:?}", check.errors);
     let dest = fx.root.join("restore-rebuilt");
     commands::restore::run(

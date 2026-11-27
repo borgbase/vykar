@@ -23,10 +23,11 @@ fn prune_errors_when_no_retention_rules_are_configured() {
     let err = commands::prune::run(
         &config,
         pass(&config),
-        true,
-        false,
-        &sources,
-        &[],
+        &commands::prune::PruneRequest {
+            dry_run: true,
+            sources: &sources,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .err()
@@ -63,10 +64,12 @@ fn prune_dry_run_reports_without_mutating_state() {
     let (stats, list_entries) = commands::prune::run(
         &config,
         pass(&config),
-        true,
-        true,
-        &sources,
-        &[],
+        &commands::prune::PruneRequest {
+            dry_run: true,
+            list: true,
+            sources: &sources,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .expect("dry-run prune should succeed");
@@ -112,10 +115,11 @@ fn prune_source_filter_only_prunes_matching_label() {
     let (stats, _list_entries) = commands::prune::run(
         &config,
         pass(&config),
-        false,
-        false,
-        &sources,
-        &source_filter,
+        &commands::prune::PruneRequest {
+            sources: &sources,
+            source_filter: &source_filter,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -164,10 +168,7 @@ fn prune_groups_by_label_even_without_configured_sources() {
     let (stats, _) = commands::prune::run(
         &config,
         pass(&config),
-        false,
-        false,
-        &[],
-        &[],
+        &commands::prune::PruneRequest::default(),
         &CancelToken::new(),
     )
     .expect("prune should succeed without a sources block");
@@ -213,10 +214,7 @@ fn prune_persists_snapshot_cache_immediately() {
     let (stats, _) = commands::prune::run(
         &config,
         pass(&config),
-        false,
-        false,
-        &[],
-        &[],
+        &commands::prune::PruneRequest::default(),
         &CancelToken::new(),
     )
     .unwrap();
@@ -244,10 +242,10 @@ fn prune_errors_without_retention_rules_when_sources_empty() {
     let err = commands::prune::run(
         &config,
         pass(&config),
-        true,
-        false,
-        &[],
-        &[],
+        &commands::prune::PruneRequest {
+            dry_run: true,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .err()
@@ -304,10 +302,10 @@ fn prune_reads_no_pack_and_writes_no_index() {
     let (stats, _) = commands::prune::run(
         &config,
         pass(&config),
-        false,
-        false,
-        &sources,
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &sources,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();

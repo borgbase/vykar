@@ -487,10 +487,10 @@ fn report_on_a_healthy_repository_is_clean() {
     let (stats, _) = commands::prune::run(
         &config,
         fx.pass,
-        false,
-        false,
-        &[source_entry(&src, "src")],
-        &[],
+        &commands::prune::PruneRequest {
+            sources: &[source_entry(&src, "src")],
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -503,8 +503,17 @@ fn report_on_a_healthy_repository_is_clean() {
     let report = fx.report().unwrap();
     assert_eq!(report.snapshots, 2);
     assert!(!report.unreferenced.is_empty());
-    let swept = commands::compact::run(&fx.config, fx.pass, 10.0, None, false, &CancelToken::new())
-        .unwrap();
+    let swept = commands::compact::run(
+        &fx.config,
+        fx.pass,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(
         swept.chunks_unreferenced as usize,
         report.unreferenced.len()
@@ -1241,7 +1250,12 @@ fn check_attributes_a_bad_tree_chunk_to_every_snapshot_that_uses_it() {
     assert_eq!(names, ["A", "B"]);
     assert_eq!(scan.snapshots_checked, 1);
 
-    let result = commands::check::run(&fx.config, fx.pass, false, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        fx.pass,
+        &commands::check::CheckRequest::default(),
+    )
+    .unwrap();
     assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
     assert_eq!(result.snapshots_checked, 1);
 }
@@ -1538,9 +1552,11 @@ fn compact(fx: &Fx, dry_run: bool) -> Result<commands::compact::CompactStats> {
     commands::compact::run(
         &fx.config,
         fx.pass,
-        10.0,
-        None,
-        dry_run,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run,
+        },
         &CancelToken::new(),
     )
 }
@@ -1645,7 +1661,15 @@ fn compact_after_a_delete_sweeps_what_the_report_names() {
     .unwrap();
     let after = fx.report().unwrap();
     assert!(after.unreferenced.is_empty(), "{:?}", after.unreferenced);
-    let check = commands::check::run(&fx.config, fx.pass, true, false).unwrap();
+    let check = commands::check::run(
+        &fx.config,
+        fx.pass,
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty(), "{:?}", check.errors);
 }
 
@@ -1835,8 +1859,16 @@ fn compact_refuses_a_listing_that_hides_a_marked_snapshot() {
         hidden: hidden.clone(),
     };
     let mut repo = Repo::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
-    let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
-        .unwrap_err();
+    let err = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap_err();
     drop(repo);
     assert_mark_refused(&err, &format!("{hidden} exists but the listing"));
     assert_eq!(repo_files(&fx), before);
@@ -1860,8 +1892,16 @@ fn compact_refuses_a_live_snapshot_whose_get_finds_nothing() {
         .storage_key();
     let before = repo_files(&fx);
     let mut repo = Ghost::open(&fx, &hidden);
-    let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
-        .unwrap_err();
+    let err = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap_err();
     drop(repo);
     assert_mark_refused(&err, &format!("{hidden} was listed but is gone"));
     assert_eq!(repo_files(&fx), before);
@@ -1945,8 +1985,16 @@ fn compact_refuses_when_the_sweep_record_cannot_be_fetched() {
         key: key.clone(),
     };
     let mut repo = Repo::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
-    let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
-        .unwrap_err();
+    let err = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap_err();
     drop(repo);
     assert_mark_refused(&err, &format!("injected get failure: {key}"));
     assert_eq!(repo_files(&fx), before);
@@ -2108,7 +2156,16 @@ fn compact_collects_old_heads_and_unnamed_objects() {
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = 1;
     repo.set_fold_policy(policy);
-    commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     let latest = repo.index_head().unwrap().clone();
     drop(repo);
     let kept = heads(&fx);
@@ -2142,6 +2199,14 @@ fn compact_collects_old_heads_and_unnamed_objects() {
         assert!(named.contains(&name), "{name} is not named by a kept head");
     }
     drop(repo);
-    let check = commands::check::run(&fx.config, fx.pass, true, false).unwrap();
+    let check = commands::check::run(
+        &fx.config,
+        fx.pass,
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty(), "{:?}", check.errors);
 }

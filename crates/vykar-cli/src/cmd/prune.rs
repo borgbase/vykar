@@ -1,8 +1,10 @@
 use vykar_core::commands;
+use vykar_core::commands::prune::PruneRequest;
 use vykar_core::config::{SourceEntry, VykarConfig};
+use vykar_core::repo::OpenOptions;
 use vykar_core::repo::control::CancelToken;
 
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use vykar_core::app::passphrase::RepoPassphrase;
 
 pub(crate) fn run_prune(
@@ -14,17 +16,20 @@ pub(crate) fn run_prune(
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let (stats, list_entries) = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::prune::run(
-            config,
-            passphrase,
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let (stats, list_entries) = commands::prune::run_on_repo(
+        &mut repo,
+        config,
+        &PruneRequest {
             dry_run,
             list,
             sources,
             source_filter,
-            cancel,
-        )?)
-    })?;
+        },
+        cancel,
+    )?;
+    // Closed before the summary, so no handle is open while `after` hooks run.
+    drop(repo);
 
     if list || dry_run {
         for entry in &list_entries {

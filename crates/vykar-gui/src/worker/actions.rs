@@ -11,7 +11,7 @@ use vykar_common::display::format_bytes;
 use vykar_types::error::VykarError;
 
 use super::WorkerContext;
-use super::shared::{OpGuard, with_hooked_repo_op, with_repo_op};
+use super::shared::{OpGuard, with_hooked_repo_op, with_open_repo_op, with_repo_op};
 
 pub(super) fn handle_restore_selected(
     ctx: &mut WorkerContext,
@@ -154,13 +154,13 @@ pub(super) fn handle_delete_snapshots(
     };
 
     // Single batch call: validates all names up front and runs in one
-    // session (see `commands::delete::run`). Avoids per-row partial
+    // session (see `commands::delete::run_on_repo`). Avoids per-row partial
     // failures and a session registration per row. A pre-mutation
     // validation failure (e.g. SnapshotNotFound) leaves the repo untouched, so
     // one error covers the whole batch.
     let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();
-    let result = match with_repo_op(ctx, &repo_name, status, "delete", |repo, pass, cancel| {
-        commands::delete::run(&repo.config, pass, &names, false, cancel)
+    let result = match with_open_repo_op(ctx, &repo_name, status, "delete", |_, r, cancel| {
+        commands::delete::run_on_repo(r, &names, false, cancel)
     }) {
         Ok(r) => r,
         Err(_) => return,
@@ -288,8 +288,16 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
         &repo_name,
         "Pruning snapshots...",
         HookedCommand::Prune,
-        |repo, pass, cancel| {
-            commands::prune::run(&repo.config, pass, false, false, &repo.sources, &[], cancel)
+        |repo, r, cancel| {
+            commands::prune::run_on_repo(
+                r,
+                &repo.config,
+                &commands::prune::PruneRequest {
+                    sources: &repo.sources,
+                    ..Default::default()
+                },
+                cancel,
+            )
         },
     ) else {
         return;

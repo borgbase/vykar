@@ -171,7 +171,17 @@ fn delete_and_compact(config: &crate::config::VykarConfig, pass: Option<&str>, n
         &["index.d", "packs"],
         super::helpers::PAST_T_PACK,
     );
-    commands::compact::run(config, pass, 0.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run(
+        config,
+        pass,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
 }
 
 fn pack_exists(fx: &Fx, pack: &PackId) -> bool {
@@ -417,11 +427,12 @@ fn check_through(
     let result = commands::check::run_on_repo(
         &mut repo,
         &fx.config,
-        false,
-        true,
+        &commands::check::CheckRequest {
+            distrust_server: true,
+            max_percent: percent,
+            ..Default::default()
+        },
         None,
-        percent,
-        false,
         &CancelToken::new(),
     )
     .unwrap();
@@ -438,7 +449,17 @@ fn pack_of_a(fx: &Fx) -> PackId {
 /// Run a compact (threshold 0, nothing to repack): a new sweep generation,
 /// so a check that loaded the head before sees entries that may be gone.
 fn compact_moves_head(config: &crate::config::VykarConfig, pass: Option<&str>) {
-    commands::compact::run(config, pass, 0.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run(
+        config,
+        pass,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
 }
 
 /// A check whose pack `a.bin` lives in looks missing, with a compact

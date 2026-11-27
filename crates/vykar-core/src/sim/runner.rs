@@ -986,10 +986,10 @@ impl Sim {
                         let (stats, list) = prune::run_on_repo(
                             &mut repo,
                             &cfg,
-                            false,
-                            true,
-                            &[],
-                            &[],
+                            &prune::PruneRequest {
+                                list: true,
+                                ..Default::default()
+                            },
                             &CancelToken::new(),
                         )?;
                         let removed = list
@@ -1011,9 +1011,7 @@ impl Sim {
                         let mut repo = open_for(store, c, &cfg, env)?;
                         let s = compact::run_on_repo(
                             &mut repo,
-                            cfg.compact.threshold,
-                            None,
-                            false,
+                            &compact::CompactRequest::from_config(&cfg),
                             &CancelToken::new(),
                         )?;
                         Ok((
@@ -1053,11 +1051,11 @@ impl Sim {
                         let result = check::run_on_repo(
                             &mut repo,
                             &cfg,
-                            false,
-                            true,
+                            &check::CheckRequest {
+                                distrust_server: true,
+                                ..Default::default()
+                            },
                             None,
-                            100,
-                            false,
                             &CancelToken::new(),
                         )?;
                         Ok((

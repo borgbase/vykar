@@ -46,9 +46,11 @@ fn info_reports_referenced_size_larger_than_unique_when_chunks_are_reused() {
     commands::compact::run(
         &config,
         pass(&config),
-        10.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &crate::repo::control::CancelToken::new(),
     )
     .unwrap();

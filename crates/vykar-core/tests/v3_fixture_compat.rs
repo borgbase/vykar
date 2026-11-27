@@ -67,7 +67,15 @@ fn sorted_entries(
 }
 
 fn assert_check_clean(fx: &Fixture, label: &str) {
-    let result = commands::check::run(&fx.config(), fx.passphrase(), true, false).unwrap();
+    let result = commands::check::run(
+        &fx.config(),
+        fx.passphrase(),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(
         result.errors.is_empty(),
         "{label}: check --verify-data reported {:?}",

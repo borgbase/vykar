@@ -16,8 +16,11 @@ use crate::app::passphrase::{NoPrompt, PassphraseCache, RepoPassphrase};
 use crate::app::preflight::{self, UnavailableRepo};
 use crate::app::{HookError, OpsError, OpsResult};
 use crate::commands;
+use crate::commands::check::CheckRequest;
+use crate::commands::compact::CompactRequest;
+use crate::commands::prune::PruneRequest;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, FnMutSink};
 use crate::repo::{HostEnv, OpenOptions, Repo};
 use vykar_types::error::VykarError;
 
@@ -757,10 +760,12 @@ pub(crate) fn run_full_cycle(
                         commands::prune::run_on_repo(
                             repo,
                             config,
-                            false,
-                            false,
-                            sources,
-                            source_filter,
+                            &PruneRequest {
+                                dry_run: false,
+                                list: false,
+                                sources,
+                                source_filter,
+                            },
                             cancel,
                         )
                         .map(|(stats, _)| stats)
@@ -773,7 +778,7 @@ pub(crate) fn run_full_cycle(
                     let stats = r?;
                     // Surface post-commit warnings as cycle events so GUI/CLI
                     // consumers can log them as persistent entries. tracing
-                    // already fired inside commands::prune::run.
+                    // already fired inside commands::prune::run_on_repo.
                     for w in &stats.warnings {
                         evt(CycleEvent::StepWarning {
                             step: CycleStep::Prune,
@@ -814,9 +819,7 @@ pub(crate) fn run_full_cycle(
                         // The config threshold is normalised at load.
                         match commands::compact::run_on_repo(
                             repo,
-                            config.compact.threshold,
-                            None,
-                            false,
+                            &CompactRequest::from_config(config),
                             cancel,
                         ) {
                             // Compact runs in every cycle; on an append-only server it
@@ -876,14 +879,17 @@ pub(crate) fn run_full_cycle(
                     // The last step: taken, so no handle is open while its
                     // `after`, `failed` and `finally` hooks run.
                     let mut repo = session.take().expect("cycle_session opened it");
+                    let sink = FnMutSink::new(|e| evt(CycleEvent::Check(e)));
                     commands::check::run_on_repo(
                         &mut repo,
                         config,
-                        false,
-                        false,
-                        Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
-                        check_max_percent,
-                        true, // record_state: daemon/GUI updates the full_every timer
+                        &CheckRequest {
+                            max_percent: check_max_percent,
+                            // daemon/GUI updates the full_every timer
+                            record_state: true,
+                            ..CheckRequest::default()
+                        },
+                        Some(&sink),
                         cancel,
                     )
                     .map_err(OpsError::from)

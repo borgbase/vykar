@@ -1867,9 +1867,11 @@ fn info_reports_repository_statistics() {
     commands::compact::run(
         &config,
         common::pass(&config),
-        10.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 10.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();

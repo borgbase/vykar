@@ -2,10 +2,11 @@ use std::io::{self, BufRead, Write};
 
 use vykar_core::commands;
 use vykar_core::commands::check::{
-    IndexLoss, IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
+    CheckRequest, IndexLoss, IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
 };
 use vykar_core::config::VykarConfig;
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::OpenOptions;
+use vykar_core::repo::control::{CancelToken, FnMutSink};
 
 use crate::error::{CliError, CliResult};
 use vykar_core::app::passphrase::RepoPassphrase;
@@ -125,16 +126,21 @@ fn run_repair(
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<RepairResult> {
-    passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::check::run_with_repair(
-            config,
-            passphrase,
-            verify_data,
-            mode,
-            Some(&mut make_progress_callback()),
-            cancel,
-        )?)
-    })
+    // Before the open, as `run_with_repair` does.
+    cancel.check()?;
+    let mut repo = passphrase.open::<CliError>(
+        commands::check::repair_open_options(mode),
+        &commands::check::repair_storage_token(mode, cancel),
+    )?;
+    let sink = FnMutSink::new(make_progress_callback());
+    Ok(commands::check::run_with_repair_on_repo(
+        &mut repo,
+        config,
+        verify_data,
+        mode,
+        Some(&sink),
+        cancel,
+    )?)
 }
 
 fn run_check_readonly(
@@ -144,18 +150,24 @@ fn run_check_readonly(
     cancel: &CancelToken,
     passphrase: &mut RepoPassphrase<'_>,
 ) -> CliResult<()> {
-    let result = passphrase.with(|passphrase| -> CliResult<_> {
-        Ok(commands::check::run_with_progress(
-            config,
-            passphrase,
+    // Before the open, as `run_with_progress` does.
+    cancel.check()?;
+    let mut repo = passphrase.open::<CliError>(OpenOptions::new(), cancel)?;
+    let sink = FnMutSink::new(make_progress_callback());
+    let result = commands::check::run_on_repo(
+        &mut repo,
+        config,
+        // Standalone: always 100%, and the daemon's full_every timer is not
+        // updated.
+        &CheckRequest {
             verify_data,
             distrust_server,
-            Some(&mut make_progress_callback()),
-            100,   // standalone always 100%
-            false, // don't update daemon's full_every timer
-            cancel,
-        )?)
-    })?;
+            ..CheckRequest::default()
+        },
+        Some(&sink),
+        cancel,
+    )?;
+    drop(repo);
 
     print_check_summary(&result);
 

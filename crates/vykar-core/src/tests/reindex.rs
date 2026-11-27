@@ -114,9 +114,11 @@ impl Fixture {
         commands::compact::run(
             config,
             pass(config),
-            config.compact.threshold,
-            None,
-            false,
+            &commands::compact::CompactRequest {
+                threshold: config.compact.threshold,
+                max_repack_size: None,
+                dry_run: false,
+            },
             &CancelToken::new(),
         )
     }
@@ -133,7 +135,15 @@ impl Fixture {
     }
 
     fn check_clean(&self, config: &VykarConfig) {
-        let result = commands::check::run(config, pass(config), true, false).unwrap();
+        let result = commands::check::run(
+            config,
+            pass(config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 

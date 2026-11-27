@@ -83,16 +83,26 @@ fn lifecycle_delete_compact_check_and_restore() {
     let compact_stats = commands::compact::run(
         &config,
         common::pass(&config),
-        0.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();
     assert!(compact_stats.chunks_unreferenced > 0);
     assert!(compact_stats.space_freed > 0);
 
-    let check = commands::check::run(&config, common::pass(&config), true, false).unwrap();
+    let check = commands::check::run(
+        &config,
+        common::pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(
         check.errors.is_empty(),
         "check errors: {:?}",
@@ -187,10 +197,12 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     let (prune_stats, list_entries) = commands::prune::run(
         &config,
         common::pass(&config),
-        false,
-        true,
-        &sources,
-        &source_filter,
+        &commands::prune::PruneRequest {
+            list: true,
+            sources: &sources,
+            source_filter: &source_filter,
+            ..Default::default()
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -205,9 +217,11 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     let compact_stats = commands::compact::run(
         &config,
         common::pass(&config),
-        0.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();
@@ -217,7 +231,15 @@ fn prune_compact_check_and_restore_kept_snapshots() {
             || compact_stats.space_freed > 0
     );
 
-    let check = commands::check::run(&config, common::pass(&config), true, false).unwrap();
+    let check = commands::check::run(
+        &config,
+        common::pass(&config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty());
 
     let repo = open_local_repo(&repo_dir, Some(common::TEST_PASSPHRASE));
@@ -296,7 +318,15 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         config.xattrs.enabled,
     );
 
-    let check = commands::check::run(&config, Some(passphrase), true, false).unwrap();
+    let check = commands::check::run(
+        &config,
+        Some(passphrase),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(check.errors.is_empty());
 
     let restore_dir = tmp.path().join("restore");
@@ -346,7 +376,14 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         "unexpected restore message: {msg}"
     );
 
-    let wrong_check = commands::check::run(&config, Some(wrong_passphrase), true, false);
+    let wrong_check = commands::check::run(
+        &config,
+        Some(wrong_passphrase),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    );
     let msg = wrong_check.expect_err("check must fail").to_string();
     assert!(
         msg.contains("likely incorrect passphrase"),

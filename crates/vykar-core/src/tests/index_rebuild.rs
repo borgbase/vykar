@@ -276,7 +276,15 @@ fn write_pack_maps_of(plan: &RepairPlan) -> Option<&[PackId]> {
 }
 
 fn check_clean(config: &VykarConfig) {
-    let result = commands::check::run(config, pass(config), true, false).unwrap();
+    let result = commands::check::run(
+        config,
+        pass(config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
@@ -319,8 +327,17 @@ fn three_backups_and_a_compact() -> Fx {
         &["index.d", "packs"],
         super::helpers::PAST_T_PACK,
     );
-    let stats =
-        commands::compact::run(&fx.config, p, 0.0, None, false, &CancelToken::new()).unwrap();
+    let stats = commands::compact::run(
+        &fx.config,
+        p,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(stats.packs_repacked > 0, "{stats:?}");
     fx
 }
@@ -382,7 +399,17 @@ fn repair_restores_every_snapshot_after_index_and_index_d_are_deleted() {
     }
     check_clean(&cold);
     backup_single_source_with(&cold, pass(&cold), &fx.source, "src", "s4");
-    commands::compact::run(&cold, pass(&cold), 0.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run(
+        &cold,
+        pass(&cold),
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
     check_clean(&cold);
 }
 
@@ -402,7 +429,15 @@ fn verify_data_reports_a_damaged_trailer_and_repair_maps_the_pack() {
     // fails authentication.
     edit_pack(&pack, |b, start| b[start + 7] ^= 0xFF);
 
-    let result = commands::check::run(&fx.config, pass(&fx.config), true, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        pass(&fx.config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
     assert!(
         result.errors[0].message.contains("trailer"),
@@ -426,7 +461,16 @@ fn verify_data_reports_a_damaged_trailer_and_repair_maps_the_pack() {
     );
     assert_eq!(fx.pack_maps(), 1);
 
-    let result = commands::check::run(&fx.config, pass(&fx.config), true, true).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        pass(&fx.config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            distrust_server: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let again = repair(&fx.config, true, RepairMode::PlanOnly).unwrap().plan;
     assert_eq!(write_pack_maps_of(&again), None, "{:?}", again.actions);
@@ -462,7 +506,15 @@ fn verify_data_reports_a_trailer_that_disagrees_with_the_index() {
     bytes.extend_from_slice(&blob);
     std::fs::write(&pack, &bytes).unwrap();
 
-    let result = commands::check::run(&fx.config, pass(&fx.config), true, false).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        pass(&fx.config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
     assert!(
         result.errors[0].message.contains("lists 1 of"),
@@ -619,7 +671,16 @@ fn repair_maps_a_pack_whose_map_is_partial() {
     assert_eq!(write_pack_maps_of(&applied.plan), Some(&[pack_id][..]));
     assert_eq!(fx.pack_maps(), 2);
 
-    let result = commands::check::run(&fx.config, pass(&fx.config), true, true).unwrap();
+    let result = commands::check::run(
+        &fx.config,
+        pass(&fx.config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            distrust_server: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let again = repair(&fx.config, true, RepairMode::PlanOnly).unwrap().plan;
     assert_eq!(write_pack_maps_of(&again), None, "{:?}", again.actions);

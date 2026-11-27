@@ -67,7 +67,15 @@ fn unreferenced(config: &VykarConfig) -> commands::compact::UnreferencedReport {
 }
 
 fn check_clean(config: &VykarConfig) {
-    let result = commands::check::run(config, pass(config), true, false).unwrap();
+    let result = commands::check::run(
+        config,
+        pass(config),
+        &commands::check::CheckRequest {
+            verify_data: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
@@ -206,9 +214,11 @@ fn drift_in_a_later_segment_skips_the_file_and_keeps_its_chunks() {
     let compacted = commands::compact::run(
         &config,
         pass(&config),
-        0.0,
-        None,
-        false,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
         &CancelToken::new(),
     )
     .unwrap();

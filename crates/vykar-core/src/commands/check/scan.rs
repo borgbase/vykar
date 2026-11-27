@@ -11,7 +11,7 @@ use crate::commands::mark::{
 };
 use crate::config::VykarConfig;
 use crate::index::{ChunkIndexEntry, LiveIndex};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::format::{
     BlobLocation, ChunkDecodeStage, ObjectType, decode_chunk_into,
     unpack_object_expect_with_context,
@@ -428,7 +428,7 @@ pub(crate) fn scan_for_test(
         skip_packs: None,
         snapshot_sample: None,
     };
-    let scan = integrity_scan(repo, config, &opts, &mut None, &CancelToken::new())?;
+    let scan = integrity_scan(repo, config, &opts, None, &CancelToken::new())?;
     Ok(ScanForTest {
         issues: scan.issues,
         snapshots_checked: scan.counters.snapshots_checked,
@@ -467,7 +467,7 @@ pub(super) fn integrity_scan(
     repo: &mut Repo,
     config: &VykarConfig,
     opts: &ScanOptions,
-    progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    events: Option<&dyn EventSink<CheckProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<ScanResult> {
     let mut counters = ScanCounters::default();
@@ -590,7 +590,7 @@ pub(super) fn integrity_scan(
     for (i, entry) in snapshot_entries.into_iter().enumerate() {
         cancel.check()?;
         emit_progress(
-            progress,
+            events,
             CheckProgressEvent::SnapshotStarted {
                 current: i + 1,
                 total: snapshot_count,
@@ -936,7 +936,7 @@ pub(super) fn integrity_scan(
     let mut missing_packs: HashSet<PackId> = HashSet::new();
     if !packs_for_existence.is_empty() {
         emit_progress(
-            progress,
+            events,
             CheckProgressEvent::PacksExistencePhaseStarted {
                 total_packs: packs_for_existence.len(),
             },
@@ -973,7 +973,7 @@ pub(super) fn integrity_scan(
         issues.extend(pack_issues);
 
         emit_progress(
-            progress,
+            events,
             CheckProgressEvent::PacksExistenceProgress {
                 checked: existence_checked,
                 total_packs: packs_for_existence.len(),
@@ -991,7 +991,7 @@ pub(super) fn integrity_scan(
         let remaining_chunks: usize = pack_chunks.values().map(|chunks| chunks.len()).sum();
 
         emit_progress(
-            progress,
+            events,
             CheckProgressEvent::ChunksDataPhaseStarted {
                 total_chunks: remaining_chunks,
             },
@@ -1020,7 +1020,7 @@ pub(super) fn integrity_scan(
         issues.extend(data_issues);
 
         emit_progress(
-            progress,
+            events,
             CheckProgressEvent::ChunksDataProgress {
                 verified: data_count,
                 total_chunks: remaining_chunks,

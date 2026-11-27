@@ -143,7 +143,15 @@ impl Fixture {
     }
 
     fn check_clean(&self, config: &VykarConfig) {
-        let result = commands::check::run(config, pass(config), true, false).unwrap();
+        let result = commands::check::run(
+            config,
+            pass(config),
+            &commands::check::CheckRequest {
+                verify_data: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
@@ -424,7 +432,16 @@ fn compact(fx: &Fixture, segments: usize) {
     policy.soft.segments = segments;
     repo.set_fold_policy(policy);
     repo.set_index_gc_grace(std::time::Duration::ZERO);
-    commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
+    commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap();
 }
 
 /// A reader holding a head from before two production folds: after the
@@ -1367,9 +1384,17 @@ fn empty_index_folds_to_a_head_without_base() {
 
     let head = fx.head();
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
-        .unwrap_err()
-        .to_string();
+    let err = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     drop(repo);
     assert!(err.starts_with(commands::compact::MARK_REFUSED), "{err}");
     assert!(err.contains("no snapshot was listed"), "{err}");
@@ -1437,10 +1462,18 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
         let mut policy = crate::repo::index_write::FoldPolicy::default();
         policy.soft.segments = 1;
         repo.set_fold_policy(policy);
-        let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
-            .err()
-            .unwrap()
-            .to_string();
+        let err = commands::compact::run_on_repo(
+            &mut repo,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
+            &CancelToken::new(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(err.contains("injected failure"), "{name}: {err}");
         drop(repo);
 
@@ -2447,7 +2480,16 @@ fn compact_soft_fold_keeps_young_segments() {
         let mut policy = crate::repo::index_write::FoldPolicy::default();
         policy.soft.segments = 2;
         repo.set_fold_policy(policy);
-        commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
+        commands::compact::run_on_repo(
+            &mut repo,
+            &commands::compact::CompactRequest {
+                threshold: 0.0,
+                max_repack_size: None,
+                dry_run: false,
+            },
+            &CancelToken::new(),
+        )
+        .unwrap();
     };
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
@@ -2523,9 +2565,17 @@ fn a_failed_segment_listing_never_fails_a_backup() {
     let mut repo = fx
         .open_with(wrap(fx.storage()), &fx.cache(), OpenOptions::new())
         .unwrap();
-    let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
-        .unwrap_err()
-        .to_string();
+    let err = commands::compact::run_on_repo(
+        &mut repo,
+        &commands::compact::CompactRequest {
+            threshold: 0.0,
+            max_repack_size: None,
+            dry_run: false,
+        },
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("injected index.d/ listing failure"), "{err}");
     assert_eq!(fx.head(), head, "nothing written");
 }

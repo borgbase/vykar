@@ -27,13 +27,23 @@ pub struct PruneListEntry {
     pub reasons: Vec<String>,
 }
 
+/// One prune run's knobs. Retention comes from the config passed alongside
+/// (`retention`) and from `sources` (per-source `retention`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PruneRequest<'a> {
+    /// Decide and list; delete nothing.
+    pub dry_run: bool,
+    /// Return every keep/prune decision (`--list`); a dry run always does.
+    pub list: bool,
+    pub sources: &'a [SourceEntry],
+    /// Only snapshots of these source labels; empty: all.
+    pub source_filter: &'a [String],
+}
+
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    dry_run: bool,
-    list: bool,
-    sources: &[SourceEntry],
-    source_filter: &[String],
+    req: &PruneRequest<'_>,
     cancel: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
     // The backend observes `cancel` in its retry waits. The phases past
@@ -41,28 +51,23 @@ pub fn run(
     // one attempt each and no retries, and on SFTP a read in flight is
     // abandoned; they are crash-safe by design.
     let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
-    run_on_repo(
-        &mut repo,
-        config,
+    run_on_repo(&mut repo, config, req, cancel)
+}
+
+/// [`run`] on a repository opened with `OpenOptions::new()`, in a
+/// registered session (`with_snapshot_removal_session`).
+pub fn run_on_repo(
+    repo: &mut Repo,
+    config: &VykarConfig,
+    req: &PruneRequest<'_>,
+    cancel: &CancelToken,
+) -> Result<(PruneStats, Vec<PruneListEntry>)> {
+    let PruneRequest {
         dry_run,
         list,
         sources,
         source_filter,
-        cancel,
-    )
-}
-
-/// [`run`] on an already opened repository, in a registered session
-/// (`with_snapshot_removal_session`).
-pub(crate) fn run_on_repo(
-    repo: &mut Repo,
-    config: &VykarConfig,
-    dry_run: bool,
-    list: bool,
-    sources: &[SourceEntry],
-    source_filter: &[String],
-    cancel: &CancelToken,
-) -> Result<(PruneStats, Vec<PruneListEntry>)> {
+    } = *req;
     with_snapshot_removal_session(repo, |repo| {
         let now = repo.host_env().now_utc();
 

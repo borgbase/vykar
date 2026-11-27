@@ -162,7 +162,7 @@ pub(crate) fn dispatch_command(
         Commands::Compact {
             report_unreferenced: true,
             ..
-        } => cmd::compact::run_report_unreferenced(cfg, cancel, passphrase).map(|()| false),
+        } => cmd::compact::run_report_unreferenced(cancel, passphrase).map(|()| false),
         Commands::Compact {
             threshold,
             max_repack_size,

@@ -36,7 +36,7 @@ use crate::limits;
 use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
-use crate::repo::lock;
+use crate::repo::sessions;
 use crate::repo::{HostEnv, Repo, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
@@ -550,8 +550,9 @@ fn upload_prepared(
     // Ends with all packs durable in storage (and recorded in the session's
     // pending_index journal), so Phase 2 has no uploads left to wait for.
 
-    // Register session marker and probe for maintenance lock.
-    let registration = lock::register_session(backend.as_ref(), &session_id, &host_env)?;
+    // Register the session marker; the registration lists `sessions/` for a
+    // live exclusive session.
+    let registration = sessions::register_session(backend.as_ref(), &session_id, &host_env)?;
     debug!(session_id, "backup session registered");
 
     // Open repo after session registration (minimizes T0→commit window).
@@ -578,21 +579,21 @@ fn upload_prepared(
     let mut repo = match open_result {
         Ok(mut r) => {
             if let Err(e) = super::util::verify_repo_identity(&open_req, &r) {
-                lock::deregister_session(backend.as_ref(), &session_id, &host_env);
+                sessions::deregister_session(backend.as_ref(), &session_id, &host_env);
                 return Err(e);
             }
             // The mode is decided before any upload: a multi-writer
             // repository whose storage this client cannot use refuses with
             // nothing but its marker written (and removed).
             if let Err(e) = r.commit_mode() {
-                lock::deregister_session(backend.as_ref(), &session_id, &host_env);
+                sessions::deregister_session(backend.as_ref(), &session_id, &host_env);
                 return Err(e);
             }
             r
         }
         Err(e) => {
             let e = super::util::enrich_repo_not_found(e, &open_req.url);
-            lock::deregister_session(backend.as_ref(), &session_id, &host_env);
+            sessions::deregister_session(backend.as_ref(), &session_id, &host_env);
             return Err(e);
         }
     };

@@ -51,7 +51,7 @@ use crate::config::{
 use crate::repo::control::CancelToken;
 use crate::repo::{
     ChunkerParams, EncryptionMode, HostEnv, HostIdentity, OpenOptions, Repo, RepoWriter, identity,
-    lock,
+    sessions,
 };
 
 /// A source directory's regular files, by `/`-separated relative path.
@@ -178,30 +178,14 @@ pub enum Call {
     Restore {
         snapshot: String,
     },
-    BreakLock {
-        sessions: bool,
-    },
+    /// `vykar break-lock` without its confirmation: everything under
+    /// `locks/` (`sessions::clear_legacy_locks`), then every session object
+    /// (`sessions::clear_all_sessions`).
+    BreakLock,
     /// Opens like delete and runs `f` as an exclusive session
     /// (`util::with_exclusive_session`, 10-single-protocol step 8): a
     /// maintenance writer.
     Custom {
-        label: String,
-        f: CustomFn,
-    },
-    /// [`Call::Delete`]'s delete under the maintenance lock
-    /// (`util::with_maintenance_lock`): a holder of the advisory lock, which
-    /// no command takes since 10-single-protocol step 8; kept for the lock's
-    /// own scenarios (H2, `lock_acquisitions_race`, `tests::lock`) until
-    /// step 9 deletes the lock. History op: `ClientOp::Delete`
-    /// (`RunRecord::lock_free` false: no session is registered).
-    LockedDelete {
-        names: Vec<String>,
-    },
-    /// [`Call::Custom`] under the maintenance lock
-    /// (`util::with_maintenance_lock`): a holder of the advisory lock, which
-    /// no command takes since 10-single-protocol step 8; kept for the lock's
-    /// own scenarios until step 9 deletes the lock.
-    LockedCustom {
         label: String,
         f: CustomFn,
     },
@@ -249,8 +233,9 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Real time `wait_paused` waits for a gate.
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Ageing before the probe of invariant 9: past the 6 h lock staleness and
-/// the 45 min session staleness.
+/// Ageing before the probe of invariant 9: past the 45 min session
+/// staleness (and the 6 h staleness of a vykar 0.24 lock; step 10
+/// re-derives the seeds before lowering it).
 const WEDGE_AGE: Duration = Duration::from_secs(6 * 3600 + 60);
 
 /// A run started with [`Sim::spawn`]; [`Sim::join`] records it.
@@ -625,8 +610,8 @@ impl Sim {
         )
     }
 
-    pub fn break_lock(&mut self, c: ClientId, sessions: bool) -> RunRecord {
-        self.call(c, Call::BreakLock { sessions })
+    pub fn break_lock(&mut self, c: ClientId) -> RunRecord {
+        self.call(c, Call::BreakLock)
     }
 
     /// Opens like prune/delete/compact and runs `f` as an exclusive session
@@ -658,7 +643,7 @@ impl Sim {
         &mut self,
         c: ClientId,
         label: &str,
-        flags: crate::repo::lock::MarkerFlags,
+        flags: crate::repo::sessions::MarkerFlags,
         f: impl FnOnce(&mut RepoWriter<'_>) -> Result<()>,
     ) -> RunRecord {
         self.assert_inline_ok(c);
@@ -1171,16 +1156,6 @@ impl Sim {
                 );
                 (op, body)
             }
-            Call::LockedCustom { label, f } => {
-                let body: Body = Box::new(
-                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
-                        let mut repo = open_for(store, c, &cfg, env)?;
-                        util::with_maintenance_lock(&mut repo, f)?;
-                        Ok((Vec::new(), String::new()))
-                    },
-                );
-                (ClientOp::Custom { label }, body)
-            }
             Call::ExclusiveCustom { label, f } => {
                 let body: Body = Box::new(
                     move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
@@ -1200,27 +1175,6 @@ impl Sim {
                         let mut repo = open_for(store, c, &cfg, env)?;
                         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
                         let result = util::with_exclusive_session(&mut repo, |w| {
-                            delete::delete_on_writer(w, &refs, false, &CancelToken::new())
-                        })?;
-                        let removed = result
-                            .stats
-                            .iter()
-                            .map(|s| s.snapshot_name.clone())
-                            .collect();
-                        Ok((removed, result.warnings.join("; ")))
-                    },
-                );
-                (op, body)
-            }
-            Call::LockedDelete { names } => {
-                let op = ClientOp::Delete {
-                    names: names.clone(),
-                };
-                let body: Body = Box::new(
-                    move |store: &SimStore, cfg: VykarConfig, _: &Path, _: usize, env: HostEnv| {
-                        let mut repo = open_for(store, c, &cfg, env)?;
-                        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                        let result = util::with_maintenance_lock(&mut repo, |w| {
                             delete::delete_on_writer(w, &refs, false, &CancelToken::new())
                         })?;
                         let removed = result
@@ -1288,20 +1242,16 @@ impl Sim {
                 );
                 (op, body)
             }
-            Call::BreakLock { sessions } => {
+            Call::BreakLock => {
                 let body: Body = Box::new(
                     move |store: &SimStore, _: VykarConfig, _: &Path, _: usize, _: HostEnv| {
                         let handle = store.handle(c);
-                        let locks = lock::break_lock(&handle)?;
-                        let cleared = if sessions {
-                            lock::clear_all_sessions(&handle)?
-                        } else {
-                            0
-                        };
+                        let locks = sessions::clear_legacy_locks(&handle)?;
+                        let cleared = sessions::clear_all_sessions(&handle)?;
                         Ok((Vec::new(), format!("locks {locks}, sessions {cleared}")))
                     },
                 );
-                (ClientOp::BreakLock { sessions }, body)
+                (ClientOp::BreakLock, body)
             }
             Call::Custom { label, f } => {
                 let body: Body = Box::new(
@@ -1497,13 +1447,13 @@ impl Sim {
 
     /// Insert the run in index order and its observation in step order.
     fn record(&mut self, index: usize, c: ClientId, op: ClientOp, f: Finished) -> RunRecord {
-        // A backup commits without a lock once it marked its session
-        // `committing` (in both modes since 10-single-protocol step 7). Maintenance
-        // (compact, prune, delete, a lock-free custom run) runs lock-free in
-        // a registered session (phase F part 10d; in both modes since step
-        // 7), which its marker shows: under the lock it registers none. An
-        // exclusive session's marker (`x-`, step 8: repair, a mode switch, a
-        // custom run) is not counted, so such a run is judged.
+        // A shared run counts as `lock_free` (no binary that opens a v6
+        // repository takes the lock since 10-single-protocol step 9): a
+        // backup once it marked its session `committing`, maintenance
+        // (compact, prune, delete, a shared custom run) by its registered
+        // session marker. An exclusive session's marker (`x-`, step 8:
+        // repair, a mode switch, a custom run) is not counted, so such a run
+        // is judged.
         let lock_free = match op {
             ClientOp::Backup { .. } => self.store.committed_lock_free_in_run(index),
             ClientOp::Compact

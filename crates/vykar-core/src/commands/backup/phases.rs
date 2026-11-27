@@ -16,11 +16,11 @@ use crate::repo::ages::HEAD_LANDING_ALLOWANCE;
 use crate::repo::control::{CancelToken, CommitEvent, EventSink, FnMutSink};
 use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
 use crate::repo::format::{ObjectType, pack_object_with_context};
-use crate::repo::lock;
 #[cfg(any(test, feature = "sim"))]
 use crate::repo::machine::{Machine, StepKind};
 use crate::repo::machine::{StepCx, drive_blocking};
 use crate::repo::manifest::SnapshotEntry;
+use crate::repo::sessions;
 use crate::repo::{BackupCommit, Committed, Fence, HostEnv, Repo, WriteSession, WriterMode};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_common::display::{format_bytes, format_count};
@@ -33,7 +33,7 @@ use vykar_types::snapshot_id::SnapshotId;
 /// `end()`) runs the guard's Drop: stop-thread → join-thread → deregister.
 pub(super) struct BackupSession {
     id: String,
-    guard: Option<lock::SessionGuard>,
+    guard: Option<sessions::SessionGuard>,
 }
 
 impl BackupSession {
@@ -41,22 +41,22 @@ impl BackupSession {
     /// failure the marker is deregistered before the error is returned.
     pub(super) fn adopt(
         storage: &Arc<dyn StorageBackend>,
-        registration: lock::Registration,
+        registration: sessions::Registration,
         env: HostEnv,
     ) -> Result<Self> {
         let id = registration.session_id().to_string();
-        match lock::SessionGuard::adopt(Arc::clone(storage), registration, env.clone()) {
+        match sessions::SessionGuard::adopt(Arc::clone(storage), registration, env.clone()) {
             Ok(g) => Ok(Self { id, guard: Some(g) }),
             Err(e) => {
-                lock::deregister_session(storage.as_ref(), &id, &env);
+                sessions::deregister_session(storage.as_ref(), &id, &env);
                 Err(e)
             }
         }
     }
 
     /// The session's marker record; `None` once the guard was handed off.
-    pub(super) fn marker(&self) -> Option<Arc<lock::SessionMarker>> {
-        self.guard.as_ref().map(lock::SessionGuard::marker)
+    pub(super) fn marker(&self) -> Option<Arc<sessions::SessionMarker>> {
+        self.guard.as_ref().map(sessions::SessionGuard::marker)
     }
 
     /// Deregister now. A no-op once the guard was handed off or ended.
@@ -90,7 +90,7 @@ pub(super) fn phase1_upload(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     cancel: &CancelToken,
     dataless: &mut DatalessTally,
-    marker: Option<Arc<lock::SessionMarker>>,
+    marker: Option<Arc<sessions::SessionMarker>>,
 ) -> Result<Phase1Output> {
     let env = repo.host_env().clone();
     let clock = Arc::clone(&env.clock);
@@ -461,7 +461,7 @@ pub(super) struct RunReport {
 /// (and deregisters) before `repo` and `write` (whose journal joins its
 /// background write on drop), as the locals of the upload did. One protocol
 /// protects its commit in both modes ([`Self::protect_commit`]): the
-/// commit mark and the probe of `locks/`, and on a single-writer
+/// commit mark and the pre-head listing of `sessions/`, and on a single-writer
 /// repository the single-writer check around the mark
 /// (10-single-protocol step 7).
 pub(crate) struct PendingCommit {
@@ -501,7 +501,7 @@ pub(crate) enum Protection {
 pub(crate) struct CommitInProgress {
     session: BackupSession,
     repo: Repo,
-    /// The exclusion the commit's steps run under: `Fence::lock_free_backup`.
+    /// The exclusion the commit's steps run under: `Fence::backup_commit`.
     fence: Fence,
     machine: BackupCommit,
     report: RunReport,
@@ -541,7 +541,7 @@ impl PendingCommit {
     }
 
     /// Production: the whole protection of the commit, with one deadline
-    /// (`COMMIT_LOCK_MAX_WAIT` from its start), reporting "waiting for
+    /// (`COMMIT_MAX_WAIT` from its start), reporting "waiting for
     /// another writer" once contended. Each attempt:
     /// - single-writer: unless marked, the listing before the mark
     ///   ([`Self::list_before_mark`]) and the mark; the listing after it
@@ -564,9 +564,9 @@ impl PendingCommit {
             self.decide_mode()?;
         }
         let env = self.repo.host_env().clone();
-        lock::wait_while_locked(
+        sessions::wait_while_locked(
             &env,
-            lock::COMMIT_LOCK_MAX_WAIT,
+            sessions::COMMIT_MAX_WAIT,
             500,
             cancel,
             |_| {
@@ -577,7 +577,7 @@ impl PendingCommit {
                     },
                 );
             },
-            |_| self.attempt(),
+            || self.attempt(),
         )
     }
 
@@ -610,7 +610,7 @@ impl PendingCommit {
     /// while another live session may write heads (a compact, a committing
     /// backup), so that two backups do not both mark and back off.
     pub(crate) fn list_before_mark(&mut self) -> Result<()> {
-        match lock::single_writer_listing(
+        match sessions::single_writer_listing(
             self.repo.storage().as_ref(),
             self.repo.host_env(),
             &self.session.id,
@@ -627,7 +627,7 @@ impl PendingCommit {
         let key = marker.mark(
             self.repo.storage().as_ref(),
             self.repo.host_env().clock.as_ref(),
-            lock::MarkerFlags {
+            sessions::MarkerFlags {
                 committing: true,
                 writes_heads: false,
             },
@@ -642,7 +642,7 @@ impl PendingCommit {
     /// unflagged and marks again); none → `Ok`. A failed unmark PUT fails
     /// the commit.
     pub(crate) fn list_after_mark(&mut self) -> Result<()> {
-        let Some(writer) = lock::single_writer_listing(
+        let Some(writer) = sessions::single_writer_listing(
             self.repo.storage().as_ref(),
             self.repo.host_env(),
             &self.session.id,
@@ -660,7 +660,7 @@ impl PendingCommit {
         let key = marker.mark(
             self.repo.storage().as_ref(),
             self.repo.host_env().clock.as_ref(),
-            lock::MarkerFlags::default(),
+            sessions::MarkerFlags::default(),
         )?;
         self.marked = false;
         debug!(key, "session unmarked");
@@ -668,7 +668,7 @@ impl PendingCommit {
     }
 
     /// The pre-head listing of `sessions/` after the mark
-    /// ([`lock::exclusive_listing`] with the marker's current key; named for
+    /// ([`sessions::exclusive_listing`] with the marker's current key; named for
     /// the probe of `locks/` it replaced in 10-single-protocol step 8), both
     /// modes: `Ok` records "now" (the key's mtime, for the fold's segment
     /// ages); `Err(Locked)` while an exclusive session is live (the mark
@@ -676,14 +676,14 @@ impl PendingCommit {
     pub(crate) fn try_probe(&mut self) -> Result<()> {
         let (_, key) = self.marker()?.current();
         let now =
-            lock::exclusive_listing(self.repo.storage().as_ref(), self.repo.host_env(), &key)?;
-        self.repo.set_lock_store_time(now);
+            sessions::exclusive_listing(self.repo.storage().as_ref(), self.repo.host_env(), &key)?;
+        self.repo.set_store_time(now);
         Ok(())
     }
 
     /// The suspend rule (10-single-protocol step 7, open decision 3), after
     /// a successful probe. `Proceed` for a session whose marker record is
-    /// [continuous](lock::MarkerReport::continuous) (no request). A record
+    /// [continuous](sessions::MarkerReport::continuous) (no request). A record
     /// that is not (a machine suspended over `MARKER_GAP_LIMIT`, marker
     /// writes failing that long, a slow marker write, a miss) means another
     /// client may have taken the session for ended, so it missed what ran
@@ -693,10 +693,10 @@ impl PendingCommit {
     ///    protection ran in: decide it ([`Repo::commit_mode`]; a
     ///    multi-writer one runs the put-if-absent check), unmark and return
     ///    `Restart` (once; a second change in one protection refuses);
-    /// 2. the pack-age term at the mark ([`lock::head_landing_check`] with
+    /// 2. the pack-age term at the mark ([`sessions::head_landing_check`] with
     ///    [`HEAD_LANDING_ALLOWANCE`] on the record as it is:
     ///    `StaleChunksDuringCommit` when the packs may be too old);
-    /// 3. restart the record from the mark ([`lock::SessionMarker::restart_record`]),
+    /// 3. restart the record from the mark ([`sessions::SessionMarker::restart_record`]),
     ///    which keeps the term binding at the fences around the head PUT,
     ///    and have every attempt of the commit re-check its reused chunks;
     ///    `Proceed`.
@@ -729,7 +729,7 @@ impl PendingCommit {
             self.unmark()?;
             return Ok(Protection::Restart);
         }
-        lock::head_landing_check(
+        sessions::head_landing_check(
             &self.session.id,
             &report,
             marker.elapsed(clock.as_ref()),
@@ -740,7 +740,7 @@ impl PendingCommit {
         Ok(Protection::Proceed)
     }
 
-    fn marker(&self) -> Result<Arc<lock::SessionMarker>> {
+    fn marker(&self) -> Result<Arc<sessions::SessionMarker>> {
         self.session.marker().ok_or_else(|| {
             VykarError::Other("BUG: a backup commit without a session marker".into())
         })
@@ -773,7 +773,7 @@ impl PendingCommit {
         CommitInProgress {
             session,
             repo,
-            fence: Fence::lock_free_backup(),
+            fence: Fence::backup_commit(),
             machine,
             report,
         }
@@ -919,7 +919,7 @@ impl CommitInProgress {
         session.end();
 
         // The store time, live sessions and segment ages.
-        repo.clear_lock_state();
+        repo.clear_session_state();
 
         if let Err(e) = result {
             // flush_on_abort writes the remote sessions/<id>.index so the next

@@ -40,7 +40,7 @@ use vykar_types::error::Result;
 use crate::index::head::{ObjectName, SegmentKind, SegmentRef};
 
 use super::host_env::HostEnv;
-use super::lock::SESSION_STALE_SECS;
+use super::sessions::SESSION_STALE_SECS;
 
 /// Grace for packs that no index entry names, on the store's clock.
 pub(crate) const T_PACK: Duration = Duration::from_secs(12 * 3600);
@@ -114,37 +114,24 @@ pub(crate) const HEAD_FRESHNESS_LIMIT: Duration =
 /// `.json` nor `.index`, so no marker or journal reader (this binary's
 /// or 0.24's) takes it for one.
 pub(crate) const CLOCK_PROBE_PREFIX: &str = "sessions/vykar-clock-";
-/// Clock probe of a contended lock wait (`NowSource::Probe`), which
-/// lists the directory it judges. Not `.json`, so no lock reader (this
-/// binary's `is_lock_key`, or 0.24's `list_lock_keys`) takes it for a
-/// lock. Goes with the lock (10-single-protocol step 9).
-pub(crate) const LOCK_CLOCK_PROBE_PREFIX: &str = "locks/vykar-clock-";
 /// The put-if-absent check's probe
 /// (`vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX`); one left by a failed
 /// delete is removed by age like a clock probe.
 pub(crate) const PUT_IF_ABSENT_PROBE_PREFIX: &str = vykar_storage::PUT_IF_ABSENT_PROBE_KEY_PREFIX;
-/// Where the put-if-absent probe lived before 10-single-protocol step 4;
-/// debris of a failed delete there is still removed.
-pub(crate) const LEGACY_PUT_IF_ABSENT_PROBE_PREFIX: &str = "locks/vykar-probe-";
 
-/// Whether `key` is a probe (clock or put-if-absent, either directory):
-/// skipped by lock and session readers, debris once older than
+/// Whether `key` is a probe (clock or put-if-absent, both under
+/// `sessions/`): skipped by session readers, debris once older than
 /// [`CLOCK_PROBE_DEBRIS_AGE`].
 pub(crate) fn is_probe_key(key: &str) -> bool {
-    [
-        CLOCK_PROBE_PREFIX,
-        LOCK_CLOCK_PROBE_PREFIX,
-        PUT_IF_ABSENT_PROBE_PREFIX,
-        LEGACY_PUT_IF_ABSENT_PROBE_PREFIX,
-    ]
-    .iter()
-    .any(|p| key.starts_with(p))
+    [CLOCK_PROBE_PREFIX, PUT_IF_ABSENT_PROBE_PREFIX]
+        .iter()
+        .any(|p| key.starts_with(p))
 }
 /// A probe older than this is debris of a failed delete.
 pub(crate) const CLOCK_PROBE_DEBRIS_AGE: Duration = Duration::from_secs(3600);
 
 /// A reading of the store's clock older than this (on the local monotonic
-/// clock) is not extrapolated: the next lock attempt probes again. Bounds
+/// clock) is not extrapolated: the next call probes again. Bounds
 /// how far a store clock stepped back after the reading can carry an
 /// extrapolated "now" ahead of it.
 pub(crate) const STORE_READING_MAX_AGE: Duration = Duration::from_secs(5 * 60);
@@ -154,7 +141,7 @@ pub(crate) const STORE_READING_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 /// a store that keeps a tombstone per deleted key (`s3_soft_delete`)
 /// probes leave one per process, not one per attempt. Two threads of one
 /// process that probe at once can delete each other's probe; the loser
-/// reads "now unknown" and its attempt ends `Locked` (fail closed).
+/// reads "now unknown" (fail closed).
 fn clock_probe_key(prefix: &str, pid: u32) -> String {
     static SUFFIX: OnceLock<u128> = OnceLock::new();
     let suffix = *SUFFIX.get_or_init(rand::random::<u128>) >> 32;
@@ -190,27 +177,15 @@ pub(crate) fn probe_store_now(
     Ok((now, listing))
 }
 
-/// One wait's reading of the store's clock: the lock attempts of one wait
-/// (`acquire_lock_with_deadline`, the simulator's lock phase) share it, so
-/// the wait probes once rather than once per attempt. The existing-pack
-/// check has its own (`in_sessions`).
+/// A reading of the store's clock that the calls of one run share
+/// (the existing-pack check's, [`Self::in_sessions`]), so the run probes
+/// once per [`STORE_READING_MAX_AGE`] rather than once per call.
 #[derive(Debug)]
 pub(crate) struct StoreClock {
     /// The last reading and the local monotonic time just after it.
     reading: Option<(StoreNow, Instant)>,
     /// Key prefix of this clock's probe; its directory is what the probe lists.
     pub(super) prefix: &'static str,
-}
-
-impl Default for StoreClock {
-    /// A lock wait's clock: its probe lives under `locks/`, the directory
-    /// the lock reaper judges.
-    fn default() -> Self {
-        Self {
-            reading: None,
-            prefix: LOCK_CLOCK_PROBE_PREFIX,
-        }
-    }
 }
 
 impl StoreClock {
@@ -223,7 +198,7 @@ impl StoreClock {
     }
 
     /// "Now" on the store's clock, and the listing of the probe's directory
-    /// (`locks/` for a lock wait's clock) when this call probed. Within [`STORE_READING_MAX_AGE`] of the last reading it
+    /// when this call probed. Within [`STORE_READING_MAX_AGE`] of the last reading it
     /// extrapolates: reading + monotonic time elapsed since. Otherwise, or
     /// when there is no reading (none yet, or the last probe failed), it
     /// probes; a failed probe is "now unknown" (`None`).
@@ -237,8 +212,8 @@ impl StoreClock {
     /// clock and the store's over `STORE_READING_MAX_AGE`, well under a
     /// second and nothing against the ages judged with it (hours). (A
     /// store clock stepped back after the reading is not seen until the
-    /// next probe, at most `STORE_READING_MAX_AGE` later: until then a lock
-    /// written after the step looks older by the step's size.)
+    /// next probe, at most `STORE_READING_MAX_AGE` later: until then an
+    /// object written after the step looks older by the step's size.)
     pub(crate) fn now(
         &mut self,
         storage: &dyn StorageBackend,
@@ -257,7 +232,7 @@ impl StoreClock {
                 (now, Some(listing))
             }
             Err(e) => {
-                debug!(error = %e, "clock probe failed; reaping nothing by age");
+                debug!(error = %e, "clock probe failed; now unknown");
                 self.reading = None;
                 (None, None)
             }
@@ -266,7 +241,7 @@ impl StoreClock {
 }
 
 /// Ages of `index.d/` objects on the store's clock: one listing and one
-/// reading of "now" (the mtime of the lock key this client holds). An
+/// reading of "now" (the run's session store time, `Repo::store_time`). An
 /// object not listed, listed without an mtime, or judged without a "now"
 /// is young (04 step 7: fail closed means keep).
 #[derive(Clone, Debug, Default)]

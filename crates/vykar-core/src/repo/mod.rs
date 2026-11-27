@@ -9,13 +9,13 @@ pub mod format;
 pub mod host_env;
 pub mod identity;
 pub(crate) mod journal_recovery;
-pub mod lock;
 pub mod manifest;
 pub(crate) mod memory_budget;
 pub mod pack;
 pub mod pack_map;
 pub mod pack_trailer;
 pub(crate) mod session_journal;
+pub mod sessions;
 pub mod snapshot_cache;
 pub(crate) mod tree_cache;
 mod upload_queue;
@@ -568,7 +568,7 @@ pub struct OpenOptions {
     /// sets this. Such a handle supports `upgrade_index_layout` and
     /// `legacy_index` only; it has no head, and `load_index` is refused.
     pub legacy_format: bool,
-    /// Clock and identity for the lock, session and maintenance code.
+    /// Clock and identity for the session and maintenance code.
     /// Default: [`HostEnv::system`]. The simulator sets one per client.
     pub host_env: HostEnv,
 }
@@ -678,17 +678,18 @@ pub struct Repo {
     /// Graces of `collect_index_garbage`: `IndexGcGrace::DEFAULT`; tests
     /// lower them.
     index_gc_grace: index_store::IndexGcGrace,
-    /// The held lock's key mtime (the maintenance lock, or a backup's commit
-    /// lock): "now" on the store's clock for the ages this lock holder
-    /// judges. `None` outside a lock, or when the storage reports no mtime.
-    lock_store_time: Option<vykar_storage::StoreNow>,
+    /// "Now" on the store's clock as the run's session read it (a
+    /// maintenance or exclusive session's marker mtime in its listing, a
+    /// backup's at its pre-head listing), for the ages the run judges.
+    /// `None` outside a run or without mtimes.
+    store_time: Option<vykar_storage::StoreNow>,
     /// How long one EXISTS of an exclusive session's marker vouches for it
-    /// (`lock::EXCLUSIVE_CHECK_REUSE`); tests lower it.
+    /// (`sessions::EXCLUSIVE_CHECK_REUSE`); tests lower it.
     exclusive_check_reuse: std::time::Duration,
     /// The sessions a maintenance run found live, for compact's horizon (an
     /// exclusive session's registration finds none, or refuses); `None`
     /// outside a run.
-    live_sessions: Option<Vec<lock::LiveSession>>,
+    live_sessions: Option<Vec<sessions::LiveSession>>,
     /// Orphan packs younger than this are kept: `ages::T_PACK`; tests lower it
     /// (zero turns the guard off, so a test double without mtimes deletes).
     pack_grace: std::time::Duration,
@@ -696,8 +697,8 @@ pub struct Repo {
     /// stay out of a fold: `ages::T_PACK`; tests lower it (zero: every
     /// segment is old, the write's own included).
     segment_grace: std::time::Duration,
-    /// The ages of `index.d/` objects, listed at most once per lock hold;
-    /// cleared with the lock fence.
+    /// The ages of `index.d/` objects, listed at most once per run;
+    /// cleared with the session state.
     segment_ages: Option<ages::SegmentAges>,
     /// The latest index a relocation loaded, see [`relocate`].
     relocation: relocate::RelocationCache,
@@ -1000,21 +1001,21 @@ impl Repo {
         self.file_cache_dirty = true;
     }
 
-    /// Forget the lock-hold state: the lock's reading of the store's clock,
+    /// Forget the run's session state: its reading of the store's clock,
     /// the live sessions it found and the segment ages it listed.
-    pub fn clear_lock_state(&mut self) {
-        self.lock_store_time = None;
+    pub fn clear_session_state(&mut self) {
+        self.store_time = None;
         self.live_sessions = None;
         self.segment_ages = None;
     }
 
-    /// Record the sessions the maintenance lock found live.
-    pub(crate) fn set_live_sessions(&mut self, s: Option<Vec<lock::LiveSession>>) {
+    /// Record the sessions the run's session listing found live.
+    pub(crate) fn set_live_sessions(&mut self, s: Option<Vec<sessions::LiveSession>>) {
         self.live_sessions = s;
     }
 
-    /// The sessions the maintenance lock found live; empty outside it.
-    pub(crate) fn live_sessions(&self) -> &[lock::LiveSession] {
+    /// The sessions the run's session listing found live; empty outside a run.
+    pub(crate) fn live_sessions(&self) -> &[sessions::LiveSession] {
         self.live_sessions.as_deref().unwrap_or_default()
     }
 
@@ -1031,13 +1032,13 @@ impl Repo {
             .map(|s| (s.session_id.clone(), s.entry.clone()))
             .collect();
         Err(vykar_types::error::VykarError::ActiveSessions(
-            lock::build_active_session_list(entries, &self.host_env.now_utc()),
+            sessions::build_active_session_list(entries, &self.host_env.now_utc()),
         ))
     }
 
-    /// Record the store's clock reading of the lock this handle works under.
-    pub(crate) fn set_lock_store_time(&mut self, t: Option<vykar_storage::StoreNow>) {
-        self.lock_store_time = t;
+    /// Record the store's clock reading of the run this handle works in.
+    pub(crate) fn set_store_time(&mut self, t: Option<vykar_storage::StoreNow>) {
+        self.store_time = t;
     }
 
     /// How long one EXISTS of an exclusive session's marker vouches for it.
@@ -1052,9 +1053,9 @@ impl Repo {
         self.exclusive_check_reuse = d;
     }
 
-    /// "Now" on the store's clock as the held lock read it, if any.
-    pub(crate) fn lock_store_time(&self) -> Option<vykar_storage::StoreNow> {
-        self.lock_store_time
+    /// "Now" on the store's clock as the run's session read it, if any.
+    pub(crate) fn store_time(&self) -> Option<vykar_storage::StoreNow> {
+        self.store_time
     }
 
     /// Set the age below which orphan packs are kept (tests).
@@ -1079,33 +1080,33 @@ impl Repo {
         self.segment_grace
     }
 
-    /// List the ages of `index.d/` objects unless this lock hold did
-    /// already; "now" is [`Self::lock_store_time`]. Without a "now" nothing
+    /// List the ages of `index.d/` objects unless this run did
+    /// already; "now" is [`Self::store_time`]. Without a "now" nothing
     /// is listed (every backup segment is young then anyway).
     ///
     /// # Errors
     ///
     /// The listing failed; nothing is cached then.
     pub(crate) fn load_segment_ages(&mut self) -> Result<()> {
-        if self.segment_ages.is_some() || self.lock_store_time.is_none() {
+        if self.segment_ages.is_some() || self.store_time.is_none() {
             return Ok(());
         }
-        let ages = ages::SegmentAges::list(self.storage.as_ref(), self.lock_store_time)?;
+        let ages = ages::SegmentAges::list(self.storage.as_ref(), self.store_time)?;
         self.segment_ages = Some(ages);
         Ok(())
     }
 
-    /// The ages listed in this lock hold, if any.
+    /// The ages listed in this run, if any.
     pub(crate) fn segment_ages(&self) -> Option<&ages::SegmentAges> {
         self.segment_ages.as_ref()
     }
 
     /// Whether judging `segments` needs a listing: a backup segment among
-    /// them, a non-zero grace, a "now", and no listing yet in this lock hold.
+    /// them, a non-zero grace, a "now", and no listing yet in this run.
     pub(crate) fn needs_segment_ages(&self, segments: &[crate::index::head::SegmentRef]) -> bool {
         !self.segment_grace.is_zero()
             && self.segment_ages.is_none()
-            && self.lock_store_time.is_some()
+            && self.store_time.is_some()
             && segments
                 .iter()
                 .any(|s| s.kind == crate::index::head::SegmentKind::Backup)
@@ -1130,7 +1131,7 @@ impl Repo {
         match mode {
             WriterMode::Multi => {
                 self.require_writer_mode()?;
-                tracing::debug!("this client commits lock-free (multi-writer)");
+                tracing::debug!("this client creates heads with put-if-absent (multi-writer)");
             }
             WriterMode::Single => {
                 tracing::debug!("this client commits as the single writer (single-writer)");

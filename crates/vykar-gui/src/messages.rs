@@ -84,9 +84,6 @@ pub(crate) enum AppCommand {
     SaveAndApplyConfig {
         yaml_text: String,
     },
-    ClearRepoLocks {
-        repo_name: String,
-    },
     ClearRepoSessions {
         repo_name: String,
     },

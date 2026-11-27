@@ -7,7 +7,7 @@
 //! (`ActiveSessions`); a backup whose marker vanished stops before its head
 //! at its pre-head listing; an exclusive run whose marker is lost writes
 //! nothing more; a crashed exclusive session stops blocking after 45 min, at
-//! once on its own machine, or after `break-lock --sessions`. The
+//! once on its own machine, or after `break-lock`. The
 //! interleavings of the advisory lock these tests covered before step 8 are
 //! the lock's own, deleted with it in step 9.
 
@@ -233,7 +233,7 @@ fn a_live_shared_session_refuses_the_exclusive_ones() {
             .rev()
             .find(|k| k.ends_with(".json"))
             .and_then(|k| {
-                crate::repo::lock::parse_session_marker_key(&k).map(|(id, _)| id.to_string())
+                crate::repo::sessions::parse_session_marker_key(&k).map(|(id, _)| id.to_string())
             })
             .expect("a's marker");
         let mode = if kind.records_multi_writer() {
@@ -521,7 +521,7 @@ fn marker_lost_at_every_write(
         let gate: GateId = sim.gate(
             GateRule::new(c, OpMatch::AnyMutation, KeyMatch::Any)
                 .filter(|_, k| !k.starts_with("sessions/"))
-                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
                 .nth(n),
         );
         let run: Spawned = sim.spawn(c, Call::CheckRepair);
@@ -703,17 +703,16 @@ fn a_crashed_exclusive_stops_blocking_after_45_minutes() {
 // machine (same hostname, installation and boot; its PID dead), is
 // `tests::sim::same_machine_reaps_dead_exclusive_holder_at_once`.
 
-/// (f3) `break-lock --sessions` removes a crashed exclusive session's
-/// marker at once (plain `break-lock` does not).
+/// (f3) `break-lock` removes a crashed exclusive session's marker at once
+/// (since 10-single-protocol step 9 it always clears session markers).
 #[test]
-fn a_crashed_exclusive_stops_blocking_after_break_lock_sessions() {
+fn a_crashed_exclusive_stops_blocking_after_break_lock() {
     let mut sim = Sim::new();
     let (c, b) = (sim.client("c"), sim.client("b"));
     sim.backup(b, "b0", &tree("b0")).expect_ok();
     crashed_exclusive(&mut sim, c);
-    sim.break_lock(b, false).expect_ok();
     assert_allowed(&sim.backup(b, "b1", &tree("b1")), AllowedError::Locked);
-    sim.break_lock(b, true).expect_ok();
+    sim.break_lock(b).expect_ok();
     assert!(exclusive_keys(&sim).is_empty());
     sim.backup(b, "b2", &tree("b2")).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();

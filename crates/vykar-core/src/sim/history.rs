@@ -18,7 +18,7 @@ pub enum ClientOp {
     Check,
     CheckRepair,
     Restore { snapshot: String },
-    BreakLock { sessions: bool },
+    BreakLock,
     Custom { label: String },
 }
 

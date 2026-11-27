@@ -108,6 +108,10 @@ fn compact_is_idempotent_after_repack() {
     let (id_a, _id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
+    // The subject is repack mechanics: a zero pack grace (and no live
+    // session) passes every source the age gate compact applies since
+    // 10-single-protocol step 9.
+    repo.set_pack_grace(std::time::Duration::ZERO);
     let first = compact_repo_without_mark(
         &mut repo.unchecked_writer(),
         1.0,
@@ -141,6 +145,10 @@ fn client_repack_writes_a_trailer() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
+    // The subject is repack mechanics: a zero pack grace (and no live
+    // session) passes every source the age gate compact applies since
+    // 10-single-protocol step 9.
+    repo.set_pack_grace(std::time::Duration::ZERO);
     compact_repo_without_mark(
         &mut repo.unchecked_writer(),
         1.0,
@@ -227,6 +235,10 @@ fn client_repack_records_the_output_trailer_length() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.unchecked_writer().chunk_index_mut().remove(&id_a);
     repo.unchecked_writer().save_state().unwrap();
+    // The subject is repack mechanics: a zero pack grace (and no live
+    // session) passes every source the age gate compact applies since
+    // 10-single-protocol step 9.
+    repo.set_pack_grace(std::time::Duration::ZERO);
     compact_repo_without_mark(
         &mut repo.unchecked_writer(),
         1.0,
@@ -265,6 +277,10 @@ fn compact_after_delete_repacks() {
     repo.unchecked_writer().save_state().unwrap();
 
     // Compact should detect the dead blob and repack
+    // The subject is repack mechanics: a zero pack grace (and no live
+    // session) passes every source the age gate compact applies since
+    // 10-single-protocol step 9.
+    repo.set_pack_grace(std::time::Duration::ZERO);
     let stats = compact_repo_without_mark(
         &mut repo.unchecked_writer(),
         1.0,
@@ -332,6 +348,10 @@ fn compact_dry_run_does_not_modify() {
     // Count packs before
     let packs_before = count_all_packs(&repo);
 
+    // The subject is repack mechanics: a zero pack grace (and no live
+    // session) passes every source the age gate compact applies since
+    // 10-single-protocol step 9.
+    repo.set_pack_grace(std::time::Duration::ZERO);
     let stats = compact_repo_without_mark(
         &mut repo.unchecked_writer(),
         1.0,
@@ -1744,7 +1764,7 @@ mod store_clock_ages {
         backend.set_age(&keys[0], Duration::from_secs(3600));
         backend.set_age(&keys[1], Duration::from_secs(12 * 3600) - minute);
         backend.set_age(&keys[2], Duration::from_secs(12 * 3600) + minute);
-        repo.set_lock_store_time(Some(StoreNow::at(backend.now)));
+        repo.set_store_time(Some(StoreNow::at(backend.now)));
 
         let dry = compact_repo_without_mark(
             &mut repo.unchecked_writer(),
@@ -1856,7 +1876,7 @@ fn repo_with_mtimes() -> (
 /// outside that of one that just started.
 #[test]
 fn orphans_inside_a_live_horizon_are_kept() {
-    use crate::repo::lock::{LiveSession, SessionEntry};
+    use crate::repo::sessions::{LiveSession, SessionEntry};
     let now = std::time::SystemTime::now();
     for (elapsed_hours, kept) in [(2u64, true), (0, false)] {
         let (mut repo, mut ws, mem) = repo_with_mtimes();

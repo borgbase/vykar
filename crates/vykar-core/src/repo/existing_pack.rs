@@ -46,7 +46,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::ages::StoreClock;
 use super::host_env::HostEnv;
-use super::lock::SessionMarker;
+use super::sessions::SessionMarker;
 
 /// The age a refused pack of unknown age counts as: the oldest possible.
 /// As a pull-back it saturates the session's `elapsed`, so the marker's
@@ -153,7 +153,7 @@ fn stored_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::lock::{self, MarkerReport, register_session};
+    use crate::repo::sessions::{self, MarkerReport, register_session};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_storage::{InnerBackend, delegate_storage_backend};
 
@@ -326,14 +326,14 @@ mod tests {
             slow_puts: 1,
             ..sound.clone()
         };
-        lock::commit_marker_check("existing", Ok(true), &sound, elapsed).unwrap();
-        lock::head_landing_check("existing", &sound, elapsed, Duration::ZERO).unwrap();
+        sessions::commit_marker_check("existing", Ok(true), &sound, elapsed).unwrap();
+        sessions::head_landing_check("existing", &sound, elapsed, Duration::ZERO).unwrap();
         assert!(matches!(
-            lock::commit_marker_check("existing", Ok(true), &unsound, elapsed),
+            sessions::commit_marker_check("existing", Ok(true), &unsound, elapsed),
             Err(VykarError::StaleChunksDuringCommit)
         ));
         assert!(matches!(
-            lock::head_landing_check("existing", &unsound, elapsed, Duration::ZERO),
+            sessions::head_landing_check("existing", &unsound, elapsed, Duration::ZERO),
             Err(VykarError::StaleChunksDuringCommit)
         ));
     }

@@ -10,7 +10,7 @@ use vykar_types::pack_id::PackId;
 
 use super::Repo;
 use super::WriterMode;
-use super::index_write::{MaintenanceWrite, OnMoved};
+use super::index_write::MaintenanceWrite;
 use super::upgrade::{UpgradeOutcome, WriterModeReport};
 use super::write_session::WriteSession;
 use crate::index::LiveIndex;
@@ -26,17 +26,14 @@ pub(crate) struct Fence(FenceKind);
 
 #[derive(Clone)]
 enum FenceKind {
-    /// The repository lock is still this client's (`lock::build_lock_fence`);
-    /// no command takes the lock since 10-single-protocol step 8.
-    Lock(FenceFn),
     /// A maintenance session or an exclusive session: its marker is present
     /// and its record continuous (`commands::util::maintenance_marker_fence`,
     /// `commands::util::exclusive_write_check`).
     Marker(FenceFn),
-    /// A lock-free backup commit: no lock and no marker check here; the
-    /// commit machine checks its marker itself (`HeadCheck` at the head
-    /// fence, `check_marker_before_snapshot`). Passes.
-    LockFreeBackup,
+    /// A backup commit: no marker check here; the commit machine checks
+    /// its marker itself (`HeadCheck` at the head fence,
+    /// `check_marker_before_snapshot`). Passes.
+    BackupCommit,
     /// Tests: what a handle without a fence did before fences were typed.
     /// Passes.
     #[cfg(test)]
@@ -44,20 +41,15 @@ enum FenceKind {
 }
 
 impl Fence {
-    /// The fence of a held repository lock.
-    pub(crate) fn lock(check: FenceFn) -> Self {
-        Self(FenceKind::Lock(check))
-    }
-
-    /// The fence of a lock-free maintenance run's session marker.
+    /// The fence of a maintenance or exclusive session's marker.
     pub(crate) fn marker(check: FenceFn) -> Self {
         Self(FenceKind::Marker(check))
     }
 
-    /// The fence of a lock-free backup commit: passes (the commit machine
-    /// checks its marker itself). Built only by `PendingCommit::begin_commit`.
-    pub(crate) fn lock_free_backup() -> Self {
-        Self(FenceKind::LockFreeBackup)
+    /// The fence of a backup commit: passes (the commit machine checks its
+    /// marker itself). Built only by `PendingCommit::begin_commit`.
+    pub(crate) fn backup_commit() -> Self {
+        Self(FenceKind::BackupCommit)
     }
 
     /// Tests: a fence that passes.
@@ -66,25 +58,18 @@ impl Fence {
         Self(FenceKind::Unchecked)
     }
 
-    /// Whether this is a held lock's fence. A session run (maintenance
-    /// session, backup) checks its fence before the index garbage
-    /// collection; a lock holder does not.
-    pub(crate) fn is_lock(&self) -> bool {
-        matches!(self.0, FenceKind::Lock(_))
-    }
-
-    /// Tests: whether this is the lock-free backup's fence.
+    /// Tests: whether this is the backup commit's fence.
     #[cfg(test)]
-    pub(crate) fn is_lock_free_backup(&self) -> bool {
-        matches!(self.0, FenceKind::LockFreeBackup)
+    pub(crate) fn is_backup_commit(&self) -> bool {
+        matches!(self.0, FenceKind::BackupCommit)
     }
 
-    /// `Ok` for a lock-free backup (and the tests' unchecked fence);
-    /// otherwise the lock or marker check.
+    /// `Ok` for a backup commit (and the tests' unchecked fence);
+    /// otherwise the marker check.
     pub(crate) fn check(&self) -> Result<()> {
         match &self.0 {
-            FenceKind::Lock(f) | FenceKind::Marker(f) => f(),
-            FenceKind::LockFreeBackup => Ok(()),
+            FenceKind::Marker(f) => f(),
+            FenceKind::BackupCommit => Ok(()),
             #[cfg(test)]
             FenceKind::Unchecked => Ok(()),
         }
@@ -227,7 +212,7 @@ impl RepoWriter<'_> {
     }
 
     /// Switch a v6 repository's writer mode (`Repo::set_writer_mode_under`)
-    /// under this writer's fence. The caller holds the maintenance lock and
+    /// under this writer's fence. The caller runs an exclusive session and
     /// has refused live sessions: a session that read the old mode must not
     /// commit across the switch.
     pub fn set_writer_mode(&mut self, want: WriterMode) -> Result<WriterModeReport> {
@@ -241,12 +226,11 @@ impl RepoWriter<'_> {
 
     /// `Repo::maintain_segmented_index_under` with this writer's
     /// fence.
-    pub(crate) fn maintain_segmented_index(&mut self, on_moved: OnMoved) -> Result<()> {
+    pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
         if self.repo.index_dirty {
             self.save_state()?;
         }
-        self.repo
-            .maintain_segmented_index_under(on_moved, &self.fence)
+        self.repo.maintain_segmented_index_under(&self.fence)
     }
 
     /// `Repo::rebase_relocations_under` (it re-applies relocations
@@ -311,22 +295,24 @@ mod tests {
     use vykar_types::error::VykarError;
 
     fn failing() -> FenceFn {
-        Arc::new(|| Err(VykarError::LockExpired("lost".into())))
+        Arc::new(|| Err(VykarError::MarkerLostDuringCommit))
     }
 
     #[test]
-    fn lock_and_marker_fences_return_their_check_error() {
-        for fence in [Fence::lock(failing()), Fence::marker(failing())] {
-            assert!(matches!(fence.check(), Err(VykarError::LockExpired(_))));
-            assert!(!fence.is_lock_free_backup());
-        }
-        assert!(Fence::lock(Arc::new(|| Ok(()))).check().is_ok());
+    fn marker_fence_returns_its_check_error() {
+        let fence = Fence::marker(failing());
+        assert!(matches!(
+            fence.check(),
+            Err(VykarError::MarkerLostDuringCommit)
+        ));
+        assert!(!fence.is_backup_commit());
+        assert!(Fence::marker(Arc::new(|| Ok(()))).check().is_ok());
     }
 
     #[test]
-    fn the_lock_free_backup_fence_passes() {
-        let fence = Fence::lock_free_backup();
+    fn the_backup_commit_fence_passes() {
+        let fence = Fence::backup_commit();
         assert!(fence.check().is_ok());
-        assert!(fence.is_lock_free_backup());
+        assert!(fence.is_backup_commit());
     }
 }

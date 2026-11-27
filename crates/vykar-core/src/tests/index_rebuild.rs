@@ -400,7 +400,7 @@ fn verify_data_reports_a_damaged_trailer_and_repair_maps_the_pack() {
     let pack_id = fx.pack_id_of(&pack);
     // Not the footer: a byte inside the trailer's sealed frame, which then
     // fails authentication.
-    edit_pack(&pack, |b, start| b[start + 7] = 0xFF);
+    edit_pack(&pack, |b, start| b[start + 7] ^= 0xFF);
 
     let result = commands::check::run(&fx.config, pass(&fx.config), true, false).unwrap();
     assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
@@ -608,7 +608,7 @@ fn repair_maps_a_pack_whose_map_is_partial() {
     assert!(entries.len() > 1, "{entries:?}");
     entries.pop();
     fx.put_pack_map(vec![(pack_id, entries)]);
-    edit_pack(&pack, |b, start| b[start + 7] = 0xFF);
+    edit_pack(&pack, |b, start| b[start + 7] ^= 0xFF);
 
     let applied = repair(&fx.config, true, RepairMode::Apply).unwrap();
     assert!(

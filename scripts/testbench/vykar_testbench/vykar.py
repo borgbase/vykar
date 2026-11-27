@@ -199,14 +199,6 @@ def vykar_delete_repo(
     )
 
 
-def vykar_break_lock(
-    vykar_bin: str,
-    config_path: str,
-    repo_label: str,
-) -> subprocess.CompletedProcess:
-    return run_vykar(vykar_bin, config_path, ["break-lock", "-R", repo_label], label="break-lock")
-
-
 def extract_snapshot_id(stdout: str) -> str | None:
     """Extract snapshot ID from vykar backup stdout."""
     m = _SNAPSHOT_RE.search(stdout)

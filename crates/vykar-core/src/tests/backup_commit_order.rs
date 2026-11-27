@@ -25,10 +25,13 @@ enum Event {
     PackPutEnd,
     /// The commit mark: a marker key PUT carrying `committing`.
     MarkPut,
+    /// Any request under `locks/` (0.24's lock directory): a backup never
+    /// makes one.
     LockPut,
     SnapshotPut,
     MarkerDelete,
     JournalDelete,
+    /// As `LockPut`, for a delete.
     LockDelete,
     SegmentPut,
     BasePut,

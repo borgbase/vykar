@@ -822,8 +822,8 @@ fn is_lock_key(key: &str) -> bool {
 /// An exclusive session's marker key (`sessions/x-*.json`, 10-single-protocol
 /// step 8): a hold for invariant 7, as a lock key is.
 fn is_exclusive_marker_key(key: &str) -> bool {
-    crate::repo::lock::parse_session_marker_key(key)
-        .is_some_and(|(id, _)| crate::repo::lock::is_exclusive_session(id))
+    crate::repo::sessions::parse_session_marker_key(key)
+        .is_some_and(|(id, _)| crate::repo::sessions::is_exclusive_session(id))
 }
 
 /// Invariant 7, as the store sees it: replay the op log, tracking which
@@ -845,13 +845,14 @@ fn is_exclusive_marker_key(key: &str) -> bool {
 /// visible only to scripted assertions (`tests::sim_exclusion` case (d),
 /// `exclusive_against_backup_race`) until step 10 replaces this invariant.
 ///
-/// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
+/// Limit: a key counts as held from its PUT. A lock acquisition (vykar
+/// 0.24's, or this binary's before 10-single-protocol step 9) publishes a
 /// tentative key that can coexist with the holder's until the loser deletes
 /// it, and so does a refused exclusive registration (its marker, from its
 /// PUT to its delete), so a protected write by the rightful holder in that
 /// window reads as `WriteUnderSeveralLocks`. No scripted scenario holds a
-/// contender there, and in the driver (`sim::driver`) `acquire_lock` and
-/// an exclusive registration are one step each, so a contender's tentative
+/// contender there, and in the driver (`sim::driver`) an exclusive
+/// registration is one step (and a lock acquisition was), so a contender's tentative
 /// key never coexists with the holder's across a decision. A delayed or duplicated lock PUT that lands later is a key
 /// with no holder; the driver names that shape (`OrphanLockKey`).
 fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
@@ -1056,7 +1057,7 @@ pub(crate) fn orphan_grace(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violatio
 /// `HEAD_LANDING_ALLOWANCE`, exceeds `PACK_AGE_LIMIT`).
 pub(crate) fn marker_gap_commit(log: &[OpRecord], runs: &[RunRecord]) -> Vec<Violation> {
     use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
-    use crate::repo::lock::MARKER_GAP_LIMIT;
+    use crate::repo::sessions::MARKER_GAP_LIMIT;
     let mut out = Vec::new();
     for run in runs {
         if !matches!(run.op, ClientOp::Backup { .. }) {

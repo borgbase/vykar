@@ -5,7 +5,7 @@ use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, RunOutcome, classify};
-use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap};
+use crate::sim::interleavings::{self, Hosts, MarkerReap};
 use crate::sim::{
     Call, ClientId, FaultAction, FaultRule, GateRule, INIT_PID_NS, KeyMatch, OpKind, OpMatch,
     OpOutcome, Sim, SimMachine, SourceTree, StoreKind,
@@ -373,12 +373,18 @@ fn crash_then_break_lock_then_backup() {
     let mut sim = Sim::new();
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.backup(b, "t0", &tree("t0")).expect_ok();
-    sim.fault(FaultRule::new(OpMatch::AnyWrite, KeyMatch::LockKey, FaultAction::Crash).client(a));
-    // A lock holder (a compact until 10-single-protocol step 7, which moved
-    // compact into a session).
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("sessions/x-".into()),
+            FaultAction::Crash,
+        )
+        .client(a),
+    );
+    // An exclusive holder (a lock holder until 10-single-protocol step 9).
     let r = sim.call(
         a,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t0".into()],
         },
     );
@@ -389,8 +395,9 @@ fn crash_then_break_lock_then_backup() {
         r.detail()
     );
     assert!(sim.store().is_crashed(a));
-    // The crash hit the lock PUT itself, so no lock was written.
-    assert!(sim.store().keys("locks/").is_empty());
+    // The crash hit the marker PUT itself, so no exclusive marker was
+    // written.
+    assert!(sim.store().keys("sessions/x-").is_empty());
 
     // A planted exclusive session marker that is not refreshed: the
     // backup's registration listing retries on virtual time and gives up
@@ -421,7 +428,7 @@ fn crash_then_break_lock_then_backup() {
         real.elapsed()
     );
 
-    sim.break_lock(b, true).expect_ok();
+    sim.break_lock(b).expect_ok();
     assert!(exclusive_keys(&sim).is_empty());
     // The failed backup used up its name.
     sim.backup(b, "t2", &tree("t2")).expect_ok();
@@ -950,7 +957,6 @@ const TESTED_IDS: &[&str] = &[
     "H1",
     "H1-session",
     "H1-late-clone",
-    "H2",
     "H2-marker",
     "H4-segment",
     "H3-compact-young",
@@ -1326,13 +1332,15 @@ fn step3_clean_on_sequential_flows() {
         compact.detail()
     );
     sim.check_repair(c).expect_ok();
-    sim.break_lock(d, false).expect_ok();
+    sim.break_lock(d).expect_ok();
     sim.check_invariants(Invariant::STEP3).assert_clean();
 }
 
-/// `c` backs up t0; `a` deletes it under the maintenance lock
-/// ([`Call::LockedDelete`]: a delete runs in a session since
-/// 10-single-protocol step 7) and is held at its snapshot delete.
+/// `c` backs up t0; `a` deletes it as an exclusive session
+/// ([`Call::ExclusiveDelete`]; a lock holder until 10-single-protocol step
+/// 9) and is held at its snapshot delete, after its write check passed
+/// (`WriteChecked` checks before it forwards the delete to the store's
+/// gate). Returns `a`'s exclusive marker key.
 fn held_delete() -> (
     Sim,
     ClientId,
@@ -1350,16 +1358,22 @@ fn held_delete() -> (
     ));
     let run = sim.spawn(
         a,
-        Call::LockedDelete {
+        Call::ExclusiveDelete {
             names: vec!["t0".into()],
         },
     );
     sim.expect_paused(gate, "a's snapshot delete");
     let key = sim
         .store()
-        .keys_written_by(a, "locks/")
-        .pop()
-        .expect("a holds a lock");
+        .keys_written_by(a, "sessions/x-")
+        .into_iter()
+        .rfind(|k| k.ends_with(".json"))
+        .expect("a holds an exclusive session");
+    assert_eq!(
+        sim.store().keys("sessions/x-"),
+        std::slice::from_ref(&key),
+        "one exclusive marker key is present"
+    );
     (sim, a, run, gate, key)
 }
 
@@ -1412,11 +1426,11 @@ fn lock_exclusion_other_and_several() {
     );
 }
 
-/// A lock whose body and key carry no time used to wedge the repository;
-/// since 04 step 5 it is aged by its mtime and reaped after 6 h. The check
-/// runs on a fork: the store is untouched.
+/// A lock key whose body and key carry no time blocks nothing: nothing
+/// reads `locks/` on a v6 repository (10-single-protocol step 9). The
+/// check runs on a fork: the store is untouched.
 #[test]
-fn unparseable_lock_ages_out_by_mtime() {
+fn a_leftover_lock_key_blocks_nothing() {
     let mut sim = Sim::new();
     let c = sim.client("c");
     sim.backup(c, "t0", &tree("t0")).expect_ok();
@@ -1450,11 +1464,6 @@ fn known_hazard_h1_late_clone() {
 }
 
 #[test]
-fn known_hazard_h2_lock_refresh_resurrects() {
-    hazards::assert_reproduces("H2");
-}
-
-#[test]
 fn neutralised_h1_not_reproduced() {
     expect_not_reproduced("H1", interleavings::h1_with(Hosts::Distinct));
 }
@@ -1465,11 +1474,6 @@ fn neutralised_h1_session_not_reproduced() {
         "H1-session",
         interleavings::h1_session_with(Hosts::Distinct),
     );
-}
-
-#[test]
-fn neutralised_h2_not_reproduced() {
-    expect_not_reproduced("H2", interleavings::h2_with(H2Reap::BeforeFence));
 }
 
 /// Both placements of the H2-marker regression, one by one (a clearer
@@ -1922,7 +1926,7 @@ fn reaped_marker_and_deleted_packs_fail_typed() {
 /// PUT or not, the record is not sound; the backup's uploads are minutes
 /// old, young enough to be kept by compact's age guard, so it commits and
 /// its snapshot restores. (With old packs it refuses with the probe's
-/// error: `tests::lock::commit_marker_check_rules`.)
+/// error: `tests::sessions::commit_marker_check_rules`.)
 #[test]
 fn a_marker_key_that_stays_unchecked_commits_while_young() {
     const WAIT: Duration = Duration::from_secs(5);
@@ -2276,8 +2280,9 @@ fn a_pack_the_sweep_empties_is_kept_while_young() {
         |repo: &mut crate::repo::RepoWriter<'_>| {
             repo.load_chunk_index_under_lock()?;
             repo.set_segment_grace(Duration::ZERO);
-            stats = Some(crate::commands::compact::compact_repo(
+            stats = Some(crate::commands::compact::compact_in_session(
                 repo,
+                crate::commands::compact::UNREGISTERED_TEST_SESSION,
                 10.0,
                 None,
                 false,
@@ -2332,8 +2337,9 @@ fn compact_dry_run_counts_young_entries() {
         "compact --dry-run",
         |repo: &mut crate::repo::RepoWriter<'_>| {
             repo.load_chunk_index_under_lock()?;
-            dry = Some(crate::commands::compact::compact_repo(
+            dry = Some(crate::commands::compact::compact_in_session(
                 repo,
+                crate::commands::compact::UNREGISTERED_TEST_SESSION,
                 10.0,
                 None,
                 true,
@@ -3185,7 +3191,7 @@ fn a_recovered_journal_pulls_the_marker_back() {
         .into_iter()
         .find(|k| k.ends_with(".1.json"))
         .expect("b's first refresh");
-    let entry: crate::repo::lock::SessionEntry =
+    let entry: crate::repo::sessions::SessionEntry =
         serde_json::from_slice(&sim.store().object(&gen1).unwrap().data).unwrap();
     let floor = (15 + 46) * 60;
     assert!(

@@ -510,8 +510,8 @@ pub(super) mod tests {
         DecodedJournal, PendingIndexJournal, PendingPackEntry, decode_pending_journal,
     };
     use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
-    use crate::repo::lock::session_index_key;
     use crate::repo::session_journal::{JOURNAL_WRITE_INTERVAL, PENDING_INDEX_OBJECT_CONTEXT};
+    use crate::repo::sessions::session_index_key;
     use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
     use crate::testutil::{MemoryBackend, PackUploadBackend, init_test_environment};
     use vykar_crypto::testing::DeterministicEngine;

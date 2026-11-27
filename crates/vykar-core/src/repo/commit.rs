@@ -64,10 +64,9 @@ impl Repo {
     }
 
     /// Load the chunk index as storage holds it now. For maintenance
-    /// operations: under the repository lock nothing else changes it until
-    /// the lock is released; in a lock-free maintenance session (04 step 9)
-    /// other writers may move the head, and every write of the session
-    /// checks for that (`RepoWriter::persist_maintenance`). Replaces any
+    /// operations: in an exclusive session nothing else changes it until the
+    /// session ends; in a maintenance session (04 step 9) other writers may
+    /// move the head, and every write of the session checks for that (`RepoWriter::persist_maintenance`). Replaces any
     /// index loaded at open.
     pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
         debug_assert!(!self.index_dirty);

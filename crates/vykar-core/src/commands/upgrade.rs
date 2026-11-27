@@ -56,8 +56,10 @@ pub fn upgrade_repo(repo: &mut Repo, mode: Option<WriterMode>) -> Result<Upgrade
 /// one sees the other. The session deregisters before the key is released:
 /// the reverse of acquisition.
 ///
-/// A failed release is `tracing::warn!`-only, with the leaked-lock
-/// sentence after a successful action (as `clear_fence_and_release`).
+/// A failed release is `tracing::warn!`-only and never changes the
+/// action's outcome: after a failed action the action's error is the one
+/// that matters; after a successful one the work is committed, and the
+/// warning names the leaked key and `vykar break-lock`.
 fn with_legacy_upgrade_lock<T>(
     repo: &mut Repo,
     action: impl FnOnce(&mut RepoWriter<'_>, &ExclusiveSession) -> Result<T>,

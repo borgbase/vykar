@@ -86,8 +86,8 @@ pub const MAX_ADVANCES: usize = 3;
 /// Real time to wait for the heartbeats to settle after a step.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lock staleness of today's protocol (`DEFAULT_STALE_LOCK_SECS`), on the
-/// store's clock since 04 step 5.
+/// Lock staleness of the removed lock protocol (6 h), on the store's clock;
+/// recorded seeds still replay its advances (10-single-protocol step 10).
 const STALE_LOCK_SECS: i64 = 6 * 3600;
 
 /// Session staleness of today's protocol (`SESSION_STALE_SECS`), on the
@@ -297,7 +297,7 @@ impl Maintenance {
 /// The name of a session's heartbeat thread: a lock-free stepped compact's
 /// heartbeat runs beside its gated main thread, its operations are not
 /// steps.
-const HEARTBEAT_THREAD: &str = crate::repo::lock::HEARTBEAT_THREAD_NAME;
+const HEARTBEAT_THREAD: &str = crate::repo::sessions::HEARTBEAT_THREAD_NAME;
 
 /// Most step operations one stepped compact makes; one more is a harness
 /// bug (at least twice the largest count the determinism test measures:
@@ -1131,7 +1131,7 @@ impl MaintRun {
             && held.key.starts_with("sessions/")
             && held.key.ends_with(".json");
         if registration {
-            self.session = crate::repo::lock::parse_session_marker_key(&held.key)
+            self.session = crate::repo::sessions::parse_session_marker_key(&held.key)
                 .map(|(id, _)| id.to_string());
             self.heartbeat = false;
             return;
@@ -2609,7 +2609,7 @@ pub(crate) fn classify_evidence(
     // with mtimes L before the delete (a plain listing, such as the sweep's
     // look for committing sessions, judges no age), the victim's newest
     // marker key was older than the session staleness at R's "now"
-    // (`lock::reap_sessions` judges a session by its newest key, against
+    // (`sessions::reap_sessions` judges a session by its newest key, against
     // the mtime of R's own newest marker key lock-free or of its lock key
     // under the lock, both written before L), so no horizon held the
     // victim's packs, and they were orphans past `PACK_AGE_LIMIT`. Who deleted the victim's stale keys does not matter:

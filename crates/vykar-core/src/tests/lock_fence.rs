@@ -1,8 +1,8 @@
 //! The exclusive write check (10-single-protocol step 8,
 //! `commands::util::exclusive_write_check`), at unit level on a memory
 //! backend and virtual time: the check before every write of `check
-//! --repair`, `vykar upgrade` and pack maps. It replaces the lock's fence
-//! (`build_lock_fence`) these tests covered before.
+//! --repair`, `vykar upgrade` and pack maps. It replaced the lock's fence,
+//! which these tests covered before (10-single-protocol step 9 deleted it).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use chrono::Utc;
 
 use crate::commands::util::exclusive_write_check;
-use crate::repo::lock::{self, EXCLUSIVE_CHECK_REUSE, SessionMarker};
+use crate::repo::sessions::{self, EXCLUSIVE_CHECK_REUSE, SessionMarker};
 use crate::repo::{FenceFn, HostEnv};
 use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
@@ -72,9 +72,9 @@ fn rig() -> Rig {
         exists: AtomicUsize::new(0),
         fail_exists: AtomicUsize::new(0),
     });
-    let reg = lock::register_exclusive(storage.as_ref(), &env).unwrap();
+    let reg = sessions::register_exclusive(storage.as_ref(), &env).unwrap();
     assert!(reg.live.is_empty());
-    let key = lock::session_marker_key(reg.registration.session_id());
+    let key = sessions::session_marker_key(reg.registration.session_id());
     let marker = Arc::new(SessionMarker::new(&reg.registration));
     Rig {
         time,
@@ -142,7 +142,7 @@ fn a_gap_over_the_limit_fails_with_the_marker_present() {
     let check = r.check();
     check().unwrap();
     r.time
-        .advance(lock::MARKER_GAP_LIMIT + std::time::Duration::from_secs(60));
+        .advance(sessions::MARKER_GAP_LIMIT + std::time::Duration::from_secs(60));
     assert!(is_lost(&check()));
     assert!(r.storage.inner.exists(&r.key).unwrap());
 }
@@ -193,7 +193,7 @@ fn a_failed_check_of_a_superseded_key_does_not_end_the_run() {
     r.storage.fail_exists.store(1, Ordering::SeqCst);
     let outcome = r.marker.refresh(r.storage.as_ref(), r.env.clock.as_ref());
     assert!(
-        matches!(outcome, lock::RefreshOutcome::Unchecked(_)),
+        matches!(outcome, sessions::RefreshOutcome::Unchecked(_)),
         "{outcome:?}"
     );
     assert_eq!(r.marker.report(r.env.clock.as_ref()).unchecked, 1);

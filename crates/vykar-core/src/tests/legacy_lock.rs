@@ -10,18 +10,21 @@ use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
 use super::vendored_v0_24_lock as v024;
-use crate::repo::lock;
 use crate::repo::{HostEnv, HostIdentity, LegacyUpgradeLock};
 use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
 
-/// A memory backend with mtimes that counts the requests reaching it and
-/// can fail PUTs to one key.
+/// What runs on the inner backend before the next PUT to a key.
+type BeforePut = Box<dyn FnOnce(&dyn StorageBackend) + Send>;
+
+/// A memory backend with mtimes that counts the requests reaching it, can
+/// fail PUTs to one key, and can run a hook before the next PUT to one key.
 struct Counted {
     inner: MemoryBackend,
     requests: AtomicUsize,
     puts: Mutex<Vec<String>>,
     fail_puts_to: Mutex<Option<String>>,
+    before_put_to: Mutex<Option<(String, BeforePut)>>,
 }
 
 impl Counted {
@@ -31,6 +34,7 @@ impl Counted {
             requests: AtomicUsize::new(0),
             puts: Mutex::new(Vec::new()),
             fail_puts_to: Mutex::new(None),
+            before_put_to: Mutex::new(None),
         })
     }
 
@@ -70,6 +74,19 @@ delegate_storage_backend! {
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.note();
         self.puts.lock().unwrap().push(key.to_string());
+        let hook = {
+            let mut armed = self.before_put_to.lock().unwrap();
+            match armed.take() {
+                Some((k, f)) if k == key => Some(f),
+                other => {
+                    *armed = other;
+                    None
+                }
+            }
+        };
+        if let Some(f) = hook {
+            f(&self.inner);
+        }
         if self.fail_puts_to.lock().unwrap().as_deref() == Some(key) {
             return Err(VykarError::Other(format!("injected failure: put {key}")));
         }
@@ -168,7 +185,7 @@ fn expired_containing(result: Result<()>, text: &str) {
     }
 }
 
-/// A 0.24 lock body, as 0.24's `acquire_lock` writes it.
+/// A 0.24 lock body, as `v024::acquire_lock` writes it.
 fn v024_body(hostname: &str, pid: u32, boot_id: Option<&str>, time: DateTime<Utc>) -> Vec<u8> {
     serde_json::to_vec(&v024::LockEntry {
         hostname: hostname.into(),
@@ -357,31 +374,61 @@ fn check_refuses_on_a_clock_anomaly() {
     lock.release().unwrap();
 }
 
-/// Until step 9 the v6 path takes today's lock: it refuses beside the
-/// legacy key, and the legacy key refuses beside it.
+/// H2's successor (10-single-protocol step 9 retired H2, the lock refresh
+/// recreating a reaped key, with this binary's lock): the legacy key's
+/// rewrite recreates a key a vykar 0.24 client reaped. A 0.24 client on the
+/// upgrader's hostname that takes the key for stale (it sees the PID dead
+/// there: the documented same-hostname residual of step 6) reaps it between
+/// the check's EXISTS and its rewrite PUT and takes its own lock; the PUT
+/// then recreates the upgrade's key: two holders, and the upgrade's next
+/// check passes. This asserts the residual reproduces; it is not fixed in
+/// this step. An EXISTS after the rewrite would not see it (it follows our
+/// own PUT), and put-if-absent cannot rewrite an existing key. The fix that
+/// works: after the rewrite PUT, LIST `locks/`; if any other `*.json` key is
+/// there, delete our own key, set `lost` and return `LockExpired` (one LIST
+/// per rewrite).
 #[test]
-fn todays_lock_refuses_beside_a_legacy_key() {
+fn h2_legacy_a_rewrite_after_a_0_24_reap_resurrects_the_key() {
     let storage = Counted::new();
-    let (_time, env) = env();
-    let legacy = acquire(&storage, &env).unwrap();
-    let other = HostEnv::system();
-    let Err(VykarError::Locked(holder)) = lock::acquire_lock(&*storage, &other) else {
-        panic!("expected Locked");
-    };
-    assert_eq!(holder.key, legacy.key());
-    assert_eq!(lock_keys(&*storage), vec![legacy.key().to_string()]);
-    legacy.release().unwrap();
-}
-
-#[test]
-fn a_legacy_key_refuses_beside_todays_lock() {
-    let storage = Counted::new();
-    let (_time, env) = env();
-    let guard = lock::acquire_lock(&*storage, &HostEnv::system()).unwrap();
-    let Err(VykarError::Locked(holder)) = acquire(&storage, &env) else {
-        panic!("expected Locked");
-    };
-    assert_eq!(holder.key, guard.key());
-    assert_eq!(lock_keys(&*storage), vec![guard.key().to_string()]);
-    lock::release_lock(&*storage, guard).unwrap();
+    let (time, env) = env();
+    let lock = acquire(&storage, &env).unwrap();
+    let key = lock.key().to_string();
+    let theirs: Arc<Mutex<Option<String>>> = Arc::default();
+    {
+        let (theirs, ours) = (Arc::clone(&theirs), key.clone());
+        let reap_and_take: BeforePut = Box::new(move |inner: &dyn StorageBackend| {
+            // 0.24 on the upgrader's hostname and boot, its PID dead there.
+            let left = v024::cleanup_stale_locks_inner(
+                inner,
+                Duration::hours(6),
+                "upgrader",
+                Some("boot-u"),
+                |_| false,
+            )
+            .unwrap();
+            assert!(
+                !left.contains(&ours),
+                "0.24 reaps the upgrade's key: {left:?}"
+            );
+            let guard = v024::acquire_lock(inner).unwrap();
+            *theirs.lock().unwrap() = Some(guard.key().to_string());
+        });
+        *storage.before_put_to.lock().unwrap() = Some((key.clone(), reap_and_take));
+    }
+    // The rewrite is due: EXISTS finds the key, 0.24 reaps it and takes
+    // its own lock, then the rewrite PUT lands.
+    advance(&time, Duration::minutes(6));
+    lock.check().unwrap();
+    let theirs = theirs
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the 0.24 client took its lock");
+    let mut both = vec![key.clone(), theirs.clone()];
+    both.sort();
+    assert_eq!(lock_keys(&*storage), both, "two holders");
+    advance(&time, Duration::minutes(1));
+    lock.check().unwrap();
+    lock.release().unwrap();
+    assert_eq!(lock_keys(&*storage), vec![theirs]);
 }

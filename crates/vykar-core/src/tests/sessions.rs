@@ -1,22 +1,20 @@
-use crate::repo::ages::StoreClock;
 use crate::repo::host_env::{Clock, StopSignal};
-use crate::repo::lock;
-use crate::repo::lock::{
-    HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, NowSource, RefreshOutcome,
-    SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, acquire_lock, break_lock,
-    cleanup_stale_locks, cleanup_stale_sessions, cleanup_stale_sessions_keeping,
+use crate::repo::sessions;
+use crate::repo::sessions::{
+    HEARTBEAT_POLL, HeartbeatAction, HeartbeatSchedule, MarkerReport, RefreshOutcome,
+    SESSION_STALE_SECS, SessionEntry, SessionGuard, SessionMarker, cleanup_stale_sessions,
     clear_all_sessions, commit_marker_check, default_stale_session_duration, format_age,
-    format_age_since, parse_session_marker_key, register_session, release_lock, session_marker_key,
-    session_marker_key_at, yield_to_lock_free_writers,
+    format_age_since, parse_session_marker_key, register_session, session_marker_key,
+    session_marker_key_at,
 };
-use crate::repo::lock::{HeadWriter, head_landing_check, single_writer_listing};
-use crate::repo::{HostEnv, HostIdentity, SystemClock};
+use crate::repo::sessions::{HeadWriter, head_landing_check, single_writer_listing};
+use crate::repo::{HostEnv, HostIdentity, LegacyUpgradeLock, SystemClock};
 use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
 use vykar_storage::StorageBackend;
-use vykar_types::error::{LockHolder, VykarError};
+use vykar_types::error::VykarError;
 
 /// Stub pid_alive function that always returns true (conservative default).
 fn pid_always_alive(_pid: u32) -> bool {
@@ -89,174 +87,6 @@ fn env_on(
 }
 
 #[test]
-fn acquire_and_release_lock() {
-    let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-    let key = guard.key().to_string();
-
-    // Lock key should exist in storage
-    assert!(storage.exists(&key).unwrap());
-
-    // Release should remove it
-    release_lock(&storage, guard).unwrap();
-    assert!(!storage.exists(&key).unwrap());
-}
-
-/// Fails the first LIST that would return a key (on an empty store, the
-/// one after the lock PUT), once.
-struct FailFirstNonEmptyList {
-    inner: MemoryBackend,
-    fired: std::sync::atomic::AtomicBool,
-}
-
-impl FailFirstNonEmptyList {
-    fn check(&self, prefix: &str) -> vykar_types::error::Result<()> {
-        if !self.inner.list(prefix)?.is_empty()
-            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(vykar_types::error::VykarError::Interrupted);
-        }
-        Ok(())
-    }
-}
-
-impl vykar_storage::InnerBackend for FailFirstNonEmptyList {
-    fn inner_backend(&self) -> &dyn StorageBackend {
-        &self.inner
-    }
-}
-
-vykar_storage::delegate_storage_backend! {
-    for FailFirstNonEmptyList;
-    except [list, list_sized, list_meta, server_ops];
-
-    fn list_meta(
-        &self,
-        prefix: &str,
-    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
-        self.list_sized(prefix)
-    }
-
-    fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
-        self.check(prefix)?;
-        self.inner.list(prefix)
-    }
-
-    fn list_sized(
-        &self,
-        prefix: &str,
-    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
-        self.check(prefix)?;
-        self.inner.list_sized(prefix)
-    }
-
-    // No server behind the inner backend: listings stay on `list_sized`.
-    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
-        None
-    }
-}
-
-/// A LIST that fails after the lock PUT must not leave the key behind.
-#[test]
-fn failed_list_after_lock_put_removes_the_key() {
-    let storage = FailFirstNonEmptyList {
-        inner: MemoryBackend::new(),
-        fired: std::sync::atomic::AtomicBool::new(false),
-    };
-    let err = acquire_lock(&storage, &HostEnv::system()).unwrap_err();
-    assert!(
-        matches!(err, vykar_types::error::VykarError::Interrupted),
-        "{err}"
-    );
-    assert!(storage.inner.list("locks/").unwrap().is_empty());
-}
-
-#[test]
-fn lock_key_in_locks_directory() {
-    let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-    assert!(guard.key().starts_with("locks/"));
-    assert!(guard.key().ends_with(".json"));
-    release_lock(&storage, guard).unwrap();
-}
-
-#[test]
-fn second_lock_is_rejected() {
-    let storage = MemoryBackend::new();
-    let first = acquire_lock(&storage, &HostEnv::system()).unwrap();
-
-    let second = acquire_lock(&storage, &HostEnv::system());
-    assert!(second.is_err(), "second lock acquisition should fail");
-    let msg = second.unwrap_err().to_string();
-    assert!(msg.contains("locked"), "unexpected error: {msg}");
-
-    release_lock(&storage, first).unwrap();
-}
-
-/// The `Locked` message must be self-diagnosing: who holds the lock, how long
-/// they have held it, and what to do about it (issue #174, where the message
-/// named only host and PID and users could not tell a brief commit apart from
-/// a long prune/compact on another machine).
-#[test]
-fn locked_error_names_holder_age_and_remedy() {
-    let storage = MemoryBackend::new();
-    let first = acquire_lock(&storage, &HostEnv::system()).unwrap();
-
-    let msg = acquire_lock(&storage, &HostEnv::system())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains(&crate::platform::hostname()),
-        "message should name the holder's host: {msg}"
-    );
-    assert!(
-        msg.contains(&format!("PID {}", std::process::id())),
-        "message should name the holder's PID: {msg}"
-    );
-    assert!(
-        msg.contains("held for 0s"),
-        "message should report a sub-minute age in seconds: {msg}"
-    );
-    assert!(
-        msg.contains("prune/compact"),
-        "message should name the likely cause: {msg}"
-    );
-    assert!(
-        msg.contains("vykar break-lock"),
-        "message should name the remedy: {msg}"
-    );
-    assert!(
-        !msg.contains("locks/"),
-        "a readable holder should be named by host/PID, not a raw key path: {msg}"
-    );
-
-    release_lock(&storage, first).unwrap();
-}
-
-/// An unreadable lock object is a normal race (the holder may have released it
-/// between our LIST and GET), so we still fail with a usable message naming the
-/// key rather than panicking or losing the remedy.
-#[test]
-fn locked_error_falls_back_to_key_when_holder_unparseable() {
-    let storage = MemoryBackend::new();
-    // Valid timestamp prefix so stale-lock cleanup does not reap it.
-    let garbage_key = lock_key_at(Utc::now() - Duration::minutes(1), "garbage");
-    storage.put(&garbage_key, b"not json").unwrap();
-
-    let msg = acquire_lock(&storage, &HostEnv::system())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains(&garbage_key),
-        "message should name the lock key: {msg}"
-    );
-    assert!(
-        msg.contains("vykar break-lock"),
-        "message should still name the remedy: {msg}"
-    );
-}
-
-#[test]
 fn format_age_renders_sub_minute_in_seconds() {
     let now = Utc::now();
     assert_eq!(
@@ -287,139 +117,33 @@ fn format_age_renders_sub_minute_in_seconds() {
     assert_eq!(format_age(&now, "not-a-timestamp"), "unknown");
 }
 
-#[test]
-fn stale_lock_is_cleaned_up() {
-    let storage = MemoryBackend::new();
-    let stale_key = "locks/00000000000000000000-stale.json";
-    let stale_time = (Utc::now() - Duration::hours(7)).to_rfc3339();
-    let stale_entry = format!(r#"{{"hostname":"old","pid":1234,"time":"{stale_time}"}}"#);
-    storage.put(stale_key, stale_entry.as_bytes()).unwrap();
-    assert!(storage.exists(stale_key).unwrap());
-
-    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-    assert!(
-        !storage.exists(stale_key).unwrap(),
-        "stale lock should be removed during acquisition"
-    );
-    release_lock(&storage, guard).unwrap();
-}
-
 fn lock_key_at(ts: chrono::DateTime<Utc>, suffix: &str) -> String {
     format!("locks/{:020}-{suffix}.json", ts.timestamp_micros())
 }
 
-fn write_lock_marker(
-    storage: &dyn StorageBackend,
-    key: &str,
-    hostname: &str,
-    pid: u32,
-    time: chrono::DateTime<Utc>,
-    boot_id: Option<&str>,
-) {
-    let mut value = serde_json::json!({
-        "hostname": hostname,
-        "pid": pid,
-        "time": time.to_rfc3339(),
-    });
-    if let Some(boot_id) = boot_id {
-        value["boot_id"] = serde_json::Value::String(boot_id.to_string());
+/// `clear_legacy_locks` deletes everything under `locks/` and counts the
+/// `.json` keys only; session markers stay.
+#[test]
+fn clear_legacy_locks_removes_everything_under_locks() {
+    let storage = MemoryBackend::new();
+    for key in [
+        "locks/a.json",
+        "locks/b.json",
+        &format!("locks/vykar-clock-{:032x}", 7u128),
+        "locks/vykar-probe-0123",
+        "locks/other",
+    ] {
+        storage.put(key, b"x").unwrap();
     }
-    storage
-        .put(key, serde_json::to_vec(&value).unwrap().as_slice())
-        .unwrap();
-}
+    write_session_marker(&storage, "s1", &Utc::now().to_rfc3339());
+    assert_eq!(sessions::clear_legacy_locks(&storage).unwrap(), 2);
+    assert!(storage.list("locks/").unwrap().is_empty());
+    assert!(storage.exists(&session_marker_key("s1")).unwrap());
 
-#[test]
-fn stale_lock_cleanup_preserves_recent_foreign_host() {
-    let storage = MemoryBackend::new();
-    let key = lock_key_at(Utc::now(), "foreign");
-    write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), Some("boot-a"));
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-b"), |_| false),
-        NowSource::Probe(&mut StoreClock::default()),
-    )
-    .unwrap();
-
-    assert!(storage.exists(&key).unwrap());
-}
-
-#[test]
-fn stale_lock_cleanup_reaps_malformed_lock_by_key_age() {
-    let storage = MemoryBackend::new();
-    let old = Utc::now() - Duration::hours(7);
-    let key = lock_key_at(old, "malformed");
-    storage.put(&key, b"not-json").unwrap();
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-a"), |_| true),
-        NowSource::Probe(&mut StoreClock::default()),
-    )
-    .unwrap();
-
-    assert!(!storage.exists(&key).unwrap());
-}
-
-#[test]
-fn stale_lock_cleanup_preserves_recent_old_format_lock() {
-    let storage = MemoryBackend::new();
-    let key = lock_key_at(Utc::now(), "old-format");
-    write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), None);
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-a"), |_| false),
-        NowSource::Probe(&mut StoreClock::default()),
-    )
-    .unwrap();
-
-    assert!(storage.exists(&key).unwrap());
-}
-
-#[test]
-fn stale_lock_cleanup_reaps_age_stale_old_format_lock() {
-    let storage = MemoryBackend::new();
-    let old = Utc::now() - Duration::hours(7);
-    let key = lock_key_at(old, "age-stale");
-    write_lock_marker(&storage, &key, "otherhost", 123, old, None);
-
-    cleanup_stale_locks(
-        &storage,
-        Duration::hours(6),
-        &env_on("myhost", Some("boot-a"), |_| false),
-        NowSource::Probe(&mut StoreClock::default()),
-    )
-    .unwrap();
-
-    assert!(!storage.exists(&key).unwrap());
-}
-
-#[test]
-fn break_lock_removes_all_locks() {
-    let storage = MemoryBackend::new();
-
-    // Acquire a lock and "forget" the guard (simulates a killed process)
-    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-    let key = guard.key().to_string();
-    assert!(storage.exists(&key).unwrap());
-    std::mem::forget(guard);
-
-    // break_lock should remove it
-    let removed = break_lock(&storage).unwrap();
-    assert_eq!(removed, 1);
-    assert!(!storage.exists(&key).unwrap());
-}
-
-#[test]
-fn break_lock_returns_zero_when_no_locks() {
-    let storage = MemoryBackend::new();
-    let removed = break_lock(&storage).unwrap();
-    assert_eq!(removed, 0);
+    assert_eq!(
+        sessions::clear_legacy_locks(&MemoryBackend::new()).unwrap(),
+        0
+    );
 }
 
 // --- cleanup_stale_sessions tests ---
@@ -438,7 +162,7 @@ fn write_session_marker_with_host(
     pid: u32,
 ) {
     let key = format!("sessions/{session_id}.json");
-    let entry = crate::repo::lock::SessionEntry {
+    let entry = crate::repo::sessions::SessionEntry {
         hostname: hostname.to_string(),
         pid,
         registered_at: last_refresh.to_string(),
@@ -1333,7 +1057,7 @@ fn commit_marker_check_rules() {
 #[test]
 fn head_landing_check_rules() {
     use crate::repo::ages::{HEAD_LANDING_ALLOWANCE, PACK_AGE_LIMIT};
-    use crate::repo::lock::head_landing_check;
+    use crate::repo::sessions::head_landing_check;
     let zero = std::time::Duration::ZERO;
     let one = std::time::Duration::from_secs(1);
     let sound = marker_report(false, 15);
@@ -1361,7 +1085,7 @@ fn head_landing_check_rules() {
 #[test]
 fn a_gone_key_found_at_the_judgement_refuses_at_the_fence() {
     use crate::repo::ages::HEAD_LANDING_ALLOWANCE;
-    use crate::repo::lock::head_landing_check;
+    use crate::repo::sessions::head_landing_check;
     let storage = MemoryBackend::new();
     let (_time, env) = sim_env();
     let clock = env.clock.as_ref();
@@ -1547,7 +1271,7 @@ fn a_slow_marker_put_breaks_continuity() {
 #[test]
 fn horizon_is_mtime_minus_elapsed_minus_margin() {
     use crate::repo::ages::MARGIN;
-    use crate::repo::lock::LiveSession;
+    use crate::repo::sessions::LiveSession;
     let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
     let entry = |elapsed: Option<u64>| SessionEntry {
         elapsed_secs: elapsed,
@@ -1653,7 +1377,7 @@ fn a_reap_after_the_check_is_refused_by_maintenance_and_not_recorded() {
     );
     // The reaper, which listed generation 0 only.
     storage.delete(&session_marker_key("after")).unwrap();
-    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    let listed = crate::repo::sessions::list_session_entries(&storage).unwrap();
     assert_eq!(listed.len(), 1, "the second LIST sees key 1: {listed:?}");
     assert!(listed[0].1.is_some());
 
@@ -1794,7 +1518,7 @@ fn the_newest_generation_is_numeric() {
         session_keys(&storage),
         ["sessions/live.10.json", "sessions/live.9.json"]
     );
-    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    let listed = crate::repo::sessions::list_session_entries(&storage).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, "live");
     assert_eq!(listed[0].1.as_ref().unwrap().last_refresh, fresh);
@@ -1808,11 +1532,14 @@ fn one_session_with_two_keys_is_listed_once() {
     write_session_marker(&storage, "two", &old);
     write_session_marker(&storage, "two.3", &new);
 
-    let entries = crate::repo::lock::list_session_entries(&storage).unwrap();
+    let entries = crate::repo::sessions::list_session_entries(&storage).unwrap();
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0].0, "two");
     assert_eq!(entries[0].1.as_ref().unwrap().last_refresh, new);
-    assert_eq!(crate::repo::lock::list_sessions(&storage).unwrap(), ["two"]);
+    assert_eq!(
+        crate::repo::sessions::list_sessions(&storage).unwrap(),
+        ["two"]
+    );
 }
 
 /// A3: a session is judged by its newest key.
@@ -1840,7 +1567,7 @@ fn cleanup_judges_a_session_by_its_newest_key() {
             "sessions/live.json",
         ]
     );
-    let listed = crate::repo::lock::list_session_entries(&storage).unwrap();
+    let listed = crate::repo::sessions::list_session_entries(&storage).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].0, "live");
 }
@@ -1959,20 +1686,30 @@ fn plant_session(storage: &dyn StorageBackend, w: &Writer) -> String {
     key
 }
 
-/// Plant `w`'s entry once as a lock (6 h limit) and once as a session
-/// marker (45 min limit), each in a fresh store, and run the reaper as
-/// `env`. Returns (lock reaped, session reaped).
+/// Plant `w`'s entry once as a 0.24-shaped lock (6 h limit) and once as a
+/// session marker (45 min limit), each in a fresh store, and run the reaper
+/// as `env`: for the lock the v2/v3 upgrade's legacy key acquisition
+/// (`LegacyUpgradeLock::acquire`, which reaps on the predicate this
+/// binary's lock reaper used: same-host dead or earlier boot, or older than
+/// 6 h), for the marker the session reaper. Returns (lock reaped, session
+/// reaped).
 fn verdicts(w: &Writer, env: &HostEnv) -> (bool, bool) {
-    let locks = MemoryBackend::new();
-    let key = plant_lock(&locks, w);
-    cleanup_stale_locks(
-        &locks,
-        Duration::hours(6),
-        env,
-        NowSource::Probe(&mut StoreClock::default()),
-    )
-    .unwrap();
-    let lock_reaped = !locks.exists(&key).unwrap();
+    let locks = Arc::new(MemoryBackend::new());
+    let key = plant_lock(locks.as_ref(), w);
+    let lock_reaped =
+        match LegacyUpgradeLock::acquire(Arc::clone(&locks) as Arc<dyn StorageBackend>, env) {
+            Ok(lock) => {
+                assert!(!locks.exists(&key).unwrap(), "acquired beside {key}");
+                lock.release().unwrap();
+                true
+            }
+            Err(VykarError::Locked(holder)) => {
+                assert_eq!(holder.key, key);
+                assert!(locks.exists(&key).unwrap());
+                false
+            }
+            Err(e) => panic!("acquire: {e}"),
+        };
 
     let sessions = MemoryBackend::new();
     let key = plant_session(&sessions, w);
@@ -2184,14 +1921,17 @@ struct SessionEntryV024 {
     last_refresh: String,
 }
 
-/// A lock and a marker written by `me()`: (lock bytes, marker bytes).
+/// A lock (the v2/v3 upgrade's legacy key) and a marker written by `me()`:
+/// (lock bytes, marker bytes).
 fn written_entries() -> (Vec<u8>, Vec<u8>) {
-    let storage = MemoryBackend::new();
+    let storage = Arc::new(MemoryBackend::new());
     let env = env_as(me(), alive, Some(HOUR));
-    let guard = acquire_lock(&storage, &env).unwrap();
-    let lock = storage.get(guard.key()).unwrap().unwrap();
-    release_lock(&storage, guard).unwrap();
-    register_session(&storage, "fmt", &env).unwrap();
+    let legacy =
+        LegacyUpgradeLock::acquire(Arc::clone(&storage) as Arc<dyn StorageBackend>, &env).unwrap();
+    let lock = storage.get(legacy.key()).unwrap().unwrap();
+    legacy.release().unwrap();
+    let storage = storage.as_ref();
+    register_session(storage, "fmt", &env).unwrap();
     let marker = storage.get(&session_marker_key("fmt")).unwrap().unwrap();
     (lock, marker)
 }
@@ -2346,71 +2086,77 @@ fn heartbeat_retries_a_failed_put_at_the_next_poll() {
     assert_eq!(session_keys(storage.as_ref()), Vec::<String>::new());
 }
 
-// ── acquire_lock_with_deadline ───────────────────────────────────────────
+// ── wait_while_locked ────────────────────────────────────────────────────
 
 mod deadline {
     use crate::repo::HostEnv;
     use crate::repo::control::CancelToken;
-    use crate::repo::lock::{
-        COMMIT_LOCK_MAX_WAIT, acquire_lock, acquire_lock_with_deadline, release_lock,
-    };
+    use crate::repo::sessions::{COMMIT_MAX_WAIT, wait_while_locked};
     use crate::sim::env::{SimTime, TimeMode};
-    use crate::testutil::MemoryBackend;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use vykar_storage::StorageBackend;
-    use vykar_types::error::VykarError;
+    use vykar_types::error::{LockHolder, Result, VykarError};
 
+    fn rival() -> LockHolder {
+        LockHolder {
+            key: "sessions/rival.json".into(),
+            details: None,
+        }
+    }
+
+    /// An attempt that is `Locked` until another thread lets it pass (after
+    /// 1 s real time) returns once it passes; `on_contended` is called once.
     #[test]
-    fn deadline_waits_for_release() {
-        let storage = Arc::new(MemoryBackend::new());
-        let held = acquire_lock(&*storage, &HostEnv::system()).unwrap();
+    fn wait_while_locked_returns_once_the_holder_goes() {
+        let gone = Arc::new(AtomicBool::new(false));
         let releaser = {
-            let storage = Arc::clone(&storage);
+            let gone = Arc::clone(&gone);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(1));
-                release_lock(&*storage, held).unwrap();
+                gone.store(true, Ordering::SeqCst);
             })
         };
-
         let mut contended = 0;
-        let guard = acquire_lock_with_deadline(
-            &*storage,
+        wait_while_locked(
             &HostEnv::system(),
             Duration::from_secs(30),
             100,
             &CancelToken::new(),
             |_| contended += 1,
+            || -> Result<()> {
+                if gone.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(VykarError::Locked(rival()))
+                }
+            },
         )
         .unwrap();
         releaser.join().unwrap();
         assert_eq!(contended, 1);
-        release_lock(&*storage, guard).unwrap();
     }
 
+    /// The production budget (`COMMIT_MAX_WAIT`) on virtual time: an attempt
+    /// that stays `Locked` ends `Locked` once 2 h have passed there, in
+    /// under 5 s of real time.
     #[test]
-    fn deadline_times_out_after_budget() {
-        let storage = MemoryBackend::new();
-        let _held = acquire_lock(&storage, &HostEnv::system()).unwrap();
+    fn wait_while_locked_times_out_after_budget() {
         let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
         let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
         let start = Instant::now();
-        let err = acquire_lock_with_deadline(
-            &storage,
+        let err = wait_while_locked(
             &env,
-            COMMIT_LOCK_MAX_WAIT,
+            COMMIT_MAX_WAIT,
             500,
             &CancelToken::new(),
             |_| {},
+            || -> Result<()> { Err(VykarError::Locked(rival())) },
         )
         .unwrap_err();
         assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
-        assert!(
-            time.elapsed() >= COMMIT_LOCK_MAX_WAIT,
-            "{:?}",
-            time.elapsed()
-        );
+        assert!(time.elapsed() >= COMMIT_MAX_WAIT, "{:?}", time.elapsed());
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -2424,15 +2170,10 @@ mod deadline {
     /// `Locked(holder)` is returned; `on_contended` is called once.
     #[test]
     fn wait_while_locked_gives_up_at_the_deadline() {
-        use crate::repo::lock::wait_while_locked;
-        use vykar_types::error::LockHolder;
         let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
         let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
         let max_wait = Duration::from_secs(10 * 60);
-        let holder = LockHolder {
-            key: "locks/rival.json".into(),
-            details: None,
-        };
+        let holder = rival();
         let (mut attempts, mut contended) = (0usize, 0usize);
         let err = wait_while_locked(
             &env,
@@ -2440,14 +2181,14 @@ mod deadline {
             500,
             &CancelToken::new(),
             |_| contended += 1,
-            |_| -> vykar_types::error::Result<()> {
+            || -> Result<()> {
                 attempts += 1;
                 Err(VykarError::Locked(holder.clone()))
             },
         )
         .unwrap_err();
         match err {
-            VykarError::Locked(h) => assert_eq!(h.key, "locks/rival.json"),
+            VykarError::Locked(h) => assert_eq!(h.key, "sessions/rival.json"),
             other => panic!("got {other:?}"),
         }
         assert!(time.elapsed() >= max_wait, "{:?}", time.elapsed());
@@ -2501,7 +2242,7 @@ mod deadline {
         fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
             self.inner.put(key, data)?;
             let committing = key.starts_with("sessions/")
-                && serde_json::from_slice::<crate::repo::lock::SessionEntry>(data)
+                && serde_json::from_slice::<crate::repo::sessions::SessionEntry>(data)
                     .is_ok_and(|e| e.committing);
             if committing && !self.marked.swap(true, Ordering::SeqCst) {
                 let rival = HostEnv::system().with_host(crate::repo::HostIdentity {
@@ -2511,11 +2252,11 @@ mod deadline {
                     installation_id: Some("inst-c".into()),
                     pid_ns: Some(1),
                 });
-                crate::repo::lock::register_session_with(
+                crate::repo::sessions::register_session_with(
                     &*self.inner,
                     "rival",
                     &rival,
-                    crate::repo::lock::MarkerFlags {
+                    crate::repo::sessions::MarkerFlags {
                         committing: false,
                         writes_heads: true,
                     },
@@ -2526,7 +2267,7 @@ mod deadline {
     }
 
     /// The single-writer arm of `PendingCommit::protect_commit` gives up at
-    /// its deadline (`COMMIT_LOCK_MAX_WAIT`, virtual time) beside a live
+    /// its deadline (`COMMIT_MAX_WAIT`, virtual time) beside a live
     /// compact (a session flagged `writes_heads` on another host, registered
     /// right after the backup's commit mark and fresh on the store's clock
     /// throughout): its listing after the mark unmarks, every later attempt
@@ -2536,7 +2277,7 @@ mod deadline {
     #[test]
     fn a_single_writer_protection_gives_up_unmarked() {
         use crate::commands;
-        use crate::repo::lock::SessionEntry;
+        use crate::repo::sessions::SessionEntry;
         use crate::repo::{EncryptionMode, OpenOptions, Repo, RepoFormat, WriterMode};
         use crate::tests::helpers::make_test_config;
         use vykar_storage::local_backend::LocalBackend;
@@ -2618,11 +2359,7 @@ mod deadline {
             VykarError::Locked(h) => assert!(h.key.starts_with("sessions/rival"), "{h:?}"),
             other => panic!("got {other:?}"),
         }
-        assert!(
-            time.elapsed() >= COMMIT_LOCK_MAX_WAIT,
-            "{:?}",
-            time.elapsed()
-        );
+        assert!(time.elapsed() >= COMMIT_MAX_WAIT, "{:?}", time.elapsed());
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "{:?}",
@@ -2637,7 +2374,7 @@ mod deadline {
             .filter(|k| k.ends_with(".json") && !k.starts_with("sessions/rival"))
             .collect();
         own.sort_by_key(|k| {
-            crate::repo::lock::parse_session_marker_key(k)
+            crate::repo::sessions::parse_session_marker_key(k)
                 .map(|(_, n)| n)
                 .unwrap_or_default()
         });
@@ -2648,28 +2385,31 @@ mod deadline {
         drop(pending);
     }
 
+    /// A cancelled token ends the wait before the first attempt.
     #[test]
-    fn deadline_interrupted_before_first_attempt() {
-        let storage = MemoryBackend::new();
+    fn wait_while_locked_interrupted_before_first_attempt() {
         let flag = CancelToken::new();
         flag.cancel();
-        let err = acquire_lock_with_deadline(
-            &storage,
+        let mut attempts = 0;
+        let err = wait_while_locked(
             &HostEnv::system(),
             Duration::from_secs(30),
             500,
             &flag,
             |_| {},
+            || -> Result<()> {
+                attempts += 1;
+                Ok(())
+            },
         )
         .unwrap_err();
         assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
-        assert!(storage.list("locks/").unwrap().is_empty());
+        assert_eq!(attempts, 0);
     }
 
+    /// A cancel during the wait (after 200 ms) ends it within a sleep slice.
     #[test]
-    fn deadline_interrupted_during_contention() {
-        let storage = MemoryBackend::new();
-        let _held = acquire_lock(&storage, &HostEnv::system()).unwrap();
+    fn wait_while_locked_interrupted_during_contention() {
         let flag = CancelToken::new();
         let setter = {
             let flag = flag.clone();
@@ -2679,13 +2419,13 @@ mod deadline {
             })
         };
         let start = Instant::now();
-        let err = acquire_lock_with_deadline(
-            &storage,
+        let err = wait_while_locked(
             &HostEnv::system(),
             Duration::from_secs(600),
             500,
             &flag,
             |_| {},
+            || -> Result<()> { Err(VykarError::Locked(rival())) },
         )
         .unwrap_err();
         setter.join().unwrap();
@@ -2701,33 +2441,22 @@ mod deadline {
 // ── Clock-independent exclusion ──────────────────────────────────────────
 
 /// The interleaving tests of this module live on the simulator
-/// (src/tests/sim_exclusion.rs). These stay: three single-client tests that
-/// assert on one call's requests, where a gate adds nothing; and
-/// lock_is_mutually_exclusive_under_threads, a free-running contention smoke
-/// test with real-time jitter, which scripted pause points cannot express
-/// (08 step 4 explores orderings systematically).
+/// (src/tests/sim_exclusion.rs). This one stays: a single-client test that
+/// asserts on one call's requests, where a gate adds nothing.
 mod exclusion {
-    use super::{lock_key_at, write_lock_marker};
     use crate::repo::HostEnv;
-    use crate::repo::lock::{
-        acquire_lock, register_session_inner, release_lock, session_marker_key,
-    };
-    use crate::testutil::{MemoryBackend, RecordingBackend};
-    use chrono::Utc;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use crate::repo::sessions::{register_session_inner, session_marker_key};
+    use crate::sim::{SimConfig, SimStore};
     use vykar_storage::StorageBackend;
     use vykar_types::error::VykarError;
 
-    fn lock_puts(entries: &[String]) -> usize {
-        entries.iter().filter(|k| k.starts_with("locks/")).count()
-    }
-
-    fn foreign_lock(storage: &dyn StorageBackend, ts: chrono::DateTime<Utc>) -> String {
-        let key = lock_key_at(ts, "foreign");
-        write_lock_marker(storage, &key, "otherhost", 4242, Utc::now(), None);
-        key
+    /// Requests under `locks/` the store saw, listings included.
+    fn lock_requests(store: &SimStore) -> usize {
+        store
+            .log()
+            .iter()
+            .filter(|r| r.key.starts_with("locks/"))
+            .count()
     }
 
     fn locked_key(err: VykarError) -> String {
@@ -2737,43 +2466,14 @@ mod exclusion {
         }
     }
 
-    /// A holder keyed in the future (its clock is ahead of ours) must still
-    /// block us: ordering by key would let us "win".
-    #[test]
-    fn newer_foreign_key_blocks_acquisition() {
-        let storage = MemoryBackend::new();
-        let foreign = foreign_lock(&storage, Utc::now() + chrono::Duration::minutes(1));
-
-        assert_eq!(
-            locked_key(acquire_lock(&storage, &HostEnv::system()).unwrap_err()),
-            foreign
-        );
-        assert_eq!(storage.list("locks/").unwrap(), vec![foreign]);
-    }
-
-    /// No PUT at all on a backend without mtimes (no clock probe); on a
-    /// real backend the property is "no lock key is PUT"
-    /// (`contended_acquire_writes_only_a_clock_probe`).
-    #[test]
-    fn contended_acquire_issues_no_put() {
-        let (storage, log) = RecordingBackend::new();
-        foreign_lock(&storage, Utc::now() - chrono::Duration::minutes(1));
-        log.clear();
-
-        assert!(matches!(
-            acquire_lock(&storage, &HostEnv::system()),
-            Err(VykarError::Locked(_))
-        ));
-        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
-    }
-
-    /// No lock PUT by a registration (10-single-protocol step 8: it lists
-    /// `sessions/`, not `locks/`); a live exclusive
-    /// session refuses it `Locked` naming the exclusive marker, and its own
-    /// marker is deleted.
+    /// No request under `locks/` by a registration (10-single-protocol step
+    /// 8: it lists `sessions/`, and nothing reads `locks/` since step 9); a
+    /// live exclusive session refuses it `Locked` naming the exclusive
+    /// marker, and its own marker is deleted.
     #[test]
     fn register_session_probe_issues_no_lock_put() {
-        let (storage, log) = RecordingBackend::new();
+        let store = SimStore::new(SimConfig::default());
+        let storage = store.handle(store.register_client("a"));
         register_session_inner(
             &storage,
             "free",
@@ -2784,10 +2484,9 @@ mod exclusion {
         )
         .unwrap();
         assert!(storage.exists(&session_marker_key("free")).unwrap());
-        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
+        assert_eq!(lock_requests(&store), 0);
 
-        let held = crate::repo::lock::register_exclusive(&storage, &HostEnv::system()).unwrap();
-        log.clear();
+        let held = crate::repo::sessions::register_exclusive(&storage, &HostEnv::system()).unwrap();
         let err = register_session_inner(
             &storage,
             "blocked",
@@ -2802,71 +2501,24 @@ mod exclusion {
             session_marker_key(held.registration.session_id())
         );
         assert!(!storage.exists(&session_marker_key("blocked")).unwrap());
-        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
-    }
-
-    /// Unforced smoke test: mutual exclusion and liveness under contention.
-    #[test]
-    fn lock_is_mutually_exclusive_under_threads() {
-        let storage = Arc::new(MemoryBackend::new());
-        let inside = Arc::new(AtomicUsize::new(0));
-        let max_inside = Arc::new(AtomicUsize::new(0));
-        let deadline = Instant::now() + Duration::from_secs(30);
-
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let (storage, inside, max_inside) = (
-                    Arc::clone(&storage),
-                    Arc::clone(&inside),
-                    Arc::clone(&max_inside),
-                );
-                std::thread::spawn(move || {
-                    loop {
-                        match acquire_lock(&*storage, &HostEnv::system()) {
-                            Ok(guard) => {
-                                let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                                max_inside.fetch_max(n, Ordering::SeqCst);
-                                std::thread::sleep(Duration::from_millis(2));
-                                inside.fetch_sub(1, Ordering::SeqCst);
-                                release_lock(&*storage, guard).unwrap();
-                                return;
-                            }
-                            Err(VykarError::Locked(_)) => {
-                                assert!(Instant::now() < deadline, "thread starved");
-                                std::thread::sleep(Duration::from_micros(
-                                    rand::random::<u64>() % 3000,
-                                ));
-                            }
-                            Err(e) => panic!("unexpected error: {e}"),
-                        }
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(max_inside.load(Ordering::SeqCst), 1);
-        assert!(storage.list("locks/").unwrap().is_empty());
+        assert_eq!(lock_requests(&store), 0);
     }
 }
 
 /// Ages on the store's clock (04 step 5): mtimes decide, the timestamps
 /// inside the entries do not. On a real `LocalBackend`, mtimes set by hand.
 mod store_clock {
-    use super::{lock_key_at, write_lock_marker};
     use crate::repo::HostEnv;
-    use crate::repo::lock::{
-        SessionEntry, acquire_lock, cleanup_stale_sessions, default_stale_session_duration,
-        release_lock,
+    use crate::repo::ages::StoreClock;
+    use crate::repo::sessions::{
+        SessionEntry, cleanup_stale_sessions, default_stale_session_duration,
     };
-    use crate::sim::{FaultAction, FaultRule, KeyMatch, OpMatch, SimConfig, SimStore};
+    use crate::sim::{SimConfig, SimStore};
     use chrono::Utc;
     use std::path::Path;
     use std::time::{Duration, SystemTime};
     use vykar_storage::StorageBackend;
     use vykar_storage::local_backend::LocalBackend;
-    use vykar_types::error::VykarError;
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -2886,13 +2538,10 @@ mod store_clock {
             .unwrap();
     }
 
-    fn probes(storage: &dyn StorageBackend) -> Vec<String> {
-        storage
-            .list("locks/")
-            .unwrap()
-            .into_iter()
-            .filter(|k| k.starts_with("locks/vykar-clock-"))
-            .collect()
+    /// "Now" on the store's clock, read with a clock probe under `sessions/`
+    /// (`StoreClock::in_sessions`, the existing-pack check's clock).
+    fn store_now(storage: &dyn StorageBackend, env: &HostEnv) -> Option<vykar_storage::StoreNow> {
+        StoreClock::in_sessions().now(storage, env).0
     }
 
     fn marker(storage: &dyn StorageBackend, id: &str, last_refresh: chrono::DateTime<Utc>) {
@@ -2917,32 +2566,6 @@ mod store_clock {
     }
 
     #[test]
-    fn lock_age_is_the_objects_mtime() {
-        // Written just now by its JSON, 7 h old by its mtime: reaped.
-        let (dir, storage) = local();
-        let key = lock_key_at(Utc::now(), "foreign");
-        write_lock_marker(&storage, &key, "otherhost", 4242, Utc::now(), None);
-        age(dir.path(), &key, 7 * HOUR);
-        let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-        assert!(!storage.exists(&key).unwrap());
-        assert!(guard.store_time().is_some());
-        release_lock(&storage, guard).unwrap();
-        assert_eq!(probes(&storage), Vec::<String>::new());
-
-        // 7 h old by its JSON and its key, fresh by its mtime: it blocks.
-        let (_dir, storage) = local();
-        let old = Utc::now() - chrono::Duration::hours(7);
-        let key = lock_key_at(old, "foreign");
-        write_lock_marker(&storage, &key, "otherhost", 4242, old, None);
-        match acquire_lock(&storage, &HostEnv::system()) {
-            Err(VykarError::Locked(holder)) => assert_eq!(holder.key, key),
-            other => panic!("expected Locked, got {other:?}"),
-        }
-        assert!(storage.exists(&key).unwrap());
-        assert_eq!(probes(&storage), Vec::<String>::new());
-    }
-
-    #[test]
     fn marker_age_is_the_objects_mtime() {
         let (dir, storage) = local();
         // Fresh by its JSON, 46 min old by its mtime.
@@ -2955,18 +2578,13 @@ mod store_clock {
         // 2 h old by its JSON, fresh by its mtime.
         marker(&storage, "live", Utc::now() - chrono::Duration::hours(2));
         let env = HostEnv::system();
-        let guard = acquire_lock(&storage, &env).unwrap();
-        let cleaned = cleanup_stale_sessions(
-            &storage,
-            default_stale_session_duration(),
-            &env,
-            guard.store_time(),
-        )
-        .unwrap();
+        let now = store_now(&storage, &env);
+        assert!(now.is_some());
+        let cleaned =
+            cleanup_stale_sessions(&storage, default_stale_session_duration(), &env, now).unwrap();
         assert_eq!(cleaned, vec!["aged".to_string()]);
         assert!(!storage.exists("sessions/aged.json").unwrap());
         assert!(storage.exists("sessions/live.json").unwrap());
-        release_lock(&storage, guard).unwrap();
     }
 
     #[test]
@@ -2975,17 +2593,17 @@ mod store_clock {
         storage.put("sessions/x.json", b"{").unwrap();
         storage.put("sessions/x.index", b"journal").unwrap();
         let env = HostEnv::system();
-        let guard = acquire_lock(&storage, &env).unwrap();
+        let now = store_now(&storage, &env);
         let max_age = default_stale_session_duration();
 
         // Young: kept, it blocks maintenance.
-        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, now).unwrap();
         assert!(cleaned.is_empty(), "{cleaned:?}");
         assert!(storage.exists("sessions/x.json").unwrap());
 
         // 46 min old by its mtime: reaped; its journal keeps one run's grace.
         age(dir.path(), "sessions/x.json", Duration::from_secs(46 * 60));
-        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, now).unwrap();
         assert_eq!(cleaned, vec!["x".to_string()]);
         assert!(!storage.exists("sessions/x.json").unwrap());
         assert!(storage.exists("sessions/x.index").unwrap());
@@ -2996,62 +2614,12 @@ mod store_clock {
         let cleaned = cleanup_stale_sessions(&storage, max_age, &env, None).unwrap();
         assert!(cleaned.is_empty(), "{cleaned:?}");
         assert!(storage.exists("sessions/y.json").unwrap());
-        release_lock(&storage, guard).unwrap();
-    }
-
-    #[test]
-    fn clock_probe_debris_is_removed_after_an_hour() {
-        let (dir, storage) = local();
-        let live = lock_key_at(Utc::now(), "foreign");
-        write_lock_marker(&storage, &live, "otherhost", 4242, Utc::now(), None);
-        let old = "locks/vykar-clock-0123456789abcdef0123456789abcdef";
-        let young = "locks/vykar-clock-fedcba9876543210fedcba9876543210";
-        storage.put(old, b"vykar clock probe").unwrap();
-        storage.put(young, b"vykar clock probe").unwrap();
-        age(dir.path(), old, 2 * HOUR);
-        age(dir.path(), young, Duration::from_secs(10 * 60));
-
-        assert!(matches!(
-            acquire_lock(&storage, &HostEnv::system()),
-            Err(VykarError::Locked(_))
-        ));
-        assert!(storage.exists(&live).unwrap());
-        assert_eq!(probes(&storage), vec![young.to_string()]);
-    }
-
-    /// The put-if-absent check's probe left by a failed delete is debris
-    /// of the same kind (04 step 8): removed once an hour old.
-    #[test]
-    fn put_if_absent_probe_debris_is_removed_after_an_hour() {
-        let (dir, storage) = local();
-        let live = lock_key_at(Utc::now(), "foreign");
-        write_lock_marker(&storage, &live, "otherhost", 4242, Utc::now(), None);
-        let old = "locks/vykar-probe-1700000000-0123456789abcdef0123456789abcdef";
-        let young = "locks/vykar-probe-1700000001-fedcba9876543210fedcba9876543210";
-        storage.put(old, b"probe").unwrap();
-        storage.put(young, b"probe").unwrap();
-        age(dir.path(), old, 2 * HOUR);
-        age(dir.path(), young, Duration::from_secs(10 * 60));
-
-        assert!(matches!(
-            acquire_lock(&storage, &HostEnv::system()),
-            Err(VykarError::Locked(_))
-        ));
-        assert!(storage.exists(&live).unwrap());
-        let left: Vec<String> = storage
-            .list("locks/")
-            .unwrap()
-            .into_iter()
-            .filter(|k| k.starts_with("locks/vykar-probe-"))
-            .collect();
-        assert_eq!(left, vec![young.to_string()]);
     }
 
     /// Probes under `sessions/` (the put-if-absent check's, the existing-pack
     /// clock's) left by a failed delete are removed by maintenance's session
     /// reap once an hour old; young ones, live sessions, and everything when
-    /// "now" is unknown are kept. A backup's commit-lock yield removes none.
-    /// A session's marker or journal is never probe debris, whatever its ID.
+    /// "now" is unknown are kept. A session's marker or journal is never probe debris, whatever its ID.
     #[test]
     fn reap_removes_old_session_probes_only() {
         let (dir, storage) = local();
@@ -3098,20 +2666,8 @@ mod store_clock {
         assert!(cleaned.is_empty(), "{cleaned:?}");
         assert_eq!(all(&storage), before);
 
-        // A backup's yield (it holds its own session) skips the second pass.
-        let guard = acquire_lock(&storage, &env).unwrap();
-        crate::repo::lock::yield_to_lock_free_writers(
-            &storage,
-            &env,
-            guard.store_time(),
-            Some("own"),
-        )
-        .unwrap();
-        for key in [old_probe, old_clock, young] {
-            assert!(storage.exists(key).unwrap(), "{key}");
-        }
-
-        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, guard.store_time()).unwrap();
+        let now = store_now(&storage, &env);
+        let cleaned = cleanup_stale_sessions(&storage, max_age, &env, now).unwrap();
         assert!(cleaned.is_empty(), "no session was stale: {cleaned:?}");
         assert!(!storage.exists(old_probe).unwrap());
         assert!(!storage.exists(old_clock).unwrap());
@@ -3121,7 +2677,6 @@ mod store_clock {
         for key in probe_named {
             assert!(storage.exists(key).unwrap(), "{key}");
         }
-        release_lock(&storage, guard).unwrap();
     }
 
     /// A probe under `sessions/` is no session: listings, the reap and the
@@ -3136,11 +2691,11 @@ mod store_clock {
         marker(&storage, "live", Utc::now());
 
         let env = HostEnv::system();
-        let ids = crate::repo::lock::list_sessions(&storage).unwrap();
+        let ids = crate::repo::sessions::list_sessions(&storage).unwrap();
         assert_eq!(ids, vec!["live".to_string()]);
-        let entries = crate::repo::lock::list_session_entries(&storage).unwrap();
+        let entries = crate::repo::sessions::list_session_entries(&storage).unwrap();
         assert_eq!(entries.len(), 1, "{entries:?}");
-        let (cleaned, kept) = crate::repo::lock::cleanup_stale_sessions_keeping(
+        let (cleaned, kept) = crate::repo::sessions::cleanup_stale_sessions_keeping(
             &storage,
             default_stale_session_duration(),
             &env,
@@ -3151,29 +2706,12 @@ mod store_clock {
         let kept: Vec<&str> = kept.iter().map(|s| s.session_id.as_str()).collect();
         assert_eq!(kept, vec!["live"]);
         assert!(
-            crate::repo::lock::committing_sessions(&storage, "own")
+            crate::repo::sessions::committing_sessions(&storage, "own")
                 .unwrap()
                 .is_empty()
         );
         assert!(storage.exists(probe).unwrap());
         assert!(storage.exists(clock).unwrap());
-    }
-
-    /// `break-lock` also removes clock probes, which are not locks and are
-    /// not counted.
-    #[test]
-    fn break_lock_removes_clock_probes_uncounted() {
-        let storage = crate::testutil::MemoryBackend::new();
-        let key = lock_key_at(Utc::now(), "foreign");
-        write_lock_marker(&storage, &key, "otherhost", 4242, Utc::now(), None);
-        storage
-            .put(
-                "locks/vykar-clock-0123456789abcdef0123456789abcdef",
-                b"vykar clock probe",
-            )
-            .unwrap();
-        assert_eq!(crate::repo::lock::break_lock(&storage).unwrap(), 1);
-        assert!(storage.list("locks/").unwrap().is_empty());
     }
 
     /// Two clients of one SimStore on distinct hosts.
@@ -3204,60 +2742,6 @@ mod store_clock {
         )
     }
 
-    /// With a live lock listed, a contended acquire writes and deletes one
-    /// clock probe under `locks/` and never a lock key.
-    #[test]
-    fn contended_acquire_writes_only_a_clock_probe() {
-        let (store, ha, hb, env_a, env_b) = sim_pair();
-        let held = acquire_lock(&ha, &env_a).unwrap();
-        let from = store.log().len();
-        assert!(matches!(
-            acquire_lock(&hb, &env_b),
-            Err(VykarError::Locked(_))
-        ));
-        let log = store.log();
-        let ops: Vec<_> = log[from..]
-            .iter()
-            .filter(|r| r.client == hb.client() && r.key.starts_with("locks/"))
-            .filter(|r| r.op.is_mutation())
-            .collect();
-        assert_eq!(ops.len(), 2, "{ops:?}");
-        assert!(
-            ops[0].op.is_write() && ops[0].key.starts_with("locks/vykar-clock-"),
-            "{ops:?}"
-        );
-        assert!(ops[1].op.is_delete() && ops[1].key == ops[0].key, "{ops:?}");
-        assert!(store.keys("locks/vykar-clock-").is_empty());
-        release_lock(&ha, held).unwrap();
-    }
-
-    /// A probe that fails to write is "now unknown": the attempt reaps
-    /// nothing by age and ends `Locked`, not with the storage error; a
-    /// later attempt goes through.
-    #[test]
-    fn failed_clock_probe_reads_as_locked() {
-        let (store, ha, hb, env_a, env_b) = sim_pair();
-        store
-            .add_fault(
-                FaultRule::new(
-                    OpMatch::AnyWrite,
-                    KeyMatch::Prefix("locks/vykar-clock-".into()),
-                    FaultAction::Fail,
-                )
-                .client(hb.client()),
-            )
-            .unwrap();
-        let held = acquire_lock(&ha, &env_a).unwrap();
-        assert!(matches!(
-            acquire_lock(&hb, &env_b),
-            Err(VykarError::Locked(_))
-        ));
-        assert_eq!(store.keys("locks/").len(), 1);
-        release_lock(&ha, held).unwrap();
-        let guard = acquire_lock(&hb, &env_b).unwrap();
-        release_lock(&hb, guard).unwrap();
-    }
-
     /// Two clients of one SimStore on distinct hosts, on a virtual clock
     /// the store's clock follows; b's environment runs on it.
     fn sim_pair_timed() -> (
@@ -3273,115 +2757,60 @@ mod store_clock {
         (store, time, ha, hb, env_b)
     }
 
-    /// PUTs of clock probes by `client` from log position `from`.
+    /// PUTs of clock probes under `sessions/` by `client` from log position
+    /// `from`.
     fn probe_puts(store: &SimStore, client: crate::sim::ClientId, from: usize) -> usize {
         store.log()[from..]
             .iter()
             .filter(|r| r.client == client && r.op.is_write())
-            .filter(|r| r.key.starts_with("locks/vykar-clock-"))
+            .filter(|r| r.key.starts_with("sessions/vykar-clock-"))
             .count()
     }
 
-    /// A wait on a live lock probes the store's clock once while its
-    /// reading is younger than `STORE_READING_MAX_AGE`, and once more per
-    /// `STORE_READING_MAX_AGE` after; every probe uses one key.
+    /// `StoreClock::in_sessions` (the existing-pack check's clock): the
+    /// first reading probes (one PUT under `sessions/vykar-clock-`, and the
+    /// listing it made is returned); within `STORE_READING_MAX_AGE` of it a
+    /// call extrapolates (reading + local monotonic time since, no request,
+    /// no listing); after that a call probes again, on the same key. No
+    /// probe key is left.
     #[test]
-    fn lock_wait_probes_once_per_reading() {
+    fn store_clock_probes_once_per_reading_and_extrapolates() {
         use crate::repo::ages::STORE_READING_MAX_AGE;
-        use crate::repo::control::CancelToken;
-        use crate::repo::lock::acquire_lock_with_deadline;
 
-        let (store, time, ha, hb, env_b) = sim_pair_timed();
-        let live = lock_key_at(store.now(), "foreign");
-        write_lock_marker(&ha, &live, "otherhost", 4242, store.now(), None);
+        let (store, time, _ha, hb, env_b) = sim_pair_timed();
+        let mut clock = StoreClock::in_sessions();
         let from = store.log().len();
-        let mut attempts = 0;
-        let wait = STORE_READING_MAX_AGE - Duration::from_secs(30);
-        let err = acquire_lock_with_deadline(&hb, &env_b, wait, 500, &CancelToken::new(), |_| {
-            attempts += 1;
-        })
-        .unwrap_err();
-        assert!(matches!(err, VykarError::Locked(_)), "{err:?}");
-        assert!(time.elapsed() >= wait);
-        let lists = store.log()[from..]
-            .iter()
-            .filter(|r| r.client == hb.client() && r.key == "locks/" && !r.op.is_mutation())
-            .count();
-        assert!(lists > 5, "few attempts: {lists} listings of locks/");
-        assert_eq!(attempts, 1, "on_contended once");
+        let (first, listing) = clock.now(&hb, &env_b);
+        let first = first.expect("a reading");
+        assert!(listing.is_some(), "the probe's listing");
         assert_eq!(probe_puts(&store, hb.client(), from), 1);
 
-        // A 10-minute wait re-probes after each STORE_READING_MAX_AGE, on
-        // the key of the first probe.
+        let four = Duration::from_secs(4 * 60);
+        assert!(four < STORE_READING_MAX_AGE);
+        time.advance(four);
         let from = store.log().len();
-        let err = acquire_lock_with_deadline(
-            &hb,
-            &env_b,
-            std::time::Duration::from_secs(10 * 60),
-            500,
-            &CancelToken::new(),
-            |_| {},
-        )
-        .unwrap_err();
-        assert!(matches!(err, VykarError::Locked(_)), "{err:?}");
-        let probes = probe_puts(&store, hb.client(), from);
-        assert!((2..=3).contains(&probes), "{probes} probes");
+        let (second, listing) = clock.now(&hb, &env_b);
+        let second = second.expect("an extrapolated reading");
+        assert!(listing.is_none(), "no probe, no listing");
+        assert_eq!(store.log().len(), from, "no request");
+        let since = second.time().duration_since(first.time()).unwrap();
+        assert!(
+            since >= four && since < four + Duration::from_secs(1),
+            "{since:?}"
+        );
+
+        time.advance(Duration::from_secs(2 * 60));
+        let (third, listing) = clock.now(&hb, &env_b);
+        assert!(third.is_some() && listing.is_some(), "probed again");
+        assert_eq!(probe_puts(&store, hb.client(), from), 1);
         let keys: std::collections::BTreeSet<_> = store
             .log()
             .iter()
-            .filter(|r| r.client == hb.client() && r.key.starts_with("locks/vykar-clock-"))
+            .filter(|r| r.client == hb.client() && r.key.starts_with("sessions/vykar-clock-"))
             .map(|r| r.key.clone())
             .collect();
         assert_eq!(keys.len(), 1, "{keys:?}");
-        assert!(store.keys("locks/vykar-clock-").is_empty());
-        assert!(store.object(&live).is_some());
-    }
-
-    /// A lock that passes the stale age during a wait is reaped by a later
-    /// attempt through the extrapolated reading, without a second probe.
-    #[test]
-    fn lock_aging_during_a_wait_is_reaped_by_extrapolation() {
-        use crate::repo::control::CancelToken;
-        use crate::repo::lock::acquire_lock_with_deadline;
-
-        let (store, time, ha, hb, env_b) = sim_pair_timed();
-        let aged = lock_key_at(store.now(), "foreign");
-        write_lock_marker(&ha, &aged, "otherhost", 4242, store.now(), None);
-        // 30 s short of the 6 h stale age when b's wait starts.
-        time.advance(6 * HOUR - Duration::from_secs(30));
-        let from = store.log().len();
-        let mut contended = 0;
-        let guard = acquire_lock_with_deadline(
-            &hb,
-            &env_b,
-            Duration::from_secs(4 * 60),
-            500,
-            &CancelToken::new(),
-            |_| contended += 1,
-        )
-        .unwrap();
-        assert_eq!(contended, 1, "the first attempt saw the lock live");
-        assert!(store.object(&aged).is_none(), "reaped");
-        assert_eq!(probe_puts(&store, hb.client(), from), 1);
-        release_lock(&hb, guard).unwrap();
-    }
-
-    /// An uncontended acquisition probes nothing but lists the old probes
-    /// for `LockGuard::remove_probe_debris`; a young probe is left.
-    #[test]
-    fn uncontended_acquire_removes_probe_debris() {
-        let (dir, storage) = local();
-        let old = "locks/vykar-clock-0123456789abcdef0123456789abcdef";
-        let young = "locks/vykar-clock-fedcba9876543210fedcba9876543210";
-        storage.put(old, b"vykar clock probe").unwrap();
-        storage.put(young, b"vykar clock probe").unwrap();
-        age(dir.path(), old, 2 * HOUR);
-        age(dir.path(), young, Duration::from_secs(10 * 60));
-        let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
-        assert_eq!(probes(&storage).len(), 2, "acquisition deletes nothing");
-        guard.remove_probe_debris(&storage);
-        assert_eq!(probes(&storage), vec![young.to_string()]);
-        release_lock(&storage, guard).unwrap();
+        assert!(store.keys("sessions/vykar-clock-").is_empty());
     }
 }
 
@@ -3398,7 +2827,7 @@ fn elsewhere() -> HostEnv {
     })
 }
 
-const COMMITTING: crate::repo::lock::MarkerFlags = crate::repo::lock::MarkerFlags {
+const COMMITTING: crate::repo::sessions::MarkerFlags = crate::repo::sessions::MarkerFlags {
     committing: true,
     writes_heads: false,
 };
@@ -3422,17 +2851,17 @@ fn a_flagged_marker_round_trips_and_a_plain_one_is_unchanged() {
     assert!(json.contains("\"committing\":true"), "{json}");
     assert!(!json.contains("writes_heads"), "{json}");
     let back: SessionEntry = serde_json::from_str(&json).unwrap();
-    assert!(back.committing && !back.writes_heads && back.may_write_heads());
+    assert!(back.committing && !back.writes_heads);
     let compact = SessionEntry {
         writes_heads: true,
         ..plain.clone()
     };
     let back: SessionEntry =
         serde_json::from_str(&serde_json::to_string(&compact).unwrap()).unwrap();
-    assert!(back.writes_heads && back.may_write_heads());
+    assert!(back.writes_heads);
     let old = r#"{"hostname":"h","pid":1,"registered_at":"2026-01-01T00:00:00Z","last_refresh":"2026-01-01T00:00:00Z","elapsed_secs":3}"#;
     let back: SessionEntry = serde_json::from_str(old).unwrap();
-    assert!(!back.committing && !back.writes_heads && !back.may_write_heads());
+    assert!(!back.committing && !back.writes_heads);
 }
 
 /// `mark` writes a new generation carrying the flag, and every later
@@ -3470,130 +2899,6 @@ fn mark_writes_a_new_key_with_the_flag_and_refreshes_keep_it() {
     }
 }
 
-/// A backend whose GET of `key` finds nothing while LIST still lists it;
-/// with `deregister`, the first such GET also deletes the key (a session
-/// that deregistered between a holder's LIST and its GET).
-struct VanishingGet {
-    inner: MemoryBackend,
-    key: String,
-    deregister: bool,
-}
-
-impl vykar_storage::InnerBackend for VanishingGet {
-    fn inner_backend(&self) -> &dyn StorageBackend {
-        &self.inner
-    }
-}
-
-vykar_storage::delegate_storage_backend! {
-    for VanishingGet;
-    except [get];
-
-    fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
-        if key == self.key {
-            if self.deregister {
-                self.inner.delete(key)?;
-            }
-            return Ok(None);
-        }
-        self.inner.get(key)
-    }
-}
-
-/// A lock holder's yield (04 step 9): a live session whose newest key
-/// carries `committing` (or `writes_heads`) fails the holder `Locked`,
-/// naming the committing host; an unflagged one and its own do not.
-#[test]
-fn a_lock_holder_yields_to_a_flagged_session() {
-    let storage = MemoryBackend::new();
-    let them = elsewhere();
-    let other = registered(&storage, "other", &them);
-    let own = HostEnv::system().with_host(me());
-    registered(&storage, "own", &own);
-    let yield_to = |own_id| yield_to_lock_free_writers(&storage, &own, None, own_id);
-    let (_, live) = yield_to(Some("own")).unwrap();
-    assert_eq!(live.len(), 2);
-    other
-        .mark(&storage, them.clock.as_ref(), COMMITTING)
-        .unwrap();
-    match yield_to(Some("own")) {
-        Err(VykarError::Locked(holder)) => {
-            let d = holder.details.expect("the committing host is named");
-            assert_eq!(d.hostname, "elsewhere");
-            assert_eq!(d.pid, 7);
-        }
-        other => panic!("expected Locked, got {other:?}"),
-    }
-    // The flagged session itself, as a holder, does not yield to itself.
-    yield_to_lock_free_writers(&storage, &them, None, Some("other")).unwrap();
-}
-
-/// Fail closed: a malformed newest key, or one gone on GET twice, counts
-/// as flagged; one gone because its session deregistered does not.
-#[test]
-fn a_lock_holder_yields_to_a_malformed_or_vanished_newest_key() {
-    let own = HostEnv::system().with_host(me());
-    let storage = MemoryBackend::new();
-    storage.put("sessions/bad.json", b"not json").unwrap();
-    // Without mtimes (this backend lists none) it is never reaped by age:
-    // the error names the key and the remedy.
-    match yield_to_lock_free_writers(&storage, &own, None, None) {
-        Err(VykarError::Locked(holder @ LockHolder { details: None, .. })) => {
-            assert_eq!(holder.key, "sessions/bad.json");
-            let text = holder.to_string();
-            assert!(
-                text.contains("sessions/bad.json") && text.contains("break-lock --sessions"),
-                "{text}"
-            );
-        }
-        other => panic!("expected Locked, got {other:?}"),
-    }
-    let (cleaned, _) =
-        cleanup_stale_sessions_keeping(&storage, default_stale_session_duration(), &own, None)
-            .unwrap();
-    assert!(cleaned.is_empty(), "a malformed key without an mtime stays");
-
-    for deregister in [false, true] {
-        let inner = MemoryBackend::new();
-        registered(&inner, "gone", &elsewhere());
-        let storage = VanishingGet {
-            inner,
-            key: session_marker_key("gone"),
-            deregister,
-        };
-        let result = yield_to_lock_free_writers(&storage, &own, None, None);
-        if deregister {
-            result.unwrap();
-        } else {
-            assert!(matches!(result, Err(VykarError::Locked(_))), "{result:?}");
-        }
-    }
-}
-
-/// A flagged marker that went unwritten longer than the session staleness
-/// (on the store's clock) is reaped, not yielded to: a crashed committing
-/// backup blocks lock holders for at most 45 minutes.
-#[test]
-fn a_lock_holder_does_not_yield_to_a_stale_one() {
-    let storage = MemoryBackend::with_mtimes();
-    let them = elsewhere();
-    let other = registered(&storage, "stale", &them);
-    let key = other
-        .mark(&storage, them.clock.as_ref(), COMMITTING)
-        .unwrap();
-    let now = std::time::SystemTime::now();
-    for k in storage.list("sessions/").unwrap() {
-        storage.set_mtime(&k, now - std::time::Duration::from_secs(46 * 60));
-    }
-    let own = HostEnv::system().with_host(me());
-    let (cleaned, live) =
-        yield_to_lock_free_writers(&storage, &own, Some(vykar_storage::StoreNow::at(now)), None)
-            .unwrap();
-    assert_eq!(cleaned, vec!["stale".to_string()]);
-    assert!(live.is_empty());
-    assert!(!storage.exists(&key).unwrap());
-}
-
 /// The pre-head listing reads "now" (the caller's key's mtime) and fails
 /// `Locked` on a live exclusive session.
 #[test]
@@ -3605,17 +2910,17 @@ fn exclusive_listing_reads_now_and_refuses_beside_a_live_exclusive() {
     let written = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
     storage.set_mtime(&key, written);
     assert_eq!(
-        lock::exclusive_listing(&storage, &env, &key).unwrap(),
+        sessions::exclusive_listing(&storage, &env, &key).unwrap(),
         Some(vykar_storage::StoreNow::at(written))
     );
-    let other = lock::register_exclusive(&storage, &elsewhere()).unwrap();
-    let err = lock::exclusive_listing(&storage, &env, &key).unwrap_err();
+    let other = sessions::register_exclusive(&storage, &elsewhere()).unwrap();
+    let err = sessions::exclusive_listing(&storage, &env, &key).unwrap_err();
     let VykarError::Locked(holder) = err else {
         panic!("{err}");
     };
     assert!(holder.key.starts_with("sessions/x-"), "{}", holder.key);
     assert!(holder.details.is_some());
-    lock::deregister_session(&storage, other.registration.session_id(), &env);
+    sessions::deregister_session(&storage, other.registration.session_id(), &env);
 }
 
 /// The pre-head listing judges only exclusive sessions: a young malformed
@@ -3628,7 +2933,7 @@ fn exclusive_listing_ignores_shared_sessions() {
     let (_, key) = m.current();
     storage.put("sessions/shared.json", b"not json").unwrap();
     registered(&storage, "other", &elsewhere());
-    assert!(lock::exclusive_listing(&storage, &env, &key).is_ok());
+    assert!(sessions::exclusive_listing(&storage, &env, &key).is_ok());
     assert!(storage.exists("sessions/shared.json").unwrap());
 }
 
@@ -3646,7 +2951,7 @@ fn exclusive_listing_judges_exclusive_markers_by_age() {
     let x = format!("sessions/x-{:032x}", 9u128);
     storage.put(&format!("{x}.json"), b"not json").unwrap();
     storage.put(&format!("{x}.index"), b"journal").unwrap();
-    let err = lock::exclusive_listing(&storage, &env, &key).unwrap_err();
+    let err = sessions::exclusive_listing(&storage, &env, &key).unwrap_err();
     let VykarError::Locked(holder) = err else {
         panic!("{err}");
     };
@@ -3658,7 +2963,7 @@ fn exclusive_listing_judges_exclusive_markers_by_age() {
         own_mtime - std::time::Duration::from_secs(46 * 60),
     );
     assert_eq!(
-        lock::exclusive_listing(&storage, &env, &key).unwrap(),
+        sessions::exclusive_listing(&storage, &env, &key).unwrap(),
         Some(vykar_storage::StoreNow::at(own_mtime))
     );
     assert!(!storage.exists(&format!("{x}.json")).unwrap(), "reaped");
@@ -3683,13 +2988,13 @@ fn register_exclusive_lists_reaps_and_names_itself() {
         std::time::SystemTime::now() - std::time::Duration::from_secs(46 * 60),
     );
     storage.put("sessions/orphan.index", b"journal").unwrap();
-    let reg = lock::register_exclusive(&storage, &env).unwrap();
+    let reg = sessions::register_exclusive(&storage, &env).unwrap();
     let id = reg.registration.session_id();
     assert!(
         id.len() == 34 && id.starts_with("x-") && id[2..].bytes().all(|b| b.is_ascii_hexdigit()),
         "{id}"
     );
-    assert!(lock::is_exclusive_session(id));
+    assert!(sessions::is_exclusive_session(id));
     assert!(storage.exists(&session_marker_key(id)).unwrap());
     assert_eq!(reg.cleaned, vec!["stale".to_string()]);
     assert_eq!(
@@ -3702,7 +3007,7 @@ fn register_exclusive_lists_reaps_and_names_itself() {
     assert!(reg.now.is_some());
     assert!(!storage.exists("sessions/orphan.index").unwrap());
     assert!(storage.exists(&live_key).unwrap());
-    lock::deregister_session(&storage, id, &env);
+    sessions::deregister_session(&storage, id, &env);
     assert!(!storage.exists(&session_marker_key(id)).unwrap());
 }
 
@@ -3813,11 +3118,11 @@ fn single_writer_listing_finds_head_writers() {
 
     // Its own flags never count.
     let s = MemoryBackend::new();
-    let reg = crate::repo::lock::register_session_with(
+    let reg = crate::repo::sessions::register_session_with(
         &s,
         "own",
         &env,
-        crate::repo::lock::MarkerFlags {
+        crate::repo::sessions::MarkerFlags {
             committing: true,
             writes_heads: true,
         },

@@ -653,23 +653,23 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
     }
 }
 
-/// Most `locks/` ops one client makes in one raw acquisition, release
-/// included (about five are expected); one more is a harness bug.
+/// Most `sessions/` ops one client's main thread makes in one exclusive
+/// registration, deregistration included; one more is a harness bug.
 const MAX_LOCK_OPS: usize = 12;
 
-/// Real time to wait for a client's next `locks/` op or its end.
+/// Real time to wait for a client's next gated op or its end.
 const GATE_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Default, Debug)]
 struct LockPairTally {
     schedules: usize,
-    /// Both clients inside the lock at once.
+    /// Both clients inside their sessions at once.
     double_holds: usize,
-    /// Both runs ended Locked.
+    /// Both runs refused.
     both_backed_off: usize,
     /// Exactly one run ended Ok.
     one_held: usize,
-    /// Both clients wrote a lock key and one backed off after its own.
+    /// Both clients wrote an exclusive marker and one refused after its own.
     contended_puts: usize,
     first_double: Option<Vec<usize>>,
 }
@@ -701,56 +701,29 @@ impl Contender {
     }
 }
 
-/// Two clients each run a no-op under the repo lock. Every op of both on a
-/// lock key or a listing of `locks/` is held at a gate (a contended
-/// pre-check's clock probe PUT and DELETE are not: no lock reader lists a
-/// probe, so their order does not matter; its listing, by which the
-/// pre-check judges, is gated); the search picks which held op proceeds next.
-/// Continuing the client resumed last is free while it is held; when it is
-/// done (or at the start) every held client is free; anything else is a
-/// preemption.
-fn lock_acquisitions(hosts: HostPlan, bound: Bound) -> (Search, LockPairTally) {
-    lock_acquisitions_on(&Template::encrypted(), hosts, bound, false)
-}
-
-/// [`lock_acquisitions`] on `template`; `exclusive`: the two clients
-/// register exclusive sessions instead (`Call::ExclusiveCustom`,
-/// 10-single-protocol step 8): every op of both on `sessions/` (the main
-/// threads only: their PUT, LIST, GETs, EXISTS and DELETE) is gated, a
-/// refusal is `ActiveSessions`, and a hold lasts from the body's entry to
-/// the delete of the session's marker.
-fn lock_acquisitions_on(
+/// Two clients register exclusive sessions (`Call::ExclusiveCustom`,
+/// 10-single-protocol step 8) and each runs a no-op in it, on `template`.
+/// Every op of both on `sessions/` (the main threads only: their PUT,
+/// LIST, GETs, EXISTS and DELETE) is held at a gate; the search picks which
+/// held op proceeds next. Continuing the client resumed last is free while
+/// it is held; when it is done (or at the start) every held client is
+/// free; anything else is a preemption. A refusal is `ActiveSessions`, and
+/// a hold lasts from the body's entry to the delete of the session's marker.
+fn exclusive_registrations(
     template: &Template,
     hosts: HostPlan,
     bound: Bound,
-    exclusive: bool,
 ) -> (Search, LockPairTally) {
-    let gated = || {
-        if exclusive {
-            KeyMatch::Prefix("sessions/".into())
-        } else {
-            KeyMatch::LockKey
-        }
-    };
-    let holds = |key: &str| {
-        if exclusive {
-            key.starts_with("sessions/x-") && key.ends_with(".json")
-        } else {
-            KeyMatch::LockKey.matches(key)
-        }
-    };
-    let refusal = if exclusive {
-        AllowedError::ActiveSessions
-    } else {
-        AllowedError::Locked
-    };
+    let gated = || KeyMatch::Prefix("sessions/".into());
+    let holds = |key: &str| key.starts_with("sessions/x-") && key.ends_with(".json");
+    let refusal = AllowedError::ActiveSessions;
     let mut tally = LockPairTally::default();
     let search = dfs(bound, |prefix| {
         let mut sim = template.fork();
         let ids = ["a", "b"].map(|name| match hosts {
             HostPlan::Distinct => sim.client(name),
             HostPlan::SameHostname => sim.client_on(name, "ubuntu", Some(&format!("boot-{name}"))),
-            HostPlan::LateClone => unreachable!("the lock-pair search places no late clone"),
+            HostPlan::LateClone => unreachable!("the exclusive-pair search places no late clone"),
         });
         let inside: Arc<Mutex<Vec<(ClientId, u64)>>> = Arc::default();
         let mut cs: Vec<Contender> = ids
@@ -761,7 +734,7 @@ fn lock_acquisitions_on(
                     .map(|n| {
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, gated())
-                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
                                 .nth(n),
                         )
                     })
@@ -778,19 +751,9 @@ fn lock_acquisitions_on(
                 inside.lock().unwrap().push((id, store.step()));
                 Ok(())
             });
-            // The advisory lock (`Call::LockedCustom`): no command takes it
-            // since 10-single-protocol step 8 (`Call::Custom` is an
-            // exclusive session); kept until step 9 deletes the lock.
-            let call = if exclusive {
-                Call::ExclusiveCustom {
-                    label: "hold".into(),
-                    f,
-                }
-            } else {
-                Call::LockedCustom {
-                    label: "hold".into(),
-                    f,
-                }
+            let call = Call::ExclusiveCustom {
+                label: "hold".into(),
+                f,
             };
             spawned.push(sim.spawn(c.id, call));
             // Spawning asserts every other run is held or done.
@@ -882,41 +845,8 @@ fn lock_acquisitions_on(
     (search, tally)
 }
 
-/// 08's "lock acquire vs lock acquire", operation by operation. On
-/// distinct hosts and, since 04 step 1 (installation ID), on one hostname
-/// (cloned machines) no schedule puts both inside the lock, and every run
-/// ends Ok or Locked: the pre-check of one no longer reaps the other's live
-/// key, before or after its confirming LIST (H1 at acquisition level).
-/// Both clients backing off (`sim_exclusion::simultaneous_acquires_both_back_off`)
-/// needs three preemptions; at K = 2 the check that the search reaches
-/// contention is a lock PUT by each client with one backing off.
-#[test]
-fn lock_acquisitions_race() {
-    let bound = Bound {
-        preemptions: GATE_K,
-        max_runs: PRECOMMIT_MAX_RUNS,
-    };
-    for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
-        let start = Instant::now();
-        let (s, t) = lock_acquisitions(hosts, bound);
-        eprintln!(
-            "gate search, {hosts:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
-            start.elapsed()
-        );
-        assert!(s.complete);
-        assert_eq!(t.double_holds, 0, "two holders on {hosts:?}: {t:?}");
-        assert!(t.one_held > 0, "{t:?}");
-        assert!(
-            t.contended_puts > 0,
-            "the search never reached contention: {t:?}"
-        );
-        if GATE_K >= 3 {
-            assert!(t.both_backed_off > 0, "{t:?}");
-        }
-    }
-}
-
-/// 10-single-protocol step 8's successor of [`lock_acquisitions_race`]: two
+/// 10-single-protocol step 8's successor of 08's "lock acquire vs lock
+/// acquire" (the lock's own race went with the lock in step 9): two
 /// exclusive registrations, every op of both on `sessions/` held at a gate.
 /// No schedule puts both inside their sessions at once (X1); every run
 /// ends Ok or `ActiveSessions`; at K ≥ 3 both refusing is reached.
@@ -928,7 +858,7 @@ fn exclusive_registrations_race() {
     };
     for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
         let start = Instant::now();
-        let (s, t) = lock_acquisitions_on(&Template::encrypted(), hosts, bound, true);
+        let (s, t) = exclusive_registrations(&Template::encrypted(), hosts, bound);
         eprintln!(
             "exclusive registrations, {hosts:?}, K = {GATE_K}: {s:?} {t:?} in {:?}",
             start.elapsed()
@@ -1008,7 +938,7 @@ fn exclusive_against_backup_search(
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, KeyMatch::Any)
                                 .filter(exclusive_backup_gated)
-                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
                                 .nth(n),
                         )
                     })
@@ -1132,8 +1062,8 @@ fn exclusive_against_backup_search(
                 })
                 .map_or(runs[0].last_step, |r| r.step);
             let own_marker = |key: &str| {
-                crate::repo::lock::parse_session_marker_key(key)
-                    .is_some_and(|(id, _)| !crate::repo::lock::is_exclusive_session(id))
+                crate::repo::sessions::parse_session_marker_key(key)
+                    .is_some_and(|(id, _)| !crate::repo::sessions::is_exclusive_session(id))
             };
             let inside: Vec<String> = log
                 .iter()
@@ -1284,7 +1214,7 @@ pub(super) fn single_writer_search(
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, KeyMatch::Any)
                                 .filter(single_writer_gated)
-                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
                                 .nth(n),
                         )
                     })
@@ -1448,8 +1378,8 @@ fn assert_single_writer_race(name: &str, rival: SingleWriterRival) {
 
 /// Two single-writer backups (10-single-protocol step 7), their
 /// `sessions/` listings, marker PUTs and head EXISTS and PUT one at a time
-/// (replaces `lock_acquisitions_race`'s role for backups, whose commits no
-/// longer take the lock): each flags its marker before the listing it
+/// (replaces the lock acquisitions race's role for backups, whose commits
+/// no longer take the lock): each flags its marker before the listing it
 /// decides on, so no two pass it (I1).
 #[test]
 fn single_writer_checks_race() {
@@ -1588,7 +1518,7 @@ pub(super) fn gapped_backup_search(
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, KeyMatch::Any)
                                 .filter(gapped_gated)
-                                .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+                                .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
                                 .nth(n),
                         )
                     })
@@ -1791,7 +1721,8 @@ fn measure_bounds() {
     for k in [2, 3] {
         for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
             let start = Instant::now();
-            let (s, tally) = lock_acquisitions(
+            let (s, tally) = exclusive_registrations(
+                &Template::encrypted(),
                 hosts,
                 Bound {
                     preemptions: k,
@@ -1799,7 +1730,7 @@ fn measure_bounds() {
                 },
             );
             eprintln!(
-                "gate {hosts:?} K = {k}: {s:?} {tally:?} in {:?}",
+                "exclusive gate {hosts:?} K = {k}: {s:?} {tally:?} in {:?}",
                 start.elapsed()
             );
         }
@@ -1920,17 +1851,16 @@ fn measure_part_10_searches() {
     }
     for hosts in [HostPlan::Distinct, HostPlan::SameHostname] {
         let start = Instant::now();
-        let (s, tally) = lock_acquisitions_on(
+        let (s, tally) = exclusive_registrations(
             &enc,
             hosts,
             Bound {
                 preemptions: GATE_K,
                 max_runs: 100_000,
             },
-            false,
         );
         eprintln!(
-            "gate {hosts:?} K = {GATE_K} (encrypted): {s:?} {tally:?} in {:?}",
+            "exclusive gate {hosts:?} K = {GATE_K} (encrypted): {s:?} {tally:?} in {:?}",
             start.elapsed()
         );
     }

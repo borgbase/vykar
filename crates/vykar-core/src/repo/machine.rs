@@ -91,9 +91,6 @@ const PERSIST_INDEX: &[(Access, &str)] = &[
     (Read, "index.h/"),
     (Write, "index.d/"),
     (Read, "index.d/"),
-    (Read, "locks/"),
-    (Write, "locks/"),
-    (Delete, "locks/"),
     (Write, "index.h/"),
     (List, "index.d/"),
     (Delete, "index.h/"),
@@ -159,13 +156,14 @@ impl StepKind {
             StepKind::PutSweepRecord | StepKind::PutSegment | StepKind::PutBase => {
                 &[(Write, "index.d/")]
             }
-            // The lock fence reads `locks/` and rewrites its lock key when
-            // the refresh is due; the put-if-absent check (once per backend
-            // instance) runs in this step for writers other than a backup,
-            // and its probe lives under `sessions/`.
+            // The fence runs the maintenance or exclusive session's marker
+            // check (an EXISTS under `sessions/`) and, for writers other
+            // than a backup, the put-if-absent check (once per backend
+            // instance), whose probe lives under `sessions/`. During a v2/v3
+            // upgrade the fence also does EXISTS and PUT on the legacy key
+            // under `locks/` (`upgrade::LegacyUpgradeLock`); this table is
+            // checked only on v6 repositories.
             StepKind::Fence => &[
-                (Read, "locks/"),
-                (Write, "locks/"),
                 (Read, "sessions/"),
                 (Write, "sessions/"),
                 (Delete, "sessions/"),

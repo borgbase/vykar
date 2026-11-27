@@ -430,10 +430,11 @@ pub struct RepairPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairMode {
     PlanOnly,
-    /// Apply the plan rebuilt under the lock, whatever it contains.
+    /// Apply the plan rebuilt in the repair's exclusive session, whatever it
+    /// contains.
     Apply,
-    /// Apply the plan rebuilt under the lock only if it matches what the user
-    /// was shown: refuses, before anything is written, when it has data loss
+    /// Apply the plan rebuilt in the repair's exclusive session only if it
+    /// matches what the user was shown: refuses, before anything is written, when it has data loss
     /// and the shown plan had none, or when the index was read differently.
     ApplyShown {
         has_data_loss: bool,

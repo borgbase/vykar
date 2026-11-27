@@ -2071,7 +2071,7 @@ fn the_legacy_key_stays_young_across_a_7h_upgrade() {
             // upgrade.
             let step = |minutes: u64| {
                 for _ in 0..minutes * 2 {
-                    time.advance(crate::repo::lock::HEARTBEAT_POLL);
+                    time.advance(crate::repo::sessions::HEARTBEAT_POLL);
                     time.wait_for_waiters(1, std::time::Duration::from_secs(5));
                 }
             };
@@ -2287,7 +2287,7 @@ fn a_key_removed_before_the_session_reap_is_lock_expired() {
     };
     // A session this machine left behind: its PID is dead, so it is reaped.
     let now = chrono::Utc::now().to_rfc3339();
-    let entry = crate::repo::lock::SessionEntry {
+    let entry = crate::repo::sessions::SessionEntry {
         hostname: host.hostname.clone(),
         pid: 7,
         registered_at: now.clone(),
@@ -2396,7 +2396,7 @@ fn a_legacy_key_that_cannot_be_rewritten_expires_beside_a_live_marker() {
         Box::new(move |call, _raw| {
             let step = |minutes: u64| {
                 for _ in 0..minutes * 2 {
-                    time.advance(crate::repo::lock::HEARTBEAT_POLL);
+                    time.advance(crate::repo::sessions::HEARTBEAT_POLL);
                     time.wait_for_waiters(1, std::time::Duration::from_secs(5));
                 }
             };
@@ -2438,8 +2438,8 @@ fn a_legacy_key_that_cannot_be_rewritten_expires_beside_a_live_marker() {
     assert!(
         ops.iter().any(|o| {
             o.strip_prefix("put ").is_some_and(|k| {
-                crate::repo::lock::parse_session_marker_key(k)
-                    .is_some_and(|(id, n)| crate::repo::lock::is_exclusive_session(id) && n > 0)
+                crate::repo::sessions::parse_session_marker_key(k)
+                    .is_some_and(|(id, n)| crate::repo::sessions::is_exclusive_session(id) && n > 0)
             })
         }),
         "{ops:?}"

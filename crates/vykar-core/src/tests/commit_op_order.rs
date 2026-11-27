@@ -6,7 +6,7 @@
 //! Since 10-single-protocol step 2 the scenarios run on an encrypted
 //! repository on the fallback store; since step 7 that is the single-writer
 //! protocol, no lock: the backup's single-writer listings of `sessions/`
-//! around its commit mark and the probe of `locks/`, compact in a session
+//! around its commit mark and its pre-head listing, compact in a session
 //! with its single-writer check, heads as EXISTS, PUT and read-back. The
 //! `multi_writer_*` scenarios pin the conditional store's multi-writer
 //! protocol, fixed through step 7 (invariant I6) but for the one `config`
@@ -87,8 +87,8 @@ pub(crate) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
     if !backup {
         return mine;
     }
-    // Dropped before the start is looked for: a background journal PUT
-    // logged between the lock's LIST and its PUT would end the walk back.
+    // Dropped before the start is looked for: a background journal PUT is
+    // no commit op.
     let mine: Vec<OpRecord> = mine
         .into_iter()
         .filter(|r| {
@@ -97,9 +97,10 @@ pub(crate) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
         .collect();
     // Phase 1 ends with the last pack upload; a backup that uploads no
     // pack is past its open once the open's listing of `sessions/` ran
-    // (its second: the registration lists first, 10-single-protocol step 8). The commit starts at the first `locks/` or session-marker op
-    // after both: the commit lock, the commit mark or the single-writer
-    // listing, whichever the protocol runs first.
+    // (its second: the registration lists first, 10-single-protocol step
+    // 8). The commit starts at the first session-marker op (not `.index`)
+    // after both: the commit mark or the single-writer listing, whichever
+    // the protocol runs first.
     let last_pack = mine.iter().rposition(|r| r.op == OpKind::PutPack);
     let open_listing = mine
         .iter()
@@ -112,9 +113,9 @@ pub(crate) fn run_records(sim: &Sim, run: &RunRecord, backup: bool) -> Vec<OpRec
     let start = (after + 1..mine.len())
         .find(|&i| {
             let key = &mine[i].key;
-            key.starts_with("locks/") || (key.starts_with("sessions/") && !key.ends_with(".index"))
+            key.starts_with("sessions/") && !key.ends_with(".index")
         })
-        .expect("a backup's commit touches locks/ or its session marker");
+        .expect("a backup's commit touches its session marker");
     let out: Vec<OpRecord> = mine.into_iter().skip(start).collect();
     assert!(
         !out.is_empty(),

@@ -918,7 +918,7 @@ fn prune_runs_beside_a_live_session() {
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
         env.backup(&src, "a", "s2");
 
-        crate::repo::lock::register_session(
+        crate::repo::sessions::register_session(
             env.local().as_ref(),
             "live-session",
             &crate::repo::HostEnv::system(),

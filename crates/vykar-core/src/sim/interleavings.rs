@@ -13,17 +13,16 @@
 //! [`h1_session_regression`]. H2-marker is a regression since 04 step 2
 //! (non-resurrecting marker refresh): [`h2_marker_regression`]. 04 step 5
 //! (ages on the store's clock) moved H4's skew route to the regressions and
-//! kept H4 on a store clock step ([`Hosts::StoreStepped`]); H2 reaches its
-//! two holders the same way.
+//! kept H4 on a store clock step ([`Hosts::StoreStepped`]).
 //!
 //! Retired by 10-single-protocol step 7: H4 and H4-skew. Their subject was
 //! compact's own lock route after a lost lock (a compact under the
 //! maintenance lock that lost it to an age reap and deleted on); since step
 //! 7 compact runs in a session on every repository and no command reaches
-//! that route (`compact_repo` under the lock is called by tests only, until
-//! step 9). The neutralised H4 and H4-segment variants and the
-//! no-prerequisite check of H4 went with them. H1, H1-late-clone and H2
-//! take the lock through [`Call::LockedDelete`] since then.
+//! that route (step 9 deleted it). The neutralised H4 and H4-segment
+//! variants and the no-prerequisite check of H4 went with them. H1 and
+//! H1-late-clone hold exclusive sessions ([`Call::ExclusiveDelete`]); H2 is
+//! retired (10-single-protocol step 9).
 
 use std::time::Duration;
 
@@ -33,7 +32,7 @@ use super::fault::{ClientId, KeyMatch, OpKind, OpMatch};
 use super::gate::{GateId, GateRule, Paused};
 use super::hazards::{HazardOutcome, base_controls, broken, deleted_in_run, different_damage};
 use super::history::{AllowedError, ErrorClass, RunRecord};
-use super::log::{OpOutcome, OpRecord};
+use super::log::OpRecord;
 use super::runner::{Call, GATE_TIMEOUT, Sim, SourceTree, seeded_bytes};
 
 /// Where the two clients of a scenario live.
@@ -211,13 +210,6 @@ fn first_write_of(sim: &Sim, run: &RunRecord, f: impl Fn(&str) -> bool) -> Optio
         .map(|r| r.key)
 }
 
-/// The lock key `run` wrote, read back from the log.
-fn lock_key_of(sim: &Sim, run: &RunRecord) -> Option<String> {
-    first_write_of(sim, run, |k| {
-        k.starts_with("locks/") && k.ends_with(".json")
-    })
-}
-
 /// The session marker `run` wrote.
 fn marker_key_of(sim: &Sim, run: &RunRecord) -> Option<String> {
     first_write_of(sim, run, |k| {
@@ -247,17 +239,6 @@ fn before_commit(c: ClientId) -> GateRule {
     .nth(3)
 }
 
-/// Steps at which `client`'s run `run` wrote `key`.
-fn steps_writing(sim: &Sim, client: ClientId, run: usize, key: &str) -> Vec<u64> {
-    records_of(sim, client, run, |r| r.op.is_write() && r.key == key)
-        .iter()
-        .map(|r| r.step)
-        .collect()
-}
-
-/// Whether `c` wrote no lock key. Lock-free clients (an encrypted
-/// repository on a store that honours put-if-absent, 04 step 9) take no
-/// lock, so a lock scenario run on them has nothing to build on.
 /// The exclusive session's marker `run` wrote (`sessions/x-*.json`).
 fn exclusive_key_of(sim: &Sim, run: &RunRecord) -> Option<String> {
     first_write_of(sim, run, |k| {
@@ -269,13 +250,6 @@ fn exclusive_key_of(sim: &Sim, run: &RunRecord) -> Option<String> {
 fn took_no_exclusive(sim: &Sim, c: ClientId) -> bool {
     !sim.store()
         .keys_written_by(c, "sessions/x-")
-        .iter()
-        .any(|k| k.ends_with(".json"))
-}
-
-fn took_no_lock(sim: &Sim, c: ClientId) -> bool {
-    !sim.store()
-        .keys_written_by(c, "locks/")
         .iter()
         .any(|k| k.ends_with(".json"))
 }
@@ -527,157 +501,6 @@ fn h1_session_scenario(hosts: Hosts) -> Scenario {
             && !report.violated_for(Invariant::CommittedSnapshotsRestore, "a1")
         {
             HazardOutcome::NotReproduced { evidence }
-        } else {
-            different_damage(evidence)
-        },
-    )
-}
-
-// ── H2 ──────────────────────────────────────────────────────────────────
-
-/// When B reaps A's lock in H2.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum H2Reap {
-    /// B reaps between A's fence `exists` and its refresh PUT: the hazard.
-    DuringRefresh,
-    /// B reaps and finishes while A waits before its fence `exists`:
-    /// the fence must then fail (what a fixed refresh looks like).
-    BeforeFence,
-}
-
-/// H2: a lock refresh recreates a reaped key; both holders finish and both
-/// fences pass.
-pub fn h2_lock_refresh_resurrects() -> HazardOutcome {
-    h2_with(H2Reap::DuringRefresh)
-}
-
-/// H2 with the reap placed by `reap`; `BeforeFence` neutralises it.
-///
-/// Both delete under the maintenance lock ([`Call::LockedDelete`], the lock
-/// holders that remain until 10-single-protocol step 9; delete itself runs
-/// in a session since step 7).
-///
-/// A deletes t0 and t2 and is held at its first fence check; time moves
-/// 3 h 1 min, so A's lock is due for refresh, and then the store's clock
-/// steps 3 h forward (an NTP correction on the server): B sees A's lock as
-/// older than 6 h on the store's clock and reaps it. A's fence before the second
-/// snapshot delete is the one that passes after the refresh rewrote its key
-/// (a delete writes no index since 05 step 8, so it has no later fence).
-pub fn h2_with(reap: H2Reap) -> HazardOutcome {
-    settle(h2_scenario(reap))
-}
-
-fn h2_scenario(reap: H2Reap) -> Scenario {
-    let mut sim = Sim::new();
-    let c = sim.client("c");
-    ok(&sim.backup(c, "t0", &seeded("t0")), "control backup t0")?;
-    ok(&sim.backup(c, "t1", &seeded("t1")), "control backup t1")?;
-    ok(&sim.backup(c, "t2", &seeded("t2")), "control backup t2")?;
-    let (a, b) = (sim.client("a"), sim.client("b"));
-    let locks = || KeyMatch::Prefix("locks/".into());
-    let g_fence = sim.gate(GateRule::new(a, OpMatch::Kind(OpKind::Exists), locks()));
-    // The 1st write of a lock key is the acquisition, the 2nd the refresh.
-    let g_refresh = sim.gate(GateRule::new(a, OpMatch::AnyWrite, KeyMatch::LockKey).nth(2));
-    let gb = sim.gate(GateRule::new(b, OpMatch::Kind(OpKind::Exists), locks()));
-    let sa = sim.spawn(
-        a,
-        Call::LockedDelete {
-            names: vec!["t0".into(), "t2".into()],
-        },
-    );
-    if sim
-        .poll_paused(g_fence, GATE_TIMEOUT)
-        .map_err(broken)?
-        .is_none()
-    {
-        let ra = sim.join(sa);
-        if took_no_lock(&sim, a) {
-            return Ok(no_lock_taken(format!("a: {:?}", ra.outcome)));
-        }
-        return Err(broken(
-            "a's first fence check: the run ended without reaching its gate; retarget the gate",
-        ));
-    }
-    sim.advance(Duration::from_secs(3 * 3600 + 60));
-    sim.step_store_clock(chrono::Duration::hours(3));
-    let delete_t1 = || Call::LockedDelete {
-        names: vec!["t1".into()],
-    };
-    let (ra, rb) = match reap {
-        H2Reap::DuringRefresh => {
-            sim.resume(g_fence);
-            reach(&sim, g_refresh, "a's lock refresh")?;
-            let sb = sim.spawn(b, delete_t1());
-            if sim.poll_paused(gb, GATE_TIMEOUT).map_err(broken)?.is_none() {
-                let rb = sim.join(sb);
-                return Err(broken(format!(
-                    "B did not reap A's lock; check the store clock step and advance \
-                     against the staleness constants: {:?}",
-                    rb.outcome
-                )));
-            }
-            sim.resume(g_refresh);
-            let ra = sim.join(sa);
-            sim.resume(gb);
-            (ra, sim.join(sb))
-        }
-        H2Reap::BeforeFence => {
-            sim.resume(gb);
-            let sb = sim.spawn(b, delete_t1());
-            let rb = sim.join(sb);
-            sim.resume(g_fence);
-            // Disarms it if the refresh is never reached.
-            sim.resume(g_refresh);
-            (sim.join(sa), rb)
-        }
-    };
-    let report = sim.check_invariants(CHECKED);
-    controls(&report)?;
-    let Some(key) = lock_key_of(&sim, &ra) else {
-        return Err(broken(format!(
-            "a wrote no lock key\n{}",
-            outcomes(&ra, &rb)
-        )));
-    };
-    let reaped = steps_deleting(&sim, b, rb.index, &key);
-    let rewritten: Vec<u64> = reaped
-        .first()
-        .map(|s1| {
-            steps_writing(&sim, a, ra.index, &key)
-                .into_iter()
-                .filter(|s| s > s1)
-                .collect()
-        })
-        .unwrap_or_default();
-    let fence_passed_after = rewritten.first().is_some_and(|s2| {
-        !records_of(&sim, a, ra.index, |r| {
-            r.op == OpKind::Exists && r.key == key && r.outcome == OpOutcome::Ok && r.step > *s2
-        })
-        .is_empty()
-    });
-    let evidence = format!(
-        "{}\na's lock {key} deleted by b at {reaped:?}, rewritten by a at {rewritten:?}, \
-         a later fence passed: {fence_passed_after}\n{report}",
-        outcomes(&ra, &rb)
-    );
-    Ok(
-        if !reaped.is_empty()
-            && fence_passed_after
-            && ra.is_ok()
-            && rb.is_ok()
-            && lock_violation(&report, ra.index, ViolationKind::WriteUnderSeveralLocks)
-        {
-            HazardOutcome::Reproduced { evidence }
-        } else if !reaped.is_empty()
-            && rewritten.is_empty()
-            && allowed(&ra, AllowedError::LockExpired)
-        {
-            HazardOutcome::NotReproduced { evidence }
-        } else if reap == H2Reap::DuringRefresh && !rb.is_ok() {
-            broken(format!(
-                "B did not reap A's lock; check the store clock step and advance \
-                 against the staleness constants\n{evidence}"
-            ))
         } else {
             different_damage(evidence)
         },

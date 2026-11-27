@@ -586,7 +586,7 @@ pub(crate) const PAST_T_PACK: std::time::Duration = std::time::Duration::from_se
 /// call compact or a fold directly): the local clock, which is a
 /// LocalBackend's.
 pub(crate) fn set_store_now(repo: &mut Repo) {
-    repo.set_lock_store_time(Some(vykar_storage::StoreNow::at(
+    repo.set_store_time(Some(vykar_storage::StoreNow::at(
         std::time::SystemTime::now(),
     )));
 }

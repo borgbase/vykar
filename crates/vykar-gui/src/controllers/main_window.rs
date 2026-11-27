@@ -59,7 +59,7 @@ pub(crate) fn wire_callbacks(
 }
 
 /// Advanced (config editor) page: open/switch/save/discard/reload plus the
-/// repository recovery buttons (clear locks / clear sessions).
+/// repository recovery button (clear sessions).
 fn wire_config_editor(ui: &MainWindow, app_tx: &Sender<AppCommand>) {
     let tx = app_tx.clone();
     ui.on_open_config_clicked(move || {
@@ -122,18 +122,9 @@ fn wire_config_editor(ui: &MainWindow, app_tx: &Sender<AppCommand>) {
     wire_recovery_button(
         ui,
         app_tx,
-        |ui, cb| ui.on_clear_locks_clicked(cb),
-        "Clear Repository Lock",
-        "Clear advisory locks for {repo}?\n\nOnly use this if no Vykar operation is currently writing to this repository.",
-        |repo_name| AppCommand::ClearRepoLocks { repo_name },
-    );
-
-    wire_recovery_button(
-        ui,
-        app_tx,
         |ui, cb| ui.on_clear_sessions_clicked(cb),
-        "Clear Backup Sessions",
-        "Clear all backup sessions for {repo}?\n\nThis can affect live backups from this or another machine. Only continue if you are sure no backups are running.",
+        "Clear Sessions",
+        "Clear all session markers for {repo}?\n\nThis can interrupt backups and maintenance running on this or another machine, and also removes lock files left by vykar 0.24. Only continue if you are sure nothing is running.",
         |repo_name| AppCommand::ClearRepoSessions { repo_name },
     );
 }

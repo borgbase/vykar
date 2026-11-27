@@ -65,8 +65,8 @@ impl fmt::Display for ActiveSessionList {
     }
 }
 
-/// Parsed fields of a lock object, present only when it could be read and
-/// decoded.
+/// Parsed fields of a marker or 0.24 lock, present only when it could be
+/// read and decoded.
 #[derive(Debug, Clone)]
 pub struct LockHolderDetails {
     pub hostname: String,
@@ -77,12 +77,13 @@ pub struct LockHolderDetails {
     pub age: String,
 }
 
-/// Identifies whatever holds the repository: the advisory lock, or a
-/// session marker (`sessions/x-*.json`: an exclusive session, 10-single-protocol
-/// step 8; another `sessions/*.json`: a committing backup or a compact).
+/// Identifies whatever holds the repository: a session marker
+/// (`sessions/x-*.json`: an exclusive session; another `sessions/*.json`: a
+/// committing backup or a compact), or a vykar 0.24 lock key
+/// (`locks/*.json`) that a v2/v3 upgrade refuses beside.
 ///
-/// `details` is `None` when the lock object or marker could not be fetched
-/// or parsed — only its storage key is known.
+/// `details` is `None` when the marker or lock could not be fetched or
+/// parsed — only its storage key is known.
 #[derive(Debug, Clone)]
 pub struct LockHolder {
     pub key: String,
@@ -122,14 +123,13 @@ impl fmt::Display for LockHolder {
             };
         }
         // A session marker (`sessions/*.json`) holds the repository when a
-        // lock-free backup is committing or a lock-free compact runs (the
-        // marker handshake).
+        // backup is committing or a compact runs.
         if self.key.starts_with("sessions/") {
             return match &self.details {
                 Some(d) => write!(
                     f,
-                    "a backup committing or a compact running without the lock on {} (PID {}, \
-                     started {} ago) holds the repository. Wait for it to finish, or run \
+                    "a backup committing or a compact running on {} (PID {}, started {} \
+                     ago) holds the repository. Wait for it to finish, or run \
                      `vykar break-lock --sessions` if that process is gone.",
                     d.hostname, d.pid, d.age
                 ),
@@ -139,8 +139,9 @@ impl fmt::Display for LockHolder {
                     "a session marker that may belong to a committing backup is unreadable or \
                      was just removed (key: {}). Run the command again; if it persists and no \
                      backup is running, run `vykar break-lock --sessions` (an unreadable marker \
-                     blocks lock holders until it is 45 minutes old by its modification time, \
-                     and for good where the storage reports none).",
+                     blocks exclusive runs and, on a single-writer repository, other head \
+                     writers until it is 45 minutes old by its modification time, and for good \
+                     where the storage reports none).",
                     self.key
                 ),
             };
@@ -473,6 +474,7 @@ pub enum VykarError {
     )]
     ChunkRemovedDuringRead { chunk_id: crate::chunk_id::ChunkId },
 
+    /// The v2/v3 upgrade's legacy lock key lapsed.
     #[error("lock expired: {0}")]
     LockExpired(String),
 
@@ -707,7 +709,7 @@ mod tests {
     fn shared_session_holder_message_is_unchanged() {
         let msg = holder("sessions/0123456789abcdef0123456789abcdef.json", true);
         assert!(
-            msg.starts_with("a backup committing or a compact running without the lock on host-a"),
+            msg.starts_with("a backup committing or a compact running on host-a"),
             "{msg}"
         );
         assert!(!msg.contains("exclusive"), "{msg}");

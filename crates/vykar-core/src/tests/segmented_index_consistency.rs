@@ -266,7 +266,7 @@ proptest! {
         for op in &ops {
             // A fresh reading of "now" for every write, as a new lock hold
             // takes one: the ages are listed again.
-            t.repo.clear_lock_state();
+            t.repo.clear_session_state();
             super::helpers::set_store_now(&mut t.repo);
             // The entries before the op: a fold (or a fold that both the
             // warm and the cold reader build from the same wrong base) must

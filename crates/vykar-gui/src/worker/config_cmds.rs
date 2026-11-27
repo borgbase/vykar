@@ -4,7 +4,7 @@ use crate::config_helpers;
 use crate::messages::{AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::view_models::send_structured_data;
-use vykar_core::{repo::lock, storage};
+use vykar_core::{repo::sessions, storage};
 use vykar_types::error::Result;
 
 use super::WorkerContext;
@@ -96,28 +96,39 @@ fn cleanup_tmp(ctx: &WorkerContext, path: &Path) {
     }
 }
 
-pub(super) fn handle_clear_repo_locks(ctx: &mut WorkerContext, repo_name: String) {
-    handle_repo_recovery_action(ctx, repo_name, "lock", "lock marker", lock::break_lock);
-}
-
+/// "Clear Sessions": the lock files vykar 0.24 or an interrupted upgrade
+/// left under `locks/`, then every session marker (the user confirmed).
 pub(super) fn handle_clear_repo_sessions(ctx: &mut WorkerContext, repo_name: String) {
-    handle_repo_recovery_action(
-        ctx,
-        repo_name,
-        "sessions",
-        "session file",
-        lock::clear_all_sessions,
-    );
+    handle_repo_recovery_action(ctx, repo_name, "sessions", |storage| {
+        let locks = sessions::clear_legacy_locks(storage)?;
+        // The lock files are gone whatever happens to the markers: say so
+        // in the failure too.
+        let removed = sessions::clear_all_sessions(storage).map_err(|e| {
+            if locks > 0 {
+                vykar_types::error::VykarError::Other(format!(
+                    "{e} ({locks} leftover lock file(s) were removed)"
+                ))
+            } else {
+                e
+            }
+        })?;
+        let mut msg = format!("cleared {removed} session file(s)");
+        if locks > 0 {
+            msg.push_str(&format!(", {locks} leftover lock file(s)"));
+        }
+        Ok(msg)
+    });
 }
 
+/// Run `action` on `repo_name`'s storage and log its outcome: the text it
+/// returns, or the failure of `action_label`.
 fn handle_repo_recovery_action<F>(
     ctx: &mut WorkerContext,
     repo_name: String,
     action_label: &str,
-    item_label: &str,
     action: F,
 ) where
-    F: FnOnce(&dyn vykar_core::storage::StorageBackend) -> Result<usize>,
+    F: FnOnce(&dyn vykar_core::storage::StorageBackend) -> Result<String>,
 {
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
@@ -140,11 +151,8 @@ fn handle_repo_recovery_action<F>(
     };
 
     match action(backend.as_ref()) {
-        Ok(removed) => {
-            send_log(
-                &ctx.ui_tx,
-                format!("[{repo_name}] cleared {removed} {item_label}(s)."),
-            );
+        Ok(done) => {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] {done}."));
             let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
             let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
                 repo_selector: repo_name,

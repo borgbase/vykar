@@ -16,12 +16,12 @@ use super::ages::RECOVERY_MAX_PACK_AGE;
 use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::host_env::Clock;
-use super::lock::{
-    SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, parse_session_marker_key, session_index_key,
-};
 use super::pack_lookup::pack_mtimes;
 use super::pack_recovery::verify_journal_packs_trailers;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
+use super::sessions::{
+    SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, parse_session_marker_key, session_index_key,
+};
 
 /// Result of recovering pending index journals from interrupted sessions.
 pub struct PendingIndexRecovery {
@@ -451,7 +451,7 @@ mod tests {
     use crate::index::{PendingPackEntry, encode_pending_journal};
     use crate::repo::format::pack_object_with_context;
     use crate::repo::host_env::SystemClock;
-    use crate::repo::lock::{session_marker_key, session_marker_key_at};
+    use crate::repo::sessions::{session_marker_key, session_marker_key_at};
     use crate::repo::write_session::WriteSession;
     use crate::repo::write_session::tests::{fake_pack, test_crypto};
     use crate::testutil::{MemoryBackend, init_test_environment};

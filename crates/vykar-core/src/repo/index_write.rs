@@ -2,13 +2,14 @@
 //! and the read side. The write sequence itself (the PUTs, the fence, the
 //! head) is the steppable machine of `publish_machine.rs`.
 //!
-//! Every write runs under the repository lock: read the latest head, check
-//! it is the head the in-memory index was loaded from, express the edits as
-//! one keyed segment ([`LiveIndex::pending_segment`], a walk over the
-//! overlay only), then PUT the segment (and a sweep record, when a sweep is
-//! pending), check the lock fence and create the head of the next generation
-//! at `index.h/<gen>` (put-if-absent where the backend offers it and its
-//! check passed, else a plain PUT under the lock: 04 step 8). A generation
+//! Every write runs in a session (a backup's commit, a maintenance or an
+//! exclusive session): read the latest head, check it is the head the
+//! in-memory index was loaded from, express the edits as one keyed segment
+//! ([`LiveIndex::pending_segment`], a walk over the overlay only), then PUT
+//! the segment (and a sweep record, when a sweep is pending), check the
+//! fence and create the head of the next generation at `index.h/<gen>`
+//! (put-if-absent on a multi-writer repository, else a plain PUT guarded
+//! by the single-writer check: 04 step 8, 10-single-protocol step 7). A generation
 //! another writer took ends a maintenance write with "index changed …
 //! retry"; a backup commit rebases and tries again. The segment is then
 //! applied in memory; nothing local is
@@ -42,9 +43,9 @@ use super::Repo;
 use super::control::{CancelToken, CommitEvent};
 use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
 use super::index_store::{self, PackedObject, StoredHead};
-use super::lock::MarkerStamp;
 use super::machine::{StepCx, drive_blocking};
 use super::publish_machine::{PublishMachine, Published};
+use super::sessions::MarkerStamp;
 use super::writer::Fence;
 use crate::index::LiveIndex;
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
@@ -488,9 +489,8 @@ impl Repo {
     /// sweep is pending. On error nothing
     /// local changes (a requested fold stays requested) and at most an
     /// unreferenced object is left on storage. A generation another writer
-    /// created is [`MaintenanceWrite::Moved`] (its callers under the lock
-    /// make it the "index changed" error: 04 "Compact" 4, a maintenance
-    /// write stops). `listed_at`: when the head listing that chose the
+    /// created is [`MaintenanceWrite::Moved`] (a maintenance write stops:
+    /// 04 "Compact" 4). `listed_at`: when the head listing that chose the
     /// generation started (`PublishMachine::listed_at`).
     fn publish_index_state(
         &mut self,
@@ -558,24 +558,19 @@ impl Repo {
     /// foldable prefix; young backup segments stay in the head (04 step 7).
     /// The deletion runs only when this handle created the latest head (the
     /// fold's, or the run's last index write): a writer that read an older
-    /// head then finds its generation taken (04 step 8). `on_moved`: what a
-    /// head that moved since the index was loaded, or a fold whose
-    /// generation another writer created, does: the "index changed" error
-    /// under the lock (`Fail`), or nothing more this run (`Skip`, a
-    /// lock-free compact, 04 step 9: the fold and the collection run in a
-    /// later compact or a backup's fold). `RepoWriter::maintain_segmented_index`
+    /// head then finds its generation taken (04 step 8). A head that moved
+    /// since the index was loaded, or a fold whose generation another writer
+    /// created, does nothing more this run (04 step 9: the fold and the
+    /// collection run in a later compact or a backup's fold). `RepoWriter::maintain_segmented_index`
     /// saves a dirty index first, then calls it with its fence.
-    pub(super) fn maintain_segmented_index_under(
-        &mut self,
-        on_moved: OnMoved,
-        fence: &Fence,
-    ) -> Result<()> {
-        let skip = |e: VykarError| match on_moved {
-            OnMoved::Skip if is_stale_index_error(&e) => {
+    pub(super) fn maintain_segmented_index_under(&mut self, fence: &Fence) -> Result<()> {
+        let skip = |e: VykarError| {
+            if is_stale_index_error(&e) {
                 debug!("the index head moved; index fold and garbage collection skipped");
                 Ok(())
+            } else {
+                Err(e)
             }
-            _ => Err(e),
         };
         let listed_at = MarkerStamp::now(self.host_env().clock.as_ref());
         let head = match self.current_head_for_write() {
@@ -616,13 +611,10 @@ impl Repo {
             debug!("no index head written by this run; index garbage collection skipped");
             return Ok(());
         }
-        if !fence.is_lock() {
-            // A session run (maintenance session, backup) checks its fence
-            // before the garbage collection; a lock holder does not. A
-            // maintenance session's marker check (04 step 9) guards its
-            // deletes too.
-            fence.check()?;
-        }
+        // The fence is checked before the garbage collection: a
+        // maintenance session's marker check (04 step 9) guards its deletes
+        // too.
+        fence.check()?;
         let gc = index_store::collect_index_garbage(
             self.storage.as_ref(),
             self.crypto.as_ref(),
@@ -900,15 +892,6 @@ pub(crate) enum MaintenanceWrite {
     /// The latest head is not the loaded one, or the head create found its
     /// generation taken: nothing on storage names this write.
     Moved,
-}
-
-/// What [`super::RepoWriter::maintain_segmented_index`] does on a moved head.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OnMoved {
-    /// The "index changed" error (under the lock).
-    Fail,
-    /// Skip the fold and the garbage collection (lock-free compact).
-    Skip,
 }
 
 /// The error of a backup commit whose head generation another writer took

@@ -1373,8 +1373,8 @@ impl vykar_storage::StorageBackend for SimClient {
             if let Some(run) = st.runs.get(&self.client).copied() {
                 // An exclusive session's marker is a hold (invariant 7),
                 // not a lock-free registration (10-single-protocol step 8).
-                if crate::repo::lock::parse_session_marker_key(key)
-                    .is_some_and(|(id, _)| crate::repo::lock::is_exclusive_session(id))
+                if crate::repo::sessions::parse_session_marker_key(key)
+                    .is_some_and(|(id, _)| crate::repo::sessions::is_exclusive_session(id))
                 {
                     st.exclusive_runs.insert(run);
                 } else {

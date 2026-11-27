@@ -165,7 +165,10 @@ impl WriteSession {
     /// The backup's session marker, pulled back by the age of every pack
     /// upload an append-only server refuses because the pack is stored
     /// already (`existing_pack`).
-    pub(crate) fn attach_session_marker(&self, marker: std::sync::Arc<super::lock::SessionMarker>) {
+    pub(crate) fn attach_session_marker(
+        &self,
+        marker: std::sync::Arc<super::sessions::SessionMarker>,
+    ) {
         if let Some(existing) = self.existing_packs.as_ref() {
             existing.attach_marker(marker);
         }

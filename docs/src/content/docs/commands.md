@@ -51,7 +51,7 @@ See [Maintain the Repository](/maintenance).
 | `vykar check` | Verify repository integrity (`--verify-data` for full content verification, `--repair` to fix problems) |
 | `vykar snapshot delete` | Delete one or more snapshots (the space is freed by the next `compact`) |
 | `vykar delete` | Delete an entire repository permanently |
-| `vykar break-lock` | Remove stale repository locks left by interrupted processes when lock conflicts block operations |
+| `vykar break-lock` | Remove any lock files left by vykar 0.24 or an interrupted upgrade (without asking), then the session markers left by killed processes (lists them and asks first) |
 | `vykar upgrade` | Upgrade a v2/v3 repository to format v6 in place, writing a pack map for every existing pack (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)); `--commit-mode single|multi` switches a v6 repository's commit mode (see [Commit mode](/maintenance#commit-mode)) |
 
 ## Common flags

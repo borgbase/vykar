@@ -38,8 +38,8 @@ use super::WriterMode;
 use super::ages::{HEAD_FRESHNESS_LIMIT, HEAD_LANDING_ALLOWANCE, INDEX_WRITE_LIMIT};
 use super::index_store::{self, HeadPut, HeadWrite, PackedObject};
 use super::index_write::FoldRequest;
-use super::lock::{self, MarkerStamp, SessionMarker};
 use super::machine::{Machine, StepCx, StepKind, bad_pick};
+use super::sessions::{self, MarkerStamp, SessionMarker};
 use crate::index::LiveIndex;
 use crate::index::head::{
     BaseRef, HEAD_LAYOUT_VERSION, IndexHead, ObjectName, SegmentKind, SegmentRef,
@@ -101,13 +101,13 @@ pub(crate) struct HeadCheck {
 }
 
 impl HeadCheck {
-    /// [`lock::head_landing_check`] with [`HEAD_LANDING_ALLOWANCE`]: the
+    /// [`sessions::head_landing_check`] with [`HEAD_LANDING_ALLOWANCE`]: the
     /// fence is the last step before the head PUT on every path.
     ///
     /// [`HEAD_LANDING_ALLOWANCE`]: super::ages::HEAD_LANDING_ALLOWANCE
     fn run(&self, repo: &super::Repo) -> Result<()> {
         let clock = repo.host_env().clock.as_ref();
-        lock::head_landing_check(
+        sessions::head_landing_check(
             &self.session_id,
             &self.marker.report(clock),
             self.marker.elapsed(clock),
@@ -1275,14 +1275,11 @@ fn write_step(
             Ok(())
         }
         StepKind::CollectGarbage => {
-            // A session run (maintenance session, backup) checks its fence
-            // before the garbage collection; a lock holder does not. A
+            // The fence is checked before the garbage collection. A
             // maintenance session's marker check (04 step 9) guards its
             // deletes: when it fails the collection is skipped (the head has
             // landed; the run's next check ends it). A backup's fence passes.
-            if !fence.is_lock()
-                && let Err(e) = fence.check()
-            {
+            if let Err(e) = fence.check() {
                 warn!("index garbage collection skipped: {e}");
                 return Ok(());
             }

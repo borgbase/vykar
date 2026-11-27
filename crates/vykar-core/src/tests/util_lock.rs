@@ -1,7 +1,7 @@
 //! `with_exclusive_session`'s epilogue (10-single-protocol step 8; the
-//! lock's `with_repo_lock` before): the action's result survives a failed
+//! lock's epilogue before): the action's result survives a failed
 //! deregistration, a write session the action began is flushed before the
-//! session ends, the handle's storage and lock state are restored, and a
+//! session ends, the handle's storage and session state are restored, and a
 //! refused registration runs nothing.
 
 use std::collections::HashMap;
@@ -12,8 +12,8 @@ use crate::commands::util::{with_exclusive_session, with_exclusive_session_as};
 use crate::compress::Compression;
 use crate::repo::ChunkerParams;
 use crate::repo::InitOptions;
-use crate::repo::lock;
 use crate::repo::pack::PackType;
+use crate::repo::sessions;
 use crate::repo::{EncryptionMode, Fence, Repo, WriteSessionOptions};
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
@@ -295,7 +295,7 @@ fn the_storage_and_lock_state_are_restored() {
         });
         assert_eq!(result.is_err(), fail);
         assert!(Arc::ptr_eq(repo.storage(), &raw));
-        assert!(repo.lock_store_time().is_none());
+        assert!(repo.store_time().is_none());
         assert!(repo.live_sessions().is_empty());
         assert!(exclusive_markers(raw.as_ref()).is_empty());
     }
@@ -308,7 +308,7 @@ fn a_refused_registration_runs_nothing_and_leaves_no_marker() {
     let backend = AdvisoryLockBackend::new(false);
     let mut repo = init_repo_with_backend(backend);
     let env = repo.host_env().clone();
-    let shared = lock::register_session(repo.storage().as_ref(), "live-backup", &env).unwrap();
+    let shared = sessions::register_session(repo.storage().as_ref(), "live-backup", &env).unwrap();
     let ran = AtomicUsize::new(0);
     let result: Result<()> = with_exclusive_session(&mut repo, |_| {
         ran.fetch_add(1, Ordering::SeqCst);
@@ -321,7 +321,7 @@ fn a_refused_registration_runs_nothing_and_leaves_no_marker() {
     assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert!(exclusive_markers(repo.storage().as_ref()).is_empty());
     assert!(repo.live_sessions().is_empty());
-    lock::deregister_session(repo.storage().as_ref(), shared.session_id(), &env);
+    sessions::deregister_session(repo.storage().as_ref(), shared.session_id(), &env);
 }
 
 /// The exclusive check guards the index write (`fence_blocks_persist_index`

@@ -1037,7 +1037,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     .unwrap();
     age_repo_objects(&fx.repo_dir, &["index.d", "packs"], PAST_T_PACK);
 
-    // `MutLog` offers no put-if-absent: lock mode.
+    // `MutLog` offers no put-if-absent: single-writer.
     crate::tests::helpers::make_single_writer(&fx.repo_dir);
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = Box::new(MutLog {
@@ -1050,7 +1050,15 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     let stats = commands::util::with_exclusive_session(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
         ops.lock().unwrap().clear();
-        commands::compact::compact_repo(repo, 0.0, None, false, 2, &CancelToken::new())
+        commands::compact::compact_in_session(
+            repo,
+            commands::compact::UNREGISTERED_TEST_SESSION,
+            0.0,
+            None,
+            false,
+            2,
+            &CancelToken::new(),
+        )
     })
     .unwrap();
     assert!(stats.chunks_unreferenced > 0, "{stats:?}");
@@ -2081,7 +2089,7 @@ fn backup_with(
         .unwrap();
 }
 
-/// `begin_commit` runs every commit under `Fence::lock_free_backup` (which
+/// `begin_commit` runs every commit under `Fence::backup_commit` (which
 /// passes: the commit machine checks its marker itself), on a single-writer
 /// repository too since 10-single-protocol step 7.
 #[test]
@@ -2117,7 +2125,7 @@ fn begin_commit_runs_under_the_backups_fence() {
     };
 
     let free = upload("free").begin_commit();
-    assert!(free.fence().is_lock_free_backup());
+    assert!(free.fence().is_backup_commit());
     let err = free
         .finish(Err(VykarError::Interrupted), &mut None, &CancelToken::new())
         .unwrap_err();
@@ -2128,7 +2136,7 @@ fn begin_commit_runs_under_the_backups_fence() {
         .protect_commit(&mut None, &CancelToken::new())
         .unwrap();
     let mut commit = pending.begin_commit();
-    assert!(commit.fence().is_lock_free_backup());
+    assert!(commit.fence().is_backup_commit());
     let result = commit.drive(&|_: crate::repo::control::CommitEvent| {});
     commit
         .finish(result, &mut None, &CancelToken::new())

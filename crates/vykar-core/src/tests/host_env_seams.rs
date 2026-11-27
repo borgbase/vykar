@@ -1,9 +1,9 @@
-//! The lock, session and maintenance code reads time and host identity only
+//! The session and maintenance code reads time and host identity only
 //! through `HostEnv`. A text scan: it misses aliases, and is a tripwire, not
 //! a proof.
 
 const FILES: &[(&str, &str)] = &[
-    ("repo/lock.rs", include_str!("../repo/lock.rs")),
+    ("repo/sessions.rs", include_str!("../repo/sessions.rs")),
     (
         "repo/journal_recovery.rs",
         include_str!("../repo/journal_recovery.rs"),

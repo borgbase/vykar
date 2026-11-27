@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::control::CancelToken;
-use crate::repo::lock;
+use crate::repo::sessions;
 use crate::repo::write_check::WriteChecked;
 use crate::repo::{Fence, FenceFn, OpenOptions, OpenRequest, Repo, RepoWriter, identity};
 use crate::storage;
@@ -92,83 +92,6 @@ pub(crate) fn open_repo_on(
     Ok(repo)
 }
 
-/// Execute a repository mutation while holding an advisory lock.
-/// Ensures the lock release is always attempted even when the action fails.
-/// A write session the action begins is the action's to save or flush
-/// (`WriteSession::flush_on_abort`) before it returns.
-pub fn with_repo_lock<T>(
-    repo: &mut Repo,
-    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
-) -> Result<T> {
-    let env = repo.host_env().clone();
-    let guard = lock::acquire_lock(repo.storage().as_ref(), &env)?;
-    run_under_fence(repo, guard, action)
-}
-
-/// Clear the lock-hold state and release the advisory lock, reporting a
-/// failed release without changing the operation's outcome.
-///
-/// # Failure policy
-///
-/// - **After a failed action**, a release failure is `tracing::warn!`-only:
-///   the caller already has a more meaningful error to propagate.
-/// - **After a successful action**, the work is already committed to storage
-///   (e.g. the snapshot blob was written), so a release failure must not be
-///   reported as a failure of the operation. It goes to `on_warning`, which
-///   decides where the user sees it.
-///
-/// `on_warning` is what lets the two callers differ: `run_under_fence` has no
-/// progress sink and passes `tracing::warn!`, while backup's commit path
-/// passes its `BackupProgressEvent::Warning` emitter so GUI consumers see it
-/// too. Leaked advisory locks self-heal after 6 hours, and `vykar break-lock`
-/// clears them immediately.
-pub(crate) fn clear_fence_and_release(
-    repo: &mut Repo,
-    guard: lock::LockGuard,
-    action_succeeded: bool,
-    on_warning: &mut dyn FnMut(String),
-) {
-    repo.clear_lock_state();
-    let lock_key = guard.key().to_string();
-    let Err(release_err) = lock::release_lock(repo.storage().as_ref(), guard) else {
-        return;
-    };
-    if !action_succeeded {
-        tracing::warn!("failed to release repository lock: {release_err}");
-        return;
-    }
-    on_warning(format!(
-        "the operation completed successfully, but releasing the repository lock \
-         failed: {release_err}. The advisory lock at `{lock_key}` may persist; \
-         future operations on this repository may be blocked for up to 6 hours \
-         until automatic stale-lock cleanup, or run `vykar break-lock` to clear \
-         it manually."
-    ));
-}
-
-/// Shared epilogue for lock-guarded operations: runs the action on a
-/// writer under the lock's fence, then releases the lock via
-/// [`clear_fence_and_release`]. Action errors are propagated as-is.
-fn run_under_fence<T>(
-    repo: &mut Repo,
-    guard: lock::LockGuard,
-    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
-) -> Result<T> {
-    let fence = Fence::lock(lock::build_lock_fence(
-        &guard,
-        Arc::clone(repo.storage()),
-        repo.host_env().clone(),
-    ));
-    repo.set_lock_store_time(guard.store_time());
-
-    let result = action(&mut repo.writer(fence));
-
-    clear_fence_and_release(repo, guard, result.is_ok(), &mut |msg| {
-        tracing::warn!("{msg}");
-    });
-    result
-}
-
 /// `Err(AppendOnlyServer { command })` when the repository's server
 /// advertises append-only mode ([`vykar_storage::ServerOps::append_only`]).
 /// Call before a command's first delete; it sends at most one `GET /health`.
@@ -182,111 +105,10 @@ pub(crate) fn refuse_on_append_only_server(
     Ok(())
 }
 
-/// Execute a maintenance operation while holding an advisory lock. Used by
-/// no command since 10-single-protocol step 8 (`check --repair`, upgrade
-/// and pack maps run as exclusive sessions, [`with_exclusive_session`]);
-/// tests and the simulator's lock hazards only, until step 9 deletes the
-/// lock.
-///
-/// Acquires the lock, cleans up stale sessions (no marker written for 45 min
-/// by the store's clock), lists the sessions that remain live (for compact's
-/// horizon, `Repo::live_sessions`), runs the action on a writer under
-/// the lock's fence and releases the lock. It does not refuse on live sessions:
-/// compact, prune and delete run beside backups (04 step 7), compact keeping
-/// their uploads by age and inside their markers' horizons. Actions that
-/// must not run beside a backup refuse themselves with
-/// `Repo::refuse_live_sessions` (`check --repair`, upgrade).
-/// Malformed markers (unparseable JSON or bad timestamps) are judged by
-/// their mtime: while younger than 45 minutes they are preserved and give
-/// compact no horizon (no orphan pack is deleted), after that they are
-/// reaped like any stale marker (`break-lock --sessions` clears them at
-/// once). A failed listing refuses.
-///
-/// The session listing runs inside the fence (it is
-/// `list_live_sessions_under_lock` called first in the action): a failed
-/// listing returns through the fence's epilogue, which releases the lock.
-pub fn with_maintenance_lock<T>(
-    repo: &mut Repo,
-    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
-) -> Result<T> {
-    with_maintenance_lock_unlisted(repo, |repo| {
-        list_live_sessions_under_lock(repo)?;
-        action(repo)
-    })
-}
-
-/// [`with_maintenance_lock`] without the session listing: acquire, remove
-/// probe debris, fence, `lock_store_time`, run, release. The action lists
-/// sessions itself ([`list_live_sessions_under_lock`]) where the order
-/// matters: compact, after its pack listing (04 "Compact" 1).
-pub(crate) fn with_maintenance_lock_unlisted<T>(
-    repo: &mut Repo,
-    action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
-) -> Result<T> {
-    let env = repo.host_env().clone();
-    let guard = lock::acquire_lock(repo.storage().as_ref(), &env)?;
-    // An uncontended acquirer never probes the store's clock, so it removes
-    // the old probes its acquisition listed (best effort).
-    guard.remove_probe_debris(repo.storage().as_ref());
-    run_under_fence(repo, guard, action)
-}
-
-/// The stale-session reap and the live listing of [`with_maintenance_lock`],
-/// for an action already under the maintenance lock; sets
-/// `Repo::live_sessions`. "Now" is `Repo::lock_store_time`.
-/// Fails closed: without the listing compact would not know whose uploads
-/// to keep, so a failed listing refuses the maintenance.
-pub(crate) fn list_live_sessions_under_lock(repo: &mut Repo) -> Result<()> {
-    // Clean up stale sessions; the ones kept are live. Backups may run
-    // beside maintenance (04 step 7): compact keeps their uploads by age and
-    // by their marker's horizon.
-    //
-    // The same listing is the lock holder's half of the marker handshake
-    // (04 step 9): a live session that may write heads without the lock (a
-    // lock-free backup committing, or a lock-free compact, whose marker
-    // carries `writes_heads` for its whole run) makes this holder yield with
-    // `Locked` naming it, before any write; the user retries.
-    let listed = lock::yield_to_lock_free_writers(
-        repo.storage().as_ref(),
-        repo.host_env(),
-        repo.lock_store_time(),
-        None,
-    );
-    let live = match listed {
-        // `LockExpired`: the deletes of a v2/v3 upgrade's reap run its
-        // lock key's check first.
-        Err(e @ (VykarError::Locked(_) | VykarError::LockExpired(_))) => return Err(e),
-        Ok((cleaned, live)) => {
-            if !cleaned.is_empty() {
-                info!(
-                    count = cleaned.len(),
-                    sessions = ?cleaned,
-                    "cleaned up stale backup sessions"
-                );
-            }
-            live
-        }
-        Err(e) => {
-            return Err(VykarError::Other(format!(
-                "cannot clean up stale backup sessions (storage error: {e}); \
-                 refusing maintenance to avoid data loss"
-            )));
-        }
-    };
-    if !live.is_empty() {
-        info!(
-            count = live.len(),
-            "backup sessions are live; maintenance runs beside them"
-        );
-    }
-    repo.set_live_sessions(Some(live));
-    Ok(())
-}
-
 /// The registered session of a lock-free maintenance run (04 step 9): its
 /// heartbeat runs until the run ends, then it deregisters.
 pub(crate) struct MaintenanceSession {
-    guard: lock::SessionGuard,
+    guard: sessions::SessionGuard,
 }
 
 impl MaintenanceSession {
@@ -295,14 +117,14 @@ impl MaintenanceSession {
     }
 
     /// The session's marker record (its heartbeat's view of the marker).
-    pub(crate) fn marker(&self) -> Arc<lock::SessionMarker> {
+    pub(crate) fn marker(&self) -> Arc<sessions::SessionMarker> {
         self.guard.marker()
     }
 }
 
 /// The fence of a lock-free maintenance run (04 step 9), installed as the
-/// handle's lock fence for the whole run: the run's marker exists now and
-/// its record is [continuous](lock::MarkerReport::continuous), the
+/// handle's fence for the whole run: the run's marker exists now and
+/// its record is [continuous](sessions::MarkerReport::continuous), the
 /// predicate a lock-free backup checks before its snapshot PUT. It runs
 /// before every head create of the run (the publish machine's fence step:
 /// the sweep head, each repack batch's create and each create after a
@@ -313,17 +135,17 @@ impl MaintenanceSession {
 ///
 /// Why: once its marker is reaped (a stall over the session staleness, a
 /// suspended laptop) nothing protects what the run decided before. Another
-/// compact takes its repack outputs for old orphans and deletes them, and a
-/// lock holder no longer yields to it, so a lock-path backup commits a
-/// reuse-only snapshot (no head) that this run's sweep, planned from an
-/// older mark, would then strip. The check narrows both to a stall between
+/// compact takes its repack outputs for old orphans and deletes them, and
+/// its decisions (the sweep planned from its mark, the repack sources it
+/// chose) are no longer guarded against another compact that took it for
+/// ended. The check narrows both to a stall between
 /// the check and the write it guards. A reap needs the marker unrefreshed
 /// for the session staleness (45 min), and such a gap breaks the record's
 /// continuity (`MARKER_GAP_LIMIT`, 30 min) whether or not the key is
 /// still there: the check also catches a reaper that listed the key stale
 /// and deletes it only after a late refresh.
 fn maintenance_marker_fence(
-    marker: Arc<lock::SessionMarker>,
+    marker: Arc<sessions::SessionMarker>,
     storage: Arc<dyn StorageBackend>,
     clock: Arc<dyn crate::repo::host_env::Clock>,
 ) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
@@ -349,21 +171,21 @@ fn maintenance_marker_fence(
 }
 
 /// The record shows a lapse no later probe can undo: the marker was found
-/// missing, it went unrefreshed longer than [`lock::MARKER_GAP_LIMIT`], or a
+/// missing, it went unrefreshed longer than [`sessions::MARKER_GAP_LIMIT`], or a
 /// marker PUT was slow. A superseded key whose check failed (`unchecked`)
 /// is not one: the next probe checks it again.
-fn marker_lapsed(report: &lock::MarkerReport) -> bool {
-    report.missing || report.longest_gap > lock::MARKER_GAP_LIMIT || report.slow_puts > 0
+fn marker_lapsed(report: &sessions::MarkerReport) -> bool {
+    report.missing || report.longest_gap > sessions::MARKER_GAP_LIMIT || report.slow_puts > 0
 }
 
 /// The check before every write of an exclusive run, as a fence function
 /// shared by the run's `WriteChecked` storage and its writer's
 /// `Fence::marker`. It passes while
-/// - the marker record is [continuous](lock::MarkerReport::continuous) at
+/// - the marker record is [continuous](sessions::MarkerReport::continuous) at
 ///   this call (no request), and
-/// - an EXISTS of the marker's current key ([`lock::SessionMarker::probe`])
+/// - an EXISTS of the marker's current key ([`sessions::SessionMarker::probe`])
 ///   found it, sent at most `reuse` ago measured with
-///   [`lock::MarkerStamp::until`] (suspend included). An older one is
+///   [`sessions::MarkerStamp::until`] (suspend included). An older one is
 ///   repeated, and so is one whose record is not continuous at this call
 ///   (a superseded key whose check failed is checked again by the probe);
 ///   one call at a time (a mutex), so concurrent uploads wait for one
@@ -371,19 +193,19 @@ fn marker_lapsed(report: &lock::MarkerReport) -> bool {
 ///
 /// The first lapse is sticky (no further request): the probe found the
 /// current key gone (recorded with `note_missing`), or the record shows the
-/// marker missing, a gap over [`lock::MARKER_GAP_LIMIT`] or a slow marker
+/// marker missing, a gap over [`sessions::MARKER_GAP_LIMIT`] or a slow marker
 /// PUT; it is warned once, then every call fails `MarkerLostDuringCommit`.
 /// A failed EXISTS (transport) returns its error and is not sticky.
 ///
 /// `storage` is the raw backend (the session guard's), never the wrapper.
 pub(crate) fn exclusive_write_check(
-    marker: Arc<lock::SessionMarker>,
+    marker: Arc<sessions::SessionMarker>,
     storage: Arc<dyn StorageBackend>,
     clock: Arc<dyn crate::repo::host_env::Clock>,
     reuse: std::time::Duration,
 ) -> FenceFn {
     // (when the last EXISTS that found the marker was sent, lapsed)
-    let state: std::sync::Mutex<(Option<lock::MarkerStamp>, bool)> =
+    let state: std::sync::Mutex<(Option<sessions::MarkerStamp>, bool)> =
         std::sync::Mutex::new((None, false));
     Arc::new(move || {
         let mut st = state
@@ -393,7 +215,7 @@ pub(crate) fn exclusive_write_check(
             return Err(VykarError::MarkerLostDuringCommit);
         }
         if let Some(stamp) = st.0
-            && stamp.until(&lock::MarkerStamp::now(clock.as_ref())) < reuse
+            && stamp.until(&sessions::MarkerStamp::now(clock.as_ref())) < reuse
             && marker.report(clock.as_ref()).continuous()
         {
             return Ok(());
@@ -401,7 +223,7 @@ pub(crate) fn exclusive_write_check(
         // A heartbeat refresh may leave a superseded key unchecked between
         // our probe and our report: probe again, a few times at most.
         for _ in 0..3 {
-            let sent = lock::MarkerStamp::now(clock.as_ref());
+            let sent = sessions::MarkerStamp::now(clock.as_ref());
             let present = marker.probe(storage.as_ref())?;
             let report = marker.report(clock.as_ref());
             if present && report.continuous() {
@@ -442,7 +264,7 @@ fn both(first: FenceFn, second: FenceFn) -> FenceFn {
 /// The registered session of an exclusive run (10-single-protocol step 8):
 /// its heartbeat runs until the run ends, then it deregisters.
 pub(crate) struct ExclusiveSession {
-    guard: lock::SessionGuard,
+    guard: sessions::SessionGuard,
 }
 
 impl ExclusiveSession {
@@ -455,7 +277,7 @@ impl ExclusiveSession {
 /// (`--commit-mode` included) and pack maps (10-single-protocol step 8).
 ///
 /// Registers `sessions/x-<32 hex>.json` and lists `sessions/` once
-/// (`lock::register_exclusive`: stale sessions reaped, orphan journals
+/// (`sessions::register_exclusive`: stale sessions reaped, orphan journals
 /// deleted); refuses `ActiveSessions` when any other session is live
 /// (malformed or vanished markers included: fail closed), its own marker
 /// deleted. Then adopts the marker with a heartbeat, reads `config` again on
@@ -465,10 +287,10 @@ impl ExclusiveSession {
 /// exclusive write check (`exclusive_write_check`) and runs `action` on a
 /// writer fenced by the same check. Every shared registration and a
 /// backup's pre-head listing refuse `Locked` while the marker is live
-/// (`lock::exclusive_listing`). At the end, whatever the result: the lock
-/// state is cleared, the raw storage restored and the session deregistered
+/// (`sessions::exclusive_listing`). At the end, whatever the result: the
+/// session state is cleared, the raw storage restored and the session deregistered
 /// (through the raw storage; a failed deregistration is warned only).
-/// "Now" on the store's clock (`Repo::lock_store_time`) is the marker's
+/// "Now" on the store's clock (`Repo::store_time`) is the marker's
 /// mtime in the registration's listing, and `Repo::live_sessions` is empty.
 pub fn with_exclusive_session<T>(
     repo: &mut Repo,
@@ -489,9 +311,8 @@ pub(crate) fn with_exclusive_session_as<T>(
     let raw = Arc::clone(repo.storage());
     // On a v2/v3 upgrade the registration's reap runs on the raw storage:
     // the legacy key is held already but its check does not run for these
-    // deletes (it did while the lock's listing ran under the upgrade's
-    // checked storage); a reap deletes only stale session objects.
-    let reg = lock::register_exclusive(raw.as_ref(), &env)?;
+    // deletes; a reap deletes only stale session objects.
+    let reg = sessions::register_exclusive(raw.as_ref(), &env)?;
     if !reg.cleaned.is_empty() {
         info!(
             count = reg.cleaned.len(),
@@ -502,15 +323,16 @@ pub(crate) fn with_exclusive_session_as<T>(
     let id = reg.registration.session_id().to_string();
     repo.set_live_sessions(Some(reg.live));
     if let Err(e) = repo.refuse_live_sessions() {
-        repo.clear_lock_state();
-        lock::deregister_session(raw.as_ref(), &id, &env);
+        repo.clear_session_state();
+        sessions::deregister_session(raw.as_ref(), &id, &env);
         return Err(e);
     }
-    let guard = match lock::SessionGuard::adopt(Arc::clone(&raw), reg.registration, env.clone()) {
+    let guard = match sessions::SessionGuard::adopt(Arc::clone(&raw), reg.registration, env.clone())
+    {
         Ok(g) => g,
         Err(e) => {
-            repo.clear_lock_state();
-            lock::deregister_session(raw.as_ref(), &id, &env);
+            repo.clear_session_state();
+            sessions::deregister_session(raw.as_ref(), &id, &env);
             return Err(e);
         }
     };
@@ -519,7 +341,7 @@ pub(crate) fn with_exclusive_session_as<T>(
     if !repo.format().is_upgrade_only()
         && let Err(e) = repo.reread_writer_mode()
     {
-        repo.clear_lock_state();
+        repo.clear_session_state();
         drop(session);
         return Err(e);
     }
@@ -537,9 +359,9 @@ pub(crate) fn with_exclusive_session_as<T>(
         Arc::clone(&raw),
         Arc::clone(&check),
     )));
-    repo.set_lock_store_time(reg.now);
+    repo.set_store_time(reg.now);
     let result = action(&mut repo.writer(Fence::marker(check)), &session);
-    repo.clear_lock_state();
+    repo.clear_session_state();
     repo.swap_storage(prev);
     drop(session);
     result
@@ -564,23 +386,26 @@ pub(crate) fn with_exclusive_session_as<T>(
 /// refusing beside any live session) that ran in it is seen by the read,
 /// one that runs after it refuses beside this session. A changed identity or format
 /// refuses. Clears the store time, live sessions and segment ages at the
-/// end (`Repo::clear_lock_state`).
+/// end (`Repo::clear_session_state`).
 pub(crate) fn with_maintenance_session<T>(
     repo: &mut Repo,
-    flags: lock::MarkerFlags,
+    flags: sessions::MarkerFlags,
     action: impl FnOnce(&mut RepoWriter<'_>, &MaintenanceSession) -> Result<T>,
 ) -> Result<T> {
     let env = repo.host_env().clone();
     let id = format!("{:032x}", rand::random::<u128>());
-    let registration = lock::register_session_with(repo.storage().as_ref(), &id, &env, flags)?;
-    let guard =
-        match lock::SessionGuard::adopt(Arc::clone(repo.storage()), registration, env.clone()) {
-            Ok(g) => g,
-            Err(e) => {
-                lock::deregister_session(repo.storage().as_ref(), &id, &env);
-                return Err(e);
-            }
-        };
+    let registration = sessions::register_session_with(repo.storage().as_ref(), &id, &env, flags)?;
+    let guard = match sessions::SessionGuard::adopt(
+        Arc::clone(repo.storage()),
+        registration,
+        env.clone(),
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            sessions::deregister_session(repo.storage().as_ref(), &id, &env);
+            return Err(e);
+        }
+    };
     tracing::debug!(session_id = id, ?flags, "maintenance session registered");
     let session = MaintenanceSession { guard };
     if let Err(e) = repo.reread_writer_mode().and_then(|_| repo.commit_mode()) {
@@ -593,7 +418,7 @@ pub(crate) fn with_maintenance_session<T>(
         Arc::clone(&repo.host_env().clock),
     ));
     let result = action(&mut repo.writer(fence), &session);
-    repo.clear_lock_state();
+    repo.clear_session_state();
     drop(session);
     result
 }
@@ -615,7 +440,9 @@ pub(crate) fn with_snapshot_removal_exclusion<T>(
 ) -> Result<T> {
     // Refuses `MultiWriterUnsupported` before anything is written.
     repo.commit_mode()?;
-    with_maintenance_session(repo, lock::MarkerFlags::default(), |repo, _| action(repo))
+    with_maintenance_session(repo, sessions::MarkerFlags::default(), |repo, _| {
+        action(repo)
+    })
 }
 
 /// Sessions #1 of a lock-free maintenance run (04 step 9): one listing of
@@ -623,22 +450,26 @@ pub(crate) fn with_snapshot_removal_exclusion<T>(
 /// key in it (written after registration and before this listing, so it
 /// precedes compact's head read, as 8b's I8 argument needs); stale sessions
 /// are reaped with that "now"; `Repo::live_sessions` are the others
-/// and `Repo::lock_store_time` is that "now". Fails closed as
-/// [`list_live_sessions_under_lock`].
+/// and `Repo::store_time` is that "now". Fails closed: without the listing
+/// compact would not know whose uploads to keep, so a failed listing
+/// refuses the maintenance.
 pub(crate) fn list_live_sessions_registered(
     repo: &mut Repo,
     own: &MaintenanceSession,
 ) -> Result<()> {
-    let (cleaned, live, now) =
-        match lock::reap_sessions_registered(repo.storage().as_ref(), repo.host_env(), own.id()) {
-            Ok(listed) => listed,
-            Err(e) => {
-                return Err(VykarError::Other(format!(
-                    "cannot clean up stale backup sessions (storage error: {e}); \
+    let (cleaned, live, now) = match sessions::reap_sessions_registered(
+        repo.storage().as_ref(),
+        repo.host_env(),
+        own.id(),
+    ) {
+        Ok(listed) => listed,
+        Err(e) => {
+            return Err(VykarError::Other(format!(
+                "cannot clean up stale backup sessions (storage error: {e}); \
                      refusing maintenance to avoid data loss"
-                )));
-            }
-        };
+            )));
+        }
+    };
     if !cleaned.is_empty() {
         info!(
             count = cleaned.len(),
@@ -652,14 +483,14 @@ pub(crate) fn list_live_sessions_registered(
             "backup sessions are live; maintenance runs beside them"
         );
     }
-    repo.set_lock_store_time(now);
+    repo.set_store_time(now);
     repo.set_live_sessions(Some(live));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::repo::lock::{SessionEntry, build_active_session_list};
+    use crate::repo::sessions::{SessionEntry, build_active_session_list};
 
     fn entry(hostname: &str, pid: u32, last_refresh: &str) -> SessionEntry {
         SessionEntry {

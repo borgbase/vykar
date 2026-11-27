@@ -3018,7 +3018,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
 #[test]
 fn maintenance_refuses_beside_a_live_session_guard() {
     use vykar_core::commands::util::with_exclusive_session;
-    use vykar_core::repo::lock;
+    use vykar_core::repo::sessions;
 
     init_test_environment();
     let tmp = tempfile::tempdir().unwrap();
@@ -3034,8 +3034,8 @@ fn maintenance_refuses_beside_a_live_session_guard() {
         std::sync::Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let session_id = format!("{:032x}", rand::random::<u128>());
     let registration =
-        lock::register_session(storage.as_ref(), &session_id, &HostEnv::system()).unwrap();
-    let guard = lock::SessionGuard::adopt(
+        sessions::register_session(storage.as_ref(), &session_id, &HostEnv::system()).unwrap();
+    let guard = sessions::SessionGuard::adopt(
         std::sync::Arc::clone(&storage),
         registration,
         HostEnv::system(),
@@ -3050,14 +3050,18 @@ fn maintenance_refuses_beside_a_live_session_guard() {
         matches!(refused, Err(VykarError::ActiveSessions(_))),
         "{refused:?}"
     );
-    let live = lock::list_session_entries(storage.as_ref()).unwrap();
+    let live = sessions::list_session_entries(storage.as_ref()).unwrap();
     assert_eq!(live.len(), 1, "the live session's marker is kept");
     assert_eq!(live[0].0, session_id);
     assert_eq!(live[0].1.as_ref().unwrap().elapsed_secs, Some(0));
 
     // Drop the guard — session deregistered
     drop(guard);
-    assert!(lock::list_sessions(storage.as_ref()).unwrap().is_empty());
+    assert!(
+        sessions::list_sessions(storage.as_ref())
+            .unwrap()
+            .is_empty()
+    );
 
     let mut repo3 = open_local_repo_cached(&repo_dir, Some(common::TEST_PASSPHRASE));
     with_exclusive_session(&mut repo3, |_| Ok(())).unwrap();
@@ -3070,7 +3074,7 @@ fn maintenance_refuses_beside_a_live_session_guard() {
 #[test]
 fn maintenance_reaps_session_older_than_45_minutes() {
     use vykar_core::commands::util::with_exclusive_session;
-    use vykar_core::repo::lock;
+    use vykar_core::repo::sessions;
 
     init_test_environment();
     let tmp = tempfile::tempdir().unwrap();
@@ -3112,7 +3116,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     );
     // Sanity: listing sessions should now be empty.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let remaining = lock::list_sessions(storage.as_ref()).unwrap();
+    let remaining = sessions::list_sessions(storage.as_ref()).unwrap();
     assert!(remaining.is_empty(), "no sessions should remain");
 }
 

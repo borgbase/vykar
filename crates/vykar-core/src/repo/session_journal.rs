@@ -10,7 +10,7 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 
 use super::format::{ObjectType, pack_object_with_context};
-use super::lock::session_index_key;
+use super::sessions::session_index_key;
 
 /// Number of new packs between debounced `pending_index` writes.
 pub(super) const JOURNAL_WRITE_INTERVAL: usize = 8;

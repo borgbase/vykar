@@ -247,7 +247,7 @@ def main() -> None:
         _log(f"Starting stress run iterations={args.iterations}")
 
         # Counters
-        backups = lists = restores = deletes = compacts = prunes = break_locks = checks = verify_checks = 0
+        backups = lists = restores = deletes = compacts = prunes = checks = verify_checks = 0
         start_ts = time.time()
 
         for i in range(1, args.iterations + 1):
@@ -260,21 +260,6 @@ def main() -> None:
                 _log(f"[{i}/{args.iterations}] drop caches (pre-backup)")
                 current_step = "drop-caches-pre-backup"
                 vykar_cmd.drop_caches()
-
-            # Break-lock for remote backends
-            if args.backend in ("rest", "s3", "sftp"):
-                _log(f"[{i}/{args.iterations}] break-lock")
-                current_step = "break-lock"
-                rc, _ = _run_vykar_logged(
-                    vykar_bin, config_path,
-                    ["break-lock", "-R", repo_label],
-                    env=env,
-                    log_file=f"{iter_prefix}-break-lock.log",
-                    time_v=args.time_v,
-                )
-                if rc != 0:
-                    _die(f"break-lock failed at iteration {i}")
-                break_locks += 1
 
             # Backup
             _log(f"[{i}/{args.iterations}] backup")
@@ -433,7 +418,6 @@ def main() -> None:
         print(f"  deletes:             {deletes}")
         print(f"  compacts:            {compacts}")
         print(f"  prunes:              {prunes}")
-        print(f"  break-lock:          {break_locks}")
         print(f"  check:               {checks}")
         print(f"  check --verify-data: {verify_checks}")
         print(f"  elapsed_sec:         {elapsed}")

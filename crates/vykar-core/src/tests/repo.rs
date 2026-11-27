@@ -1318,12 +1318,10 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = 1;
     repo.set_fold_policy(policy);
-    repo.unchecked_writer()
-        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
-        .unwrap();
+    repo.unchecked_writer().maintain_segmented_index().unwrap();
     assert!(repo.index_head().unwrap().segments.is_empty(), "folded");
 
-    // A load under the lock, at the head the fold wrote.
+    // A load at the head the fold wrote.
     repo.load_chunk_index_under_lock().unwrap();
     assert_eq!(repo.chunk_index().len(), 2);
 

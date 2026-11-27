@@ -92,8 +92,9 @@ fn plan_repair(
     Ok(plan)
 }
 
-/// For `RepairMode::ApplyShown`: refuse the plan rebuilt under the lock when
-/// it differs from the shown one in data loss or in how the index was read.
+/// For `RepairMode::ApplyShown`: refuse the plan rebuilt in the repair's
+/// exclusive session when it differs from the shown one in data loss or in
+/// how the index was read.
 fn refuse_repair_if_plan_changed(mode: RepairMode, plan: &RepairPlan) -> Result<()> {
     let RepairMode::ApplyShown {
         has_data_loss,
@@ -104,7 +105,7 @@ fn refuse_repair_if_plan_changed(mode: RepairMode, plan: &RepairPlan) -> Result<
     };
     if !has_data_loss && plan.has_data_loss {
         return Err(VykarError::Other(
-            "aborting repair: the plan rebuilt under the repository lock removes data, \
+            "aborting repair: the plan rebuilt in the repair's exclusive session removes data, \
              but the plan that was shown did not; nothing was changed. Run \
              `vykar check --repair` again to review the new plan"
                 .into(),
@@ -623,7 +624,8 @@ fn refuse_repair_if_unreadable_snapshots(scan: &ScanResult) -> Result<()> {
 
 /// Run `check --repair`. `RepairMode::ApplyShown` behaves like
 /// `RepairMode::Apply`, except that it refuses, before anything is written,
-/// a plan rebuilt under the lock that differs from the one shown.
+/// a plan rebuilt in the repair's exclusive session that differs from the
+/// one shown.
 pub fn run_with_repair(
     config: &VykarConfig,
     passphrase: Option<&str>,

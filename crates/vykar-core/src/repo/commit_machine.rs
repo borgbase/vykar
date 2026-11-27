@@ -11,7 +11,7 @@
 //!    fetch the index head when there is a delta to merge. Production runs
 //!    them concurrently, as one batch; the simulator one at a time.
 //! 3. Judge them in the old order: marker (the probe together with what the
-//!    heartbeat recorded, [`lock::commit_marker_check`]), snapshot list and
+//!    heartbeat recorded, [`sessions::commit_marker_check`]), snapshot list and
 //!    name check, head.
 //! 4. Sync the index to the head, check reuse and verify the session's
 //!    packs, then publish the additions as a backup segment (a
@@ -48,12 +48,12 @@ use super::Repo;
 use super::commit::{check_reused_chunks, commit_additions, needs_recheck};
 use super::index_store::{self, SyncedIndex};
 use super::index_write::head_contention_error;
-use super::lock::{self, MarkerStamp, SessionMarker};
 use super::machine::{
     Machine, StepCx, StepKind, bad_pick, emit_stage, join_scoped, log_stage_elapsed,
 };
 use super::manifest::SnapshotEntry;
 use super::publish_machine::{HeadCheck, PublishMachine, Published};
+use super::sessions::{self, MarkerStamp, SessionMarker};
 use super::snapshot_cache::{self, SnapshotRefresh};
 use super::write_session::{SessionView, WriteSession};
 use crate::index::head::{IndexHead, SegmentKind};
@@ -467,7 +467,7 @@ impl BackupCommit {
             return Ok(());
         };
         let clock = repo.host_env().clock.as_ref();
-        lock::head_landing_check(
+        sessions::head_landing_check(
             &self.session_id,
             &m.report(clock),
             m.elapsed(clock),
@@ -475,17 +475,17 @@ impl BackupCommit {
         )
     }
 
-    /// A lock-free commit (04 step 9) writes its snapshot only while its
-    /// marker was never reaped: the marker handshake keeps lock holders
-    /// out of this commit, and a compact's mark relies on the marker until
+    /// A commit (04 step 9) writes its snapshot only while its marker was
+    /// never reaped: the exclusive sessions' listing keeps them out of this
+    /// commit, and a compact's mark relies on the marker until
     /// the snapshot is listed, both only while the marker is visible. A
-    /// present current key and a [continuous](lock::MarkerReport::continuous)
+    /// present current key and a [continuous](sessions::MarkerReport::continuous)
     /// record mean no reap. A miss alone is not enough: a reaper deletes
     /// the keys its listing showed, so one that listed key n aged (the
     /// record has a gap over `MARKER_GAP_LIMIT`, since a key ages only
     /// unrefreshed) and deletes it after the heartbeat wrote n + 1 and found
     /// n present leaves n + 1 present and no miss recorded, while it
-    /// believes the session reaped and did not yield to it. Otherwise
+    /// believes the session reaped. Otherwise
     /// `MarkerLostDuringCommit`: the head stays without its snapshot. A
     /// retry reads its sources again (the failed run saved no file cache)
     /// but deduplicates against that head, which indexes this run's chunks:
@@ -515,7 +515,7 @@ impl BackupCommit {
                 session_id = self.session_id,
                 ?report,
                 "the session marker's record is not continuous before the snapshot write \
-                 (unrefreshed for a while, a slow marker write, or a miss): a lock holder may \
+                 (unrefreshed for a while, a slow marker write, or a miss): another client may \
                  have reaped it; retry the backup"
             );
         }
@@ -637,7 +637,12 @@ impl BackupCommit {
             if matches!(probe, Ok(false)) {
                 m.note_missing();
             }
-            lock::commit_marker_check(&self.session_id, probe, &report, m.elapsed(clock.as_ref()))?;
+            sessions::commit_marker_check(
+                &self.session_id,
+                probe,
+                &report,
+                m.elapsed(clock.as_ref()),
+            )?;
         }
         match refresh {
             Slot::Done(refresh) => repo.apply_snapshot_refresh(refresh?),

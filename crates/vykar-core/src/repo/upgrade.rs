@@ -47,13 +47,14 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::ages::{CLOCK_PROBE_DEBRIS_AGE, is_probe_key};
 use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::host_env::HostEnv;
 use super::index_store;
 use super::index_write::PendingSweep;
-use super::lock::{EntryAge, EntryHost, SameHost, format_age_since, same_host};
+use super::sessions::{
+    EntryAge, EntryHost, LEGACY_LOCKS_PREFIX, SameHost, format_age_since, same_host,
+};
 use super::writer::FenceFn;
 use super::writer_mode::{ModeCheck, init_time_check};
 use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat, WriterMode};
@@ -505,8 +506,6 @@ impl Repo {
 
 // ── The legacy lock key (10-single-protocol step 6) ─────────────────────
 
-/// 0.24's lock directory; a lock is a key under it ending in `.json`.
-const LEGACY_LOCKS_PREFIX: &str = "locks/";
 /// 0.24 reaps a lock whose `time` is older than this on its own clock
 /// (v0.24.0 `DEFAULT_STALE_LOCK_SECS`); also the age after which the
 /// acquisition reaps a foreign lock (on the store's clock).
@@ -519,13 +518,12 @@ const LEGACY_LOCK_STALE: chrono::Duration = chrono::Duration::hours(6);
 /// key before it (at most 12 rewrites an hour).
 const LEGACY_LOCK_REWRITE_SECS: i64 = 5 * 60;
 /// A check fails once the last successful rewrite is older than this
-/// (0.24's `LOCK_MAX_UNREFRESHED_SECS`: 6 h − 30 min).
+/// (0.24's limit for an unrefreshed lock: 6 h − 30 min).
 const LEGACY_LOCK_MAX_UNREWRITTEN_SECS: i64 = 6 * 60 * 60 - 30 * 60;
 
 /// The body of a lock key: exactly the JSON 0.24 parses (`hostname`,
 /// `pid`, `time` as RFC 3339, `boot_id`) plus this binary's identity
-/// fields, which 0.24 ignores. The same field names and order as
-/// `lock::LockEntry`.
+/// fields, which 0.24 ignores, in the field order of 0.24's lock entry.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyLockEntry {
     hostname: String,
@@ -565,7 +563,8 @@ impl LegacyLockEntry {
 /// and fails once the key is gone or its last rewrite is 5.5 h old.
 ///
 /// Self-contained, apart from the age and same-host judgements it shares
-/// with `lock`: it outlives the lock (10-single-protocol step 9).
+/// with `sessions`: it outlived this binary's lock (10-single-protocol
+/// step 9).
 pub(crate) struct LegacyUpgradeLock {
     shared: Arc<LegacyKey>,
 }
@@ -625,16 +624,9 @@ impl LegacyUpgradeLock {
         let mut live = Vec::new();
         for object in listing.iter().filter(|o| o.key != key) {
             let other = object.key.as_str();
+            // Not a lock (probe debris of development builds, say):
+            // nothing to judge; `vykar break-lock` removes it.
             if !(other.starts_with(LEGACY_LOCKS_PREFIX) && other.ends_with(".json")) {
-                if let Some(now) = store_now
-                    && is_probe_key(other)
-                    && object
-                        .mtime
-                        .is_some_and(|m| now.age_of(m) > CLOCK_PROBE_DEBRIS_AGE)
-                    && let Err(e) = storage.delete(other)
-                {
-                    debug!(key = other, error = %e, "could not delete an old clock probe");
-                }
                 continue;
             }
             let Some(data) = storage.get(other).map_err(undo)? else {
@@ -789,8 +781,7 @@ impl LegacyKey {
 }
 
 /// When a 0.24-shaped lock was written: its `time`, else the key's
-/// 20-digit microsecond prefix (as `lock::lock_timestamp`, which step 9
-/// deletes with the lock).
+/// 20-digit microsecond prefix.
 fn legacy_lock_timestamp(
     entry: Option<&LegacyLockEntry>,
     key: &str,
@@ -810,7 +801,7 @@ fn legacy_lock_timestamp(
         })
 }
 
-/// The holder of `key` for the `Locked` error (as `lock::build_lock_holder`):
+/// The holder of `key` for the `Locked` error:
 /// no details when it cannot be read; its age since its `time` on `env`'s clock.
 fn legacy_lock_holder(storage: &dyn StorageBackend, key: &str, env: &HostEnv) -> LockHolder {
     let entry = storage

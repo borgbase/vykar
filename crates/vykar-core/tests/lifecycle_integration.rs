@@ -11,7 +11,7 @@ use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::control::CancelToken;
-use vykar_core::repo::lock;
+use vykar_core::repo::sessions;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend};
@@ -465,7 +465,7 @@ fn backup_fails_while_an_exclusive_session_is_live() {
     // now by another machine.
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
     let now = chrono::Utc::now();
-    let entry = lock::SessionEntry {
+    let entry = sessions::SessionEntry {
         hostname: "other-host".into(),
         pid: 4242,
         registered_at: now.to_rfc3339(),

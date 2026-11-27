@@ -328,9 +328,7 @@ pub(crate) fn dispatch_command(
             source,
         )
         .map(|()| false),
-        Commands::BreakLock { sessions, .. } => {
-            cmd::break_lock::run_break_lock(cfg, label, *sessions).map(|()| false)
-        }
+        Commands::BreakLock { .. } => cmd::break_lock::run_break_lock(cfg, label).map(|()| false),
         Commands::Compact {
             report_unreferenced: true,
             ..

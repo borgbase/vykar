@@ -15,7 +15,6 @@ export component AdvancedPage inherits Rectangle {
     callback reload_config_clicked();
     callback save_clicked();
     callback discard_clicked();
-    callback clear_locks_clicked();
     callback clear_sessions_clicked();
     callback text_edited(string);
 
@@ -102,11 +101,6 @@ export component AdvancedPage inherits Rectangle {
                 text: "Recovery:";
                 vertical-alignment: center;
                 font-weight: 700;
-            }
-            Button {
-                text: "Clear Lock";
-                enabled: !root.operation_busy && root.selected_repo_name != "";
-                clicked => { root.clear_locks_clicked(); }
             }
             Button {
                 text: "Clear Sessions";

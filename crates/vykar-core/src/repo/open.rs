@@ -223,7 +223,7 @@ impl Repo {
         // (vykar_storage::PROBE_DIR). A server-side init leaves the
         // directory to the server, whose PUT creates it.
         if !server_did_init {
-            storage.create_dir(super::lock::SESSIONS_PREFIX)?;
+            storage.create_dir(super::sessions::SESSIONS_PREFIX)?;
         }
         // The verdict is permanent (only `vykar upgrade --commit-mode`
         // changes it), so init runs the strict check: sequential plus the
@@ -280,7 +280,6 @@ impl Repo {
         // Create directory structure (skip if server already did it)
         if !server_did_init {
             storage.create_dir("snapshots/")?;
-            storage.create_dir("locks/")?;
             for i in 0u8..=255 {
                 storage.create_dir(&format!("packs/{:02x}/", i))?;
             }
@@ -316,8 +315,8 @@ impl Repo {
             commit_mode: None,
             pending_sweep: None,
             index_gc_grace: index_store::IndexGcGrace::DEFAULT,
-            lock_store_time: None,
-            exclusive_check_reuse: super::lock::EXCLUSIVE_CHECK_REUSE,
+            store_time: None,
+            exclusive_check_reuse: super::sessions::EXCLUSIVE_CHECK_REUSE,
             live_sessions: None,
             pack_grace: super::ages::T_PACK,
             segment_grace: super::ages::T_PACK,
@@ -527,8 +526,8 @@ impl Repo {
             commit_mode: None,
             pending_sweep: None,
             index_gc_grace: index_store::IndexGcGrace::DEFAULT,
-            lock_store_time: None,
-            exclusive_check_reuse: super::lock::EXCLUSIVE_CHECK_REUSE,
+            store_time: None,
+            exclusive_check_reuse: super::sessions::EXCLUSIVE_CHECK_REUSE,
             live_sessions: None,
             pack_grace: super::ages::T_PACK,
             segment_grace: super::ages::T_PACK,

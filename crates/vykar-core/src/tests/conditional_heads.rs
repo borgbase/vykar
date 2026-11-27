@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
 use crate::index::head::IndexHead;
-use crate::repo::ages::{LEGACY_PUT_IF_ABSENT_PROBE_PREFIX, PUT_IF_ABSENT_PROBE_PREFIX};
+use crate::repo::ages::PUT_IF_ABSENT_PROBE_PREFIX;
 use crate::repo::control::CommitEvent;
 use crate::repo::host_env::{Clock, HostEnv, StopSignal};
 use crate::repo::index_store;
@@ -112,11 +112,7 @@ fn backup_creates_its_head() {
     assert_eq!(probe(OpKind::Get), 1);
     assert_eq!(probe(OpKind::Delete), 1);
     assert!(sim.store().keys(PUT_IF_ABSENT_PROBE_PREFIX).is_empty());
-    assert!(
-        sim.store()
-            .keys(LEGACY_PUT_IF_ABSENT_PROBE_PREFIX)
-            .is_empty()
-    );
+    assert!(sim.store().keys("locks/").is_empty());
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
@@ -233,17 +229,13 @@ fn init_records_single_writer_on_an_ignoring_backend() {
         );
     }
     assert!(sim.store().keys(PUT_IF_ABSENT_PROBE_PREFIX).is_empty());
-    assert!(
-        sim.store()
-            .keys(LEGACY_PUT_IF_ABSENT_PROBE_PREFIX)
-            .is_empty()
-    );
+    assert!(sim.store().keys("locks/").is_empty());
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// On a local repository (LocalBackend: no-clobber rename) a backup creates
-/// its head and its check leaves no probe under `sessions/` (nor under
-/// `locks/`, where it lived before).
+/// its head and its check leaves no probe under `sessions/`; init creates
+/// no `locks/` (10-single-protocol step 9), where the probe lived before.
 #[test]
 fn local_backup_leaves_no_probe() {
     let tmp = tempfile::tempdir().unwrap();
@@ -253,16 +245,15 @@ fn local_backup_leaves_no_probe() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("a"), "alpha").unwrap();
     crate::tests::helpers::backup_single_source(&config, &source, "src", "s1");
-    for dir in ["sessions", "locks"] {
-        let names: Vec<String> = std::fs::read_dir(repo_dir.join(dir))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            !names.iter().any(|n| n.starts_with("vykar-probe-")),
-            "{dir}: {names:?}"
-        );
-    }
+    let names: Vec<String> = std::fs::read_dir(repo_dir.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("vykar-probe-")),
+        "sessions: {names:?}"
+    );
+    assert!(!repo_dir.join("locks").exists(), "init creates no locks/");
     assert!(
         repo_dir
             .join("index.h")
@@ -619,8 +610,8 @@ fn a_named_segment_the_store_lacks_refuses_the_fold() {
     let head = latest_head(&sim);
     let lost = index_store::object_key(&head.segments[0].name);
     sim.tamper_delete(&lost);
-    // "Now" on the store's clock, as a held lock gives it.
-    ra.set_lock_store_time(Some(vykar_storage::StoreNow::at(sim.store().now().into())));
+    // "Now" on the store's clock, as a registered session gives it.
+    ra.set_store_time(Some(vykar_storage::StoreNow::at(sim.store().now().into())));
     ra.request_index_fold();
     let mut m = session(&mut ra, "a3", &[b"chunk a3"]);
     let err = step_until(&mut ra, &mut m, |_| false).unwrap_err();
@@ -747,17 +738,13 @@ fn gc_needs_the_callers_own_head() {
     sim.tamper_put(&junk, b"unreferenced");
     sim.advance(index_store::INDEX_OBJECT_GRACE + Duration::from_secs(60));
     let mut ra = open(&sim, a, sim.host_env(a));
-    ra.unchecked_writer()
-        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
-        .unwrap();
+    ra.unchecked_writer().maintain_segmented_index().unwrap();
     assert!(sim.store().object(&junk).is_some(), "no head of its own");
     let mut ws = ra.begin_write_session(&WriteSessionOptions::default());
     ws.store_chunk(&ra, b"chunk of a", Compression::None, PackType::Data)
         .unwrap();
     ra.unchecked_writer().save_session(ws).unwrap();
-    ra.unchecked_writer()
-        .maintain_segmented_index(crate::repo::index_write::OnMoved::Fail)
-        .unwrap();
+    ra.unchecked_writer().maintain_segmented_index().unwrap();
     assert!(
         sim.store().object(&junk).is_none(),
         "collected after its head"
@@ -865,7 +852,7 @@ fn taken_generation_during_a_fold_rebases_and_commits() {
         sim.advance(crate::repo::ages::T_PACK + Duration::from_secs(60));
         let mut ra = open(&sim, a, sim.host_env(a));
         let mut ma = session(&mut ra, "a1", &[b"chunk of a"]);
-        ra.set_lock_store_time(Some(vykar_storage::StoreNow::at(sim.store().now().into())));
+        ra.set_store_time(Some(vykar_storage::StoreNow::at(sim.store().now().into())));
         if full {
             // Every segment foldable, the backup's own too: a full fold.
             ra.set_segment_grace(Duration::ZERO);

@@ -89,8 +89,8 @@ pub(crate) fn run_check(
     Ok(())
 }
 
-/// The Apply mode after the user saw `plan`: the plan rebuilt under the lock
-/// may not add data loss or come from an index read differently.
+/// The Apply mode after the user saw `plan`: the plan rebuilt in the
+/// repair's exclusive session may not add data loss or come from an index read differently.
 fn apply_mode_after(plan: &RepairPlan) -> RepairMode {
     RepairMode::ApplyShown {
         has_data_loss: plan.has_data_loss,

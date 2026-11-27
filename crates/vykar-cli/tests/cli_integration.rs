@@ -951,12 +951,14 @@ fn cli_delete_repo_with_flag() {
     assert!(!fx.repo_dir.exists());
 }
 
-/// Plain `break-lock` removes no session marker, but names a live
-/// exclusive session's (`check --repair`, `upgrade`, a pack-map write) on
-/// stderr with the way out, `break-lock --sessions`; a backup's marker is
-/// not named.
+/// `break-lock` (10-single-protocol step 9): on a fresh repository it
+/// finds nothing; with leftover lock files and session markers it removes
+/// everything under `locks/` without asking, lists every marker on stderr
+/// (the exclusive one labelled), and without a terminal refuses to remove
+/// them, naming the lock files it removed; `--sessions` is accepted and
+/// does the same.
 #[test]
-fn cli_break_lock_names_a_live_exclusive_session() {
+fn cli_break_lock_lists_sessions_and_refuses_without_a_terminal() {
     let fx = CliFixture::new();
     write_test_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -965,11 +967,15 @@ fn cli_break_lock_names_a_live_exclusive_session() {
     let quiet = fx.run(&["--config", &cfg, "break-lock"]);
     assert!(quiet.status.success(), "{}", stderr(&quiet));
     assert!(
-        !stderr(&quiet).contains("exclusive session"),
+        stdout(&quiet).contains("No active sessions found."),
         "{}",
-        stderr(&quiet)
+        stdout(&quiet)
     );
 
+    let locks = fx.repo_dir.join("locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    std::fs::write(locks.join("old.json"), br#"{"hostname":"h","pid":1}"#).unwrap();
+    std::fs::write(locks.join("vykar-clock-x"), b"vykar clock probe").unwrap();
     let sessions = fx.repo_dir.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -986,17 +992,51 @@ fn cli_break_lock_names_a_live_exclusive_session() {
     std::fs::write(&shared_key, marker("backup-host", 77)).unwrap();
 
     let output = fx.run(&["--config", &cfg, "break-lock"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let err = stderr(&output);
+    assert!(!output.status.success(), "{}", stdout(&output));
     assert!(
-        err.contains(&format!(
-            "An exclusive session ({exclusive}: host=repair-host, pid=4242"
-        )),
+        stdout(&output).contains("Removed 1 leftover lock file(s)"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        std::fs::read_dir(&locks).unwrap().count(),
+        0,
+        "locks/ emptied"
+    );
+    let err = stderr(&output);
+    let exclusive_line = err
+        .lines()
+        .find(|l| l.contains(&format!("{exclusive}: host=repair-host, pid=4242")))
+        .unwrap_or_else(|| panic!("no line for the exclusive session: {err}"));
+    assert!(
+        exclusive_line.ends_with("(exclusive: check --repair, upgrade or a pack-map write)"),
+        "{exclusive_line}"
+    );
+    assert!(
+        err.contains(&format!("{shared}: host=backup-host, pid=77")),
         "{err}"
     );
-    assert!(err.contains("`vykar break-lock --sessions`"), "{err}");
-    assert!(!err.contains(shared), "{err}");
-    assert!(!stdout(&output).contains(exclusive), "{}", stdout(&output));
+    assert!(
+        err.contains("refusing to remove sessions without confirmation"),
+        "{err}"
+    );
+    assert!(
+        err.contains("1 leftover lock file(s) were removed"),
+        "{err}"
+    );
+    assert!(exclusive_key.exists() && shared_key.exists());
+
+    let flagged = fx.run(&["--config", &cfg, "break-lock", "--sessions"]);
+    assert!(!flagged.status.success(), "{}", stdout(&flagged));
+    let err = stderr(&flagged);
+    assert!(
+        err.contains("refusing to remove sessions without confirmation"),
+        "{err}"
+    );
+    assert!(
+        err.contains("0 leftover lock file(s) were removed"),
+        "{err}"
+    );
     assert!(exclusive_key.exists() && shared_key.exists());
 }
 

@@ -16,7 +16,7 @@
 //! the stalled-compact residuals with a single-writer backup. Each invariant that judges a lock-free run's deletes now that
 //! invariant 7 exempts it flags a wrong delete (V3).
 
-use crate::repo::lock::MarkerFlags;
+use crate::repo::sessions::MarkerFlags;
 use crate::sim::history::{AllowedError, ErrorClass};
 use crate::sim::{
     Call, ClientId, FaultAction, FaultRule, GateRule, Invariant, KeyMatch, OpKind, OpMatch,
@@ -111,7 +111,7 @@ fn plain_head_write(c: ClientId, n: u32) -> GateRule {
         OpMatch::Kind(OpKind::Exists),
         KeyMatch::Prefix("index.h/".into()),
     )
-    .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+    .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
     .nth(n)
 }
 
@@ -713,7 +713,7 @@ fn heartbeat_put(c: ClientId) -> GateRule {
 /// batch's segment: before the publish's fence and head create).
 fn index_object_put(c: ClientId) -> GateRule {
     GateRule::new(c, OpMatch::AnyWrite, KeyMatch::Prefix("index.d/".into()))
-        .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME)
+        .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME)
 }
 
 /// Two snapshots sharing a file, `old` deleted and everything past T_pack:
@@ -757,7 +757,7 @@ fn a_compact_stalled_before_its_batch_head_stops_at_its_marker_check() {
     // there).
     let persist = sim.gate(
         GateRule::new(a, OpMatch::AnyRead, KeyMatch::Prefix("index.h/".into()))
-            .not_on_thread(crate::repo::lock::HEARTBEAT_THREAD_NAME),
+            .not_on_thread(crate::repo::sessions::HEARTBEAT_THREAD_NAME),
     );
     sim.resume(output);
     sim.expect_paused(persist, "the repack batch's persist, its output written");

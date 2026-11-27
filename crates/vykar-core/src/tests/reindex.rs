@@ -652,7 +652,7 @@ fn a_failed_read_of_a_reindexed_tree_changes_nothing() {
 }
 
 /// The shown plan re-indexed and lost nothing; the packs are gone by the
-/// time it is applied: the plan rebuilt under the lock removes s2, which
+/// time it is applied: the plan rebuilt in the repair's exclusive session removes s2, which
 /// the shown one did not, so the repair refuses.
 #[test]
 fn apply_shown_refuses_when_the_packs_vanished() {

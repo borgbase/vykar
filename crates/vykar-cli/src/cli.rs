@@ -255,13 +255,14 @@ pub(crate) enum Commands {
         cache_size: usize,
     },
 
-    /// Remove stale repository locks left by killed processes
+    /// Remove lock files left by vykar 0.24 or an interrupted upgrade (without
+    /// asking), then list all session markers and remove them (asks first)
     BreakLock {
         /// Select repository by label or path
         #[arg(short = 'R', long = "repo")]
         repo: Option<String>,
 
-        /// Also remove all session markers (orphaned by crashed backups)
+        /// Accepted for compatibility: break-lock always removes session markers
         #[arg(long)]
         sessions: bool,
     },

@@ -24,11 +24,14 @@
 //! runs on an encrypted repository. Since step 7 the fallback store means a
 //! single-writer repository: the session protocol with the single-writer
 //! check and the plain head arm (EXISTS, PUT, read-back), no lock; the
-//! conditional store means lock-free multi-writer clients. The lock hazards
-//! take the lock through [`Call::LockedDelete`] (the lock holders until
-//! step 9 are `check --repair`, upgrade and pack maps), on both stores.
-//! H-racy is a known hazard of a store that passes the sequential check
-//! yet lets a late create win.
+//! conditional store means lock-free multi-writer clients. H-racy is a
+//! known hazard of a store that passes the sequential check yet lets a late
+//! create win.
+//!
+//! Retired by 10-single-protocol step 9: H2 (the lock refresh recreating a
+//! reaped key; no binary that opens a v6 repository takes the lock). Its
+//! shape on the v2/v3 upgrade's legacy key is the residual
+//! `tests::legacy_lock::h2_legacy_a_rewrite_after_a_0_24_reap_resurrects_the_key`.
 //!
 //! Retired by 10-single-protocol step 7: H4 and H4-skew (compact's own lock
 //! route after a lost lock, which no command reaches since compact runs in a
@@ -142,22 +145,6 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         // Its holders delete as exclusive sessions (`Call::ExclusiveDelete`,
         // since 10-single-protocol step 8), which clients register on every
         // store.
-        conditional: OnConditional::Reproduces,
-    },
-    KnownHazard {
-        id: "H2",
-        summary: "lock refresh recreates a reaped key: two holders, both fences pass \
-                  (route: the store's clock steps 3 h forward)",
-        fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
-        run: interleavings::h2_lock_refresh_resurrects,
-        // Its holders delete under the maintenance lock
-        // (`Call::LockedDelete`, since 10-single-protocol step 7), which
-        // clients take on every store: the lock carries it there too. No
-        // command takes the lock since step 8; step 9 deletes it with the
-        // lock. With an exclusive holder it does not reproduce: the marker
-        // refresh does not resurrect a key (H2-marker, a regression), and
-        // the 3 h stall breaks the marker record's continuity, so the
-        // holder's next check refuses (`tests::sim_exclusion` case (e)).
         conditional: OnConditional::Reproduces,
     },
     KnownHazard {
@@ -1110,7 +1097,7 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
 /// (T_idx then; T_pack, the same 12 h, since phase F part 10b2), and the
 /// compact's index GC would collect it (the loud shape again). The route
 /// is a store clock step of T_pack + 1 min between a's pack uploads and
-/// its segment PUT (an NTP correction on the server, as for H2 and H4):
+/// its segment PUT (an NTP correction on the server, as for the retired H2 and H4):
 /// the packs are old orphans, the segment is new. Without the step it is
 /// the regression H3-compact-young.
 pub fn h3_compact_then_late_head() -> HazardOutcome {

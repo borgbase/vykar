@@ -674,8 +674,8 @@ fn upgrade_failing_before_the_head_keeps_the_legacy_index() {
     }
 }
 
-/// Upgrades under the maintenance lock with `fence` as the lock fence
-/// (installed inside the lock, replacing the real one).
+/// Upgrades in an exclusive session with `fence` as the writer's fence
+/// (installed inside the session, replacing the real one).
 fn upgrade_with_fence(
     fx: &Fixture,
     fence: Arc<dyn Fn() -> Result<()> + Send + Sync>,
@@ -777,7 +777,7 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
     fx.check_clean();
 }
 
-/// The lock is lost just before the version switch, on a fresh upgrade and
+/// The writer's fence fails just before the version switch, on a fresh upgrade and
 /// on a resumed one: `config` is not written, the legacy index stays, and a
 /// rerun resumes.
 #[test]
@@ -1440,7 +1440,7 @@ fn a_trailer_recorded_as_absent_is_repacked_once() {
             .all(|p| repo.chunk_index().pack_trailer_len(p) == Some(0))
     );
     drop(repo);
-    // Lock-free compact repacks only packs older than T_pack.
+    // Compact repacks only packs older than T_pack.
     super::helpers::age_repo_objects(&fx.repo_dir, &["packs"], super::helpers::PAST_T_PACK);
     let first = commands::compact::run(
         &fx.config,
@@ -1570,7 +1570,7 @@ impl Fixture {
         .unwrap()
     }
 
-    /// The upgrade's production body (maintenance lock, live sessions
+    /// The upgrade's production body (exclusive session, live sessions
     /// refused) on a handle without put-if-absent.
     fn upgrade_without_conditional(&self, mode: Option<WriterMode>) -> Result<UpgradeOutcome> {
         let mut repo = self.open_without_conditional();

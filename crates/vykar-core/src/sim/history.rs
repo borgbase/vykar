@@ -28,7 +28,7 @@ pub enum AllowedError {
     Locked,
     ActiveSessions,
     StaleChunksDuringCommit,
-    /// A lock-free commit's marker reaped or its record broken between its
+    /// A commit's marker reaped or its record broken between its
     /// commit mark and its snapshot write (`MarkerLostDuringCommit`).
     MarkerLostDuringCommit,
     LockExpired,

@@ -72,10 +72,10 @@ pub(crate) const INDEX_GC_GRACE: std::time::Duration = super::ages::T_IDX;
 /// no head it publishes names an object a collector judged old (M absorbs
 /// the rate difference of the two clocks).
 /// Objects a write did not PUT (kept segments, the predecessor's base) are
-/// named by the predecessor head, which the collector retains. Without the
-/// lock this is what keeps a slow writer's objects; under it, it only makes
-/// garbage stay longer: every fold in the last 12 h leaves its predecessor's
-/// base and folded segments, and each lost fold attempt its own base.
+/// named by the predecessor head, which the collector retains. This is what
+/// keeps a slow writer's objects; its cost is garbage that stays longer:
+/// every fold in the last 12 h leaves its predecessor's base and folded
+/// segments, and each lost fold attempt its own base.
 pub(crate) const INDEX_OBJECT_GRACE: std::time::Duration = super::ages::T_PACK;
 
 /// The two graces of [`collect_index_garbage`].
@@ -199,7 +199,7 @@ pub(crate) enum HeadPut {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum HeadWrite<'a> {
     /// Single-writer: EXISTS, plain PUT, GET-compare (10-single-protocol
-    /// step 7); no lock.
+    /// step 7).
     Plain,
     /// Multi-writer: put-if-absent, never a plain PUT. `backend` names the
     /// storage in a `MultiWriterUnsupported`.
@@ -1113,8 +1113,7 @@ fn log_failed_delete(what: &str, key: &str, e: &VykarError) {
 /// listed, not deleted) or is younger than `grace.objects` at "now" (the
 /// heads listing includes `latest`, so "now" is its mtime) — unless the
 /// writer's head lands more than `grace.objects` after its first object
-/// PUT started, which the lock excludes and the writer itself refuses
-/// ([`INDEX_OBJECT_GRACE`]).
+/// PUT started, which the writer itself refuses ([`INDEX_OBJECT_GRACE`]).
 pub(crate) fn collect_index_garbage(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
@@ -1244,8 +1243,8 @@ fn partition_heads(
 
 /// The head part of [`collect_index_garbage`] alone: one listing of
 /// `index.h/`, then the deletes of the heads it would delete; no object is
-/// listed, read or deleted. For the head a lock-free backup that added no
-/// chunk creates (04 step 9, U9): such heads add no segment and trigger no
+/// listed, read or deleted. For the head a backup that added no chunk
+/// creates (04 step 9, U9): such heads add no segment and trigger no
 /// fold, so without this `index.h/` would grow by one key per unchanged
 /// backup until the next fold or compact. Same precondition, "now" and
 /// skips as [`collect_index_garbage`]; the objects old heads named are

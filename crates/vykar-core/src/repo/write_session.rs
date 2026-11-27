@@ -120,7 +120,7 @@ pub struct WriteSession {
     /// `.json` markers are never deleted here — their lifecycle is managed
     /// exclusively by `deregister_session()` (normal exit) and
     /// `cleanup_stale_sessions()` (newest marker written >45 min ago by its
-    /// mtime, under maintenance lock).
+    /// mtime).
     pub(crate) recovered_index_keys: Vec<String>,
     /// Number of distinct packs (data + tree) in the persisted index at load time.
     pub(crate) persisted_pack_count: usize,

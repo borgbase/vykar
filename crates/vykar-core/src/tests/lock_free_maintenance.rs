@@ -1,7 +1,7 @@
-//! Lock-free maintenance (04 step 9, phase F part 10d) on the simulator:
-//! compact, prune and delete run without the repository lock on an
-//! encrypted repository whose storage passed the put-if-absent check, beside
-//! lock-free backups and beside each other. A compact skips its sweep beside
+//! Maintenance sessions (04 step 9, phase F part 10d) on the simulator:
+//! compact, prune and delete run in registered sessions on an encrypted
+//! repository whose storage passed the put-if-absent check, beside
+//! multi-writer backups and beside each other. A compact skips its sweep beside
 //! a committing backup, marks again when a backup committed during its mark
 //! (incrementally) and gives the sweep up after three moved heads; a repack
 //! batch rebases onto a backup's head, and drops a relocation another
@@ -13,8 +13,9 @@
 //! 10-single-protocol step 7 the tests whose second writer was a lock
 //! client (a lock-mode backup or compact) run on a single-writer repository
 //! instead: compacts refuse each other, a backup waits for a compact, and
-//! the stalled-compact residuals with a single-writer backup. Each invariant that judges a lock-free run's deletes now that
-//! invariant 7 exempts it flags a wrong delete (V3).
+//! the stalled-compact residuals with a single-writer backup. Each
+//! invariant that judges a shared run's deletes (invariant 13 judges one
+//! only under an exclusive hold) flags a wrong delete (V3).
 
 use crate::repo::sessions::MarkerFlags;
 use crate::sim::history::{AllowedError, ErrorClass};
@@ -40,8 +41,8 @@ fn backup_call(name: &str) -> Call {
     }
 }
 
-/// An encrypted repository on a store of `kind`: maintenance runs
-/// lock-free where the client's handle offers put-if-absent.
+/// An encrypted repository on a store of `kind`: multi-writer where the
+/// client's handle offers put-if-absent.
 fn encrypted(kind: StoreKind) -> Sim {
     Sim::with_config(SimConfig {
         kind,
@@ -77,7 +78,7 @@ fn lock_writes(recs: &[OpRecord]) -> usize {
         .count()
 }
 
-/// `c`'s `n`th plain listing of `sessions/` (a lock-free compact's
+/// `c`'s `n`th plain listing of `sessions/` (a compact's
 /// sessions #2; its sessions #1 lists with mtimes).
 fn second_session_listing(c: ClientId, n: u32) -> GateRule {
     GateRule::new(
@@ -98,7 +99,7 @@ fn head_create(c: ClientId, n: u32) -> GateRule {
     .nth(n)
 }
 
-/// `c`'s first PUT of a snapshot (a lock-free commit is between its head
+/// `c`'s first PUT of a snapshot (a commit is between its head
 /// create and its commit point there, its marker flagged).
 fn snapshot_put(c: ClientId) -> GateRule {
     GateRule::new(
@@ -164,9 +165,9 @@ fn swept_and_aged(sim: &mut Sim, a: ClientId) {
 }
 
 /// Compact, prune and delete on an encrypted repository whose storage
-/// passed the check take no lock: each registers a session marker (compact
-/// with `writes_heads`, the others without), writes no lock key, and its
-/// run is lock-free.
+/// passed the check each register a session marker (compact with
+/// `writes_heads`, the others without), write no legacy lock key, and run
+/// as shared sessions.
 #[test]
 fn maintenance_runs_without_the_lock() {
     let mut sim = encrypted(StoreKind::Conditional);
@@ -180,8 +181,8 @@ fn maintenance_runs_without_the_lock() {
         .iter()
         .map(|run| {
             let recs = records(&sim, a, run.index);
-            assert!(run.shared, "run {} is lock-free", run.index);
-            assert_eq!(lock_writes(&recs), 0, "run {} wrote a lock key", run.index);
+            assert!(run.shared, "run {} is a shared session", run.index);
+            assert_eq!(lock_writes(&recs), 0, "run {} wrote a legacy lock key", run.index);
             let marker = sim
                 .store()
                 .log()
@@ -205,7 +206,7 @@ fn maintenance_runs_without_the_lock() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// 3.4's step 4: a lock-free compact whose second session listing finds a
+/// 3.4's step 4: a compact whose second session listing finds a
 /// backup committing (gated between its head create and its snapshot PUT)
 /// removes nothing this run (`sweep_skipped: Committing`) and goes on; the
 /// backup commits and every snapshot restores.
@@ -242,7 +243,7 @@ fn compact_skips_the_sweep_beside_a_committing_backup() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// U1: a backup that commits whole while a lock-free compact is held
+/// U1: a backup that commits whole while a compact is held
 /// before its second session listing moves the head: compact's snapshot
 /// listing shows the backup's snapshot, the head read after it differs from
 /// the loaded one, and compact marks again on the latest head (a second
@@ -306,7 +307,7 @@ fn compact_skips_the_sweep_after_three_moved_heads() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// 3.6: a backup that creates the head a lock-free compact's repack batch
+/// 3.6: a backup that creates the head a compact's repack batch
 /// was about to create makes the batch's create taken; the batch rebases
 /// its relocations onto the backup's head, creates the next generation and
 /// deletes its sources. Every snapshot restores, the backup's included.
@@ -349,7 +350,7 @@ fn a_repack_batch_rebases_onto_a_backup_head() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// Two lock-free compacts repack one pack: the first is held at its repack
+/// Two compacts repack one pack: the first is held at its repack
 /// batch's head create after it wrote its new pack; the second runs whole
 /// (its sweep finds nothing left, it repacks the same source and deletes
 /// it). The first's create is then taken, its rebase finds the chunks in
@@ -391,7 +392,7 @@ fn a_rebase_drops_a_relocation_another_compact_made() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// W4: a snapshot deleted (lock-free) after a lock-free compact listed
+/// W4: a snapshot deleted (in a session) after a compact listed
 /// `snapshots/` and before its GET is skipped: a second listing taken
 /// after the GETs no longer shows it. The compact completes and nothing is
 /// damaged.
@@ -462,7 +463,7 @@ fn the_mark_still_fails_on_other_read_errors() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// Q2 (U7): a lock-free backup that adds no chunk (the same source again:
+/// Q2 (U7): a multi-writer backup that adds no chunk (the same source again:
 /// equal items, equal tree chunks) creates a head anyway, the
 /// predecessor's state at generation + 1, and still commits.
 #[test]
@@ -608,7 +609,7 @@ fn repair_and_a_lock_free_compact_exclude_each_other() {
     sim.resume(held);
     sim.join(rc).expect_ok();
 
-    // A lock-free delete, registered and held before its delete.
+    // A delete, registered and held before its delete.
     sim.backup(a, "a2", &tree("a2")).expect_ok();
     let delete_held = sim.gate(GateRule::new(
         a,
@@ -654,7 +655,7 @@ fn repair_and_a_lock_free_compact_exclude_each_other() {
 }
 
 /// 04 "Current issues" 4-6 gone: a backup registers, uploads and commits
-/// lock-free while a lock-free compact is in flight (held after its pack
+/// while a compact is in flight (held after its pack
 /// listing); the compact then completes and every snapshot restores.
 #[test]
 fn a_backup_starts_and_commits_during_a_lock_free_compact() {
@@ -736,7 +737,7 @@ fn shared_swept_and_aged(sim: &mut Sim, a: ClientId) {
     sim.advance(PAST_T_PACK);
 }
 
-/// F1 (a): a lock-free compact stalls 12 h after it wrote a repack batch's
+/// F1 (a): a compact stalls 12 h after it wrote a repack batch's
 /// output pack, before the batch's segment and head (a suspended laptop).
 /// Another compact (threshold 100: it repacks no pack with live entries)
 /// reaps the stalled run's marker and deletes the output as an old orphan.
@@ -1076,7 +1077,7 @@ fn a_lock_path_backup_waits_for_a_lock_free_compact() {
 /// before its snapshot. `a` is deleted and a compact (threshold 100)
 /// sweeps X's other copy. B2 recovers B1's journal (P' younger than
 /// T_pack/2) and adopts X into P', then holds before its head create.
-/// Compact C finds P' with live Y and dead X: lock-free it does not repack
+/// Compact C finds P' with live Y and dead X: it does not repack
 /// a pack younger than T_pack (or inside a live horizon), so P' stays; B2's
 /// create is taken by nothing of C's batch, B2 commits, and its snapshot
 /// restores. Without the rule C repacked P', won the generation, deleted
@@ -1121,7 +1122,7 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
     sim.backup(a, "a", &tree_a).expect_ok();
     sim.delete(a, &["a"]).expect_ok();
     // 6 h 45 min, the heartbeat polling every 30 s and refreshing: b1's
-    // record stays continuous, so it commits lock-free.
+    // record stays continuous, so it commits.
     assert!(sim.time().wait_for_waiters(1, WAIT), "b1's heartbeat waits");
     for _ in 0..810 {
         sim.advance(std::time::Duration::from_secs(30));
@@ -1143,7 +1144,7 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
     assert_eq!(
         lock_writes(&records(&sim, b, r1.index)),
         0,
-        "b1 committed lock-free: {}",
+        "b1 wrote no legacy lock key: {}",
         r1.detail()
     );
     let b1_packs = sim.store().keys_written_by(b, "packs/");
@@ -1187,7 +1188,7 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
 }
 
 /// F2's horizon half: a pack with unused space 12 h old that lies inside a
-/// live backup's horizon is not a lock-free repack source either. B
+/// live backup's horizon is not a repack source either. B
 /// registers and is held before its first pack; `old` and `keep` (sharing
 /// a file) are written after B's start, `old` is deleted, and 12 h pass
 /// with B's heartbeat refreshing. The compact sweeps `old`'s chunks but
@@ -1246,7 +1247,7 @@ fn an_old_pack_inside_a_live_horizon_is_not_a_lock_free_repack_source() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-// ── V3: what judges a lock-free run's deletes ───────────────────────────
+// ── V3: what judges a shared run's deletes ──────────────────────────────
 //
 // Invariant 13 judges a shared run (`RunRecord::shared`) only under an
 // exclusive hold. Each test below makes a shared maintenance run
@@ -1380,7 +1381,8 @@ fn a_lock_free_delete_of_a_named_index_object_is_flagged() {
     );
 }
 
-/// A head replaced by other bytes (a lock-free writer must only create):
+/// A head replaced by other bytes (on a multi-writer repository a writer
+/// must only create):
 /// invariant 12.
 #[test]
 fn a_lock_free_head_overwrite_is_flagged() {

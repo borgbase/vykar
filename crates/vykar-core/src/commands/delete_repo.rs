@@ -31,7 +31,7 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
         return Err(VykarError::RepoNotFound(config.repository.url.clone()));
     }
 
-    // No maintenance lock, deliberately: taking one is a write, which would
+    // No session, deliberately: registering one is a write, which would
     // block deleting a repo on a full disk/quota or a read-only backend, and
     // it would buy nothing — deleting the repository breaks a concurrent
     // backup regardless of whether its temp files go too.

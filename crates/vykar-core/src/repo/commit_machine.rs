@@ -29,8 +29,8 @@
 //!    when the head moved, since the session began, in a way that can
 //!    remove entries; only packs not verified yet are verified.
 //! 5. Check the fence (and, when a head was written, the pack-age term
-//!    again with no allowance: the binding check; lock-free, that the
-//!    session marker is still there) and PUT the snapshot.
+//!    again with no allowance: the binding check; and that the session
+//!    marker is still there) and PUT the snapshot.
 //!
 //! No lock and no fence: the session marker carries `committing` from
 //! before the flush (`PendingCommit::protect_commit`) until deregistration.
@@ -419,7 +419,7 @@ impl BackupCommit {
         if self.attempt >= HEAD_CREATE_ATTEMPTS {
             return Err(head_contention_error(generation, self.attempt));
         }
-        // A head-only write (a lock-free commit that added no chunk) hands
+        // A head-only write (a commit that added no chunk) hands
         // back no segment: the delta is what `RetryDelta` kept.
         let Some(kept) = self.retry.take() else {
             return Err(VykarError::Other(

@@ -946,7 +946,7 @@ fn stepped_compact_replays_identically() {
             StoreKind::Plain,
         ));
     }
-    // Lock-free (phase F part 10d): the encrypted template on the
+    // Multi-writer (phase F part 10d): the encrypted template on the
     // conditional store; its compact registers, lists sessions twice and
     // deregisters, so it makes more step ops.
     most = most.max(stepped_compact_replays_identically_on(

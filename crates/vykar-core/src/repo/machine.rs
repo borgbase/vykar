@@ -35,8 +35,8 @@ pub(crate) enum StepKind {
     VerifyPacks,
     /// LIST `index.h/` (a fold without a previous head).
     ListHeads,
-    /// Compound: LIST_META `index.d/` (the segments' ages) unless this lock
-    /// hold listed it; then GET the segments a partial fold needs that the
+    /// Compound: LIST_META `index.d/` (the segments' ages) unless this
+    /// run listed it already; then GET the segments a partial fold needs that the
     /// local cache lacks (04 step 7).
     FoldPrefix,
     /// PUT the sweep record `index.d/<name>`.
@@ -47,7 +47,8 @@ pub(crate) enum StepKind {
     PutBase,
     /// Compound: the put-if-absent check on a handle's first index write
     /// (two creates, a GET and a DELETE of a probe under `sessions/`), then
-    /// EXISTS the lock key, PUT it when the refresh is due.
+    /// the writer's fence (an EXISTS of its session marker where the fence
+    /// checks one) and, for a backup, the pack-age term.
     Fence,
     /// Compound: create `index.h/<gen>` (put-if-absent where offered and
     /// checked at the fence; a plain PUT otherwise), GET it after an

@@ -804,7 +804,7 @@ pub(crate) const MARKER_GAP_LIMIT: std::time::Duration = std::time::Duration::fr
 pub(crate) const EXCLUSIVE_CHECK_REUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a session knows about its marker; shared by the heartbeat and the
-/// commit, whose writes (the heartbeat's refreshes and rechecks, a lock-free
+/// commit, whose writes (the heartbeat's refreshes and rechecks, a
 /// commit's [`Self::mark`]) are serialised by `write`.
 ///
 /// The `n`-th refresh attempt PUTs a new key, generation `n`, checks with an
@@ -1045,7 +1045,7 @@ impl SessionMarker {
     }
 
     /// Set `flags` and write a new key carrying them (04 step 9, the
-    /// lock-free writer's half of the marker handshake): one refresh
+    /// writer's half of the marker handshake): one refresh
     /// attempt, serialised with the heartbeat. `Ok(key)`: the key whose PUT
     /// succeeded (it carries the flags); what the attempt found about
     /// superseded keys (gone, unchecked) and a slow PUT is recorded as a
@@ -1659,8 +1659,7 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// session whose newest key is fresh is kept.
 ///
 /// Ages are on the store's clock: (`now` − the marker key's mtime), `now`
-/// being the mtime of an object the caller has just written (the
-/// maintenance lock's key). The timestamps inside a marker are used only
+/// being the mtime of an object the caller has just written. The timestamps inside a marker are used only
 /// when the listing reports no mtime; with an mtime but no `now` nothing is
 /// stale by age (fail closed). A malformed marker (unparseable JSON or bad
 /// timestamps) is judged by its mtime alone: it is preserved, and keeps
@@ -1706,17 +1705,17 @@ pub(crate) fn cleanup_stale_sessions_keeping(
 
 /// Where [`reap_sessions`] reads "now" on the store's clock.
 pub(crate) enum ReapNow<'a> {
-    /// Read already by the caller (a held lock's key mtime; `None`:
+    /// Read already by the caller (the mtime of a key it wrote; `None`:
     /// unknown).
     Known(Option<StoreNow>),
-    /// The caller's own registered session (a lock-free maintenance run,
-    /// 04 step 9): "now" is the mtime of its newest key in this listing,
+    /// The caller's own registered session (a maintenance run, 04 step
+    /// 9): "now" is the mtime of its newest key in this listing,
     /// written before the listing; the session itself is neither reaped
     /// nor returned as live.
     OwnSession(&'a str),
 }
 
-/// The stale-session reap and live listing of a lock-free maintenance run
+/// The stale-session reap and live listing of a maintenance run
 /// (04 step 9, compact's sessions #1): [`cleanup_stale_sessions_keeping`]
 /// from one listing of `sessions/`, "now" being the mtime of `own`'s
 /// newest key in it ([`ReapNow::OwnSession`]). Returns the cleaned
@@ -1926,7 +1925,7 @@ fn reap_sessions(
     Ok((cleaned, kept, now))
 }
 
-/// Sessions #2 of a lock-free compact (04 step 9, O3): one listing of
+/// Sessions #2 of a compact (04 step 9, O3): one listing of
 /// `sessions/` and a GET of each other session's newest key. Returns the
 /// IDs of the sessions that are committing: their newest key carries
 /// `committing`, or is malformed, or is gone on GET twice (fail closed: a

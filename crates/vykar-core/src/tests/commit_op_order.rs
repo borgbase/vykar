@@ -507,7 +507,7 @@ fn multi_writer_second_backup_of_the_same_tree_writes_a_segment() {
 }
 
 /// A reuse-only commit (a delta whose additions another session committed
-/// first) on a multi-writer repository: the lock-free commit machine forces
+/// first) on a multi-writer repository: the commit machine forces
 /// a head. Outside any run (no lock, no marker), at repository level as
 /// `commit_with_no_new_additions_writes_no_index`.
 #[test]

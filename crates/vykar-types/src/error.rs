@@ -251,7 +251,7 @@ pub enum VykarError {
     )]
     IndexObjectMissing { kind: &'static str, key: String },
 
-    /// A lock-free index read kept finding objects missing and the head
+    /// An index read kept finding objects missing and the head
     /// moved on every re-read: a concurrent writer, not damage.
     #[error(
         "index objects kept vanishing while reading the index, and the index head \
@@ -386,7 +386,7 @@ pub enum VykarError {
     AppendOnlyServer { command: &'static str },
 
     /// The repository is multi-writer (`multi_writer` in its config): its
-    /// clients commit without a lock, which needs put-if-absent, and this
+    /// clients create index heads with put-if-absent, and this
     /// client's storage does not offer it or its check concluded it
     /// unsupported. A write command returns it right after open, before it
     /// writes anything; a commit whose storage withdrew put-if-absent after
@@ -433,7 +433,7 @@ pub enum VykarError {
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
 
-    /// A run writing without the lock found its session marker reaped, or
+    /// A run writing in a session found its session marker reaped, or
     /// its record of the marker broken (a gap, a miss, or a marker write
     /// that was too slow), before a write the marker guards:
     /// another client may have taken the session for ended. A backup checks

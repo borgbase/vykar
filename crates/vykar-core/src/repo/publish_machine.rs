@@ -4,7 +4,7 @@
 //! module doc, one storage PUT per step:
 //!
 //! - head only (a sweep pending, nothing else to write): [record] → fence →
-//!   head; a forced head (a lock-free backup that added no chunk,
+//!   head; a forced head (a backup that added no chunk,
 //!   [`PublishMachine::force_head`]): fence → head → old heads deleted;
 //! - segment: [record] → segment → fence → head;
 //! - fold: [list heads] → [base] → [record] → fence → head → garbage
@@ -21,7 +21,7 @@
 //!
 //! The head step creates the head (04 step 8, [`index_store::create_head`]):
 //! put-if-absent on a multi-writer repository (its check runs at the fence,
-//! before the lock and pack-age checks); on a single-writer one EXISTS,
+//! before the fence's marker check and the pack-age term); on a single-writer one EXISTS,
 //! a plain PUT and a read-back (10-single-protocol step 7), where other
 //! bytes read back fail the write (`ConcurrentHeadWrite`). When another writer holds the generation the
 //! write ends there: nothing local changes (the error cleanup runs), the
@@ -95,7 +95,7 @@ pub(crate) struct PublishMachine {
     state: State,
 }
 
-/// What a backup's index write checks at its fence, after the lock fence:
+/// What a backup's index write checks at its fence, after the writer's fence:
 /// the commit rule's pack-age term against the session's marker record.
 pub(crate) struct HeadCheck {
     pub(crate) session_id: String,
@@ -304,7 +304,7 @@ impl PublishMachine {
     /// Write a head when there is nothing else to write: the predecessor's
     /// state (base, segments, sweep) at generation + 1, created with
     /// put-if-absent, then the head part of the garbage collection
-    /// ([`index_store::collect_old_heads`]). A lock-free backup that added
+    /// ([`index_store::collect_old_heads`]). A backup that added
     /// no chunk but reused some (04 step 9, Q2): without a head of its own
     /// nothing would conflict with a concurrent sweep that removes a chunk
     /// it reused, since compact's second session listing alone does not
@@ -456,8 +456,8 @@ impl PublishMachine {
         self.decide(repo, prep, k)
     }
 
-    /// The fold-prefix step: the segments' ages (one listing per lock
-    /// hold; a failed listing means unknown, so young), the decision, and
+    /// The fold-prefix step: the segments' ages (one listing per run; a
+    /// failed listing means unknown, so young), the decision, and
     /// the bytes a partial fold needs that the local cache lacks.
     fn fold_prefix(&mut self, repo: &mut super::Repo, prep: PrefixPrep) -> Result<State> {
         if repo.needs_segment_ages(&prep.prev.segments)
@@ -944,8 +944,8 @@ fn own_foldable(repo: &super::Repo, seg: &SegmentBody) -> bool {
 /// metadata, not read: [`segment_body`] reads and verifies it once, when
 /// it is decoded); the others fetched in one batch. A fetched kept segment
 /// goes into the cache when there is one, and is held only without one.
-/// Under the lock a named object is never deleted, so an absent one is
-/// damage.
+/// No writer deletes an object the current head names, so an absent one
+/// fails the write (`IndexObjectMissing`).
 fn segment_bytes(
     repo: &super::Repo,
     segments: &[SegmentRef],

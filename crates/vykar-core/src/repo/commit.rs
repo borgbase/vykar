@@ -173,7 +173,7 @@ impl Repo {
         self.commit_finalize(ws, new_file_cache, events, cancel);
     }
 
-    /// Commit `ws` as `entry` with no lock (an unchecked fence): the backup
+    /// Commit `ws` as `entry` with an unchecked fence: the backup
     /// commit driven to the end, then [`Self::finish_backup_commit`] (tests
     /// that commit at repository level). `RepoWriter::commit_session_blocking`
     /// runs it under the writer's fence.

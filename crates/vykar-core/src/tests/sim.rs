@@ -760,7 +760,7 @@ fn same_machine_session_reaped_at_once() {
 #[test]
 fn stale_session_journal_recovered_after_staleness() {
     let mut sim = Sim::new();
-    // One machine, so `c` reaps the lock `a` leaves; journal recovery judges
+    // One machine, so `c` reaps the marker `a` leaves; journal recovery judges
     // the marker by age alone.
     let a = sim.client_on("a", "hostx", Some("boot1"));
     let c = sim.client_on("c", "hostx", Some("boot1"));
@@ -1670,7 +1670,7 @@ fn backup_during_a_sweep_is_locked_out() {
 
 /// SIM-3: a crash, or an applied write whose answer is lost, at every
 /// mutation of a sweeping compact leaves the repository consistent; once
-/// the lock is stale another client's compact completes the sweep.
+/// its marker is stale another client's compact completes the sweep.
 #[test]
 fn a_crash_at_every_write_of_the_sweep_is_recoverable() {
     let probe = {
@@ -2434,12 +2434,12 @@ fn a_store_clock_step_ages_every_object() {
     let _ = sim.join(sa);
 }
 
-/// A young malformed marker makes compact under the lock yield: the lock
-/// holder's half of the marker handshake counts it as flagged (fail
-/// closed), so compact is refused `Locked` and deletes no orphan pack, not
-/// even one older than T_pack (a crashed backup's). Once 45 min old by its
-/// mtime it is reaped and the next compact deletes the orphans. Invariant 9
-/// no longer skips it. Lock mode: the default store offers no
+/// A young malformed marker makes a single-writer compact refuse: its
+/// single-writer check counts it as a committing writer (fail closed), so
+/// compact is refused `Locked` and deletes no orphan pack, not even one
+/// older than T_pack (a crashed backup's). Once 45 min old by its mtime it
+/// is reaped and the next compact deletes the orphans. Invariant 9 no
+/// longer skips it. Single-writer: the default store offers no
 /// put-if-absent.
 #[test]
 fn malformed_marker_ages_out() {

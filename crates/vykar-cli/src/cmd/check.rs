@@ -81,7 +81,7 @@ pub(crate) fn run_check(
         }
     }
 
-    // Re-scan and apply under maintenance lock.
+    // Re-scan and apply in an exclusive session.
     let mode = apply_mode_after(&plan_result.plan);
     let result = run_repair(config, label, verify_data, mode, cancel)?;
     print_repair_result(&result);
@@ -98,8 +98,8 @@ fn apply_mode_after(plan: &RepairPlan) -> RepairMode {
     }
 }
 
-/// One scan-and-repair pass. `RepairMode::Apply` re-scans from scratch under the
-/// maintenance lock, so an earlier `PlanOnly` pass never carries state forward.
+/// One scan-and-repair pass. `RepairMode::Apply` re-scans from scratch in the
+/// repair's exclusive session, so an earlier `PlanOnly` pass never carries state forward.
 fn run_repair(
     config: &VykarConfig,
     label: Option<&str>,

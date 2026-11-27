@@ -316,7 +316,7 @@ fn setup() -> (
     fs::write(src_dir.join("a.bin"), vec![0x5au8; 64 * 1024]).unwrap();
     fs::write(src_dir.join("b.txt"), b"hello").unwrap();
     let config = crate::tests::helpers::init_repo(&repo_dir);
-    // The recording wrapper offers no put-if-absent: lock mode.
+    // The recording wrapper offers no put-if-absent: single-writer.
     crate::tests::helpers::make_single_writer(&repo_dir);
     (dir, config, src_dir)
 }

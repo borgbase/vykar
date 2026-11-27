@@ -1,6 +1,6 @@
 //! Bounded exhaustive search over the driver (08 step 5): every schedule of
 //! a small scenario with at most K preemptions, a gate-stepped search over
-//! two raw lock acquisitions, and gate-stepped searches of the
+//! two exclusive registrations, and gate-stepped searches of the
 //! single-writer check (10-single-protocol step 7). The expectations are
 //! exact: a clean scenario must stay clean, and so must the one-hostname
 //! pair since 04 step 1 (installation ID) removed H1. The scenario builders
@@ -38,7 +38,8 @@ pub(super) const PRECOMMIT_K: u32 = 1;
 /// search completed, so a bound that silently stopped exploring fails.
 pub(super) const PRECOMMIT_MAX_RUNS: usize = 5_000;
 
-/// Preemption bound of the pre-commit gate-stepped lock search: K = 3, the
+/// Preemption bound of the pre-commit gate-stepped searches (two exclusive
+/// registrations; an exclusive session against a backup): K = 3, the
 /// least that reaches both clients backing off, costs well under a second.
 const GATE_K: u32 = 3;
 
@@ -165,7 +166,7 @@ pub(super) fn fault_plans() -> Vec<FaultSpec> {
 
 /// The campaign's searches, in the order the campaign hands them out:
 /// (name, base, K). The K = 1 scenarios (the faults, time jumps and
-/// crashes) take turns by store family (plain, lock-free, then plain
+/// crashes) take turns by store family (single, multi, then single
 /// again), and the K >= 2 searches are placed at a fixed
 /// stride through that list, the first at its head, K = 2 before K = 3 and
 /// taking turns by family too. Within one family and K the cheapest
@@ -426,10 +427,9 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
     assert!(lock_free > 0, "{name}: no schedule committed in a session");
 }
 
-/// Two lock-free backups (phase F part 10c: the encrypted template on the
-/// conditional store), on distinct hosts and on one hostname: every
-/// schedule is clean (their head creates meet as part 9's do; no lock is
-/// taken), and the search completes in the pre-commit bound although
+/// Two multi-writer backups (phase F part 10c: the encrypted template on
+/// the conditional store), on distinct hosts and on one hostname: every
+/// schedule is clean (their head creates meet as part 9's do), and the search completes in the pre-commit bound although
 /// object names are random per run.
 #[test]
 fn lock_free_pair_is_clean() {
@@ -443,11 +443,10 @@ fn lock_free_pair_is_clean() {
     );
 }
 
-/// A lock-free backup against a lock-free delete + compact (phase F part
-/// 10d: both clients' handles pass the put-if-absent check), whole and
+/// A multi-writer backup against a delete + compact in sessions (phase F
+/// part 10d: both clients' handles pass the put-if-absent check), whole and
 /// gate-stepped, on the aged and the young template: every schedule is
-/// clean. The compact registers a `writes_heads` marker instead of the
-/// lock; its second session listing skips the sweep beside a committing
+/// clean. The compact registers a `writes_heads` marker; its second session listing skips the sweep beside a committing
 /// backup; a backup that commits during its mark moves the head, and the
 /// compact marks again or its sweep head's create is taken; the backup's
 /// reuse re-check fails it `StaleChunksDuringCommit` when it read the sweep.
@@ -471,9 +470,8 @@ fn lock_free_backup_against_lock_free_compact_young_is_clean() {
     );
 }
 
-/// The stepped lock-free compact with time jumps offered inside it (phase
-/// F part 10d: it holds no lock, so a jump cannot age one), on the aged
-/// template: every schedule is clean (a jump past a marker's staleness
+/// The stepped compact with time jumps offered inside it (phase F part
+/// 10d), on the aged template: every schedule is clean (a jump past a marker's staleness
 /// inside the compact reaps nothing live: the driver's backups refresh).
 #[test]
 fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean() {
@@ -495,7 +493,7 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clea
     );
 }
 
-/// The stepped lock-free compact with one crash offered (either client, at
+/// The stepped compact with one crash offered (either client, at
 /// any decision), aged and young templates: every schedule is clean.
 #[test]
 fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() {
@@ -509,8 +507,8 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() 
     );
 }
 
-/// a: a backup, then a lock-free delete of c0; b: a stepped lock-free
-/// compact. The delete can land between the compact's snapshot listing and
+/// a: a backup, then a delete of c0; b: a stepped compact, on a
+/// multi-writer repository. The delete can land between the compact's snapshot listing and
 /// its GET of c0 (the mark skips it once a second listing no longer shows
 /// it) or anywhere else: every schedule is clean.
 #[test]
@@ -522,7 +520,7 @@ fn lock_free_delete_during_compact_is_clean() {
 }
 
 /// a: a backup sharing c0's file, then a compact; b: a stepped compact;
-/// both lock-free: their sweeps meet at a head generation (one marks
+/// both multi-writer: their sweeps meet at a head generation (one marks
 /// again), their repacks rebase over each other's heads, and an orphan or
 /// source one deleted is gone for the other. Every schedule is clean.
 #[test]
@@ -534,8 +532,8 @@ fn two_lock_free_compacts_are_clean() {
 }
 
 /// On one hostname (cloned machines: one installation, other boot IDs) the
-/// second backup's registration no longer reaps the first one's live lock
-/// (H1 before 04 step 1): every schedule is clean.
+/// second backup's registration no longer reaps the first one's live
+/// marker (H1 before 04 step 1): every schedule is clean.
 #[test]
 fn lock_pair_on_one_hostname_is_clean() {
     assert_clean("pair-hostname", &lock_pair(HostPlan::SameHostname));
@@ -544,14 +542,15 @@ fn lock_pair_on_one_hostname_is_clean() {
 /// A backup against delete + compact, compact one protocol-key operation at
 /// a time (`Maintenance::Stepped`) against every boundary of the backup:
 /// before its registration (compact removes c0's chunks, the backup
-/// uploads the shared file anew); between upload and lock compact
+/// uploads the shared file anew); between upload and commit mark compact
 /// proceeds (04 step 7): it keeps the backup's uploads (young, and inside
 /// its horizon) and, when the delete of c0 came first, sweeps c0's
 /// chunks, so the backup fails its reuse re-check as
 /// `StaleChunksDuringCommit` (allowed), or commits when nothing it reused
-/// was swept; a backup whose registration probe meets compact's lock fails
-/// `Locked`; inside the commit window compact fails `Locked`; after the
-/// finish. The driver never refreshes markers, so a search exercises the
+/// was swept; a backup whose single-writer listing meets compact's
+/// `writes_heads` marker waits (`Locked` once its attempts run out);
+/// inside the commit window compact's single-writer check fails `Locked`;
+/// after the finish. The driver never refreshes markers, so a search exercises the
 /// age guard and I8, not the horizon
 /// (`tests::sim::a_refreshed_marker_keeps_uploads_older_than_t_pack` does).
 /// The same search with time jumps (none inside the stepped compact) is
@@ -582,8 +581,8 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
             "compact-young-distinct-stepped",
             stepped(commit_vs_compact(HostPlan::Distinct)),
         ),
-        // The same search as lock-free-compact-young-stepped, kept here for
-        // the stale count this test asserts on the lock-free route too.
+        // The same search as multi-compact-young-stepped, kept here for
+        // the stale count this test asserts on a multi-writer repository too.
         (
             "compact-young-distinct-stepped-lock-free",
             conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
@@ -1377,7 +1376,7 @@ pub(super) enum GappedRival {
     SwitchToMulti,
     /// `vykar upgrade --commit-mode single` of a multi-writer repository.
     SwitchToSingle,
-    /// `check --repair` (under the maintenance lock).
+    /// `check --repair` (an exclusive session).
     CheckRepair,
     /// A compact (a session) after the delete of c0, on a single-writer
     /// repository.

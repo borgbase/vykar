@@ -19,10 +19,9 @@
 //!
 //! Segment age (04 step 7): a backup segment's age is the store's "now"
 //! minus the mtime of its `index.d/` key in one LIST_META ([`SegmentAges`]).
-//! "Now" is the mtime of a key this client wrote: the maintenance lock's
-//! for a lock holder, a session's own marker key for a backup's or a
-//! compact's index write (since 10-single-protocol step 7 on every
-//! repository). While a
+//! "Now" is the mtime of a key this client wrote: a session's own marker
+//! key for a backup's or a compact's index write (since 10-single-protocol
+//! step 7 on every repository). While a
 //! backup segment is younger than [`T_PACK`], compact's sweep leaves the
 //! entries it adds and no fold writes it into a base. Unknown is young: an
 //! object the listing lacks, one listed without an mtime, or no "now".

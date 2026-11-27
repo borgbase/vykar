@@ -264,7 +264,7 @@ proptest! {
         let mut synthetic: HashSet<ChunkId> = HashSet::new();
 
         for op in &ops {
-            // A fresh reading of "now" for every write, as a new lock hold
+            // A fresh reading of "now" for every write, as a new session
             // takes one: the ages are listed again.
             t.repo.clear_session_state();
             super::helpers::set_store_now(&mut t.repo);

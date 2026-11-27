@@ -1,8 +1,8 @@
 //! Clock and host identity of one client, carried by value.
 //!
 //! Production uses [`HostEnv::system`]; the protocol simulator gives each
-//! logical client its own. This file is the only place in the lock, session
-//! and maintenance code that reads the system clock or the platform identity.
+//! logical client its own. This file is the only place in the session and
+//! maintenance code that reads the system clock or the platform identity.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,10 +11,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-/// Time source of the lock, session and maintenance code.
+/// Time source of the session and maintenance code.
 pub trait Clock: Send + Sync {
-    /// Wall-clock time. Lock and session ages and the lock fence use it,
-    /// because it keeps running while the machine is suspended.
+    /// Wall-clock time. Session ages, the legacy lock key's and the marker
+    /// checks use it, because it keeps running while the machine is
+    /// suspended.
     fn now_utc(&self) -> DateTime<Utc>;
     /// Monotonic time for deadlines and instrumentation.
     fn monotonic(&self) -> Instant;
@@ -131,7 +132,8 @@ impl Default for StopSignal {
     }
 }
 
-/// Who a client is, as written into lock and session markers.
+/// Who a client is, as written into session markers (and the v2/v3
+/// upgrade's legacy lock key).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostIdentity {
     /// Hostname, with its domain if the system reports one.

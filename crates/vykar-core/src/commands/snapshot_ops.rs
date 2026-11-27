@@ -31,8 +31,8 @@ pub fn prepare_removal_targets<S: AsRef<str>>(
         .collect()
 }
 
-/// Delete the `snapshots/<id>` objects (each fenced by the maintenance lock,
-/// or lock-free, 04 step 9, by the run's session marker check),
+/// Delete the `snapshots/<id>` objects (each fenced by the run's session
+/// marker check, 04 step 9),
 /// remove them from the manifest and re-sync the local snapshot list cache.
 /// Returns the removed names. The index is not read or written: the chunks
 /// only these snapshots referenced stay until `vykar compact` sweeps them.

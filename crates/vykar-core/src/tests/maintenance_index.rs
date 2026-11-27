@@ -1,5 +1,5 @@
-//! Maintenance operations load the chunk index under the repository lock,
-//! and leave this machine's chunk table at the state they write.
+//! Maintenance operations load the chunk index at the latest head in their
+//! session, and leave this machine's chunk table at the state they write.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -506,7 +506,7 @@ fn maintenance_on_a_host_without_caches_segmented() {
 fn failed_index_write_in_compact_leaves_caches_untouched() {
     for format in FORMATS {
         let env = Env::new(format);
-        // `FailIndexPut` offers no put-if-absent: lock mode.
+        // `FailIndexPut` offers no put-if-absent: single-writer.
         crate::tests::helpers::make_single_writer(&env.repo_dir);
         let src = env.source("a", &[("one.bin", 0x11)]);
         env.backup(&src, "a", "s1");
@@ -722,7 +722,7 @@ fn takeover_keeps_the_newer_table_segmented() {
     assert_backup_uses_caches(&env, &src, "s2");
 }
 
-// --- (C) index loaded under the maintenance lock ---
+// --- (C) index loaded at the latest head in the session ---
 
 /// Chunks in the remote index after `f` that were not there before it.
 fn new_chunks(env: &Env, f: impl FnOnce()) -> HashMap<ChunkId, ChunkIndexEntry> {

@@ -234,7 +234,7 @@ impl Fx {
         (head, objects)
     }
 
-    /// Edit the index under the maintenance lock and persist it.
+    /// Edit the index in an exclusive session and persist it.
     pub(super) fn edit_index(&self, f: impl FnOnce(&mut Repo)) {
         let mut repo = self.open();
         commands::util::with_exclusive_session(&mut repo, |repo| {
@@ -836,8 +836,8 @@ impl Ghost {
     }
 }
 
-/// Under the maintenance lock a listed snapshot whose GET finds nothing may
-/// be live (a reaped lock, an out-of-band delete, a false "not found"): the
+/// A listed snapshot whose GET finds nothing, and that a second listing still
+/// shows, may be live (an out-of-band delete, a false "not found"): the
 /// strict listing fails closed on it.
 #[test]
 fn the_strict_listing_fails_on_a_listed_snapshot_that_is_gone() {

@@ -1617,7 +1617,7 @@ fn compact_honours_shutdown_during_analysis() {
 }
 
 /// 04 step 5: orphan packs (no index entry names them) go only once they are
-/// T_pack old on the store's clock, read against the lock's reading of
+/// T_pack old on the store's clock, read against the session's reading of
 /// "now"; of unknown age they stay.
 mod store_clock_ages {
     use std::sync::atomic::{AtomicUsize, Ordering};

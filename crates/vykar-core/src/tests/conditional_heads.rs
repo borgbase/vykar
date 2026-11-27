@@ -144,7 +144,7 @@ fn lost_reply_is_recognised_by_the_bytes() {
 
 /// A create with an unknown outcome whose key is absent fails the commit
 /// with the error. Landing before any other commit it extends the head it
-/// was built on (no snapshot: a leak only; its late write is invariant 7's);
+/// was built on (no snapshot: a leak only);
 /// landing after another commit it finds the generation taken.
 #[test]
 fn unknown_outcome_fails_and_a_late_create_is_harmless() {
@@ -187,7 +187,8 @@ fn unknown_outcome_fails_and_a_late_create_is_harmless() {
 }
 
 /// A backend that ignores the condition (Garage) fails init's check: the
-/// repository is single-writer, its heads are plain PUTs under the lock,
+/// repository is single-writer, its heads are plain PUTs (EXISTS, PUT,
+/// read-back),
 /// and no backup run checks again (10-single-protocol step 5).
 #[test]
 fn init_records_single_writer_on_an_ignoring_backend() {
@@ -1054,9 +1055,9 @@ impl vykar_storage::ConditionalWrite for RefusesAfterCheck {
 }
 
 /// O4: a multi-writer repository whose storage passed the check commits
-/// lock-free; a create refused after that fails the commit with
-/// `MultiWriterUnsupported`, and no head is written with a plain PUT (there
-/// is no lock to make one safe).
+/// with put-if-absent heads; a create refused after that fails the commit with
+/// `MultiWriterUnsupported`, and no head is written with a plain PUT
+/// (nothing would make one safe beside other multi-writer commits).
 #[test]
 fn a_refusal_after_a_passed_check_fails_the_commit() {
     let mut sim = Sim::with_config(SimConfig {

@@ -653,7 +653,7 @@ pub fn run_with_repair(
 /// Open options `run_with_repair` uses for `mode`.
 pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
     if mode == RepairMode::PlanOnly {
-        // PlanOnly: no marker, no lock, purely read-only. `skip_key_backfill`
+        // PlanOnly: no session marker, purely read-only. `skip_key_backfill`
         // is what keeps that promise: the dry run prints "no changes applied",
         // and a key-copy backfill firing during the open underneath would make
         // that statement false.

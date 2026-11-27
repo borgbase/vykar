@@ -105,7 +105,7 @@ pub(crate) fn refuse_on_append_only_server(
     Ok(())
 }
 
-/// The registered session of a lock-free maintenance run (04 step 9): its
+/// The registered session of a maintenance run (04 step 9): its
 /// heartbeat runs until the run ends, then it deregisters.
 pub(crate) struct MaintenanceSession {
     guard: sessions::SessionGuard,
@@ -122,10 +122,10 @@ impl MaintenanceSession {
     }
 }
 
-/// The fence of a lock-free maintenance run (04 step 9), installed as the
+/// The fence of a maintenance run in a session (04 step 9), installed as the
 /// handle's fence for the whole run: the run's marker exists now and
 /// its record is [continuous](sessions::MarkerReport::continuous), the
-/// predicate a lock-free backup checks before its snapshot PUT. It runs
+/// predicate a backup checks before its snapshot PUT. It runs
 /// before every head create of the run (the publish machine's fence step:
 /// the sweep head, each repack batch's create and each create after a
 /// rebase, the fold), before each batch of pack deletes, before the index
@@ -372,7 +372,7 @@ pub(crate) fn with_exclusive_session_as<T>(
 /// carrying `flags`, adopt it with a heartbeat, read `config` again and
 /// take the repository's mode from that read
 /// ([`Repo::reread_writer_mode`], then [`Repo::commit_mode`]), run
-/// `action`, deregister. No lock is taken; the action's writer is fenced by
+/// `action`, deregister. The action's writer is fenced by
 /// the marker check ([`maintenance_marker_fence`]) for the whole run.
 ///
 /// The registration keeps the exclusive sessions out (10-single-protocol
@@ -445,7 +445,7 @@ pub(crate) fn with_snapshot_removal_exclusion<T>(
     })
 }
 
-/// Sessions #1 of a lock-free maintenance run (04 step 9): one listing of
+/// Sessions #1 of a maintenance run in a session (04 step 9): one listing of
 /// `sessions/`; "now" on the store's clock is the mtime of `own`'s newest
 /// key in it (written after registration and before this listing, so it
 /// precedes compact's head read, as 8b's I8 argument needs); stale sessions

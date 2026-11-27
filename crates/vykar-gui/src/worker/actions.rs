@@ -157,9 +157,9 @@ pub(super) fn handle_delete_snapshots(
         "Deleting snapshots..."
     };
 
-    // Single batch call: validates all names up front and runs under one
-    // maintenance lock (see `commands::delete::run`). Avoids per-row partial
-    // failures and per-row maintenance-lock contention. A pre-mutation
+    // Single batch call: validates all names up front and runs in one
+    // session (see `commands::delete::run`). Avoids per-row partial
+    // failures and a session registration per row. A pre-mutation
     // validation failure (e.g. SnapshotNotFound) leaves the repo untouched, so
     // one error covers the whole batch.
     let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();

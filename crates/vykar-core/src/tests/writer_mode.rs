@@ -180,7 +180,7 @@ fn switch(
 /// 10-single-protocol step 7) with a plain head PUT; its switch back to
 /// multi-writer refuses. A client whose storage passes the
 /// check switches back, after which the first client refuses again and the
-/// other commits lock-free.
+/// other commits multi-writer.
 #[test]
 fn switch_to_single_and_back() {
     let (mut sim, ctl, u) = multi_writer_sim();
@@ -204,7 +204,7 @@ fn switch_to_single_and_back() {
         !recs.iter().any(|r| r.op.is_write()
             && r.key
                 .starts_with(crate::repo::sessions::LEGACY_LOCKS_PREFIX)),
-        "a lock was taken: {recs:?}"
+        "a legacy lock key was written: {recs:?}"
     );
     let heads: Vec<&OpRecord> = recs
         .iter()

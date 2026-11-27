@@ -582,7 +582,7 @@ pub(crate) fn age_repo_objects(repo_dir: &Path, prefixes: &[&str], by: std::time
 /// 13 h: past T_pack (12 h) with room to spare.
 pub(crate) const PAST_T_PACK: std::time::Duration = std::time::Duration::from_secs(13 * 3600);
 
-/// "Now" on the store's clock for a handle that holds no lock (tests that
+/// "Now" on the store's clock for a handle in no session (tests that
 /// call compact or a fold directly): the local clock, which is a
 /// LocalBackend's.
 pub(crate) fn set_store_now(repo: &mut Repo) {

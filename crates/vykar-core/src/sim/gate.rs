@@ -20,7 +20,7 @@ pub struct GateRule {
     /// Applied after `op` and `key`, to the same key (any key of a
     /// `BatchDelete`); `None` matches everything.
     pub filter: Option<fn(OpKind, &str) -> bool>,
-    /// Operations of threads with this name do not count (a lock-free
+    /// Operations of threads with this name do not count (a
     /// stepped compact's heartbeat, `session-refresh`, beside its gated
     /// main thread).
     pub skip_thread: Option<&'static str>,

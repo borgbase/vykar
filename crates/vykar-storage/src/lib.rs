@@ -114,14 +114,15 @@ pub trait StorageBackend: Send + Sync {
     /// # Consistency
     ///
     /// A LIST must reflect every PUT and DELETE that completed before it
-    /// started, **including those made by other clients**. Repository locking
-    /// (PUT own key, then LIST for others) depends on this. What provides it:
+    /// started, **including those made by other clients**. Session
+    /// coordination (PUT own marker, then LIST `sessions/` for others)
+    /// depends on this. What provides it:
     /// - S3: AWS guarantees strong read-after-write and list consistency.
     ///   S3-compatible services must provide the same; not all are verified.
     /// - vykar-server: a single process over a local directory.
     /// - Local and SFTP: only as consistent as the filesystem underneath. A
     ///   repository on NFS/SMB with directory or attribute caching can serve a
-    ///   stale listing (RFC 8881 §10.8.2), which breaks locking.
+    ///   stale listing (RFC 8881 §10.8.2), which breaks that coordination.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
     /// Read a byte range from an object. Returns `None` if not found.
@@ -314,10 +315,10 @@ pub trait StorageBackend: Send + Sync {
     /// client's. A file the storage refuses to delete is logged and skipped;
     /// returns how many were removed.
     ///
-    /// Callers must hold the maintenance lock, except delete-repo with
-    /// `Duration::ZERO`: it destroys the repository, so a concurrent backup
-    /// fails regardless, and a lock write could block deleting a full or
-    /// read-only repository.
+    /// Callers run in a registered session (compact), except delete-repo
+    /// with `Duration::ZERO`: it destroys the repository, so a concurrent
+    /// backup fails regardless, and a marker write could block deleting a
+    /// full or read-only repository.
     ///
     /// Required for the reason in the note above: a default `Ok(0)` would let
     /// a wrapper silently skip the sweep. Backends that never leave
@@ -996,7 +997,8 @@ pub struct StorageConfig {
     /// Cancels retry waits and abandons SFTP reads in flight. Once it is
     /// cancelled, a remote backend starts no new attempt of an operation and
     /// returns Interrupted. The first attempt of an operation still runs, so
-    /// cleanup after a cancel (lock release, session removal) is attempted.
+    /// cleanup after a cancel (session removal, the legacy lock key's release)
+    /// is attempted.
     /// Requests that change storage are never abandoned in flight. Use
     /// CancelToken::new() for a backend that nothing cancels. The local
     /// backend ignores it.

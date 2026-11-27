@@ -355,9 +355,9 @@ impl Repo {
     }
 
     /// Switch a v6 repository's writer mode to `want` (`vykar upgrade
-    /// --commit-mode`, 10-single-protocol step 5). The caller holds the
-    /// maintenance lock, whose fence is `fence`, and has refused live
-    /// sessions. A no-op (nothing written, no check) when the mode already
+    /// --commit-mode`, 10-single-protocol step 5). The caller runs in an
+    /// exclusive session, whose write check is `fence`, and so has refused
+    /// live sessions. A no-op (nothing written, no check) when the mode already
     /// matches. To multi-writer the init-time check must pass on this
     /// handle; to single-writer no check runs, so a client whose storage
     /// fails it can switch. Only the one feature of `config` changes.

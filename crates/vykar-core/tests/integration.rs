@@ -114,7 +114,7 @@ fn init_store_reopen_read() {
         let (id2, _, _) = ws
             .store_chunk(&repo, data2, Compression::Lz4, PackType::Data)
             .unwrap();
-        // No cfg(test) writer outside the crate: save under the lock.
+        // No cfg(test) writer outside the crate: save in an exclusive session.
         commands::util::with_exclusive_session(&mut repo, |w| w.save_session(ws)).unwrap();
         (id1, id2)
     };

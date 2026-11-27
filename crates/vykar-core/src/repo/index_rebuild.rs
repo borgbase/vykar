@@ -7,9 +7,8 @@
 //! neither). A pack none describes is reported as uncovered. A chunk stored
 //! in several packs resolves to the lowest (pack ID, offset). Storage errors
 //! and objects written by a newer vykar abort the rebuild; only damage makes
-//! a pack uncovered. A trailer of an unknown version is newer only when the
-//! pack still matches its ID: without encryption one flipped byte also
-//! produces it.
+//! a pack uncovered. A trailer of an unknown version is always newer: the
+//! AEAD authenticates the trailer, so a flipped byte reads as damage.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

@@ -1267,7 +1267,7 @@ fn persist_refuses_an_unloaded_index_over_a_non_empty_head() {
 
 /// Without a cache dir, and after a load that ignores local tables, the
 /// repository's own table serves every later sync: a write, a fold, a load
-/// under the lock and a backup commit read no index object (R2).
+/// at the latest head and a backup commit read no index object (R2).
 #[test]
 fn writes_reuse_the_live_table_without_a_cache_dir() {
     use std::sync::Arc;

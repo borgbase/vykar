@@ -199,8 +199,8 @@ fn cold_index(fx: &Fixture, name: &str) -> Vec<String> {
 /// Every backup that stores new chunks appends one backup segment of new
 /// entries and uploads nothing else to `index.d/` (a small
 /// index stays below the fold limits); a backup that stores nothing new
-/// writes no index object (BK-1), only the next head, as a lock-free
-/// commit does (Q2). Clients with and without a
+/// writes no index object (BK-1), only the next head, as every commit
+/// does (Q2). Clients with and without a
 /// local cache read the same index, and the snapshots restore.
 #[test]
 fn backups_append_one_segment_each() {
@@ -222,7 +222,7 @@ fn backups_append_one_segment_each() {
         assert_eq!(fx.index_objects(), 2);
 
         // Unchanged files: reuse only, which writes no index object. The
-        // lock-free commit writes the head read's state at its generation + 1.
+        // commit writes the head read's state at its generation + 1.
         let before = fx.head();
         fx.backup(&fx.config, "s3");
         let head = fx.head();
@@ -1131,7 +1131,7 @@ fn faulty(
     fx: &Fixture,
     fail: impl Fn(&str, &[u8]) -> bool + Send + Sync + 'static,
 ) -> (Box<dyn StorageBackend>, Arc<Mutex<Vec<String>>>) {
-    // `FaultyPut` offers no put-if-absent: lock mode.
+    // `FaultyPut` offers no put-if-absent: single-writer.
     crate::tests::helpers::make_single_writer(&fx.repo_dir);
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = FaultyPut {
@@ -1569,7 +1569,7 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
 }
 
 /// Two backups over the same cache, then a repository at the second head
-/// loaded under the lock. Returns the fixture, the repo cache dir, the
+/// loaded at the latest head. Returns the fixture, the repo cache dir, the
 /// repository and the head after the first backup.
 fn loaded_after_two_backups() -> (Fixture, PathBuf, Repo, IndexHead) {
     let fx = fixture(RepoFormat::CURRENT);

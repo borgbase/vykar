@@ -50,8 +50,8 @@ pub(crate) fn run_on_repo(
     })
 }
 
-/// The delete itself on a writer that holds an exclusion (a session, or in
-/// the simulator's lock-holder scenarios the maintenance lock): names
+/// The delete itself on a writer in a session (a shared one, or in the
+/// simulator's `Call::ExclusiveDelete` an exclusive one): names
 /// deduplicated in order, resolved, and unless `dry_run` removed.
 pub(crate) fn delete_on_writer(
     repo: &mut RepoWriter<'_>,

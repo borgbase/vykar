@@ -1,13 +1,13 @@
-//! Lock-free backups (04 step 9, phase F part 10c) on the simulator: two
-//! backups commit without a lock; a backup waits for a live exclusive
+//! Multi-writer backups (04 step 9, phase F part 10c) on the simulator: two
+//! backups commit side by side; a backup waits for a live exclusive
 //! session at its pre-head listing and an exclusive session refuses beside a
 //! committing backup; a crashed committing marker blocks exclusive sessions
 //! until it is stale. Exclusive sessions list `sessions/` only after their
 //! marker PUT; a marker
 //! reaped by age beside its refresh, an undecided put-if-absent check and a
 //! cancel during the wait each fail the backup as they should. A backup
-//! whose marker record has a gap before its commit commits lock-free after
-//! the suspend rule.
+//! whose marker record has a gap before its commit commits after the
+//! suspend rule.
 //!
 //! Since 10-single-protocol step 7 no backup or compact takes the lock, and
 //! since step 8 no command does: the holders here are exclusive sessions
@@ -37,8 +37,7 @@ fn backup_call(name: &str) -> Call {
     }
 }
 
-/// An encrypted repository (the lock-free path exists only there) on a
-/// store of `kind`.
+/// An encrypted repository on a store of `kind`.
 fn encrypted(kind: StoreKind) -> Sim {
     Sim::with_config(SimConfig {
         kind,
@@ -74,7 +73,7 @@ fn is_protected(key: &str) -> bool {
         .any(|p| key.starts_with(p))
 }
 
-/// `c`'s first PUT of a snapshot: a lock-free commit is between its head
+/// `c`'s first PUT of a snapshot: a commit is between its head
 /// create and its commit point there, its marker flagged.
 fn snapshot_put(c: ClientId) -> GateRule {
     GateRule::new(
@@ -176,9 +175,9 @@ fn expect_locked(run: &crate::sim::RunRecord) {
     );
 }
 
-/// Two lock-free backups whose head creates meet: neither writes a lock
-/// key, the one whose generation was taken rebases and commits, and both
-/// snapshots restore.
+/// Two multi-writer backups whose head creates meet: neither writes a
+/// legacy lock key, the one whose generation was taken rebases and
+/// commits, and both snapshots restore.
 #[test]
 fn two_lock_free_backups_commit_without_a_lock() {
     let mut sim = encrypted(StoreKind::Conditional);
@@ -195,7 +194,7 @@ fn two_lock_free_backups_commit_without_a_lock() {
     sim.resume(gate);
     let ra = sim.join(ra);
     ra.expect_ok();
-    assert!(ra.shared && rb.shared, "both commit lock-free");
+    assert!(ra.shared && rb.shared, "both commit in a shared session");
     let (ra_recs, rb_recs) = (records(&sim, a, ra.index), records(&sim, b, rb.index));
     for recs in [&ra_recs, &rb_recs] {
         assert!(lock_writes(recs).is_empty(), "{:?}", lock_writes(recs));
@@ -485,13 +484,13 @@ fn exclusive_runs_list_sessions_after_their_marker_put() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// F3: a lock holder that listed the lock-free writer's flagged key n when
-/// it was stale (the heartbeat held for 47 min) deletes it after the
+/// F3: a compact that listed a committing writer's flagged key n when it
+/// was stale (the heartbeat held for 47 min) deletes it after the
 /// heartbeat wrote key n + 1 and found n still present: n + 1 is present
-/// and no miss is recorded, yet the holder took the session for reaped and
-/// did not yield. The record's gap (over `MARKER_GAP_LIMIT`) is what tells:
+/// and no miss is recorded, yet the compact took the session for reaped
+/// and did not count it as committing. The record's gap (over `MARKER_GAP_LIMIT`) is what tells:
 /// the commit refuses its snapshot with `MarkerLostDuringCommit`. The gap
-/// arose after the commit mark, so the backup had decided lock-free.
+/// arose after the commit mark, so the backup had already marked.
 #[test]
 fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -558,7 +557,7 @@ fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
         "{}",
         rf.detail()
     );
-    assert!(rf.shared, "f decided lock-free before the gap");
+    assert!(rf.shared, "f marked in a shared session before the gap");
     assert!(lock_writes(&records(&sim, f, rf.index)).is_empty());
     assert!(
         !records(&sim, f, rf.index)
@@ -571,10 +570,9 @@ fn a_marker_reaped_by_age_beside_its_refresh_refuses_the_snapshot() {
 
 /// An undecided put-if-absent check (its probe create fails) fails the
 /// backup right after open, before the upload (10-single-protocol step 5):
-/// no guess either way, so no lock is taken (no fallback to lock mode), no
-/// pack, head or snapshot written; what the run wrote is its session
-/// marker and the check's probe. The next backup checks again and commits
-/// lock-free.
+/// no guess either way (no fallback to single-writer), no pack, head or
+/// snapshot written; what the run wrote is its session marker and the
+/// check's probe. The next backup checks again and commits.
 #[test]
 fn an_undecided_put_if_absent_check_fails_the_backup() {
     let mut sim = encrypted(StoreKind::Conditional);
@@ -597,7 +595,7 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
         .filter(|r| !r.key.starts_with("sessions/"))
         .collect();
     assert!(stray.is_empty(), "{}: {stray:?}", run.detail());
-    assert!(lock_writes(&recs).is_empty(), "no lock was taken");
+    assert!(lock_writes(&recs).is_empty(), "no legacy lock key was written");
     assert!(
         sim.store()
             .keys("sessions/")
@@ -611,14 +609,14 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
     sim.check_invariants(Invariant::STEP8).assert_clean();
 }
 
-/// A cancel while a lock-free commit waits for a live exclusive session
+/// A cancel while a commit waits for a live exclusive session
 /// (its marker flagged; its earlier keys reaped by a misjudging reaper, as
 /// in [`a_commit_waits_for_a_live_exclusive_session`]) returns `Interrupted` within one sleep slice (500 ms), with no
 /// further probe. The cancelled backup leaves what any abandoned backup
 /// leaves: its packs and its journal (`sessions/<id>.index`, for the next
 /// run's recovery); its marker keys, the flagged one included, are deleted
-/// at deregistration, so lock holders no longer yield to it; no lock, head
-/// or snapshot.
+/// at deregistration, so other sessions no longer wait for it; no head or
+/// snapshot.
 #[test]
 fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
@@ -731,9 +729,9 @@ fn suspend_mid_upload(sim: &mut Sim, c: ClientId, name: &str) -> (GateId, Spawne
 
 /// A backup whose marker record already has a gap over
 /// `MARKER_GAP_LIMIT` when it is about to commit (its machine suspended
-/// for 35 min mid-upload) commits lock-free, on an encrypted repository on
-/// the conditional store (10-single-protocol step 7, the suspend rule; it
-/// committed under the lock before): no lock key written, a GET of
+/// for 35 min mid-upload) commits, on an encrypted repository on the
+/// conditional store (10-single-protocol step 7, the suspend rule; it
+/// committed under the lock before): no legacy lock key written, a GET of
 /// `config` after its commit mark (the rule's re-read), put-if-absent
 /// heads, the snapshot committed and restorable. The next backup's record
 /// is continuous: no `config` GET in its commit.
@@ -745,9 +743,9 @@ fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
     sim.resume(gate);
     let ra = sim.join(ra);
     ra.expect_ok();
-    assert!(ra.shared, "a commits lock-free");
+    assert!(ra.shared, "a commits in a shared session");
     let recs = records(&sim, a, ra.index);
-    assert!(lock_writes(&recs).is_empty(), "a lock was taken: {recs:?}");
+    assert!(lock_writes(&recs).is_empty(), "a legacy lock key was written: {recs:?}");
     let mark = recs
         .iter()
         .position(|r| r.op == OpKind::Put && r.key.ends_with(".1.json"))

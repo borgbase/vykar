@@ -52,8 +52,8 @@ pub fn run(
     )
 }
 
-/// [`run`] on an already opened repository, under the maintenance lock or,
-/// lock-free, a registered session (`with_snapshot_removal_exclusion`).
+/// [`run`] on an already opened repository, in a registered session
+/// (`with_snapshot_removal_exclusion`).
 pub(crate) fn run_on_repo(
     repo: &mut Repo,
     config: &VykarConfig,

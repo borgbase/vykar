@@ -193,7 +193,7 @@ pub struct RepoConfig {
 }
 
 /// The config feature of a multi-writer repository (10-single-protocol
-/// step 5): clients commit without a lock, with put-if-absent index heads.
+/// step 5): clients commit side by side, with put-if-absent index heads.
 /// Absent: single-writer.
 pub const MULTI_WRITER_FEATURE: &str = "multi_writer";
 
@@ -205,10 +205,9 @@ pub const KNOWN_CONFIG_FEATURES: &[&str] = &[MULTI_WRITER_FEATURE];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriterMode {
     /// No `multi_writer`: one writer at a time, kept apart by a
-    /// best-effort check of the session markers, no lock
-    /// (10-single-protocol step 7).
+    /// best-effort check of the session markers (10-single-protocol step 7).
     Single,
-    /// `multi_writer`: lock-free commits with put-if-absent heads.
+    /// `multi_writer`: commits side by side, with put-if-absent heads.
     Multi,
 }
 

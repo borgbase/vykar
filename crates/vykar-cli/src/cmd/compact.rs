@@ -112,7 +112,7 @@ pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {
     print_compact_warnings(stats);
 }
 
-/// Packs a lock-free compact did not repack under its source rule (04 step
+/// Packs a compact did not repack under its source rule (04 step
 /// 9), on stdout: a later compact repacks them.
 fn print_repack_held(stats: &commands::compact::CompactStats) {
     if stats.packs_repack_held > 0 {

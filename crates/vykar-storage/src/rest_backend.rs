@@ -1193,8 +1193,8 @@ impl ServerOps for RestBackend {
     /// One `GET <prefix>?list&sized&mtime`: the server walks the whole tree.
     ///
     /// Not retried: the caller's per-directory fallback supplies the retries,
-    /// and a retry after the admin timeout would hold the maintenance lock
-    /// while the server is still walking the tree.
+    /// and a retry after the admin timeout would keep the maintenance run
+    /// waiting while the server is still walking the tree.
     fn list_tree_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         let retry = RetryConfig {
             max_retries: 0,

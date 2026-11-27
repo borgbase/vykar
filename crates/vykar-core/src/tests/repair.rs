@@ -736,7 +736,7 @@ fn index_sweep_excludes_doomed_snapshots() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. PlanOnly does not take maintenance lock (sessions don't block it)
+// 16. PlanOnly registers no session (sessions don't block it)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -758,7 +758,7 @@ fn plan_only_does_not_take_maintenance_lock() {
     )
     .unwrap();
 
-    // PlanOnly should succeed — it does not acquire maintenance lock
+    // PlanOnly should succeed — it registers no exclusive session
     let result = plan_only(&config, false);
     assert!(
         !result.plan.actions.is_empty(),
@@ -863,7 +863,7 @@ fn repair_reclaims_crash_orphan_index_entries() {
 
     // Inject the F6 post-crash state and persist it, mimicking the crash window
     // between the index PUT and the snapshot PUT. chunk_index_mut() auto-marks
-    // the index dirty; save_state() persists it (no-op lock fence on a locally
+    // the index dirty; save_state() persists it (no-op fence on a locally
     // opened repo).
     {
         let mut repo = open_local_repo(&repo_dir);

@@ -352,8 +352,8 @@ impl Repo {
         }
     }
 
-    /// [`Self::persist_segmented_index`] for lock-free maintenance (04 step
-    /// 9): a head that moved since the index was loaded, or a generation
+    /// [`Self::persist_segmented_index`] for maintenance in a session (04
+    /// step 9): a head that moved since the index was loaded, or a generation
     /// another writer created, is [`MaintenanceWrite::Moved`] instead of the
     /// "index changed" error. Nothing on storage names a moved write (its
     /// objects are unreferenced garbage); the index edits are kept and the
@@ -375,7 +375,7 @@ impl Repo {
     }
 
     /// Rebase a repack batch's pending relocations onto the latest head (04
-    /// step 9, lock-free compact): take the pending segment (relocations and
+    /// step 9, compact): take the pending segment (relocations and
     /// their packs' trailers only; anything else is a BUG error), discard
     /// the edits, load the index at the latest head, and re-apply each
     /// relocation whose chunk that index still holds in one of `sources`
@@ -884,7 +884,7 @@ fn is_stale_index_error(e: &VykarError) -> bool {
     matches!(e, VykarError::IndexChanged)
 }
 
-/// What a lock-free maintenance write found (04 step 9, phase F part 10d).
+/// What a maintenance write found (04 step 9, phase F part 10d).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaintenanceWrite {
     /// The write is published (or there was nothing to write).

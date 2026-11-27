@@ -104,7 +104,7 @@ impl LiveSnapshot {
 /// build all fail the call. A listed object whose GET finds nothing is
 /// skipped only when a second listing of `snapshots/`, taken after every
 /// GET, no longer shows it: a concurrent `delete` or `prune` removed it
-/// (they run without the lock beside compact, 04 step 9), and a deleted
+/// (they run beside compact, 04 step 9), and a deleted
 /// snapshot needs no marking. Reads storage only; the local snapshot list
 /// is neither read nor written. Objects are fetched at the backend's
 /// request width.
@@ -144,8 +144,7 @@ pub(crate) fn load_snapshots_strict(
             }
         };
         // A listed key that is gone is a concurrent delete or prune (they
-        // take no lock beside a lock-free compact, 04 step 9), a reaped lock,
-        // an out-of-band delete or a false "not found" (a proxy's 404, a
+        // run beside compact, 04 step 9), an out-of-band delete or a false "not found" (a proxy's 404, a
         // pooled filesystem branch dropping out), and in the last cases the
         // snapshot may be live. It is skipped only after a second listing,
         // taken after every GET, no longer shows it; a key still listed with

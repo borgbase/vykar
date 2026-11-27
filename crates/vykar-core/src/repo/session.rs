@@ -234,7 +234,8 @@ impl WriteSession {
     /// Recover chunk→pack mappings from a previous interrupted session's
     /// `pending_index` file. Verifies each pack exists before adding entries.
     ///
-    /// Must be called inside the repo lock, before any chunk is stored.
+    /// Must be called after the session is registered, before any chunk is
+    /// stored.
     /// Pack lookups use the backend's request width
     /// (`BackendProfile::request_width`) and stop when `cancel` fires.
     pub fn recover_pending_index(

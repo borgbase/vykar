@@ -204,7 +204,7 @@ fn remote_budget_lends_sealed_packs_and_settles() {
     config.repository.min_pack_size = 1024;
     config.repository.max_pack_size = 1024;
     crate::commands::init::run(&config, pass(&config)).unwrap();
-    // The wrapper below offers no put-if-absent: lock mode.
+    // The wrapper below offers no put-if-absent: single-writer.
     crate::tests::helpers::make_single_writer(&repo_dir);
     write_distinct_files(&src);
 

@@ -159,7 +159,7 @@ fn age_file(path: &Path, secs: u64) {
 }
 
 /// TWO-1. A and B open at S0 (one base file). A writes a segment; B still
-/// reads S0's chunks, and B's load under the lock uses the base file and
+/// reads S0's chunks, and B's load at the latest head uses the base file and
 /// A's cached segment, downloading nothing. B writes a maintenance segment,
 /// and A's next load catches up from the cached files too. Every file each
 /// open used was verified.

@@ -112,7 +112,8 @@ pub(crate) struct RecoveryTarget<'a> {
 /// its chunks are uploaded again. The oldest adopted pack's age is returned
 /// so the caller pulls the session's start back by it.
 ///
-/// Must be called inside the repo lock, before any chunk is stored.
+/// Must be called after the session is registered, before any chunk is
+/// stored.
 /// Returns the total number of recovered chunk entries. `persisted_packs` and
 /// `width` steer the pack lookups (see `pack_lookup`).
 pub(crate) fn recover_pending_index(
@@ -227,7 +228,7 @@ pub(crate) fn recover_pending_index(
                 // Only delete the corrupt .index — never touch .json markers.
                 // Session marker lifecycle is managed by deregister_session()
                 // and cleanup_stale_sessions() (newest marker written >45 min
-                // ago by its mtime, under maintenance lock).
+                // ago by its mtime).
                 warn!(key = %index_key, "corrupt pending index journal, deleting");
                 let _ = storage.delete(index_key);
             }

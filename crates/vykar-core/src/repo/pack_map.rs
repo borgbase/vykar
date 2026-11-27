@@ -509,7 +509,7 @@ impl Repo {
     /// holds all of its index entries. Errors
     /// when the index is not loaded, when the server does not accept
     /// `packmaps/`, on any storage error and on a map from a newer vykar.
-    /// Writes nothing else. The caller holds the maintenance lock. A
+    /// Writes nothing else. The caller runs in an exclusive session. A
     /// cancelled run leaves the maps written so far, which a rerun counts as
     /// covering their packs.
     pub(crate) fn write_pack_maps(

@@ -581,7 +581,7 @@ fn deleting_commands_refuse_early_on_an_append_only_server() {
     assert_eq!(before.1.len(), 2);
     let cancel = CancelToken::new();
 
-    // compact: refused before the lock, so nothing is written at all.
+    // compact: refused before its session, so nothing is written at all.
     server.take_requests();
     let err =
         commands::compact::run(&c.config, pass(&c.config), 0.0, None, false, &cancel).unwrap_err();

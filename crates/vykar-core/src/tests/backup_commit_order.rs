@@ -1265,9 +1265,9 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
         assert_eq!(latest_head(&*storage), head_at_mark, "the head moved");
         assert_eq!(repo_keys(&config, "index.d/"), objects_at_mark);
         let events = shared.events.lock().unwrap().clone();
-        let lock = events.iter().position(|e| *e == Event::MarkPut).unwrap();
+        let mark = events.iter().position(|e| *e == Event::MarkPut).unwrap();
         assert!(
-            !events[lock..]
+            !events[mark..]
                 .iter()
                 .any(|e| matches!(e, Event::SegmentPut | Event::BasePut | Event::HeadPut)),
             "{events:?}"

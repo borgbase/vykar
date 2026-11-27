@@ -269,7 +269,7 @@ fn a_failed_save_session_writes_the_journal() {
 }
 
 /// After the call the handle's storage is the raw backend again and the
-/// lock state is cleared, whatever the action returned; inside it the
+/// session state is cleared, whatever the action returned; inside it the
 /// storage is the write-checked wrapper and the session is `x-` + 32 hex.
 #[test]
 fn the_storage_and_session_state_are_restored() {

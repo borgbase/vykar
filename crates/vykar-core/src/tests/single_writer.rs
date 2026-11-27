@@ -5,8 +5,9 @@
 //! writer is live; a compact refuses beside one), the suspend rule (a
 //! backup whose marker record is not continuous at its commit mark reads
 //! `config` again, applies the pack-age term, restarts its record and
-//! re-checks its reuse on every attempt), and maintenance's re-read of
-//! `config` after its registration. Searched schedules are in
+//! re-checks its reuse on every attempt), maintenance's re-read of
+//! `config` after its registration, and a crashed committing marker that
+//! blocks an exclusive session and a compact until it is stale. Searched schedules are in
 //! `tests::sim_exhaustive` (`single_writer_checks_race`,
 //! `single_writer_compact_race`, `gapped_backup_against_*`).
 
@@ -508,6 +509,51 @@ fn a_compact_beside_a_committing_backup_refuses_and_the_backup_commits() {
     sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
+/// A backup that crashed after its commit mark leaves a flagged marker: an
+/// exclusive session refuses beside it (`ActiveSessions`) until it is stale
+/// (45 min on the store's clock), and so does a single-writer compact
+/// (`Locked`, its single-writer check); then they reap it and proceed.
+/// Nothing is wedged. On a single-writer repository (the fallback store),
+/// so here rather than in `tests::multi_writer`, where it was until the
+/// lock-name sweep; the first holder took the maintenance lock and yielded `Locked` before
+/// 10-single-protocol step 8.
+#[test]
+fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
+    let mut sim = sim_of(StoreKind::Plain);
+    let (f, l, c) = (sim.client("f"), sim.client("l"), sim.client("c"));
+    let f_head = sim.gate(GateRule::new(
+        f,
+        OpMatch::Kind(OpKind::Put),
+        KeyMatch::Prefix("index.h/".into()),
+    ));
+    let rf = sim.spawn(f, backup_call("f1"));
+    sim.expect_paused(f_head, "f after its mark");
+    sim.crash(f);
+    sim.resume(f_head);
+    assert!(!sim.join(rf).is_ok());
+    let flagged = sim
+        .store()
+        .keys("sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .any(|k| {
+            let body = sim.store().object(&k).expect("listed").data;
+            String::from_utf8_lossy(&body).contains("\"committing\":true")
+        });
+    assert!(flagged, "the crashed backup's marker stays flagged");
+    expect_class(
+        &sim.call(l, super::multi_writer::exclusive_fold()),
+        AllowedError::ActiveSessions,
+    );
+    expect_class(&sim.compact(c), AllowedError::Locked);
+    sim.advance(STALE);
+    sim.call(l, super::multi_writer::exclusive_fold())
+        .expect_ok();
+    sim.compact(c).expect_ok();
+    sim.backup(l, "l1", &tree("l1")).expect_ok();
+    sim.check_invariants(Invariant::STEP7).assert_clean();
+}
+
 // ── The suspend rule ────────────────────────────────────────────────────
 
 /// 6.3 (h), closing step 5's window: a backup opened on a single-writer
@@ -698,7 +744,8 @@ fn a_suspended_backup_whose_repository_changed_refuses() {
     assert!(sim.store().keys_written_by(a, "snapshots/").is_empty());
 }
 
-/// 6.3 (m), replacing `lock_free::a_backup_with_a_gap_yields_to_a_committing_backup`:
+/// 6.3 (m), replacing `a_backup_with_a_gap_yields_to_a_committing_backup`
+/// (then in `lock_free`, now `tests::multi_writer`):
 /// a backup with a gap in its record before its commit, beside a backup
 /// that is committing. On a multi-writer repository both commit (one head
 /// create is taken and rebased); on a single-writer one the gap backup's

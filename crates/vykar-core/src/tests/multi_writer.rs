@@ -1,10 +1,8 @@
 //! Multi-writer backups (04 step 9, phase F part 10c) on the simulator: two
 //! backups commit side by side; a backup waits for a live exclusive
 //! session at its pre-head listing and an exclusive session refuses beside a
-//! committing backup; a crashed committing marker blocks exclusive sessions
-//! until it is stale. Exclusive sessions list `sessions/` only after their
-//! marker PUT; a marker
-//! reaped by age beside its refresh, an undecided put-if-absent check and a
+//! committing backup. Exclusive sessions list `sessions/` only after their
+//! marker PUT; a marker reaped by age beside its refresh, an undecided put-if-absent check and a
 //! cancel during the wait each fail the backup as they should. A backup
 //! whose marker record has a gap before its commit commits after the
 //! suspend rule.
@@ -16,6 +14,8 @@
 //! moved to `tests::single_writer` (a single-writer compact), and
 //! `a_backup_with_a_gap_yields_to_a_committing_backup` became
 //! `tests::single_writer::a_gap_backup_commits_beside_a_committing_backup`.
+//! `a_crashed_committing_marker_stops_blocking_after_45_minutes` (a
+//! single-writer store) moved to `tests::single_writer`.
 
 use crate::repo::control::CancelToken;
 use crate::sim::history::{AllowedError, ErrorClass};
@@ -92,7 +92,7 @@ fn sessions_listing(c: ClientId, n: u32) -> GateRule {
 /// ([`Call::ExclusiveCustom`]), as `check --repair`, upgrade and pack maps
 /// run since 10-single-protocol step 8 (a fold under the maintenance lock
 /// before).
-fn exclusive_fold() -> Call {
+pub(super) fn exclusive_fold() -> Call {
     Call::ExclusiveCustom {
         label: "exclusive fold".into(),
         f: Box::new(|repo| {
@@ -161,15 +161,6 @@ fn expect_active_sessions(run: &crate::sim::RunRecord) {
     assert_eq!(
         run.error_class(),
         Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
-        "{}",
-        run.detail()
-    );
-}
-
-fn expect_locked(run: &crate::sim::RunRecord) {
-    assert_eq!(
-        run.error_class(),
-        Some(&ErrorClass::Allowed(AllowedError::Locked)),
         "{}",
         run.detail()
     );
@@ -314,46 +305,6 @@ fn an_exclusive_session_refuses_beside_a_committing_backup() {
         };
         sim.check_invariants(set).assert_clean();
     }
-}
-
-/// A backup that crashed after its commit mark leaves a flagged marker: an
-/// exclusive session refuses beside it (`ActiveSessions`) until it is stale
-/// (45 min on the store's clock), and so does a single-writer compact
-/// (`Locked`, its single-writer check); then they reap it and proceed.
-/// Nothing is wedged. On a single-writer repository (the fallback store);
-/// the first holder took the maintenance lock and yielded `Locked` before
-/// 10-single-protocol step 8.
-#[test]
-fn a_crashed_committing_marker_stops_blocking_after_45_minutes() {
-    let mut sim = encrypted(StoreKind::Plain);
-    let (f, l, c) = (sim.client("f"), sim.client("l"), sim.client("c"));
-    let f_head = sim.gate(GateRule::new(
-        f,
-        OpMatch::Kind(OpKind::Put),
-        KeyMatch::Prefix("index.h/".into()),
-    ));
-    let rf = sim.spawn(f, backup_call("f1"));
-    sim.expect_paused(f_head, "f after its mark");
-    sim.crash(f);
-    sim.resume(f_head);
-    assert!(!sim.join(rf).is_ok());
-    let flagged = sim
-        .store()
-        .keys("sessions/")
-        .into_iter()
-        .filter(|k| k.ends_with(".json"))
-        .any(|k| {
-            let body = sim.store().object(&k).expect("listed").data;
-            String::from_utf8_lossy(&body).contains("\"committing\":true")
-        });
-    assert!(flagged, "the crashed backup's marker stays flagged");
-    expect_active_sessions(&sim.call(l, exclusive_fold()));
-    expect_locked(&sim.compact(c));
-    sim.advance(std::time::Duration::from_secs(46 * 60));
-    sim.call(l, exclusive_fold()).expect_ok();
-    sim.compact(c).expect_ok();
-    sim.backup(l, "l1", &tree("l1")).expect_ok();
-    sim.check_invariants(Invariant::STEP7).assert_clean();
 }
 
 /// The exclusive registration's order (10-single-protocol step 8, X1): its

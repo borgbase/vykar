@@ -526,7 +526,9 @@ fn two_multi_writer_compacts_are_clean() {
 
 /// On one hostname (cloned machines: one installation, other boot IDs) the
 /// second backup's registration no longer reaps the first one's live
-/// marker (H1 before 04 step 1): every schedule is clean.
+/// marker (H1 before 04 step 1): every schedule is clean. Named
+/// `lock_pair_on_one_hostname_is_clean` until the lock-name sweep (the name
+/// seed h1-bounded's note gives).
 #[test]
 fn backup_pair_on_one_hostname_is_clean() {
     assert_clean("pair-hostname", &backup_pair(HostPlan::SameHostname));

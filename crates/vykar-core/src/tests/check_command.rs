@@ -2598,6 +2598,67 @@ fn a_repair_judges_two_objects_of_one_name_after_the_reindex() {
     });
 }
 
+/// Refuses every DELETE under `snapshots/` (the delete probe's too) as an
+/// append-only server does.
+struct RefuseSnapshotDeletes {
+    inner: LocalBackend,
+}
+
+impl vykar_storage::InnerBackend for RefuseSnapshotDeletes {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for RefuseSnapshotDeletes;
+    except [delete, batch_delete];
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if key.starts_with("snapshots/") {
+            return Err(VykarError::Other("403 Forbidden: append-only".into()));
+        }
+        self.inner.delete(key)
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+}
+
+/// A plan whose one delete is the removal of an interrupted rewrite (here
+/// two equal rewrites, the original already deleted) has no data loss, but
+/// it still runs the delete probe: on storage that refuses deletes the
+/// repair refuses before anything is written.
+#[test]
+fn a_repair_that_only_removes_a_rewrite_refuses_on_append_only_storage() {
+    let fx = interrupted_item_repair();
+    fx.store_meta(fx.rewrite, id_after(), |_| {});
+    LocalBackend::new(fx.repo_dir.to_str().unwrap())
+        .unwrap()
+        .delete(&fx.original.storage_key())
+        .unwrap();
+    let shown = fx.repair(RepairMode::PlanOnly).unwrap();
+    assert!(!shown.plan.has_data_loss, "{:?}", shown.plan.actions);
+    assert!(
+        removes_rewrite(&shown.plan, id_after(), fx.rewrite),
+        "the equal one with the higher ID: {:?}",
+        shown.plan.actions
+    );
+    assert!(shown.plan.deletes_objects());
+
+    let files = fx.files();
+    let storage = RefuseSnapshotDeletes {
+        inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
+    };
+    let err = repair_on(storage, &fx.config).unwrap_err().to_string();
+    assert!(
+        err.contains("repair requires deleting immutable snapshot objects"),
+        "{err}"
+    );
+    assert_eq!(fx.files(), files, "nothing was written");
+}
+
 /// The new action itself interrupted: the DELETE of the rewrite fails, with
 /// a plain error and with the exclusion lost. Nothing is written (no
 /// snapshot, no pack, no index head), and a rerun converges.

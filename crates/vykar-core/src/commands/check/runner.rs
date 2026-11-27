@@ -792,10 +792,12 @@ pub(crate) fn run_with_repair_on_repo(
             // Before the delete probe.
             refuse_repair_if_plan_changed(mode, &plan)?;
 
-            // A plan with data loss deletes objects. Refuse before the mutation
-            // boundary: by capability on a server that advertises append-only
-            // mode (no probe is sent), else by the delete probe.
-            if plan.has_data_loss {
+            // A plan that deletes objects (every plan with data loss, and the
+            // removal of an interrupted rewrite, which loses nothing) refuses
+            // before the mutation boundary: by capability on a server that
+            // advertises append-only mode (no probe is sent), else by the
+            // delete probe.
+            if plan.has_data_loss || plan.deletes_objects() {
                 crate::commands::util::refuse_on_append_only_server(
                     repo.storage().as_ref(),
                     "vykar check --repair",

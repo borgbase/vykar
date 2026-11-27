@@ -447,6 +447,25 @@ pub struct RepairPlan {
     pub uncovered_packs: Vec<UncoveredPack>,
 }
 
+impl RepairPlan {
+    /// Whether applying the plan deletes objects from storage (snapshot
+    /// objects, invalid snapshot keys): the delete probe and the append-only
+    /// refusal run first. An item-level rewrite deletes the original.
+    pub fn deletes_objects(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                RepairAction::RemoveCorruptSnapshot { .. }
+                    | RepairAction::RemoveInvalidSnapshotKey { .. }
+                    | RepairAction::RemoveDanglingSnapshot { .. }
+                    | RepairAction::RemoveInterruptedRewrite { .. }
+                    | RepairAction::RemoveUnreadableDuplicate { .. }
+                    | RepairAction::DropItemsFromSnapshot { .. }
+            )
+        })
+    }
+}
+
 /// Whether to just show the plan or actually apply it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairMode {

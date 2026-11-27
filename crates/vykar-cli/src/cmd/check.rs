@@ -61,7 +61,13 @@ pub(crate) fn run_check(
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
 
-    if !plan_result.plan.has_data_loss && plan_result.plan.actions.iter().all(is_safe_action) {
+    if !plan_result.plan.has_data_loss
+        && plan_result
+            .plan
+            .actions
+            .iter()
+            .all(|a| is_safe_action(a) || is_lossless_removal(a))
+    {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let mode = apply_mode_after(&plan_result.plan);
@@ -232,34 +238,46 @@ fn is_safe_action(action: &RepairAction) -> bool {
     )
 }
 
+/// Removals that lose nothing: listed in a section of their own and, like
+/// the safe actions, applied without the prompt. The repair still refuses
+/// them on append-only storage, before anything is written.
+fn is_lossless_removal(action: &RepairAction) -> bool {
+    matches!(action, RepairAction::RemoveInterruptedRewrite { .. })
+}
+
 fn print_repair_plan(plan: &RepairPlan) {
     print_index_recovery(plan);
+    for line in repair_plan_lines(plan) {
+        println!("{line}");
+    }
+}
+
+/// The plan's lines [`print_repair_plan`] prints after the index recovery.
+fn repair_plan_lines(plan: &RepairPlan) -> Vec<String> {
     if plan.actions.is_empty() {
-        println!("\nRepair plan: no actions needed.");
-        return;
+        return vec!["\nRepair plan: no actions needed.".into()];
     }
-
-    println!("\nRepair plan:");
-
-    // Tier 1 (safe)
-    let safe_actions: Vec<&RepairAction> =
-        plan.actions.iter().filter(|a| is_safe_action(a)).collect();
-    if !safe_actions.is_empty() {
-        println!("  Safe:");
-        for a in safe_actions {
-            println!("    - {}", format_repair_action(a));
+    let mut lines = vec!["\nRepair plan:".to_string()];
+    type Belongs = fn(&RepairAction) -> bool;
+    let sections: [(&str, Belongs); 3] = [
+        // Tier 1 (safe)
+        ("  Safe:", is_safe_action),
+        ("  Will remove (loses nothing):", is_lossless_removal),
+        // Tier 2 (data loss)
+        ("  Will remove (data loss):", |a| {
+            !is_safe_action(a) && !is_lossless_removal(a)
+        }),
+    ];
+    for (title, belongs) in sections {
+        let actions: Vec<&RepairAction> = plan.actions.iter().filter(|a| belongs(a)).collect();
+        if !actions.is_empty() {
+            lines.push(title.into());
+            for a in actions {
+                lines.push(format!("    - {}", format_repair_action(a)));
+            }
         }
     }
-
-    // Tier 2 (data loss)
-    let loss_actions: Vec<&RepairAction> =
-        plan.actions.iter().filter(|a| !is_safe_action(a)).collect();
-    if !loss_actions.is_empty() {
-        println!("  Will remove (data loss):");
-        for a in &loss_actions {
-            println!("    - {}", format_repair_action(a));
-        }
-    }
+    lines
 }
 
 /// How the index was read, when not simply in full.
@@ -508,6 +526,54 @@ mod tests {
         assert_eq!(
             format_repair_action(&action),
             "Re-index 7 chunk(s) the index lost, from 2 pack(s) it did not name"
+        );
+    }
+
+    /// The removal of an interrupted rewrite has a section of its own,
+    /// between the safe actions and the data loss.
+    #[test]
+    fn an_interrupted_rewrite_is_listed_as_a_removal_that_loses_nothing() {
+        use vykar_types::snapshot_id::SnapshotId;
+        let rewrite = RepairAction::RemoveInterruptedRewrite {
+            snapshot_name: "s".into(),
+            snapshot_id: SnapshotId::from_bytes([1; 32]),
+            kept_id: SnapshotId::from_bytes([2; 32]),
+        };
+        assert!(!is_safe_action(&rewrite) && is_lossless_removal(&rewrite));
+        let only = RepairPlan {
+            actions: vec![rewrite.clone(), RepairAction::RemoveUnreferencedEntries],
+            has_data_loss: false,
+            index_recovery: IndexRecovery::Complete,
+            uncovered_packs: Vec::new(),
+        };
+        let lines = repair_plan_lines(&only);
+        assert_eq!(lines[1], "  Safe:", "{lines:?}");
+        assert_eq!(lines[3], "  Will remove (loses nothing):", "{lines:?}");
+        assert!(lines[4].contains("a rewrite of 's'"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("data loss")), "{lines:?}");
+
+        let with_loss = RepairPlan {
+            actions: vec![
+                rewrite,
+                RepairAction::RemoveDanglingSnapshot {
+                    snapshot_name: "t".into(),
+                    missing_chunks: 1,
+                },
+            ],
+            has_data_loss: true,
+            index_recovery: IndexRecovery::Complete,
+            uncovered_packs: Vec::new(),
+        };
+        let lines = repair_plan_lines(&with_loss);
+        assert_eq!(
+            lines,
+            vec![
+                "\nRepair plan:".to_string(),
+                "  Will remove (loses nothing):".into(),
+                format!("    - {}", format_repair_action(&with_loss.actions[0])),
+                "  Will remove (data loss):".into(),
+                "    - Remove snapshot 't' with 1 unresolvable chunk(s)".into(),
+            ]
         );
     }
 

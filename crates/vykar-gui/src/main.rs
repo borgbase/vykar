@@ -110,7 +110,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<UiEvent>();
 
     let scheduler = Arc::new(Mutex::new(scheduler::SchedulerState::default()));
-    let backup_running = Arc::new(AtomicBool::new(false));
     // Set while *any* worker operation runs (backup or UI read); drives the tray
     // "Cancel" item so it matches the window Cancel button.
     let operation_running = Arc::new(AtomicBool::new(false));
@@ -150,7 +149,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app_rx,
         ui_tx.clone(),
         scheduler,
-        backup_running.clone(),
         operation_running,
         cancel_requested.clone(),
         runtime,

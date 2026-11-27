@@ -13,8 +13,9 @@ pub(super) struct Harness {
     pub(super) ctx: WorkerContext,
     pub(super) ui_rx: crossbeam_channel::Receiver<UiEvent>,
     pub(super) tmp: tempfile::TempDir,
+    /// Commands the worker queued for itself. Held so sends keep succeeding.
+    pub(super) app_rx: crossbeam_channel::Receiver<AppCommand>,
     // Held so sends on the context's channels keep succeeding.
-    _app_rx: crossbeam_channel::Receiver<AppCommand>,
     _sched_rx: crossbeam_channel::Receiver<()>,
 }
 
@@ -42,7 +43,6 @@ pub(super) fn harness(build_yaml: impl FnOnce(&Path) -> String) -> Harness {
         ui_tx,
         sched_notify_tx,
         scheduler: Default::default(),
-        backup_running: Default::default(),
         operation_running: Default::default(),
         cancel_requested: Default::default(),
         scheduler_lock_held: true,
@@ -53,7 +53,7 @@ pub(super) fn harness(build_yaml: impl FnOnce(&Path) -> String) -> Harness {
         ctx,
         ui_rx,
         tmp,
-        _app_rx: app_rx,
+        app_rx,
         _sched_rx: sched_rx,
     }
 }

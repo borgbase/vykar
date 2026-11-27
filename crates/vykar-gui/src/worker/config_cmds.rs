@@ -195,7 +195,7 @@ pub(super) fn apply_config(
 
     // A repo-less config (starter template) has no schedule; the scheduler is
     // switched off and the Overview shows "Off".
-    let schedule_brief = super::rebuild_scheduler_state(ctx);
+    let schedule_brief = super::rebuild_scheduler_state(ctx, false);
 
     let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     ctx.config_display_path = canonical.clone();

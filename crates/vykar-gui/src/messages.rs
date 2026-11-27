@@ -33,9 +33,12 @@ pub(crate) enum AppCommand {
     },
     /// Scheduled full cycle limited to the repositories whose slot came due.
     /// Distinct from `RunBackupRepo`, which is the manual per-repo button and
-    /// runs only a backup, not the full cycle.
+    /// runs only a backup, not the full cycle. `order` is the scheduler's id for
+    /// it: the worker must end it through its `OpGuard`, or the scheduler
+    /// counts it as running forever.
     RunBackupRepos {
         repo_names: Vec<String>,
+        order: vykar_core::app::scheduler::CycleId,
     },
     RunBackupRepo {
         repo_name: String,

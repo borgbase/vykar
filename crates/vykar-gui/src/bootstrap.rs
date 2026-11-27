@@ -172,7 +172,6 @@ pub(crate) fn spawn_background_threads(
     app_rx: Receiver<AppCommand>,
     ui_tx: Sender<UiEvent>,
     scheduler: Arc<Mutex<scheduler::SchedulerState>>,
-    backup_running: Arc<AtomicBool>,
     operation_running: Arc<AtomicBool>,
     cancel_requested: CancelSlot,
     runtime: app::RuntimeConfig,
@@ -180,13 +179,7 @@ pub(crate) fn spawn_background_threads(
     sched_notify_tx: Sender<()>,
     sched_notify_rx: Receiver<()>,
 ) {
-    scheduler::spawn_scheduler(
-        app_tx.clone(),
-        ui_tx.clone(),
-        scheduler.clone(),
-        backup_running.clone(),
-        sched_notify_rx,
-    );
+    scheduler::spawn_scheduler(app_tx.clone(), scheduler.clone(), sched_notify_rx);
 
     // Best-effort, once-per-launch update check. Detached from the worker so the
     // network call never delays startup commands.
@@ -206,7 +199,6 @@ pub(crate) fn spawn_background_threads(
             app_rx,
             ui_tx,
             scheduler,
-            backup_running,
             operation_running,
             cancel_requested,
             runtime,

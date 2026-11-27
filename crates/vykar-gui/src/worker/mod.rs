@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
@@ -35,7 +36,6 @@ pub(super) struct WorkerContext {
     pub(super) sched_notify_tx: Sender<()>,
 
     pub(super) scheduler: Arc<Mutex<scheduler::SchedulerState>>,
-    pub(super) backup_running: Arc<AtomicBool>,
     /// Set while any operation (backup *or* UI read) is running. Drives the
     /// tray "Cancel" item, mirroring the window Cancel button.
     pub(super) operation_running: Arc<AtomicBool>,
@@ -48,7 +48,11 @@ pub(super) struct WorkerContext {
 }
 
 fn startup(ctx: &mut WorkerContext) {
-    let schedule_brief = rebuild_scheduler_state(ctx);
+    // Queued before the scheduler state is loaded: the scheduler thread may
+    // enqueue the on-startup order as soon as it is, and the info fetch runs first.
+    let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+
+    let schedule_brief = rebuild_scheduler_state(ctx, true);
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: ctx.config_display_path.display().to_string(),
         schedule_brief,
@@ -71,17 +75,14 @@ fn startup(ctx: &mut WorkerContext) {
         }
     }
 
-    let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
-
-    // `on_startup` is per repository: only the repos that ask for it run now.
+    // `on_startup` is per repository and lives in the scheduler: the repos
+    // that ask for it are due now, and the scheduler thread hands them out.
     if ctx.scheduler_lock_held {
-        let on_startup: Vec<String> = ctx
-            .runtime
-            .repos
-            .iter()
-            .filter(|r| r.config.schedule.enabled && r.config.schedule.on_startup)
-            .map(|r| r.label_or_url().to_string())
-            .collect();
+        let on_startup = ctx
+            .scheduler
+            .lock()
+            .map(|s| s.due_names(SystemTime::now()))
+            .unwrap_or_default();
         if !on_startup.is_empty() {
             send_log(
                 &ctx.ui_tx,
@@ -90,17 +91,15 @@ fn startup(ctx: &mut WorkerContext) {
                     on_startup.join(", ")
                 ),
             );
-            let _ = ctx.app_tx.send(AppCommand::RunBackupRepos {
-                repo_names: on_startup,
-            });
         }
     }
 }
 
 /// Rebuild the scheduler's per-repo entries from `ctx.runtime.repos` and return
 /// the Overview schedule summary. Shared by startup and config reload so the
-/// two cannot drift apart.
-pub(super) fn rebuild_scheduler_state(ctx: &mut WorkerContext) -> String {
+/// two cannot drift apart. `honor_on_startup` is true only at startup: a
+/// reload must not re-trigger a repo's `on_startup` run.
+pub(super) fn rebuild_scheduler_state(ctx: &mut WorkerContext, honor_on_startup: bool) -> String {
     let schedules: Vec<&vykar_core::config::ScheduleConfig> = ctx
         .runtime
         .repos
@@ -111,26 +110,20 @@ pub(super) fn rebuild_scheduler_state(ctx: &mut WorkerContext) -> String {
 
     let mut cadence_errors = Vec::new();
     if let Ok(mut state) = ctx.scheduler.lock() {
-        state.enabled =
-            ctx.scheduler_lock_held && ctx.runtime.repos.iter().any(|r| r.config.schedule.enabled);
-        state.paused = paused;
+        state.set_paused(paused);
         cadence_errors = state.set_repos(
             ctx.runtime
                 .repos
                 .iter()
                 .map(|r| (r.label_or_url().to_string(), r.config.schedule.clone()))
                 .collect(),
+            SystemTime::now(),
+            honor_on_startup,
         );
     }
     // Per-repo, never a global pause: an unschedulable cadence drops that one
-    // repo from the timer and leaves the others running, which is what the
-    // shared `SchedulePlan` promises and what the daemon already does.
-    for (repo, e) in cadence_errors {
-        let _ = ctx.ui_tx.send(crate::messages::log_entry_now(format!(
-            "[{repo}] scheduler error: {e}. This repository will not run automatically \
-             until the config is fixed and reloaded."
-        )));
-    }
+    // repo from the timer and leaves the others running, as in the daemon.
+    scheduler::send_cadence_errors(&ctx.ui_tx, cadence_errors);
     let _ = ctx.sched_notify_tx.try_send(());
 
     if ctx.scheduler_lock_held {
@@ -146,7 +139,6 @@ pub(crate) fn run_worker(
     cmd_rx: Receiver<AppCommand>,
     ui_tx: Sender<UiEvent>,
     scheduler: Arc<Mutex<scheduler::SchedulerState>>,
-    backup_running: Arc<AtomicBool>,
     operation_running: Arc<AtomicBool>,
     cancel_requested: CancelSlot,
     runtime: app::RuntimeConfig,
@@ -165,7 +157,6 @@ pub(crate) fn run_worker(
         ui_tx,
         sched_notify_tx,
         scheduler,
-        backup_running,
         operation_running,
         cancel_requested,
         scheduler_lock_held,
@@ -180,8 +171,8 @@ pub(crate) fn run_worker(
             AppCommand::RunBackupAll { scheduled } => {
                 backup::handle_backup_all(&mut ctx, scheduled)
             }
-            AppCommand::RunBackupRepos { repo_names } => {
-                backup::handle_backup_repos(&mut ctx, repo_names)
+            AppCommand::RunBackupRepos { repo_names, order } => {
+                backup::handle_backup_repos(&mut ctx, repo_names, order)
             }
             AppCommand::RunBackupRepo { repo_name } => {
                 backup::handle_backup_repo(&mut ctx, repo_name)
@@ -239,4 +230,60 @@ pub(crate) fn run_worker(
 
     // On worker shutdown, stop any active mount so we don't leak a listener.
     mount::handle_stop_mount(&mut ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{drain, harness};
+    use super::*;
+
+    const ON_STARTUP_LOG: &str = "Scheduled on-startup backup requested by configuration for: nas";
+
+    fn on_startup_harness() -> test_support::Harness {
+        harness(|tmp| {
+            format!(
+                "repositories:\n  - url: '{}'\n    label: nas\n\
+                 encryption:\n  mode: aes256gcm\n  passphrase: gui-test\n\
+                 schedule:\n  enabled: true\n  every: 1h\n  on_startup: true\n\
+                 sources:\n  - path: '{}'\n",
+                tmp.join("repo").display(),
+                tmp.display(),
+            )
+        })
+    }
+
+    /// The on-startup run is the scheduler's: startup queues no backup itself,
+    /// the info fetch is queued first, and the repo is due in the scheduler.
+    #[test]
+    fn startup_leaves_the_on_startup_run_to_the_scheduler() {
+        let mut h = on_startup_harness();
+        startup(&mut h.ctx);
+
+        let cmds: Vec<AppCommand> = h.app_rx.try_iter().collect();
+        assert!(
+            matches!(cmds.as_slice(), [AppCommand::FetchAllRepoInfo]),
+            "unexpected commands: {cmds:?}"
+        );
+        let (logs, _) = drain(&h.ui_rx);
+        assert_eq!(
+            logs.iter().filter(|m| m.as_str() == ON_STARTUP_LOG).count(),
+            1,
+            "logs: {logs:?}"
+        );
+        let due = h.ctx.scheduler.lock().unwrap().due_names(SystemTime::now());
+        assert_eq!(due, ["nas"]);
+    }
+
+    /// Applying a config (reload, switch, save) never honours `on_startup`.
+    #[test]
+    fn apply_config_does_not_make_the_on_startup_repo_due() {
+        let mut h = on_startup_harness();
+        let path = h.tmp.path().join("config.yaml");
+        assert!(config_cmds::apply_config(&mut h.ctx, path, false));
+
+        let due = h.ctx.scheduler.lock().unwrap().due_names(SystemTime::now());
+        assert!(due.is_empty(), "due after apply: {due:?}");
+        let (logs, _) = drain(&h.ui_rx);
+        assert!(!logs.iter().any(|m| m == ON_STARTUP_LOG), "logs: {logs:?}");
+    }
 }

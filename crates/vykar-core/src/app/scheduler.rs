@@ -1,15 +1,14 @@
-// libc::flock for the process-wide scheduler lock; SAFETY documented per block.
-#![allow(unsafe_code)]
-
 use std::fs::File;
 use std::time::{Duration, SystemTime};
 
 use rand::RngExt;
 
+use crate::app::service::RepoSelection;
 use crate::config::ScheduleConfig;
 use vykar_types::error::{Result, VykarError};
 
-/// Process-wide scheduler lock backed by `flock(2)`.
+/// Process-wide scheduler lock: an OS file lock (`flock(2)` on Unix,
+/// `LockFileEx` on Windows) on `<config dir>/vykar/scheduler.lock`.
 ///
 /// The OS releases the lock automatically when the process exits (even on crash).
 /// Only one scheduler (daemon or GUI) can hold this lock at a time.
@@ -59,36 +58,14 @@ impl SchedulerLock {
             }
         };
 
-        Self::platform_flock(file)
-    }
-
-    #[cfg(unix)]
-    fn platform_flock(file: File) -> Option<Self> {
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        // SAFETY: fd belongs to the `file` owned in this scope (still alive
-        // through the call), and the flag set is a valid combination per the
-        // flock(2) contract.
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if ret == 0 {
-            Some(Self { _file: Some(file) })
-        } else {
-            let errno = std::io::Error::last_os_error();
-            match errno.raw_os_error() {
-                // EWOULDBLOCK and EAGAIN alias on most platforms; check both for portability.
-                Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN => None,
-                _ => {
-                    tracing::warn!(%errno, "flock failed unexpectedly; proceeding without lock");
-                    Some(Self { _file: Some(file) })
-                }
+        match file.try_lock() {
+            Ok(()) => Some(Self { _file: Some(file) }),
+            Err(std::fs::TryLockError::WouldBlock) => None,
+            Err(std::fs::TryLockError::Error(e)) => {
+                tracing::warn!(%e, "scheduler lock failed unexpectedly; proceeding without lock");
+                Some(Self { _file: Some(file) })
             }
         }
-    }
-
-    #[cfg(windows)]
-    fn platform_flock(file: File) -> Option<Self> {
-        // Windows locking not implemented yet — fail-open.
-        Some(Self { _file: Some(file) })
     }
 }
 
@@ -100,13 +77,13 @@ pub fn random_jitter(jitter_seconds: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Compute the delay until the next cron tick, plus jitter.
-fn next_cron_delay(schedule: &ScheduleConfig) -> Result<Duration> {
+/// Compute the delay from `now` until the next cron tick (local time), plus jitter.
+fn next_cron_delay(schedule: &ScheduleConfig, now: SystemTime) -> Result<Duration> {
     let expr = schedule.cron.as_deref().unwrap_or("");
     let cron = crate::config::parse_cron(expr)
         .map_err(|e| VykarError::Config(format!("schedule.cron: invalid expression: {e}")))?;
 
-    let delay = cron_delay_at(&cron, &chrono::Local::now())?;
+    let delay = cron_delay_at(&cron, &chrono::DateTime::<chrono::Local>::from(now))?;
     Ok(delay + random_jitter(schedule.jitter_seconds))
 }
 
@@ -126,8 +103,13 @@ fn cron_delay_at<Tz: chrono::TimeZone>(
 /// Unified entry point: returns the delay until the next scheduled run.
 /// Uses cron when `schedule.cron` is set, otherwise falls back to `every` interval.
 pub fn next_run_delay(schedule: &ScheduleConfig) -> Result<Duration> {
+    next_run_delay_at(schedule, SystemTime::now())
+}
+
+/// [`next_run_delay`] measured from `now` (cron is evaluated in local time).
+pub fn next_run_delay_at(schedule: &ScheduleConfig, now: SystemTime) -> Result<Duration> {
     if schedule.is_cron() {
-        next_cron_delay(schedule)
+        next_cron_delay(schedule, now)
     } else {
         Ok(schedule.every_duration()? + random_jitter(schedule.jitter_seconds))
     }
@@ -178,29 +160,29 @@ pub fn repos_schedule_brief(schedules: &[&ScheduleConfig], paused: bool) -> Stri
 
 /// Per-repository next-run times, index-aligned with a slice of repositories.
 ///
-/// Both schedulers (daemon and GUI) share this so the due-set and next-wake
-/// logic exist in one place. An entry is `None` when the repo's schedule is
-/// disabled *or* unschedulable — a broken cadence on one repo must not stop the
-/// others from running, so construction degrades instead of failing.
+/// An entry is `None` when the repo's schedule is disabled *or* unschedulable —
+/// a broken cadence on one repo must not stop the others from running, so
+/// construction degrades instead of failing.
 #[derive(Debug, Clone, Default)]
-pub struct SchedulePlan {
+struct SchedulePlan {
     next_runs: Vec<Option<SystemTime>>,
 }
 
 impl SchedulePlan {
-    /// Build a plan from one schedule per repository, in repository order.
+    /// Build a plan from one schedule per repository, in repository order,
+    /// with every slot counted from `now`.
     ///
     /// Returns the plan plus the per-index errors of any entry whose next run
-    /// could not be computed; the caller logs them (core never prints). Those
-    /// entries are `None` and simply never fire on the timer.
+    /// could not be computed. Those entries are `None` and never fire on the
+    /// timer.
     ///
-    /// `honor_on_startup` is false on the SIGHUP/reload path, where a repo's
+    /// `honor_on_startup` is false on the reload path, where a repo's
     /// `on_startup` must not re-trigger an immediate backup.
-    pub fn new(
-        schedules: &[&ScheduleConfig],
+    fn new(
+        schedules: &[ScheduleConfig],
+        now: SystemTime,
         honor_on_startup: bool,
     ) -> (Self, Vec<(usize, VykarError)>) {
-        let now = SystemTime::now();
         let mut next_runs = Vec::with_capacity(schedules.len());
         let mut errors = Vec::new();
 
@@ -213,7 +195,7 @@ impl SchedulePlan {
                 next_runs.push(Some(now));
                 continue;
             }
-            match next_run_delay(schedule) {
+            match next_run_delay_at(schedule, now) {
                 Ok(delay) => next_runs.push(Some(now + delay)),
                 Err(e) => {
                     next_runs.push(None);
@@ -226,14 +208,13 @@ impl SchedulePlan {
     }
 
     /// The earliest upcoming run across all repositories, or `None` when every
-    /// entry is disabled/unschedulable (the timer then never fires; ad-hoc
-    /// triggers and the status page still work).
-    pub fn next_wake(&self) -> Option<SystemTime> {
+    /// entry is disabled/unschedulable.
+    fn next_wake(&self) -> Option<SystemTime> {
         self.next_runs.iter().flatten().min().copied()
     }
 
     /// Indices of the repositories whose next run has arrived.
-    pub fn due(&self, now: SystemTime) -> Vec<usize> {
+    fn due(&self, now: SystemTime) -> Vec<usize> {
         self.next_runs
             .iter()
             .enumerate()
@@ -245,26 +226,26 @@ impl SchedulePlan {
     }
 
     /// The next run for one repository, if it has one.
-    pub fn next_run(&self, idx: usize) -> Option<SystemTime> {
+    fn next_run(&self, idx: usize) -> Option<SystemTime> {
         self.next_runs.get(idx).copied().flatten()
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.next_runs.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.next_runs.is_empty()
-    }
-
     /// Move one entry to `now + interval` (drift, not fixed slots). On error the
-    /// entry becomes `None` and the error is returned for the caller to log.
+    /// entry becomes `None` and the error is returned.
     ///
-    /// `idx` must index this plan — indices come from [`SchedulePlan::due`], so
-    /// an out-of-range one is a caller bug. It trips a `debug_assert!` and is a
-    /// no-op in release; note that the `None` return then reads as "no error",
-    /// not as "not rescheduled".
-    pub fn reschedule(&mut self, idx: usize, schedule: &ScheduleConfig) -> Option<VykarError> {
+    /// `idx` must index this plan; an out-of-range one is a caller bug. It
+    /// trips a `debug_assert!` and is a no-op in release; the `None` return
+    /// then reads as "no error", not as "not rescheduled".
+    fn reschedule(
+        &mut self,
+        idx: usize,
+        schedule: &ScheduleConfig,
+        now: SystemTime,
+    ) -> Option<VykarError> {
         debug_assert!(
             idx < self.next_runs.len(),
             "reschedule index {idx} out of range for {} entries",
@@ -275,9 +256,9 @@ impl SchedulePlan {
             *slot = None;
             return None;
         }
-        match next_run_delay(schedule) {
+        match next_run_delay_at(schedule, now) {
             Ok(delay) => {
-                *slot = Some(SystemTime::now() + delay);
+                *slot = Some(now + delay);
                 None
             }
             Err(e) => {
@@ -286,25 +267,279 @@ impl SchedulePlan {
             }
         }
     }
+}
 
-    /// Reschedule only the entries whose slot has already passed, leaving future
-    /// slots untouched. Used after an ad-hoc (SIGUSR1) cycle so the configured
-    /// cadence is preserved when the cycle finished before the next slot.
-    pub fn reschedule_overdue(
+/// Identifies one piece of work the scheduler knows is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CycleId(u64);
+
+/// Why the scheduler hands out a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleTrigger {
+    /// One or more per-repo slots arrived.
+    Scheduled,
+    /// [`Scheduler::trigger`] (SIGUSR1): every repository.
+    Adhoc,
+}
+
+/// A cycle the frontend must run now, then report with [`Scheduler::finished`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleOrder {
+    pub id: CycleId,
+    /// `Indices` (ascending) for a scheduled cycle, `All` for an ad-hoc one.
+    pub selection: RepoSelection,
+    pub trigger: CycleTrigger,
+}
+
+/// Work a frontend starts on its own (not handed out by [`Scheduler::poll`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Work {
+    /// A full cycle over `selection` (GUI "Back up all"). When it ends, the
+    /// overdue slots of the repos it covered are recomputed from that moment.
+    Cycle(RepoSelection),
+    /// Anything else that must hold scheduled cycles off (a single-repo or
+    /// single-source backup). Reschedules nothing.
+    Other,
+}
+
+/// What [`Scheduler::poll`] decided.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Poll {
+    /// Run this now. The scheduler counts it as running until `finished(id)`.
+    pub run: Option<CycleOrder>,
+    /// When to poll again if nothing else happens. `None` means wait for an
+    /// input (paused, running, or nothing scheduled).
+    pub wake_at: Option<SystemTime>,
+}
+
+/// Result of [`Scheduler::finished`].
+#[derive(Debug, Default)]
+pub struct Rescheduled {
+    /// Indices whose slot was recomputed (including those that failed to).
+    pub indices: Vec<usize>,
+    /// Indices whose cadence could not be computed; they lost their slot.
+    pub errors: Vec<(usize, VykarError)>,
+}
+
+/// The scheduling state machine shared by the daemon and the GUI.
+///
+/// It is pure: it holds no clock, and every input that depends on time takes
+/// `now`. The frontend sleeps or waits, delivers inputs, and runs what
+/// [`Scheduler::poll`] hands out.
+///
+/// Rules:
+///
+/// - **One piece of work at a time.** While anything handed out by `poll` or
+///   recorded with [`Scheduler::started`] runs, `poll` hands out nothing.
+/// - **Ad-hoc first.** A pending [`Scheduler::trigger`] is handed out as one
+///   cycle over every repository before any due slot, even when paused (pause
+///   is about automatic runs, not explicit requests). Repeated triggers before
+///   it runs coalesce.
+/// - **Paused** hands out no scheduled cycle.
+/// - **Scheduled cycles** cover the repositories whose slot has arrived, in
+///   index order.
+/// - **Rescheduling happens at the end** ([`Scheduler::finished`]), counted
+///   from the end time. Every repository of a scheduled cycle is rescheduled,
+///   whatever its outcome. An ad-hoc cycle or a [`Work::Cycle`] reschedules
+///   only the repositories it covered whose slot passed while it ran, so a
+///   future slot keeps its cadence. [`Work::Other`] reschedules nothing.
+/// - **A broken cadence** costs only that repository its slot; the others keep
+///   firing. A disabled repository is never due.
+/// - **Reload** ([`Scheduler::load`] with `honor_on_startup = false`)
+///   recomputes every slot from the reload time. Work that was running keeps
+///   holding scheduled cycles off, but its end reschedules nothing, because
+///   its indices belong to the previous configuration.
+#[derive(Debug, Default)]
+pub struct Scheduler {
+    schedules: Vec<ScheduleConfig>,
+    plan: SchedulePlan,
+    paused: bool,
+    adhoc_pending: bool,
+    running: Vec<Running>,
+    generation: u64,
+    next_id: u64,
+}
+
+#[derive(Debug)]
+struct Running {
+    id: CycleId,
+    generation: u64,
+    on_finish: OnFinish,
+}
+
+#[derive(Debug)]
+enum OnFinish {
+    /// Scheduled order: reschedule each of these indices from the end time.
+    All(Vec<usize>),
+    /// Ad-hoc order or `Work::Cycle`: reschedule only those of the selection
+    /// overdue at the end.
+    Overdue(RepoSelection),
+    /// `Work::Other`.
+    Nothing,
+}
+
+impl Scheduler {
+    /// Replace the schedules (index-aligned with the repositories) and compute
+    /// every slot from `now`. Returns the per-index errors of the cadences that
+    /// could not be computed; those repositories get no slot.
+    ///
+    /// `honor_on_startup` is true only on a process's first load; a reload
+    /// must pass false. Running work stays running, but its end no longer
+    /// reschedules anything. A pending trigger and the pause flag survive.
+    pub fn load(
         &mut self,
-        schedules: &[&ScheduleConfig],
+        schedules: Vec<ScheduleConfig>,
         now: SystemTime,
+        honor_on_startup: bool,
     ) -> Vec<(usize, VykarError)> {
-        let mut errors = Vec::new();
-        for idx in self.due(now) {
-            let Some(schedule) = schedules.get(idx) else {
+        let (plan, errors) = SchedulePlan::new(&schedules, now, honor_on_startup);
+        self.plan = plan;
+        self.schedules = schedules;
+        self.generation = self.generation.wrapping_add(1);
+        errors
+    }
+
+    /// Stop (or resume) handing out scheduled cycles. Triggers still run.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Ask for one ad-hoc cycle over every repository; repeated triggers
+    /// before it runs coalesce.
+    pub fn trigger(&mut self) {
+        self.adhoc_pending = true;
+    }
+
+    /// Decide what to do at `now`. Hands out at most one order, and nothing
+    /// while any work runs.
+    pub fn poll(&mut self, now: SystemTime) -> Poll {
+        if !self.running.is_empty() {
+            return Poll::default();
+        }
+        if self.adhoc_pending {
+            self.adhoc_pending = false;
+            let id = self.push_running(OnFinish::Overdue(RepoSelection::All));
+            return Poll {
+                run: Some(CycleOrder {
+                    id,
+                    selection: RepoSelection::All,
+                    trigger: CycleTrigger::Adhoc,
+                }),
+                wake_at: None,
+            };
+        }
+        if self.paused {
+            return Poll::default();
+        }
+        let due = self.plan.due(now);
+        if !due.is_empty() {
+            let id = self.push_running(OnFinish::All(due.clone()));
+            return Poll {
+                run: Some(CycleOrder {
+                    id,
+                    selection: RepoSelection::Indices(due),
+                    trigger: CycleTrigger::Scheduled,
+                }),
+                wake_at: None,
+            };
+        }
+        Poll {
+            run: None,
+            wake_at: self.plan.next_wake(),
+        }
+    }
+
+    /// Record work the frontend started itself; pass the id to
+    /// [`Scheduler::finished`] when it ends.
+    pub fn started(&mut self, work: Work) -> CycleId {
+        let on_finish = match work {
+            Work::Cycle(selection) => OnFinish::Overdue(selection),
+            Work::Other => OnFinish::Nothing,
+        };
+        self.push_running(on_finish)
+    }
+
+    /// End running work at `now` (the work's end). Unknown ids are a no-op.
+    pub fn finished(&mut self, id: CycleId, now: SystemTime) -> Rescheduled {
+        let mut done = Rescheduled::default();
+        let Some(pos) = self.running.iter().position(|r| r.id == id) else {
+            return done;
+        };
+        let running = self.running.swap_remove(pos);
+        if running.generation != self.generation {
+            return done;
+        }
+        let len = self.plan.len().min(self.schedules.len());
+        let candidates: Vec<usize> = match running.on_finish {
+            OnFinish::All(indices) => indices.into_iter().filter(|&i| i < len).collect(),
+            OnFinish::Overdue(selection) => {
+                let covered: Vec<usize> = match selection {
+                    RepoSelection::All => (0..len).collect(),
+                    RepoSelection::Indices(v) => v,
+                    RepoSelection::Explicit(i) => vec![i],
+                };
+                covered
+                    .into_iter()
+                    .filter(|&i| i < len && self.plan.next_run(i).is_some_and(|t| t <= now))
+                    .collect()
+            }
+            OnFinish::Nothing => Vec::new(),
+        };
+        for idx in candidates {
+            let Some(schedule) = self.schedules.get(idx) else {
                 continue;
             };
-            if let Some(e) = self.reschedule(idx, schedule) {
-                errors.push((idx, e));
+            if let Some(e) = self.plan.reschedule(idx, schedule, now) {
+                done.errors.push((idx, e));
             }
+            done.indices.push(idx);
         }
-        errors
+        done
+    }
+
+    /// Whether any work (handed out or started) is running.
+    pub fn is_running(&self) -> bool {
+        !self.running.is_empty()
+    }
+
+    /// Indices of the repositories whose slot has arrived at `now`.
+    pub fn due(&self, now: SystemTime) -> Vec<usize> {
+        self.plan.due(now)
+    }
+
+    /// The earliest slot across all repositories, or `None` when nothing is
+    /// scheduled.
+    pub fn next_wake(&self) -> Option<SystemTime> {
+        self.plan.next_wake()
+    }
+
+    /// The slot of one repository, if it has one.
+    pub fn next_run(&self, idx: usize) -> Option<SystemTime> {
+        self.plan.next_run(idx)
+    }
+
+    /// Number of repositories loaded.
+    pub fn len(&self) -> usize {
+        self.plan.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.plan.len() == 0
+    }
+
+    fn push_running(&mut self, on_finish: OnFinish) -> CycleId {
+        let id = CycleId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        self.running.push(Running {
+            id,
+            generation: self.generation,
+            on_finish,
+        });
+        id
     }
 }
 
@@ -368,18 +603,28 @@ mod tests {
         );
     }
 
+    /// A fixed start for the fake clock.
+    fn t0() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+    }
+
+    fn mins(m: u64) -> Duration {
+        Duration::from_secs(m * 60)
+    }
+
     #[test]
     fn plan_due_set_and_earliest_wake() {
         let fast = sched(true, Some("1s"), false);
         let slow = sched(true, Some("1h"), false);
-        let (plan, errors) = SchedulePlan::new(&[&slow, &fast], false);
+        let (plan, errors) = SchedulePlan::new(&[slow, fast], t0(), false);
         assert!(errors.is_empty());
 
         let fast_at = plan.next_run(1).unwrap();
+        assert_eq!(fast_at, t0() + Duration::from_secs(1));
         assert_eq!(plan.next_wake(), Some(fast_at));
 
         // Before the fast slot nothing is due; after it only the fast repo is.
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert!(plan.due(t0()).is_empty());
         assert_eq!(plan.due(fast_at), vec![1]);
     }
 
@@ -387,7 +632,7 @@ mod tests {
     fn plan_skips_disabled_entries() {
         let off = sched(false, Some("1h"), false);
         let on = sched(true, Some("1h"), false);
-        let (plan, errors) = SchedulePlan::new(&[&off, &on], false);
+        let (plan, errors) = SchedulePlan::new(&[off, on], t0(), false);
         assert!(errors.is_empty());
         assert!(plan.next_run(0).is_none());
         assert!(plan.next_run(1).is_some());
@@ -399,54 +644,31 @@ mod tests {
         let startup = sched(true, Some("1h"), true);
         let plain = sched(true, Some("1h"), false);
 
-        let (honored, _) = SchedulePlan::new(&[&startup, &plain], true);
-        assert_eq!(honored.due(SystemTime::now()), vec![0]);
+        let (honored, _) = SchedulePlan::new(&[startup.clone(), plain.clone()], t0(), true);
+        assert_eq!(honored.due(t0()), vec![0]);
 
-        let (ignored, _) = SchedulePlan::new(&[&startup, &plain], false);
-        assert!(ignored.due(SystemTime::now()).is_empty());
+        let (ignored, _) = SchedulePlan::new(&[startup, plain], t0(), false);
+        assert!(ignored.due(t0()).is_empty());
     }
 
     #[test]
     fn plan_reschedule_moves_only_that_entry() {
         let fast = sched(true, Some("1s"), false);
         let slow = sched(true, Some("1h"), false);
-        let (mut plan, _) = SchedulePlan::new(&[&fast, &slow], false);
+        let (mut plan, _) = SchedulePlan::new(&[fast.clone(), slow], t0(), false);
 
         let slow_before = plan.next_run(1).unwrap();
-        let fast_before = plan.next_run(0).unwrap();
-        assert!(plan.reschedule(0, &fast).is_none());
+        let later = t0() + mins(10);
+        assert!(plan.reschedule(0, &fast, later).is_none());
 
         assert_eq!(plan.next_run(1), Some(slow_before));
-        assert!(plan.next_run(0).unwrap() >= fast_before);
-    }
-
-    #[test]
-    fn plan_reschedule_overdue_preserves_future_slots() {
-        let overdue = sched(true, Some("1h"), true); // fires immediately
-        let future = sched(true, Some("1h"), false);
-        let (mut plan, _) = SchedulePlan::new(&[&overdue, &future], true);
-
-        let future_before = plan.next_run(1).unwrap();
-        let errors = plan.reschedule_overdue(&[&overdue, &future], SystemTime::now());
-        assert!(errors.is_empty());
-
-        assert_eq!(plan.next_run(1), Some(future_before));
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert_eq!(plan.next_run(0), Some(later + Duration::from_secs(1)));
     }
 
     #[test]
     fn plan_unschedulable_entry_degrades_to_none() {
-        let bad = ScheduleConfig {
-            enabled: true,
-            every: None,
-            cron: Some("not a cron".into()),
-            on_startup: false,
-            jitter_seconds: 0,
-            passphrase_prompt_timeout_seconds: 300,
-        };
-        let good = sched(true, Some("1h"), false);
-
-        let (plan, errors) = SchedulePlan::new(&[&bad, &good], false);
+        let (plan, errors) =
+            SchedulePlan::new(&[broken(), sched(true, Some("1h"), false)], t0(), false);
         assert!(plan.next_run(0).is_none());
         assert!(plan.next_run(1).is_some());
         assert_eq!(errors.len(), 1);
@@ -456,11 +678,274 @@ mod tests {
     #[test]
     fn plan_all_disabled_has_no_wake() {
         let off = sched(false, None, false);
-        let (plan, errors) = SchedulePlan::new(&[&off, &off], true);
+        let (plan, errors) = SchedulePlan::new(&[off.clone(), off], t0(), true);
         assert!(errors.is_empty());
         assert_eq!(plan.len(), 2);
         assert!(plan.next_wake().is_none());
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert!(plan.due(t0()).is_empty());
+    }
+
+    fn broken() -> ScheduleConfig {
+        ScheduleConfig {
+            enabled: true,
+            every: None,
+            cron: Some("not a cron".into()),
+            on_startup: false,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        }
+    }
+
+    fn hourly() -> ScheduleConfig {
+        sched(true, Some("1h"), false)
+    }
+
+    /// A scheduler loaded at `t0` with `schedules` (no `on_startup`).
+    fn loaded(schedules: Vec<ScheduleConfig>) -> Scheduler {
+        let mut s = Scheduler::default();
+        assert!(s.load(schedules, t0(), false).is_empty());
+        s
+    }
+
+    #[test]
+    fn scheduled_cycle_reschedules_from_its_end() {
+        let mut s = loaded(vec![hourly()]);
+        assert_eq!(s.next_run(0), Some(t0() + mins(60)));
+
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        assert_eq!(order.selection, RepoSelection::Indices(vec![0]));
+        assert_eq!(order.trigger, CycleTrigger::Scheduled);
+
+        let done = s.finished(order.id, t0() + mins(80));
+        assert_eq!(done.indices, vec![0]);
+        assert!(done.errors.is_empty());
+        assert_eq!(s.next_run(0), Some(t0() + mins(140)));
+        assert!(!s.is_running());
+    }
+
+    #[test]
+    fn nothing_is_handed_out_while_work_runs() {
+        let mut s = loaded(vec![hourly()]);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        assert!(s.is_running());
+        assert_eq!(s.poll(t0() + mins(61)), Poll::default());
+        assert_eq!(s.poll(t0() + mins(600)), Poll::default());
+        s.finished(order.id, t0() + mins(70));
+        assert!(s.poll(t0() + mins(71)).run.is_none());
+    }
+
+    #[test]
+    fn only_due_repos_run_in_index_order() {
+        let mut s = loaded(vec![
+            sched(true, Some("30m"), false),
+            hourly(),
+            sched(true, Some("20m"), false),
+        ]);
+        let order = s.poll(t0() + mins(30)).run.unwrap();
+        assert_eq!(order.selection, RepoSelection::Indices(vec![0, 2]));
+        s.finished(order.id, t0() + mins(35));
+        assert_eq!(s.next_run(1), Some(t0() + mins(60)));
+    }
+
+    #[test]
+    fn every_repo_of_an_order_is_rescheduled_whatever_happened() {
+        let mut s = loaded(vec![hourly(), hourly()]);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        assert_eq!(order.selection, RepoSelection::Indices(vec![0, 1]));
+        let done = s.finished(order.id, t0() + mins(65));
+        assert_eq!(done.indices, vec![0, 1]);
+        assert_eq!(s.next_run(0), Some(t0() + mins(125)));
+        assert_eq!(s.next_run(1), Some(t0() + mins(125)));
+    }
+
+    #[test]
+    fn on_startup_only_on_first_load() {
+        let mut s = Scheduler::default();
+        let schedules = vec![sched(true, Some("1h"), true), hourly()];
+        assert!(s.load(schedules.clone(), t0(), true).is_empty());
+        assert_eq!(s.due(t0()), vec![0]);
+
+        let reload_at = t0() + mins(5);
+        assert!(s.load(schedules, reload_at, false).is_empty());
+        assert!(s.due(reload_at).is_empty());
+        assert_eq!(s.next_run(0), Some(reload_at + mins(60)));
+    }
+
+    #[test]
+    fn trigger_preserves_future_slots() {
+        let mut s = loaded(vec![hourly()]);
+        s.trigger();
+        let order = s.poll(t0() + mins(10)).run.unwrap();
+        assert_eq!(order.selection, RepoSelection::All);
+        assert_eq!(order.trigger, CycleTrigger::Adhoc);
+        let done = s.finished(order.id, t0() + mins(20));
+        assert!(done.indices.is_empty());
+        assert_eq!(s.next_run(0), Some(t0() + mins(60)));
+    }
+
+    #[test]
+    fn trigger_overrunning_a_slot_moves_it_from_the_end() {
+        let mut s = loaded(vec![hourly()]);
+        s.trigger();
+        let order = s.poll(t0() + mins(50)).run.unwrap();
+        let done = s.finished(order.id, t0() + mins(70));
+        assert_eq!(done.indices, vec![0]);
+        assert_eq!(s.next_run(0), Some(t0() + mins(130)));
+    }
+
+    #[test]
+    fn trigger_waits_for_running_work_and_coalesces() {
+        let mut s = loaded(vec![hourly()]);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        s.trigger();
+        s.trigger();
+        assert_eq!(s.poll(t0() + mins(61)), Poll::default());
+        s.finished(order.id, t0() + mins(62));
+
+        let adhoc = s.poll(t0() + mins(63)).run.unwrap();
+        assert_eq!(adhoc.trigger, CycleTrigger::Adhoc);
+        s.finished(adhoc.id, t0() + mins(64));
+        assert!(s.poll(t0() + mins(65)).run.is_none());
+    }
+
+    #[test]
+    fn trigger_beats_due_slots_and_absorbs_them() {
+        let mut s = loaded(vec![hourly(), sched(true, Some("2h"), false)]);
+        s.trigger();
+        let at = t0() + mins(60);
+        let order = s.poll(at).run.unwrap();
+        assert_eq!(order.trigger, CycleTrigger::Adhoc);
+        let done = s.finished(order.id, at + mins(5));
+        assert_eq!(done.indices, vec![0]);
+
+        let after = s.poll(at + mins(6));
+        assert!(after.run.is_none());
+        assert!(after.wake_at.unwrap() > at + mins(6));
+    }
+
+    #[test]
+    fn paused_hands_out_nothing_but_triggers() {
+        let mut s = loaded(vec![hourly()]);
+        s.set_paused(true);
+        assert!(s.is_paused());
+        let at = t0() + mins(60);
+        assert_eq!(s.poll(at), Poll::default());
+
+        s.trigger();
+        let adhoc = s.poll(t0() + mins(10)).run.unwrap();
+        assert_eq!(adhoc.trigger, CycleTrigger::Adhoc);
+        s.finished(adhoc.id, t0() + mins(20));
+        assert_eq!(s.poll(at), Poll::default());
+
+        s.set_paused(false);
+        let order = s.poll(at).run.unwrap();
+        assert_eq!(order.trigger, CycleTrigger::Scheduled);
+    }
+
+    #[test]
+    fn started_other_blocks_and_reschedules_nothing() {
+        let mut s = loaded(vec![hourly()]);
+        let id = s.started(Work::Other);
+        let at = t0() + mins(60);
+        assert_eq!(s.poll(at), Poll::default());
+        let done = s.finished(id, at + mins(10));
+        assert!(done.indices.is_empty());
+        assert_eq!(s.next_run(0), Some(at));
+        assert!(s.poll(at + mins(10)).run.is_some());
+    }
+
+    #[test]
+    fn started_cycle_reschedules_only_overdue_covered_repos() {
+        let mut s = loaded(vec![hourly(), hourly()]);
+        let id = s.started(Work::Cycle(RepoSelection::Indices(vec![0])));
+        let end = t0() + mins(70);
+        let done = s.finished(id, end);
+        assert_eq!(done.indices, vec![0]);
+        assert_eq!(s.next_run(0), Some(end + mins(60)));
+        assert_eq!(s.next_run(1), Some(t0() + mins(60)));
+    }
+
+    #[test]
+    fn reload_during_work_leaves_new_slots_alone() {
+        let mut s = loaded(vec![hourly()]);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        let reload_at = t0() + mins(65);
+        assert!(
+            s.load(vec![hourly(), hourly()], reload_at, false)
+                .is_empty()
+        );
+        // The old work still holds scheduled cycles off.
+        assert_eq!(s.poll(reload_at + mins(120)), Poll::default());
+        let done = s.finished(order.id, t0() + mins(90));
+        assert!(done.indices.is_empty());
+        assert_eq!(s.next_run(0), Some(reload_at + mins(60)));
+        assert_eq!(s.next_run(1), Some(reload_at + mins(60)));
+    }
+
+    #[test]
+    fn finished_with_unknown_id_is_a_no_op() {
+        let mut s = loaded(vec![hourly()]);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        let done = s.finished(CycleId(order.id.0 + 100), t0() + mins(61));
+        assert!(done.indices.is_empty());
+        assert!(s.is_running());
+        s.finished(order.id, t0() + mins(62));
+        assert!(!s.is_running());
+        // A second finish of the same id is unknown too.
+        assert!(s.finished(order.id, t0() + mins(63)).indices.is_empty());
+    }
+
+    #[test]
+    fn wake_at_is_the_earliest_slot_and_none_when_nothing_is_scheduled() {
+        let mut s = loaded(vec![sched(true, Some("2h"), false), hourly()]);
+        assert_eq!(s.poll(t0()).wake_at, Some(t0() + mins(60)));
+
+        let mut off = loaded(vec![sched(false, None, false), sched(false, None, false)]);
+        assert_eq!(off.len(), 2);
+        assert_eq!(off.poll(t0()), Poll::default());
+        assert!(Scheduler::default().is_empty());
+    }
+
+    #[test]
+    fn broken_cadence_loses_only_its_slot() {
+        let mut s = Scheduler::default();
+        let errors = s.load(vec![broken(), hourly()], t0(), false);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, 0);
+        let order = s.poll(t0() + mins(60)).run.unwrap();
+        assert_eq!(order.selection, RepoSelection::Indices(vec![1]));
+    }
+
+    #[test]
+    fn a_jittered_slot_is_bounded_from_the_end() {
+        let mut jittered = hourly();
+        jittered.jitter_seconds = 30;
+        let mut s = loaded(vec![jittered]);
+        let order = s.poll(t0() + mins(61)).run.unwrap();
+        let end = t0() + mins(70);
+        s.finished(order.id, end);
+        let next = s.next_run(0).unwrap();
+        assert!(next >= end + mins(60));
+        assert!(next <= end + mins(60) + Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_run_delay_at_uses_the_given_time_for_cron() {
+        let schedule = ScheduleConfig {
+            enabled: true,
+            every: None,
+            cron: Some("*/5 * * * *".into()),
+            on_startup: false,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        };
+        let now = t0() + Duration::from_millis(12_345);
+        let delay = next_run_delay_at(&schedule, now).unwrap();
+        assert!(delay <= Duration::from_secs(300));
+
+        let cron = crate::config::parse_cron("*/5 * * * *").unwrap();
+        let expected = cron_delay_at(&cron, &chrono::DateTime::<chrono::Local>::from(now)).unwrap();
+        assert_eq!(delay, expected);
     }
 
     #[test]
@@ -570,7 +1055,6 @@ mod tests {
         assert!(delay.as_secs() > 0);
     }
 
-    #[cfg(unix)]
     #[test]
     fn scheduler_lock_contention() {
         let dir = tempfile::tempdir().unwrap();
@@ -580,7 +1064,7 @@ mod tests {
         let lock1 = SchedulerLock::try_acquire_at(Some(&lock_path));
         assert!(lock1.is_some(), "first lock acquisition should succeed");
 
-        // Second acquire fails (same lock file, different open-file-description)
+        // Second acquire fails (same lock file, a second handle)
         let lock2 = SchedulerLock::try_acquire_at(Some(&lock_path));
         assert!(lock2.is_none(), "second lock acquisition should fail");
 

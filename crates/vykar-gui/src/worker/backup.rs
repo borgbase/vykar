@@ -1,4 +1,5 @@
 use vykar_core::app::SkipKind;
+use vykar_core::app::scheduler::CycleId;
 use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::app::{OpsError, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
@@ -10,15 +11,22 @@ use crate::progress::{BackupStatusTracker, format_check_status, format_step_outc
 use crate::repo_helpers::{DialogPrompt, log_backup_report, send_log};
 
 use super::WorkerContext;
-use super::shared::{OpGuard, run_selection_with_progress};
+use super::shared::{BackupWork, OpGuard, run_selection_with_progress};
 
+/// Full cycle over every repository (tray "Back up all"). The scheduler treats
+/// it like an ad-hoc trigger: only the slots it overran move.
 pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
-    run_backup_cycle(ctx, scheduled, None);
+    run_backup_cycle(ctx, scheduled, BackupWork::Cycle, None);
 }
 
-/// Scheduled cycle for the repositories whose per-repo slot came due.
-pub(super) fn handle_backup_repos(ctx: &mut WorkerContext, repo_names: Vec<String>) {
-    run_backup_cycle(ctx, true, Some(&repo_names));
+/// Scheduled cycle for the repositories whose per-repo slot came due; ends the
+/// scheduler's `order` when it finishes.
+pub(super) fn handle_backup_repos(
+    ctx: &mut WorkerContext,
+    repo_names: Vec<String>,
+    order: CycleId,
+) {
+    run_backup_cycle(ctx, true, BackupWork::Order(order), Some(&repo_names));
 }
 
 /// Indices of the repositories a cycle should cover: all of them, or just the
@@ -44,6 +52,7 @@ fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) 
 fn run_backup_cycle(
     ctx: &mut WorkerContext,
     scheduled: bool,
+    work: BackupWork,
     only: Option<&[String]>,
 ) -> Option<CycleReport> {
     let status = if scheduled {
@@ -55,8 +64,9 @@ fn run_backup_cycle(
         &ctx.ui_tx,
         &ctx.cancel_requested,
         &ctx.operation_running,
-        &ctx.backup_running,
+        &ctx.scheduler,
         &ctx.sched_notify_tx,
+        work,
         status,
     );
 
@@ -222,8 +232,9 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
         &ctx.ui_tx,
         &ctx.cancel_requested,
         &ctx.operation_running,
-        &ctx.backup_running,
+        &ctx.scheduler,
         &ctx.sched_notify_tx,
+        BackupWork::Other,
         format!("Running backup for [{rn}]..."),
     );
 
@@ -274,8 +285,9 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         &ctx.ui_tx,
         &ctx.cancel_requested,
         &ctx.operation_running,
-        &ctx.backup_running,
+        &ctx.scheduler,
         &ctx.sched_notify_tx,
+        BackupWork::Other,
         format!("Running backup for source '{source_label}'..."),
     );
 
@@ -684,7 +696,7 @@ mod tests {
         let mut h = test_support::harness(conformance::config_yaml);
         conformance::init_present(&h.ctx.runtime.repos);
 
-        let report = run_backup_cycle(&mut h.ctx, true, None).unwrap();
+        let report = run_backup_cycle(&mut h.ctx, true, BackupWork::Cycle, None).unwrap();
         let (logs, errors) = drain(&h.ui_rx);
 
         assert!(errors.is_empty(), "{errors:?} {logs:?}");

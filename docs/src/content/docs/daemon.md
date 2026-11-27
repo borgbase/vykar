@@ -6,7 +6,7 @@ title: "Schedule Backups"
 
 - **Scheduling**: a fixed interval (`schedule.every`) or a cron expression (`schedule.cron`), with optional random jitter. See [Configuration → Schedule](/configuration#schedule) for all fields.
 - **Passphrase**: the daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env). It cannot prompt interactively.
-- **Scheduler lock**: the daemon and GUI share a process-wide scheduler lock under the local config directory so only one scheduler is active at a time. On Unix this uses `flock(2)` and is released automatically on process exit. On Windows the lock is not implemented yet, so do not run the daemon and the GUI side by side there.
+- **Scheduler lock**: the daemon and GUI share a process-wide scheduler lock under the local config directory so only one scheduler is active at a time. On Unix this uses `flock(2)`, on Windows `LockFileEx`; the OS releases it when the process exits.
 
 A minimal schedule:
 
@@ -46,6 +46,7 @@ How the daemon runs this:
 - The loop sleeps until the **earliest** upcoming per-repo run, then runs a cycle
   for only the repositories whose slot has arrived. Each is rescheduled to
   `now + interval` after it runs (drift, not fixed slots).
+- The GUI schedules by the same rules.
 - The daemon starts as long as **at least one** repository has an enabled
   schedule; otherwise it exits with `schedule.enabled is false for all
   repositories`.

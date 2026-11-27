@@ -1,8 +1,11 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use crossbeam_channel::Sender;
 use vykar_core::app::SkipKind;
-use vykar_core::app::service::HookedCommand;
+use vykar_core::app::scheduler::{CycleId, Work};
+use vykar_core::app::service::{HookedCommand, RepoSelection};
 use vykar_core::app::{AppService, OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
@@ -14,12 +17,33 @@ use crate::cancel::CancelSlot;
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
 use crate::repo_helpers::{DialogPrompt, send_log};
+use crate::scheduler::{SchedulerState, send_cadence_errors};
 
 use super::WorkerContext;
 
+/// How a backup operation counts in the scheduler.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum BackupWork {
+    /// An order the scheduler handed out; the guard ends it.
+    Order(CycleId),
+    /// A manual full cycle over every repository ("Back up all"): when it ends,
+    /// only the slots it overran move.
+    Cycle,
+    /// A single-repo or single-source backup: holds scheduled cycles off,
+    /// reschedules nothing.
+    Other,
+}
+
+/// The scheduler work a backup guard ends on drop.
+struct ScheduleHold<'a> {
+    state: &'a Mutex<SchedulerState>,
+    notify: &'a Sender<()>,
+    id: CycleId,
+}
+
 /// RAII guard for a worker operation. Construction emits `OperationStarted` +
 /// an initial `Status`; `Drop` emits `OperationFinished` + `Status("Idle")` and,
-/// for backup operations, clears `backup_running` and pokes the scheduler.
+/// for backup operations, ends the work in the scheduler and pokes it.
 ///
 /// The guard borrows only the individual channel/flag fields it needs (not the
 /// whole [`WorkerContext`]), so handlers can still mutably borrow disjoint ctx
@@ -29,10 +53,9 @@ pub(super) struct OpGuard<'a> {
     /// Cleared on drop; set for every operation so the tray (and window) can
     /// tell whether *any* operation is in flight, not just backups.
     operation_running: &'a AtomicBool,
-    /// `Some` for backup operations, cleared on drop; `None` for UI operations.
-    backup_running: Option<&'a AtomicBool>,
-    /// `Some` for backup operations, poked on drop so the scheduler recomputes.
-    sched_notify_tx: Option<&'a Sender<()>>,
+    /// `Some` for backup operations: the scheduler work this guard ends on drop.
+    /// `None` for UI operations.
+    schedule: Option<ScheduleHold<'a>>,
     /// Failure message recorded via [`OpGuard::fail`]. When set, `Drop` emits a
     /// persistent `ErrorStatus` instead of `Status("Idle")`.
     failed: Option<String>,
@@ -53,32 +76,43 @@ impl<'a> OpGuard<'a> {
         Self {
             ui_tx,
             operation_running,
-            backup_running: None,
-            sched_notify_tx: None,
+            schedule: None,
             failed: None,
         }
     }
 
-    /// Begin a backup operation (also sets `backup_running` and, on drop, pokes
-    /// the scheduler).
+    /// Begin a backup operation. It holds scheduled cycles off until the guard
+    /// drops; the drop ends the work in the scheduler (rescheduling what
+    /// `work` covers) and then pokes the scheduler thread.
     pub(super) fn backup(
         ui_tx: &'a Sender<UiEvent>,
         cancel_requested: &CancelSlot,
         operation_running: &'a AtomicBool,
-        backup_running: &'a AtomicBool,
+        scheduler: &'a Mutex<SchedulerState>,
         sched_notify_tx: &'a Sender<()>,
+        work: BackupWork,
         status_msg: impl Into<String>,
     ) -> Self {
         cancel_requested.renew();
         operation_running.store(true, Ordering::SeqCst);
-        backup_running.store(true, Ordering::SeqCst);
+        let id = match work {
+            BackupWork::Order(id) => Some(id),
+            BackupWork::Cycle => scheduler
+                .lock()
+                .ok()
+                .map(|mut s| s.started(Work::Cycle(RepoSelection::All))),
+            BackupWork::Other => scheduler.lock().ok().map(|mut s| s.started(Work::Other)),
+        };
         let _ = ui_tx.send(UiEvent::OperationStarted);
         let _ = ui_tx.send(UiEvent::Status(status_msg.into()));
         Self {
             ui_tx,
             operation_running,
-            backup_running: Some(backup_running),
-            sched_notify_tx: Some(sched_notify_tx),
+            schedule: id.map(|id| ScheduleHold {
+                state: scheduler,
+                notify: sched_notify_tx,
+                id,
+            }),
             failed: None,
         }
     }
@@ -98,8 +132,14 @@ impl<'a> OpGuard<'a> {
 
 impl Drop for OpGuard<'_> {
     fn drop(&mut self) {
-        if let Some(running) = self.backup_running {
-            running.store(false, Ordering::SeqCst);
+        // End the work before the final notify: a scheduler thread blocked
+        // because this work ran is woken only after it can see the work ended.
+        if let Some(hold) = &self.schedule
+            && let Ok(mut state) = hold.state.lock()
+        {
+            let errors = state.finished(hold.id, SystemTime::now());
+            drop(state);
+            send_cadence_errors(self.ui_tx, errors);
         }
         self.operation_running.store(false, Ordering::SeqCst);
         let _ = self.ui_tx.send(UiEvent::OperationFinished);
@@ -111,8 +151,8 @@ impl Drop for OpGuard<'_> {
                 let _ = self.ui_tx.send(UiEvent::Status("Idle".to_string()));
             }
         }
-        if let Some(tx) = self.sched_notify_tx {
-            let _ = tx.try_send(());
+        if let Some(hold) = &self.schedule {
+            let _ = hold.notify.try_send(());
         }
     }
 }
@@ -421,31 +461,87 @@ mod tests {
         assert!(matches!(events.last(), Some(UiEvent::ErrorStatus(_))));
     }
 
+    /// A state whose `1h` slot for "repo-a" lies an hour in the past.
+    fn overdue_state() -> Mutex<SchedulerState> {
+        let mut state = SchedulerState::default();
+        let schedule = config::ScheduleConfig {
+            enabled: true,
+            every: Some("1h".into()),
+            cron: None,
+            on_startup: false,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        };
+        let past = SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        assert!(
+            state
+                .set_repos(vec![("repo-a".into(), schedule)], past, false)
+                .is_empty()
+        );
+        Mutex::new(state)
+    }
+
     #[test]
-    fn backup_guard_toggles_running_and_notifies_scheduler() {
+    fn backup_guard_holds_and_releases_the_scheduler() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (sched_tx, sched_rx) = crossbeam_channel::bounded(1);
         let cancel = CancelSlot::default();
         let op_running = AtomicBool::new(false);
-        let running = AtomicBool::new(false);
+        let state = overdue_state();
         {
             let _g = OpGuard::backup(
                 &tx,
                 &cancel,
                 &op_running,
-                &running,
+                &state,
                 &sched_tx,
+                BackupWork::Other,
                 "Backing up...",
             );
-            assert!(running.load(Ordering::SeqCst));
             assert!(op_running.load(Ordering::SeqCst));
+            let (order, _) = state.lock().unwrap().poll(SystemTime::now());
+            assert!(
+                order.is_none(),
+                "nothing is handed out while the guard lives"
+            );
         }
-        assert!(!running.load(Ordering::SeqCst));
         assert!(!op_running.load(Ordering::SeqCst));
         // Scheduler was poked exactly once.
         assert!(sched_rx.try_recv().is_ok());
+        assert!(sched_rx.try_recv().is_err());
         let events = drain(&rx);
         assert!(matches!(events.first(), Some(UiEvent::OperationStarted)));
         assert!(matches!(events.last(), Some(UiEvent::Status(s)) if s == "Idle"));
+
+        // `Other` rescheduled nothing: the overdue slot is handed out now.
+        let (order, _) = state.lock().unwrap().poll(SystemTime::now());
+        let (_, names) = order.expect("the overdue slot fires after the guard drops");
+        assert_eq!(names, ["repo-a"]);
+    }
+
+    #[test]
+    fn backup_guard_for_an_order_reschedules_its_repos() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (sched_tx, sched_rx) = crossbeam_channel::bounded(1);
+        let cancel = CancelSlot::default();
+        let op_running = AtomicBool::new(false);
+        let state = overdue_state();
+        let (order, _) = state.lock().unwrap().poll(SystemTime::now());
+        let (id, _) = order.expect("the overdue slot is handed out");
+
+        drop(OpGuard::backup(
+            &tx,
+            &cancel,
+            &op_running,
+            &state,
+            &sched_tx,
+            BackupWork::Order(id),
+            "Running scheduled backup cycle...",
+        ));
+        assert!(sched_rx.try_recv().is_ok());
+
+        let mut s = state.lock().unwrap();
+        assert!(s.next_run(0).unwrap() > SystemTime::now());
+        assert!(s.poll(SystemTime::now()).0.is_none());
     }
 }

@@ -175,7 +175,8 @@ const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 ///
 /// Mount deliberately does **not** use this: it interleaves
 /// `UiEvent::MountFailed` / `MountStopped` lifecycle events with every failure
-/// arm and hands the validated passphrase to a spawned thread.
+/// arm and hands the opened repository (or, for one snapshot, the validated
+/// passphrase) to a spawned thread.
 pub(super) fn with_open_repo_op<T>(
     ctx: &mut WorkerContext,
     repo_name: &str,

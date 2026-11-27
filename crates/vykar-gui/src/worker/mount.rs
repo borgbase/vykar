@@ -1,23 +1,25 @@
-use std::sync::Arc;
-
-use vykar_core::commands::mount::{self, MountProgressEvent};
+use vykar_core::app::OpsError;
+use vykar_core::app::passphrase::PASSPHRASE_PROMPT_CANCELED;
+use vykar_core::commands::mount::{self, MountProgressEvent, MountRequest};
+use vykar_core::config::VykarConfig;
+use vykar_core::repo::Repo;
+use vykar_core::repo::control::CancelToken;
+use zeroize::Zeroizing;
 
 use crate::messages::UiEvent;
-use crate::repo_helpers::{
-    PassphraseRun, find_repo_for_snapshot, run_with_passphrase_value, send_log,
-};
+use crate::repo_helpers::{DialogPrompt, PassphraseRun, find_repo_for_snapshot, send_log};
 
 use super::WorkerContext;
 use super::shared::OpGuard;
 
 pub(crate) struct MountHandle {
-    shutdown: Arc<tokio::sync::Notify>,
+    cancel: CancelToken,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MountHandle {
     pub(super) fn stop(mut self) {
-        self.shutdown.notify_one();
+        self.cancel.cancel();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -46,11 +48,19 @@ pub(super) fn handle_start_mount(
         "Starting mount...",
     );
 
-    // Resolve repo config and passphrase.
-    let (repo_cfg, pass) = match &snapshot_name {
+    // The mount thread stops when this token is cancelled; the storage
+    // observes it too.
+    let mount_cancel = CancelToken::new();
+
+    // Resolve the repository: opened here, or its config and passphrase.
+    let source = match &snapshot_name {
         Some(snap) => {
             match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, snap, &mut ctx.service) {
-                Ok(PassphraseRun::Ran((repo, pass))) => (repo.config.clone(), pass),
+                // The probe opened once; the mount thread opens again.
+                Ok(PassphraseRun::Ran((repo, pass))) => MountSource::Config {
+                    config: Box::new(repo.config.clone()),
+                    passphrase: pass,
+                },
                 Ok(PassphraseRun::Canceled) => {
                     send_log(
                         &ctx.ui_tx,
@@ -82,15 +92,16 @@ pub(super) fn handle_start_mount(
                     return;
                 }
             };
-            // Validate the passphrase before spawning the mount thread so a wrong
-            // entry re-prompts (and is never cached) instead of failing async.
-            let outcome = run_with_passphrase_value(&mut ctx.service, repo, |pass| {
-                vykar_core::commands::info::run(&repo.config, pass)
-            });
+            // Open before spawning the mount thread so a wrong entry
+            // re-prompts (and is never cached) instead of failing async. The
+            // opened repository goes to the mount thread.
+            let outcome = ctx
+                .service
+                .passphrase(&repo.config, repo.label.as_deref(), &mut DialogPrompt)
+                .open::<OpsError>(mount::open_options(), &mount_cancel);
             match outcome {
-                // The validated value goes to the mount thread.
-                Ok(PassphraseRun::Ran((_, pass))) => (repo.config.clone(), pass),
-                Ok(PassphraseRun::Canceled) => {
+                Ok(opened) => MountSource::Opened(Box::new(opened)),
+                Err(OpsError::Skipped(r)) if r == PASSPHRASE_PROMPT_CANCELED => {
                     send_log(
                         &ctx.ui_tx,
                         format!("[{repo_name}] passphrase prompt canceled; mount skipped."),
@@ -110,8 +121,7 @@ pub(super) fn handle_start_mount(
         }
     };
 
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let shutdown_thread = shutdown.clone();
+    let thread_cancel = mount_cancel.clone();
     let ui_tx = ctx.ui_tx.clone();
     let snap_opt = snapshot_name.clone();
 
@@ -119,7 +129,7 @@ pub(super) fn handle_start_mount(
         .name("vykar-gui-mount".into())
         .spawn(move || {
             let ui_tx_cb = ui_tx.clone();
-            let mut on_event = |e: MountProgressEvent| match e {
+            let on_event = |e: MountProgressEvent| match e {
                 MountProgressEvent::Serving { address } => {
                     let _ = ui_tx_cb.send(UiEvent::MountStarted {
                         url: format!("http://{address}"),
@@ -132,19 +142,33 @@ pub(super) fn handle_start_mount(
                 MountProgressEvent::ShuttingDown => {}
                 MountProgressEvent::SnapshotLoaded { .. } => {}
             };
-            let pass_ref: Option<&str> = pass.as_deref().map(|s| s.as_str());
-            let result = mount::run_with_progress(
-                &repo_cfg,
-                pass_ref,
-                snap_opt.as_deref(),
-                "127.0.0.1:0",
-                256,
-                &[],
-                Some(&mut on_event),
-                Some(shutdown_thread),
-            );
+            let req = MountRequest {
+                snapshot: snap_opt.as_deref(),
+                address: "127.0.0.1:0",
+                cache_size: 256,
+                source_filter: &[],
+            };
+            let result = match source {
+                MountSource::Opened(repo) => {
+                    mount::run_on_repo(*repo, &req, Some(&on_event), &thread_cancel)
+                }
+                MountSource::Config { config, passphrase } => mount::run(
+                    &config,
+                    passphrase.as_deref().map(|s| s.as_str()),
+                    &req,
+                    Some(&on_event),
+                    &thread_cancel,
+                ),
+            };
             match result {
                 Ok(()) => {
+                    let _ = ui_tx.send(UiEvent::MountStopped);
+                }
+                // Stopped while the thread was still opening or loading: the
+                // reads observe the mount's token. A stop, not a failure.
+                Err(vykar_types::error::VykarError::Interrupted)
+                    if thread_cancel.is_cancelled() =>
+                {
                     let _ = ui_tx.send(UiEvent::MountStopped);
                 }
                 Err(e) => {
@@ -157,9 +181,20 @@ pub(super) fn handle_start_mount(
         .expect("failed to spawn mount thread");
 
     ctx.mount = Some(MountHandle {
-        shutdown,
+        cancel: mount_cancel,
         join: Some(join),
     });
+}
+
+/// What the mount thread serves from.
+enum MountSource {
+    /// Opened on the worker with [`mount::open_options`].
+    Opened(Box<Repo>),
+    /// Opened by the mount thread.
+    Config {
+        config: Box<VykarConfig>,
+        passphrase: Option<Zeroizing<String>>,
+    },
 }
 
 pub(super) fn handle_stop_mount(ctx: &mut WorkerContext) {

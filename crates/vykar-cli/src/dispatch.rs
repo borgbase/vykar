@@ -148,11 +148,11 @@ pub(crate) fn dispatch_command(
             cache_size,
             ..
         } => cmd::mount::run_mount(
-            cfg,
-            snapshot.clone(),
-            address.clone(),
+            snapshot.as_deref(),
+            address,
             *cache_size,
             source,
+            cancel,
             passphrase,
         )
         .map(|()| false),

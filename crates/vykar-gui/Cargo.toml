@@ -19,7 +19,6 @@ workspace = true
 vykar-core = { workspace = true, features = ["backend-sftp", "mount"] }
 vykar-common.workspace = true
 vykar-types.workspace = true
-tokio = { workspace = true, features = ["sync"] }
 opener = "0.9"
 slint = { version = "~1.19", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility", "system-tray"] }
 crossbeam-channel.workspace = true

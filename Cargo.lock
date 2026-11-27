@@ -7777,7 +7777,6 @@ dependencies = [
  "slint-build",
  "tempfile",
  "tinyfiledialogs",
- "tokio",
  "ureq",
  "vykar-common",
  "vykar-core",

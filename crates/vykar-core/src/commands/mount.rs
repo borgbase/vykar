@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use crate::commands::list as list_cmd;
 use crate::commands::listing::ListingView;
 use crate::config::VykarConfig;
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::{Repo, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
@@ -1318,60 +1318,58 @@ pub enum MountProgressEvent {
     ShuttingDown,
 }
 
-/// Start a read-only WebDAV server exposing snapshot contents.
-///
-/// If `snapshot_name` is given, serves that single snapshot at the root.
-/// Otherwise, serves all snapshots as top-level directories.
+/// One mount.
+#[derive(Debug, Clone, Copy)]
+pub struct MountRequest<'a> {
+    /// Serve this snapshot at the root; `None`: every snapshot as a directory.
+    pub snapshot: Option<&'a str>,
+    pub address: &'a str,
+    pub cache_size: usize,
+    /// With `snapshot: None`: only snapshots of these source labels; empty: all.
+    pub source_filter: &'a [String],
+}
+
+/// How a mount opens the repository.
+pub fn open_options() -> crate::repo::OpenOptions {
+    crate::repo::OpenOptions::new().with_index()
+}
+
+/// Open the repository and serve a read-only WebDAV view of its snapshots
+/// until `cancel` is cancelled. The storage observes `cancel` too.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    snapshot_name: Option<&str>,
-    address: &str,
-    cache_size: usize,
-    source_filter: &[String],
+    req: &MountRequest<'_>,
+    events: Option<&dyn EventSink<MountProgressEvent>>,
+    cancel: &CancelToken,
 ) -> Result<()> {
-    run_with_progress(
-        config,
-        passphrase,
-        snapshot_name,
-        address,
-        cache_size,
-        source_filter,
-        None,
-        None,
-    )
+    let repo = open_repo(config, passphrase, open_options(), cancel)?;
+    run_on_repo(repo, req, events, cancel)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_with_progress(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: Option<&str>,
-    address: &str,
-    cache_size: usize,
-    source_filter: &[String],
-    mut progress: Option<&mut dyn FnMut(MountProgressEvent)>,
-    shutdown: Option<Arc<tokio::sync::Notify>>,
+/// Serve `repo` (opened with [`open_options`]) until `cancel` is cancelled.
+///
+/// With `req.snapshot`, that snapshot is served at the root; otherwise every
+/// snapshot (filtered by `req.source_filter`) is a top-level directory. A
+/// token cancelled before the call still binds and emits `Serving`, then
+/// `ShuttingDown`, and returns `Ok(())`.
+pub fn run_on_repo(
+    repo: Repo,
+    req: &MountRequest<'_>,
+    events: Option<&dyn EventSink<MountProgressEvent>>,
+    cancel: &CancelToken,
 ) -> Result<()> {
-    // Mount cancels through `shutdown` (a Notify), not a token.
-    let repo = open_repo(
-        config,
-        passphrase,
-        crate::repo::OpenOptions::new().with_index(),
-        &CancelToken::new(),
-    )?;
-
-    if let Some(ref mut cb) = progress {
-        cb(MountProgressEvent::LoadingSnapshots);
+    if let Some(sink) = events {
+        sink.emit(MountProgressEvent::LoadingSnapshots);
     }
     let repo = Arc::new(repo);
-    let root = if let Some(name) = snapshot_name {
+    let root = if let Some(name) = req.snapshot {
         // One snapshot: its root directory (or its whole tree, without a
         // usable key index) is read before serving, so a bad snapshot fails
         // the mount.
         let (root, item_count) = open_snapshot(&repo, name)?;
-        if let (Some(item_count), Some(cb)) = (item_count, progress.as_mut()) {
-            cb(MountProgressEvent::SnapshotLoaded {
+        if let (Some(item_count), Some(sink)) = (item_count, events) {
+            sink.emit(MountProgressEvent::SnapshotLoaded {
                 name: name.to_string(),
                 item_count,
             });
@@ -1382,13 +1380,13 @@ pub fn run_with_progress(
             .manifest()
             .snapshots
             .iter()
-            .filter(|e| source_filter.is_empty() || source_filter.contains(&e.source_label))
+            .filter(|e| req.source_filter.is_empty() || req.source_filter.contains(&e.source_label))
             .cloned()
             .collect();
         multi_snapshot_root(&repo, &entries)
     };
 
-    let cache_size = NonZeroUsize::new(cache_size)
+    let cache_size = NonZeroUsize::new(req.cache_size)
         .unwrap_or_else(|| NonZeroUsize::new(256).expect("literal non-zero cache size"));
     let cache = Arc::new(Mutex::new(LruCache::new(cache_size)));
 
@@ -1405,18 +1403,15 @@ pub fn run_with_progress(
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| VykarError::Other(format!("failed to create tokio runtime: {e}")))?;
 
-    let is_multi_snapshot = snapshot_name.is_none();
-    rt.block_on(async {
-        serve(
-            handler,
-            root,
-            address,
-            is_multi_snapshot,
-            &mut progress,
-            shutdown,
-        )
-        .await
-    })
+    let is_multi_snapshot = req.snapshot.is_none();
+    rt.block_on(serve(
+        handler,
+        root,
+        req.address,
+        is_multi_snapshot,
+        events,
+        cancel,
+    ))
 }
 
 /// The root of a multi-snapshot mount: one directory per snapshot of
@@ -1449,8 +1444,8 @@ async fn serve(
     root: VfsNode,
     address: &str,
     is_multi_snapshot: bool,
-    progress: &mut Option<&mut dyn FnMut(MountProgressEvent)>,
-    shutdown: Option<Arc<tokio::sync::Notify>>,
+    events: Option<&dyn EventSink<MountProgressEvent>>,
+    cancel: &CancelToken,
 ) -> Result<()> {
     let addr: std::net::SocketAddr = address
         .parse()
@@ -1463,12 +1458,16 @@ async fn serve(
         .local_addr()
         .map_err(|e| VykarError::Other(format!("local_addr failed: {e}")))?;
 
-    if let Some(cb) = progress.as_deref_mut() {
-        cb(MountProgressEvent::Serving {
+    if let Some(sink) = events {
+        sink.emit(MountProgressEvent::Serving {
             address: format!("{bound}"),
         });
     }
 
+    // One future for the whole loop: a new one per iteration would register
+    // a new waiter (and, on a static token, may respawn its watcher thread).
+    let cancelled = cancel.cancelled();
+    tokio::pin!(cancelled);
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -1535,20 +1534,9 @@ async fn serve(
                     }
                 });
             }
-            _ = tokio::signal::ctrl_c() => {
-                if let Some(cb) = progress.as_deref_mut() {
-                    cb(MountProgressEvent::ShuttingDown);
-                }
-                break;
-            }
-            _ = async {
-                match shutdown.as_ref() {
-                    Some(n) => n.notified().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                if let Some(cb) = progress.as_deref_mut() {
-                    cb(MountProgressEvent::ShuttingDown);
+            () = &mut cancelled => {
+                if let Some(sink) = events {
+                    sink.emit(MountProgressEvent::ShuttingDown);
                 }
                 break;
             }
@@ -1820,6 +1808,75 @@ mod tests {
         backup(&config, &paths, "s1", &[]);
         backup(&config, &paths, "s2", &[]);
         (tmp, repo_dir)
+    }
+
+    /// Serve `two_snapshots` on a thread bound to a free port; events go
+    /// to the returned channel.
+    fn spawn_mount(
+        cancel: &CancelToken,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::mpsc::Receiver<MountProgressEvent>,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        let (tmp, repo_dir) = two_snapshots();
+        let repo = open_local_repo(&repo_dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = cancel.clone();
+        let join = std::thread::spawn(move || {
+            let sink = move |e: MountProgressEvent| {
+                let _ = tx.send(e);
+            };
+            let req = MountRequest {
+                snapshot: None,
+                address: "127.0.0.1:0",
+                cache_size: 16,
+                source_filter: &[],
+            };
+            run_on_repo(repo, &req, Some(&sink), &cancel)
+        });
+        (tmp, rx, join)
+    }
+
+    #[test]
+    fn serve_stops_on_cancel() {
+        let cancel = CancelToken::new();
+        let (_tmp, rx, join) = spawn_mount(&cancel);
+        loop {
+            let event = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the mount reports Serving");
+            if matches!(event, MountProgressEvent::Serving { .. }) {
+                break;
+            }
+        }
+        cancel.cancel();
+        join.join().unwrap().unwrap();
+        let rest: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(rest.as_slice(), [MountProgressEvent::ShuttingDown]),
+            "{rest:?}"
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_mount_returns_ok() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let (_tmp, rx, join) = spawn_mount(&cancel);
+        join.join().unwrap().unwrap();
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    MountProgressEvent::LoadingSnapshots,
+                    MountProgressEvent::Serving { .. },
+                    MountProgressEvent::ShuttingDown,
+                ]
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

@@ -2110,7 +2110,7 @@ fn backup_with(
     let mut pending = commands::backup::upload(
         &fx.config,
         &req,
-        &mut None,
+        None,
         &CancelToken::new(),
         wrap,
         crate::repo::HostEnv::system(),
@@ -2118,13 +2118,11 @@ fn backup_with(
     .map_err(|(_, e)| e)
     .unwrap();
     tweak(pending.repo_mut());
-    pending
-        .protect_commit(&mut None, &CancelToken::new())
-        .unwrap();
+    pending.protect_commit(None, &CancelToken::new()).unwrap();
     let mut commit = pending.begin_commit();
     let result = commit.drive(&no_events);
     commit
-        .finish(result, &mut None, &crate::repo::control::CancelToken::new())
+        .finish(result, None, &crate::repo::control::CancelToken::new())
         .unwrap();
 }
 
@@ -2154,7 +2152,7 @@ fn begin_commit_runs_under_the_backups_fence() {
         commands::backup::upload(
             &fx.config,
             &req,
-            &mut None,
+            None,
             &CancelToken::new(),
             None,
             crate::repo::HostEnv::system(),
@@ -2166,20 +2164,16 @@ fn begin_commit_runs_under_the_backups_fence() {
     let free = upload("free").begin_commit();
     assert!(free.fence().is_backup_commit());
     let err = free
-        .finish(Err(VykarError::Interrupted), &mut None, &CancelToken::new())
+        .finish(Err(VykarError::Interrupted), None, &CancelToken::new())
         .unwrap_err();
     assert!(matches!(err, VykarError::Interrupted));
 
     let mut pending = upload("protected");
-    pending
-        .protect_commit(&mut None, &CancelToken::new())
-        .unwrap();
+    pending.protect_commit(None, &CancelToken::new()).unwrap();
     let mut commit = pending.begin_commit();
     assert!(commit.fence().is_backup_commit());
     let result = commit.drive(&|_: crate::repo::control::CommitEvent| {});
-    commit
-        .finish(result, &mut None, &CancelToken::new())
-        .unwrap();
+    commit.finish(result, None, &CancelToken::new()).unwrap();
 }
 
 /// A backup whose commit folds (requested: the hard limit's stand-in)

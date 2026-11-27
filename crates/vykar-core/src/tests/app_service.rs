@@ -5,7 +5,7 @@ use crate::app::passphrase::NoPrompt;
 use crate::app::service::{AppEvent, AppService, CycleRequest, HookedCommand, RepoSelection};
 use crate::app::{OpsError, StepErrorKind};
 use crate::config::{HooksConfig, ResolvedRepo};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, FnMutSink};
 use crate::testing::{TEST_PASSPHRASE, conformance};
 use crate::testutil::{cmd_append, cmd_touch};
 use vykar_types::error::VykarError;
@@ -204,7 +204,7 @@ fn started(
         request,
         &mut NoPrompt,
         &CancelToken::new(),
-        &mut |e| {
+        &FnMutSink::new(|e: AppEvent<'_>| {
             if let AppEvent::RepoStarted {
                 index,
                 position,
@@ -214,7 +214,7 @@ fn started(
             {
                 seen.push((index, position, total));
             }
-        },
+        }),
     );
     (seen, report)
 }
@@ -289,7 +289,7 @@ fn run_cycle_cancelled_reports_not_reached() {
         &CycleRequest::default(),
         &mut NoPrompt,
         &cancel,
-        &mut |e| {
+        &|e: AppEvent<'_>| {
             if let AppEvent::RepoFinished { .. } = e {
                 cancel.cancel();
             }
@@ -308,7 +308,13 @@ fn run_cycle_reuses_an_accepted_value() {
     let mut service = AppService::new();
     let request = CycleRequest::default();
     let cycle = |service: &mut AppService, repos: &[ResolvedRepo], prompt: &mut ScriptedPrompt| {
-        let report = service.run_cycle(repos, &request, prompt, &CancelToken::new(), &mut |_| {});
+        let report = service.run_cycle(
+            repos,
+            &request,
+            prompt,
+            &CancelToken::new(),
+            &|_: AppEvent<'_>| {},
+        );
         assert!(
             !report.has_failures(),
             "{:?}",
@@ -334,7 +340,7 @@ fn run_cycle_reuses_an_accepted_value() {
         &request,
         &mut prompt,
         &CancelToken::new(),
-        &mut |_| {},
+        &|_: AppEvent<'_>| {},
     );
     assert!(report.has_failures(), "the failing passcommand now runs");
     assert!(!service.is_cached(&repos[0].config));
@@ -350,7 +356,7 @@ fn conformance_core_cycle() {
         &CycleRequest::default(),
         &mut NoPrompt,
         &CancelToken::new(),
-        &mut |_| {},
+        &|_: AppEvent<'_>| {},
     );
     assert_eq!(
         conformance::summary(&report, &repos),

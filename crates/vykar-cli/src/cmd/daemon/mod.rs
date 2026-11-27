@@ -18,6 +18,7 @@ use vykar_core::app::passphrase::{NoPrompt, configured_passphrase};
 use vykar_core::app::scheduler::{SchedulePlan, SchedulerLock};
 use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::config::{self, ConfigSource, ResolvedRepo, ScheduleConfig};
+use vykar_core::repo::control::FnMutSink;
 use vykar_types::error::VykarError;
 
 use crate::cycle::CycleRenderer;
@@ -393,7 +394,7 @@ fn run_backup_cycle_report(
         &request,
         &mut NoPrompt,
         crate::signal::shutdown_token(),
-        &mut |event| match event {
+        &FnMutSink::new(|event: AppEvent<'_>| match event {
             AppEvent::RepoStarted { repo, .. } => {
                 if multi {
                     eprintln!("=== Repository: {} ===", repo.label_or_url());
@@ -427,7 +428,7 @@ fn run_backup_cycle_report(
                     }
                 }
             }
-        },
+        }),
     );
     if !report.not_reached.is_empty() {
         tracing::info!("shutdown signal received, skipping remaining repos");

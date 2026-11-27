@@ -2341,19 +2341,13 @@ mod deadline {
             command_dumps: &[],
             verbose: false,
         };
-        let mut pending = commands::backup::upload(
-            &config,
-            &req,
-            &mut None,
-            &CancelToken::new(),
-            Some(&wrap),
-            env,
-        )
-        .map_err(|(_, e)| e)
-        .unwrap();
+        let mut pending =
+            commands::backup::upload(&config, &req, None, &CancelToken::new(), Some(&wrap), env)
+                .map_err(|(_, e)| e)
+                .unwrap();
         let start = Instant::now();
         let err = pending
-            .protect_commit(&mut None, &CancelToken::new())
+            .protect_commit(None, &CancelToken::new())
             .unwrap_err();
         match &err {
             VykarError::Locked(h) => assert!(h.key.starts_with("sessions/rival"), "{h:?}"),

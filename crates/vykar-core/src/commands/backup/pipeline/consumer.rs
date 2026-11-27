@@ -11,6 +11,7 @@
 //! proceed. Skip handling lives in the orchestrator, not here.
 
 use crate::index::table::DedupPrefilter;
+use crate::repo::control::EventSink;
 use crate::repo::file_cache::FileCache;
 use crate::repo::memory_budget::MemoryBudget;
 use crate::repo::{Repo, WriteSession};
@@ -34,7 +35,7 @@ pub(super) fn consume_processed_entry(
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
     listing: &mut ListingWriter,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     memory: &MemoryBudget,
     prefilter: Option<&DedupPrefilter>,
     large_file_accum: &mut Option<LargeFileAccum>,

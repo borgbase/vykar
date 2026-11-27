@@ -11,7 +11,7 @@ use crate::app::passphrase::{
 use crate::app::preflight::UnavailableRepo;
 use crate::app::{HookError, OpsError, OpsResult, StepError};
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, FnMutSink};
 use crate::testutil::{cmd_append, cmd_rename, env_word};
 use vykar_types::error::VykarError;
 
@@ -113,7 +113,7 @@ fn hooked_step_classified_failure_fires_failed_hooks() {
     let value = run_hooked_step(
         CycleStep::Check,
         &repo,
-        &mut |e| events.push(e),
+        &FnMutSink::new(|e: CycleEvent| events.push(e)),
         &mut steps,
         |_| Ok(3usize),
         |n| {
@@ -156,7 +156,7 @@ fn hooked_step_skipped_fires_after_hooks() {
     run_hooked_step(
         CycleStep::Check,
         &repo,
-        &mut |_| {},
+        &|_| {},
         &mut steps,
         |_| Ok(()),
         |_| StepOutcome::Skipped("check not due".into()),
@@ -190,7 +190,7 @@ fn hooked_step_before_failure_skips_action_and_warns_before_finish() {
     let value: Option<()> = run_hooked_step(
         CycleStep::Prune,
         &repo,
-        &mut |e| events.push(e),
+        &FnMutSink::new(|e: CycleEvent| events.push(e)),
         &mut steps,
         |_| {
             action_ran = true;
@@ -254,7 +254,7 @@ fn run_cycle(repo: &ResolvedRepo) -> FullCycleResult {
         false,
         &[],
         UnavailableRepo::Skip,
-        &mut |_| {},
+        &|_| {},
     )
 }
 
@@ -417,7 +417,7 @@ fn run_prompted(
         false,
         &[],
         UnavailableRepo::Skip,
-        &mut |_| {},
+        &|_| {},
     )
 }
 
@@ -552,7 +552,7 @@ fn run_counting(
         false,
         &[],
         unavailable,
-        &mut |_| {},
+        &|_| {},
     );
     drop(pass);
     calls.set(prompt.asks() as u32);
@@ -680,7 +680,7 @@ fn run_collecting(
         Some(crate::testing::TEST_PASSPHRASE),
         &CancelToken::new(),
         false,
-        Some(&mut |e| events.push(e)),
+        Some(&FnMutSink::new(|e: BackupRunEvent| events.push(e))),
     );
     (result, events)
 }
@@ -924,11 +924,11 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
         false,
         &[],
         UnavailableRepo::Skip,
-        &mut |e| {
+        &FnMutSink::new(|e: CycleEvent| {
             if let CycleEvent::StepWarning { step, message } = e {
                 warnings.push((step, message));
             }
-        },
+        }),
     );
 
     assert!(matches!(
@@ -1197,7 +1197,7 @@ fn unknown_source_filter_is_a_config_failure() {
         false,
         &["nope".to_string()],
         UnavailableRepo::Skip,
-        &mut |_| {},
+        &|_| {},
     );
 
     assert!(

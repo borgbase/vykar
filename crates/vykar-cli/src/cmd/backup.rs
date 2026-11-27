@@ -4,7 +4,7 @@ use vykar_core::app::AppService;
 use vykar_core::app::operations::BackupRunEvent;
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, FnMutSink};
 use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
@@ -113,7 +113,7 @@ pub(crate) fn run_backup(
     // Delegate to core's hook-aware backup
     let mut renderer = show_progress.then(|| BackupProgressRenderer::new(verbose, is_tty));
 
-    let mut callback = |evt: BackupRunEvent| match evt {
+    let callback = FnMutSink::new(|evt: BackupRunEvent| match evt {
         BackupRunEvent::Backup(bpe) => {
             if let Some(ref mut r) = renderer {
                 r.on_event(bpe);
@@ -129,7 +129,7 @@ pub(crate) fn run_backup(
                 None => eprintln!("{line}"),
             }
         }
-    };
+    });
 
     let result = service.backup(
         &repo,
@@ -137,7 +137,7 @@ pub(crate) fn run_backup(
         &mut TtyPrompt,
         cancel,
         verbose >= 1,
-        Some(&mut callback),
+        Some(&callback),
     );
 
     if let Some(ref mut r) = renderer {

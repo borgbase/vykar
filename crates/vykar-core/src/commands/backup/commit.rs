@@ -14,6 +14,7 @@ use super::{
     BackupProgressEvent, FileStatus, ListingWriter, emit_progress, emit_stats_progress,
     stamp_item_metadata,
 };
+use crate::repo::control::EventSink;
 
 /// Store one content chunk of a file or a command dump and account for it:
 /// its reference goes to `chunks`, its sizes to `stats` (`deduplicated_size`
@@ -152,12 +153,12 @@ pub(super) struct FileOutcome<'c> {
 /// Announce a file to progress. Returns the `dedup_before` baseline for
 /// its [`FileOutcome`]. Call before any of the file's chunks are committed.
 pub(super) fn start_file(
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     stats: &SnapshotStats,
     path: &str,
 ) -> u64 {
-    if let Some(cb) = progress.as_deref_mut() {
-        cb(BackupProgressEvent::FileStarted {
+    if let Some(sink) = progress {
+        sink.emit(BackupProgressEvent::FileStarted {
             path: path.to_owned(),
         });
     }
@@ -211,7 +212,7 @@ pub(super) fn finish_file(
     ws: &mut WriteSession,
     stats: &mut SnapshotStats,
     listing: &mut ListingWriter,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     verbose: bool,
     outcome: FileOutcome<'_>,
 ) -> Result<()> {
@@ -652,6 +653,7 @@ mod tests {
         use super::*;
         use crate::commands::list::for_each_decoded_item;
         use crate::compress::Compression;
+        use crate::repo::control::FnMutSink;
 
         fn meta(base: u32) -> fs::MetadataSummary {
             fs::MetadataSummary {
@@ -744,8 +746,8 @@ mod tests {
             };
             let mut events = Vec::new();
             {
-                let mut cb = |e| events.push(e);
-                let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
+                let sink = FnMutSink::new(|e: BackupProgressEvent| events.push(e));
+                let progress: Option<&dyn EventSink<BackupProgressEvent>> = Some(&sink);
                 let dedup_before = stats.deduplicated_size;
                 stats.deduplicated_size += 42;
                 finish_file(
@@ -753,7 +755,7 @@ mod tests {
                     &mut ws,
                     &mut stats,
                     &mut listing,
-                    &mut progress,
+                    progress,
                     verbose,
                     FileOutcome {
                         item,
@@ -855,14 +857,14 @@ mod tests {
             let mut stats = SnapshotStats::default();
             let mut events = Vec::new();
             {
-                let mut cb = |e| events.push(e);
-                let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
+                let sink = FnMutSink::new(|e: BackupProgressEvent| events.push(e));
+                let progress: Option<&dyn EventSink<BackupProgressEvent>> = Some(&sink);
                 finish_file(
                     &repo,
                     &mut ws,
                     &mut stats,
                     &mut listing,
-                    &mut progress,
+                    progress,
                     true,
                     FileOutcome {
                         item,
@@ -932,14 +934,14 @@ mod tests {
             let mut stats = SnapshotStats::default();
             let mut events = Vec::new();
             {
-                let mut cb = |e| events.push(e);
-                let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
+                let sink = FnMutSink::new(|e: BackupProgressEvent| events.push(e));
+                let progress: Option<&dyn EventSink<BackupProgressEvent>> = Some(&sink);
                 finish_file(
                     &repo,
                     &mut ws,
                     &mut stats,
                     &mut listing,
-                    &mut progress,
+                    progress,
                     true,
                     FileOutcome {
                         item: Item::test_file("vykar-dumps/x"),
@@ -965,9 +967,9 @@ mod tests {
             };
             let mut events = Vec::new();
             {
-                let mut cb = |e| events.push(e);
-                let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
-                assert_eq!(start_file(&mut progress, &stats, "a/b"), 77);
+                let sink = FnMutSink::new(|e: BackupProgressEvent| events.push(e));
+                let progress: Option<&dyn EventSink<BackupProgressEvent>> = Some(&sink);
+                assert_eq!(start_file(progress, &stats, "a/b"), 77);
             }
             assert_eq!(events.len(), 1);
             assert!(
@@ -975,8 +977,7 @@ mod tests {
                 "{:?}",
                 events[0]
             );
-            let mut none: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
-            assert_eq!(start_file(&mut none, &stats, "a/b"), 77);
+            assert_eq!(start_file(None, &stats, "a/b"), 77);
         }
     }
 

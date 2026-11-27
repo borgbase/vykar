@@ -392,7 +392,7 @@ fn backup_with_fold(c: &Client, name: &str) {
     let mut pending = commands::backup::upload(
         &c.config,
         &req,
-        &mut None,
+        None,
         &CancelToken::new(),
         None,
         crate::repo::HostEnv::system(),
@@ -400,13 +400,11 @@ fn backup_with_fold(c: &Client, name: &str) {
     .map_err(|(_, e)| e)
     .unwrap();
     pending.repo_mut().request_index_fold();
-    pending
-        .protect_commit(&mut None, &CancelToken::new())
-        .unwrap();
+    pending.protect_commit(None, &CancelToken::new()).unwrap();
     let mut commit = pending.begin_commit();
     let result = commit.drive(&no_events);
     commit
-        .finish(result, &mut None, &crate::repo::control::CancelToken::new())
+        .finish(result, None, &crate::repo::control::CancelToken::new())
         .unwrap();
 }
 
@@ -751,7 +749,7 @@ fn the_cycle_skips_compact_on_an_append_only_server() {
                 false,
                 &[],
                 crate::app::preflight::UnavailableRepo::Skip,
-                &mut |_| {},
+                &|_| {},
             )
         });
         let outcome = |step: CycleStep| {

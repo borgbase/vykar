@@ -16,11 +16,11 @@ use crate::app::passphrase::{NoPrompt, PassphraseCache, RepoPassphrase};
 use crate::app::preflight::{self, UnavailableRepo};
 use crate::app::{HookError, OpsError, OpsResult};
 use crate::commands;
-use crate::commands::check::CheckRequest;
+use crate::commands::check::{CheckProgressEvent, CheckRequest};
 use crate::commands::compact::CompactRequest;
 use crate::commands::prune::PruneRequest;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
-use crate::repo::control::{CancelToken, FnMutSink};
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::{HostEnv, OpenOptions, Repo};
 use vykar_types::error::VykarError;
 
@@ -232,7 +232,7 @@ fn run_backup_sources(
     repo_label: Option<&str>,
     cancel: &CancelToken,
     verbose: bool,
-    on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
+    events: Option<&dyn EventSink<BackupRunEvent>>,
 ) -> OpsResult<BackupRunReport> {
     use commands::backup::FailureScope;
 
@@ -248,7 +248,7 @@ fn run_backup_sources(
     for (idx, source) in sources.iter().enumerate() {
         let snapshot_name = generate_snapshot_name();
 
-        let run_backup = |on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>| {
+        let run_backup = || {
             let req = commands::backup::BackupRequest {
                 snapshot_name: &snapshot_name,
                 passphrase,
@@ -264,14 +264,12 @@ fn run_backup_sources(
                 verbose,
             };
 
-            let r = if let Some(cb) = on_event {
-                let mut backup_cb = |bpe| {
-                    cb(BackupRunEvent::Backup(bpe));
-                };
+            let r = if let Some(sink) = events {
+                let backup_events = |bpe| sink.emit(BackupRunEvent::Backup(bpe));
                 commands::backup::run_scoped(
                     config,
                     req,
-                    Some(&mut backup_cb),
+                    Some(&backup_events),
                     cancel,
                     None,
                     HostEnv::system(),
@@ -304,7 +302,7 @@ fn run_backup_sources(
             let outer = crate::hooks::run_lifecycle(
                 crate::hooks::HookPhases::Source(&source.hooks),
                 &mut ctx,
-                || run_backup(on_event),
+                run_backup,
                 |r| match r {
                     Ok(_) => crate::hooks::Verdict::Success,
                     Err((_, OpsError::Skipped(_))) => crate::hooks::Verdict::Skipped,
@@ -313,12 +311,12 @@ fn run_backup_sources(
             );
 
             // Drain accumulated warnings into events (tracing already fired)
-            drain_backup_warnings(&mut ctx, on_event, &scope);
+            drain_backup_warnings(&mut ctx, events, &scope);
 
             // An outer error is a before-hook failure or skip: source-local.
             outer.unwrap_or_else(|e| Err((FailureScope::Source, e)))
         } else {
-            run_backup(on_event)
+            run_backup()
         };
 
         let outcome = match result {
@@ -333,8 +331,8 @@ fn run_backup_sources(
             Err((FailureScope::Source, e)) => {
                 let error = e.to_string();
                 tracing::error!("backup of source '{}' failed: {error}", source.label);
-                if let Some(cb) = on_event {
-                    cb(BackupRunEvent::SourceFailed {
+                if let Some(sink) = events {
+                    sink.emit(BackupRunEvent::SourceFailed {
                         label: source.label.clone(),
                         error: error.clone(),
                     });
@@ -415,12 +413,12 @@ fn run_backup_sources(
 /// Drain accumulated warnings from HookContext into BackupRunEvent.
 fn drain_backup_warnings(
     ctx: &mut crate::hooks::HookContext,
-    on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
+    events: Option<&dyn EventSink<BackupRunEvent>>,
     scope: &HookScope,
 ) {
-    if let Some(cb) = on_event {
+    if let Some(sink) = events {
         for warning in ctx.warnings.drain(..) {
-            cb(BackupRunEvent::HookWarning {
+            sink.emit(BackupRunEvent::HookWarning {
                 scope: scope.clone(),
                 warning,
             });
@@ -440,10 +438,9 @@ pub(crate) fn run_backup_selection_with(
     passphrase: &mut RepoPassphrase<'_>,
     cancel: &CancelToken,
     verbose: bool,
-    on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
+    events: Option<&dyn EventSink<BackupRunEvent>>,
 ) -> OpsResult<BackupRunReport> {
     let config = &repo.config;
-    let mut on_event = on_event;
     let mut ctx = crate::hooks::HookContext {
         command: "backup".to_string(),
         repository: config.repository.url.clone(),
@@ -470,7 +467,7 @@ pub(crate) fn run_backup_selection_with(
                     repo.label.as_deref(),
                     cancel,
                     verbose,
-                    &mut on_event,
+                    events,
                 )
             });
             // `Ok` means a snapshot was created, so the repository opened.
@@ -485,7 +482,7 @@ pub(crate) fn run_backup_selection_with(
         },
     );
     // Drain before flattening so before/failed/finally warnings always arrive.
-    drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
+    drain_backup_warnings(&mut ctx, events, &HookScope::Repo);
     outer.and_then(|r| r)
 }
 
@@ -497,12 +494,12 @@ pub(crate) fn run_backup_selection(
     passphrase: Option<&str>,
     cancel: &CancelToken,
     verbose: bool,
-    on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
+    events: Option<&dyn EventSink<BackupRunEvent>>,
 ) -> OpsResult<BackupRunReport> {
     let mut cache = PassphraseCache::default();
     let mut prompt = NoPrompt;
     let mut scope = RepoPassphrase::preset(&mut cache, &mut prompt, &repo.config, passphrase);
-    run_backup_selection_with(repo, sources, &mut scope, cancel, verbose, on_event)
+    run_backup_selection_with(repo, sources, &mut scope, cancel, verbose, events)
 }
 
 // ── Hook wrapper for standalone commands ──────────────────────────────────
@@ -581,7 +578,7 @@ pub(crate) fn run_full_cycle_for_repo(
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
-    on_event: &mut dyn FnMut(CycleEvent),
+    events: &dyn EventSink<CycleEvent>,
 ) -> FullCycleResult {
     let mut cache = PassphraseCache::default();
     let mut prompt = NoPrompt;
@@ -593,7 +590,7 @@ pub(crate) fn run_full_cycle_for_repo(
         verbose,
         source_filter,
         unavailable,
-        on_event,
+        events,
     )
 }
 
@@ -616,7 +613,7 @@ pub(crate) fn run_full_cycle(
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
-    on_event: &mut dyn FnMut(CycleEvent),
+    events: &dyn EventSink<CycleEvent>,
 ) -> FullCycleResult {
     let config = &repo.config;
     let sources = &repo.sources;
@@ -645,14 +642,14 @@ pub(crate) fn run_full_cycle(
             Err(e) => emit_terminal(
                 CycleStep::Backup,
                 StepOutcome::Failed(StepError::new(StepErrorKind::Config, e)),
-                on_event,
+                events,
                 &mut steps,
             ),
             Ok(effective_sources) => {
                 backup_report = run_hooked_step(
                     CycleStep::Backup,
                     repo,
-                    on_event,
+                    events,
                     &mut steps,
                     |evt| {
                         // After the `before` hooks, so one can mount the repository;
@@ -672,17 +669,17 @@ pub(crate) fn run_full_cycle(
                                 repo.label.as_deref(),
                                 cancel,
                                 verbose,
-                                &mut Some(&mut |bpe: BackupRunEvent| match bpe {
-                                    BackupRunEvent::Backup(e) => evt(CycleEvent::Backup(e)),
+                                Some(&|bpe: BackupRunEvent| match bpe {
+                                    BackupRunEvent::Backup(e) => evt.emit(CycleEvent::Backup(e)),
                                     BackupRunEvent::HookWarning { scope, warning } => {
-                                        evt(CycleEvent::HookWarning {
+                                        evt.emit(CycleEvent::HookWarning {
                                             step: CycleStep::Backup,
                                             scope,
                                             warning,
                                         });
                                     }
                                     BackupRunEvent::SourceFailed { label, error } => {
-                                        evt(CycleEvent::StepWarning {
+                                        evt.emit(CycleEvent::StepWarning {
                                             step: CycleStep::Backup,
                                             message: format!("source '{label}': {error}"),
                                         });
@@ -729,31 +726,26 @@ pub(crate) fn run_full_cycle(
                 .any(|s| s.retention.as_ref().is_some_and(|r| r.has_any_rule()));
 
         if backup_skipped {
-            emit_terminal(
-                CycleStep::Prune,
-                backup_skip_outcome(),
-                on_event,
-                &mut steps,
-            );
+            emit_terminal(CycleStep::Prune, backup_skip_outcome(), events, &mut steps);
         } else if !has_retention {
             emit_terminal(
                 CycleStep::Prune,
                 StepOutcome::Skipped("no retention rules".into()),
-                on_event,
+                events,
                 &mut steps,
             );
         } else if !backup_ok {
             emit_terminal(
                 CycleStep::Prune,
                 StepOutcome::Skipped("backup failed".into()),
-                on_event,
+                events,
                 &mut steps,
             );
         } else {
             prune_stats = run_hooked_step(
                 CycleStep::Prune,
                 repo,
-                on_event,
+                events,
                 &mut steps,
                 |evt| {
                     let r = cycle_session(&mut session, passphrase, cancel).and_then(|repo| {
@@ -780,7 +772,7 @@ pub(crate) fn run_full_cycle(
                     // consumers can log them as persistent entries. tracing
                     // already fired inside commands::prune::run_on_repo.
                     for w in &stats.warnings {
-                        evt(CycleEvent::StepWarning {
+                        evt.emit(CycleEvent::StepWarning {
                             step: CycleStep::Prune,
                             message: w.clone(),
                         });
@@ -798,21 +790,21 @@ pub(crate) fn run_full_cycle(
             emit_terminal(
                 CycleStep::Compact,
                 backup_skip_outcome(),
-                on_event,
+                events,
                 &mut steps,
             );
         } else if !backup_ok {
             emit_terminal(
                 CycleStep::Compact,
                 StepOutcome::Skipped("backup failed".into()),
-                on_event,
+                events,
                 &mut steps,
             );
         } else {
             compact_stats = run_hooked_step(
                 CycleStep::Compact,
                 repo,
-                on_event,
+                events,
                 &mut steps,
                 |_evt| {
                     let r = cycle_session(&mut session, passphrase, cancel).and_then(|repo| {
@@ -846,25 +838,20 @@ pub(crate) fn run_full_cycle(
     if !cancel.is_cancelled() {
         let check_max_percent = config.check.max_percent;
         if backup_skipped {
-            emit_terminal(
-                CycleStep::Check,
-                backup_skip_outcome(),
-                on_event,
-                &mut steps,
-            );
+            emit_terminal(CycleStep::Check, backup_skip_outcome(), events, &mut steps);
         } else if passphrase.failed() {
             // The backup step already reported why; don't repeat the same error.
             emit_terminal(
                 CycleStep::Check,
                 StepOutcome::Skipped("backup failed".into()),
-                on_event,
+                events,
                 &mut steps,
             );
         } else {
             check_result = run_hooked_step(
                 CycleStep::Check,
                 repo,
-                on_event,
+                events,
                 &mut steps,
                 |evt| {
                     // First, as the opener does: a cancel during the `before`
@@ -879,7 +866,7 @@ pub(crate) fn run_full_cycle(
                     // The last step: taken, so no handle is open while its
                     // `after`, `failed` and `finally` hooks run.
                     let mut repo = session.take().expect("cycle_session opened it");
-                    let sink = FnMutSink::new(|e| evt(CycleEvent::Check(e)));
+                    let sink = |e: CheckProgressEvent| evt.emit(CycleEvent::Check(e));
                     commands::check::run_on_repo(
                         &mut repo,
                         config,
@@ -954,9 +941,9 @@ fn cycle_session<'s>(
 pub(crate) fn run_hooked_step<T>(
     step: CycleStep,
     repo: &ResolvedRepo,
-    on_event: &mut dyn FnMut(CycleEvent),
+    events: &dyn EventSink<CycleEvent>,
     steps: &mut Vec<(CycleStep, StepOutcome)>,
-    action: impl FnOnce(&mut dyn FnMut(CycleEvent)) -> OpsResult<T>,
+    action: impl FnOnce(&dyn EventSink<CycleEvent>) -> OpsResult<T>,
     classify: impl FnOnce(&T) -> StepOutcome,
 ) -> Option<T> {
     let mut ctx = crate::hooks::HookContext {
@@ -969,7 +956,7 @@ pub(crate) fn run_hooked_step<T>(
         warnings: Vec::new(),
     };
 
-    on_event(CycleEvent::StepStarted(step));
+    events.emit(CycleEvent::StepStarted(step));
 
     // A classified failure (e.g. check with errors) fires `failed` hooks. A step
     // that ran and classified itself Skipped (check not due) or Partial counts as
@@ -980,7 +967,7 @@ pub(crate) fn run_hooked_step<T>(
             repo: &repo.repo_hooks,
         },
         &mut ctx,
-        || action(on_event).map(|v| (classify(&v), v)),
+        || action(events).map(|v| (classify(&v), v)),
         |r| match r {
             Err(OpsError::Skipped(_)) => crate::hooks::Verdict::Skipped,
             Err(e) => crate::hooks::Verdict::Failed(e.to_string()),
@@ -990,7 +977,7 @@ pub(crate) fn run_hooked_step<T>(
             },
         },
     );
-    drain_cycle_warnings(&mut ctx, step, on_event);
+    drain_cycle_warnings(&mut ctx, step, events);
 
     let (outcome, value) = match result {
         Err(OpsError::Skipped(reason)) | Ok(Err(OpsError::Skipped(reason))) => {
@@ -1000,7 +987,7 @@ pub(crate) fn run_hooked_step<T>(
         Ok(Ok((o, v))) => (o, Some(v)),
     };
 
-    on_event(CycleEvent::StepFinished(step, outcome.clone()));
+    events.emit(CycleEvent::StepFinished(step, outcome.clone()));
     steps.push((step, outcome));
     value
 }
@@ -1023,21 +1010,21 @@ fn resolve_cycle_sources<'a>(
 fn emit_terminal(
     step: CycleStep,
     outcome: StepOutcome,
-    on_event: &mut dyn FnMut(CycleEvent),
+    events: &dyn EventSink<CycleEvent>,
     steps: &mut Vec<(CycleStep, StepOutcome)>,
 ) {
-    on_event(CycleEvent::StepStarted(step));
-    on_event(CycleEvent::StepFinished(step, outcome.clone()));
+    events.emit(CycleEvent::StepStarted(step));
+    events.emit(CycleEvent::StepFinished(step, outcome.clone()));
     steps.push((step, outcome));
 }
 
 fn drain_cycle_warnings(
     ctx: &mut crate::hooks::HookContext,
     step: CycleStep,
-    on_event: &mut dyn FnMut(CycleEvent),
+    events: &dyn EventSink<CycleEvent>,
 ) {
     for warning in ctx.warnings.drain(..) {
-        on_event(CycleEvent::HookWarning {
+        events.emit(CycleEvent::HookWarning {
             step,
             scope: HookScope::Repo,
             warning,

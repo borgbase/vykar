@@ -13,7 +13,7 @@ use super::{
 };
 use crate::config::VykarConfig;
 use crate::repo::ages::HEAD_LANDING_ALLOWANCE;
-use crate::repo::control::{CancelToken, CommitEvent, EventSink, FnMutSink};
+use crate::repo::control::{CancelToken, CommitEvent, EventSink};
 use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
 use crate::repo::format::{ObjectType, pack_object_with_context};
 #[cfg(any(test, feature = "sim"))]
@@ -87,7 +87,7 @@ pub(super) fn phase1_upload(
     req: &BackupRequest<'_>,
     prepared: &Prepared<'_>,
     num_workers: usize,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
     dataless: &mut DatalessTally,
     marker: Option<Arc<sessions::SessionMarker>>,
@@ -104,7 +104,7 @@ pub(super) fn phase1_upload(
     let git_ignore = req.git_ignore;
     let compression = req.compression;
     let command_dumps = req.command_dumps;
-    // Verbose per-file events only make sense when there is a callback to receive them.
+    // Verbose per-file events only make sense when there is a sink to receive them.
     let verbose = req.verbose && progress.is_some();
     let xattrs_enabled = prepared.xattrs_enabled;
     let exclude_patterns: &[String] = &prepared.exclude_patterns;
@@ -557,7 +557,7 @@ impl PendingCommit {
     /// waits (`Interrupted`).
     pub(crate) fn protect_commit(
         &mut self,
-        progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+        progress: Option<&dyn EventSink<BackupProgressEvent>>,
         cancel: &CancelToken,
     ) -> Result<()> {
         if self.mode.is_none() {
@@ -856,7 +856,7 @@ impl CommitInProgress {
     pub(crate) fn finish(
         self,
         result: Result<Committed>,
-        progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+        progress: Option<&dyn EventSink<BackupProgressEvent>>,
         cancel: &CancelToken,
     ) -> Result<BackupOutcome> {
         let Self {
@@ -880,7 +880,7 @@ impl CommitInProgress {
         let repo_storage = Arc::clone(repo.storage());
         let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
         let result = result.map(|committed| {
-            let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
+            let events = |e: CommitEvent| emit_progress(progress, e.into());
             let write = write.take().expect("the session is taken once");
             repo.finish_backup_commit(
                 committed,

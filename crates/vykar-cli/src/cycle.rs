@@ -11,6 +11,7 @@ use vykar_core::app::operations::{CycleEvent, CycleStep, FullCycleResult, StepOu
 use vykar_core::app::passphrase::PassphrasePrompt;
 use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest};
 use vykar_core::config::ResolvedRepo;
+use vykar_core::repo::control::FnMutSink;
 
 use crate::cmd;
 use crate::cmd::check::{format_check_progress, print_check_summary};
@@ -111,7 +112,7 @@ pub(crate) fn run_bare_cycle(
         request,
         prompt,
         signal::shutdown_token(),
-        &mut |event| match event {
+        &FnMutSink::new(|event: AppEvent<'_>| match event {
             AppEvent::RepoStarted { repo, .. } => {
                 if multi {
                     eprintln!("--- Repository: {} ---", repo.label_or_url());
@@ -132,7 +133,7 @@ pub(crate) fn run_bare_cycle(
                     eprintln!("Error: one or more steps failed");
                 }
             }
-        },
+        }),
     )
 }
 

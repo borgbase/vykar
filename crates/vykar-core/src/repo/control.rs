@@ -18,7 +18,9 @@ impl<E, F: Fn(E) + ?Sized> EventSink<E> for F {
     }
 }
 
-/// Adapts a stateful `FnMut` callback for use on one thread.
+/// Adapts a stateful `FnMut` callback for use on one thread. The callback
+/// must not emit into this sink again: `emit` holds the borrow while it runs,
+/// so a re-entrant emit panics.
 pub struct FnMutSink<F>(RefCell<F>);
 
 impl<F> FnMutSink<F> {

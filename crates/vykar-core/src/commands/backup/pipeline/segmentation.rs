@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::platform::fs;
 use crate::repo::WriteSession;
+use crate::repo::control::EventSink;
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use vykar_types::error::{Result, VykarError};
@@ -51,7 +52,7 @@ pub(super) fn skip_large_file(
     ws: &mut WriteSession,
     stats: &mut SnapshotStats,
     large_file_accum: &mut Option<LargeFileAccum>,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     current_segment_index: usize,
     reason: &str,
 ) -> usize {
@@ -456,9 +457,7 @@ mod tests {
             txn,
         };
         let mut accum = Some(accum);
-        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
-
-        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, &mut progress, 2, "drift");
+        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, None, 2, "drift");
 
         // 4 segments, skipped at index 2 → segments 3 remain to drain.
         assert_eq!(drain, 1, "4 segs, skipped at idx 2 → 1 remaining");
@@ -489,9 +488,7 @@ mod tests {
             ..Default::default()
         };
         let mut accum: Option<LargeFileAccum> = None;
-        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
-
-        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, &mut progress, 0, "ignored");
+        let drain = skip_large_file(&mut ws, &mut stats, &mut accum, None, 0, "ignored");
 
         assert_eq!(drain, 0);
         assert_eq!(stats.errors, 0, "no error counted when accum was empty");

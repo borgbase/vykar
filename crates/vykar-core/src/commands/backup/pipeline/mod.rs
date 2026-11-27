@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::compress::Compression;
 use crate::index::table::DedupPrefilter;
 use crate::platform::fs;
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::memory_budget::MemoryBudget;
 use crate::repo::{Repo, WriteSession};
@@ -288,7 +288,7 @@ pub(crate) fn run_parallel_pipeline(
     ws: &mut WriteSession,
     ctx: &PipelineCtx<'_>,
     bufs: &mut PipelineBuffers<'_>,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
 ) -> Result<PipelineTimings> {
     let PipelineCtx {
         sources,

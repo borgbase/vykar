@@ -11,6 +11,7 @@ use crate::chunker;
 use crate::compress::Compression;
 use crate::config::CommandDump;
 use crate::platform::shell;
+use crate::repo::control::EventSink;
 use crate::repo::{ChunkInput, Repo, WriteSession};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
@@ -98,7 +99,7 @@ fn stream_dump_command(
     compression: Compression,
     stats: &mut SnapshotStats,
     timeout: Duration,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
 ) -> Result<(Vec<ChunkRef>, u64)> {
     // Spawn child with piped stdout and stderr.
     let mut cmd = shell::command_for_script(&dump.command);
@@ -230,7 +231,7 @@ pub(super) fn process_command_dumps(
     compression: Compression,
     listing: &mut ListingWriter,
     stats: &mut SnapshotStats,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     time_start: chrono::DateTime<Utc>,
 ) -> Result<()> {
     if command_dumps.is_empty() {
@@ -381,7 +382,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_secs(10),
-            &mut None,
+            None,
         )
         .unwrap();
         assert!(!refs.is_empty());
@@ -403,7 +404,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_secs(10),
-            &mut None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -428,7 +429,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_secs(10),
-            &mut None,
+            None,
         )
         .unwrap();
         assert!(refs.is_empty());
@@ -451,7 +452,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_millis(500),
-            &mut None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -477,7 +478,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_secs(30),
-            &mut None,
+            None,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -504,7 +505,7 @@ mod tests {
             Compression::None,
             &mut stats,
             Duration::from_secs(30),
-            &mut None,
+            None,
         );
         assert!(result.is_err());
         // The error message will contain stderr, verify we didn't OOM

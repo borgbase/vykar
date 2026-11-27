@@ -1,6 +1,6 @@
 //! The application service: passphrase policy, repository selection, the
 //! multi-repository cycle and the hooked commands. Frontends supply a prompt,
-//! a cancel token and an event callback, and render.
+//! a cancel token and an event sink, and render.
 
 use zeroize::Zeroizing;
 
@@ -9,7 +9,7 @@ use crate::app::passphrase::{PassphraseCache, PassphrasePrompt, RepoPassphrase};
 use crate::app::preflight::UnavailableRepo;
 use crate::app::{HookError, OpsResult};
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, EventSink};
 
 /// A command with repo-level hooks, other than backup (see [`AppService::backup`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +204,10 @@ impl AppService {
         prompt: &mut dyn PassphrasePrompt,
         cancel: &CancelToken,
         verbose: bool,
-        on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
+        events: Option<&dyn EventSink<BackupRunEvent>>,
     ) -> OpsResult<BackupRunReport> {
         let mut pass = self.passphrase(&repo.config, repo.label.as_deref(), prompt);
-        operations::run_backup_selection_with(repo, sources, &mut pass, cancel, verbose, on_event)
+        operations::run_backup_selection_with(repo, sources, &mut pass, cancel, verbose, events)
     }
 
     /// The full cycle (backup → prune → compact → check) for the selected
@@ -219,7 +219,7 @@ impl AppService {
         request: &CycleRequest,
         prompt: &mut dyn PassphrasePrompt,
         cancel: &CancelToken,
-        on_event: &mut dyn FnMut(AppEvent<'_>),
+        events: &dyn for<'e> EventSink<AppEvent<'e>>,
     ) -> CycleReport {
         let (indices, unavailable): (Vec<usize>, _) = match &request.selection {
             RepoSelection::All => ((0..repos.len()).collect(), UnavailableRepo::Skip),
@@ -244,7 +244,7 @@ impl AppService {
             let Some(repo) = repos.get(index) else {
                 continue;
             };
-            on_event(AppEvent::RepoStarted {
+            events.emit(AppEvent::RepoStarted {
                 repo,
                 index,
                 position,
@@ -259,12 +259,12 @@ impl AppService {
                     request.verbose,
                     &request.source_filter,
                     unavailable,
-                    &mut |event| on_event(AppEvent::Cycle { repo, event }),
+                    &|event| events.emit(AppEvent::Cycle { repo, event }),
                 )
             };
             report.repos.push(RepoCycleReport { index, result });
             if let Some(finished) = report.repos.last() {
-                on_event(AppEvent::RepoFinished {
+                events.emit(AppEvent::RepoFinished {
                     repo,
                     report: finished,
                 });

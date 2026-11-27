@@ -11,7 +11,7 @@ use vykar_core::commands;
 use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, FnMutSink};
 use vykar_core::repo::sessions;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repo};
 use vykar_storage::local_backend::LocalBackend;
@@ -1032,7 +1032,8 @@ fn file_cache_survives_label_rename() {
     let exclude_if_present: Vec<String> = Vec::new();
 
     let mut events = Vec::new();
-    let mut on_progress = |event: commands::backup::BackupProgressEvent| events.push(event);
+    let on_progress =
+        FnMutSink::new(|event: commands::backup::BackupProgressEvent| events.push(event));
 
     commands::backup::run_with_progress(
         &config,
@@ -1050,7 +1051,7 @@ fn file_cache_survives_label_rename() {
             command_dumps: &[],
             verbose: true,
         },
-        Some(&mut on_progress),
+        Some(&on_progress),
         &CancelToken::new(),
     )
     .unwrap();
@@ -1119,7 +1120,8 @@ fn parent_fallback_survives_label_rename() {
     let exclude_if_present: Vec<String> = Vec::new();
 
     let mut events = Vec::new();
-    let mut on_progress = |event: commands::backup::BackupProgressEvent| events.push(event);
+    let on_progress =
+        FnMutSink::new(|event: commands::backup::BackupProgressEvent| events.push(event));
 
     commands::backup::run_with_progress(
         &config,
@@ -1137,7 +1139,7 @@ fn parent_fallback_survives_label_rename() {
             command_dumps: &[],
             verbose: true,
         },
-        Some(&mut on_progress),
+        Some(&on_progress),
         &CancelToken::new(),
     )
     .unwrap();

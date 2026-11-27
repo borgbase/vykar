@@ -6,7 +6,7 @@ use vykar_core::app::service::HookedCommand;
 use vykar_core::app::{AppService, OpsError, OpsResult, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, FnMutSink};
 use vykar_core::repo::{OpenOptions, Repo};
 use vykar_types::error::Result;
 
@@ -295,28 +295,30 @@ pub(super) fn run_selection_with_progress(
         &mut DialogPrompt,
         cancel,
         false,
-        Some(&mut |evt| match evt {
-            operations::BackupRunEvent::Backup(BackupProgressEvent::Warning { message }) => {
-                send_log(&ui_tx_progress, format!("[{repo_name}] warning: {message}"));
-            }
-            operations::BackupRunEvent::Backup(bpe) => {
-                if let Some(status) = tracker.format(&bpe) {
-                    let _ = ui_tx_progress.send(UiEvent::Status(status));
+        Some(&FnMutSink::new(
+            |evt: operations::BackupRunEvent| match evt {
+                operations::BackupRunEvent::Backup(BackupProgressEvent::Warning { message }) => {
+                    send_log(&ui_tx_progress, format!("[{repo_name}] warning: {message}"));
                 }
-            }
-            operations::BackupRunEvent::HookWarning { warning, .. } => {
-                send_log(
-                    &ui_tx_progress,
-                    format!("[{repo_name}] hook warning: {warning}"),
-                );
-            }
-            operations::BackupRunEvent::SourceFailed { label, error } => {
-                send_log(
-                    &ui_tx_progress,
-                    format!("[{repo_name}] source {label} failed: {error}"),
-                );
-            }
-        }),
+                operations::BackupRunEvent::Backup(bpe) => {
+                    if let Some(status) = tracker.format(&bpe) {
+                        let _ = ui_tx_progress.send(UiEvent::Status(status));
+                    }
+                }
+                operations::BackupRunEvent::HookWarning { warning, .. } => {
+                    send_log(
+                        &ui_tx_progress,
+                        format!("[{repo_name}] hook warning: {warning}"),
+                    );
+                }
+                operations::BackupRunEvent::SourceFailed { label, error } => {
+                    send_log(
+                        &ui_tx_progress,
+                        format!("[{repo_name}] source {label} failed: {error}"),
+                    );
+                }
+            },
+        )),
     )
 }
 

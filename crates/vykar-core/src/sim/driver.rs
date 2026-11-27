@@ -1411,7 +1411,7 @@ impl<'c> Driver<'c> {
                 match backup::upload(
                     &cfg,
                     &req,
-                    &mut None,
+                    None,
                     &CancelToken::new(),
                     Some(&wrap),
                     started.env,
@@ -1616,7 +1616,7 @@ impl<'c> Driver<'c> {
         self.label(i, "finish");
         let Running { run, commit } = *r;
         let outcome = commit
-            .finish(result, &mut None, &crate::repo::control::CancelToken::new())
+            .finish(result, None, &crate::repo::control::CancelToken::new())
             .map(|o| (Vec::new(), format!("partial: {}", o.is_partial)));
         self.end_run(i, run, outcome);
         "finish".into()

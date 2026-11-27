@@ -3,6 +3,7 @@ use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelectio
 use vykar_core::app::{OpsError, operations};
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
+use vykar_core::repo::control::FnMutSink;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{BackupStatusTracker, format_check_status, format_step_outcome};
@@ -95,7 +96,7 @@ fn run_backup_cycle(
         &request,
         &mut DialogPrompt,
         &cancel,
-        &mut |event| match event {
+        &FnMutSink::new(|event: AppEvent<'_>| match event {
             AppEvent::RepoStarted {
                 repo,
                 position,
@@ -172,7 +173,7 @@ fn run_backup_cycle(
                     failures.push((repo_name, reason));
                 }
             }
-        },
+        }),
     );
 
     if !report.not_reached.is_empty() {
@@ -661,7 +662,7 @@ mod tests {
                 &CycleRequest::default(),
                 &mut NoPrompt,
                 &CancelToken::new(),
-                &mut |_| {},
+                &|_: AppEvent<'_>| {},
             )
         });
 

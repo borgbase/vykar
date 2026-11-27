@@ -20,7 +20,7 @@ use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::ChunkIndexEntry;
 use crate::index::head::IndexHead;
 use crate::index::table::{self, ChunkTable};
-use crate::repo::control::CancelToken;
+use crate::repo::control::{CancelToken, FnMutSink};
 use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, Repo, RepoFormat, RepoWriter};
 
@@ -187,11 +187,11 @@ impl Env {
         std::thread::sleep(Duration::from_millis(2));
         let source_paths = vec![src.to_string_lossy().to_string()];
         let mut stages = Vec::new();
-        let mut on_event = |e: BackupProgressEvent| {
+        let on_event = FnMutSink::new(|e: BackupProgressEvent| {
             if let BackupProgressEvent::CommitStage { stage } = e {
                 stages.push(stage);
             }
-        };
+        });
         backup::run_impl(
             &self.config,
             backup::BackupRequest {
@@ -208,7 +208,7 @@ impl Env {
                 command_dumps: &[],
                 verbose: false,
             },
-            Some(&mut on_event),
+            Some(&on_event),
             &CancelToken::new(),
             wrap,
             crate::repo::HostEnv::system(),

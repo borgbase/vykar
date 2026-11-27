@@ -11,7 +11,7 @@ use vykar_core::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelec
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::ChunkerParams;
-use vykar_core::repo::control::CancelToken;
+use vykar_core::repo::control::{CancelToken, FnMutSink};
 use vykar_core::repo::pack::PackType;
 use vykar_core::repo::{
     EncryptionMode, HostEnv, OpenOptions, Repo, WriteSession, WriteSessionOptions,
@@ -597,7 +597,7 @@ fn backup_run_with_progress_emits_events_and_final_stats() {
             command_dumps: &[],
             verbose: false,
         },
-        Some(&mut on_progress),
+        Some(&FnMutSink::new(&mut on_progress)),
         &CancelToken::new(),
     )
     .unwrap()
@@ -700,7 +700,7 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
                 command_dumps: &[],
                 verbose: false,
             },
-            Some(&mut on_progress),
+            Some(&FnMutSink::new(&mut on_progress)),
             &CancelToken::new(),
         )
         .unwrap();
@@ -2616,7 +2616,7 @@ fn backup_emits_intermediate_progress_during_large_file() {
             command_dumps: &[],
             verbose: false,
         },
-        Some(&mut on_progress),
+        Some(&FnMutSink::new(&mut on_progress)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -2731,7 +2731,7 @@ fn command_dump_emits_progress_events() {
             command_dumps: &dumps,
             verbose: false,
         },
-        Some(&mut on_progress),
+        Some(&FnMutSink::new(&mut on_progress)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -2843,7 +2843,7 @@ fn command_dump_mixed_progress_events() {
             command_dumps: &dumps,
             verbose: false,
         },
-        Some(&mut on_progress),
+        Some(&FnMutSink::new(&mut on_progress)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -2940,7 +2940,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             command_dumps: &[],
             verbose: true,
         },
-        Some(&mut cb1),
+        Some(&FnMutSink::new(&mut cb1)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -2982,7 +2982,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             command_dumps: &[],
             verbose: true,
         },
-        Some(&mut cb2),
+        Some(&FnMutSink::new(&mut cb2)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -3028,7 +3028,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             command_dumps: &[],
             verbose: true,
         },
-        Some(&mut cb3),
+        Some(&FnMutSink::new(&mut cb3)),
         &CancelToken::new(),
     )
     .unwrap();
@@ -3281,7 +3281,7 @@ fn large_file_chunk_ids_do_not_depend_on_threads() {
                 command_dumps: &[],
                 verbose: true,
             },
-            Some(&mut on_progress),
+            Some(&FnMutSink::new(&mut on_progress)),
             &CancelToken::new(),
         )
         .unwrap();

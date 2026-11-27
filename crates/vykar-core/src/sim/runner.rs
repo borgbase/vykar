@@ -1135,9 +1135,9 @@ impl Sim {
                         };
                         let cancel = CancelToken::new();
                         let mut pending =
-                            backup::upload(&cfg, &req, &mut None, &cancel, Some(&wrap), env)
+                            backup::upload(&cfg, &req, None, &cancel, Some(&wrap), env)
                                 .map_err(|(_, e)| e)?;
-                        if let Err(e) = pending.protect_commit(&mut None, &cancel) {
+                        if let Err(e) = pending.protect_commit(None, &cancel) {
                             pending.abandon();
                             return Err(e);
                         }
@@ -1147,7 +1147,7 @@ impl Sim {
                             std::sync::atomic::Ordering::SeqCst,
                         );
                         let result = commit.drive(&|_: crate::repo::control::CommitEvent| {});
-                        let outcome = commit.finish(result, &mut None, &cancel)?;
+                        let outcome = commit.finish(result, None, &cancel)?;
                         Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
                     },
                 );

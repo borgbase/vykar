@@ -34,7 +34,7 @@ use crate::config::{CommandDump, VykarConfig};
 
 use crate::limits;
 use crate::platform::fs;
-use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
+use crate::repo::control::{CancelToken, CommitEvent, EventSink};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::sessions;
 use crate::repo::{HostEnv, Repo, WriteSessionOptions};
@@ -213,7 +213,7 @@ pub enum BackupProgressEvent {
     },
     /// A non-fatal post-commit issue. The snapshot is durably committed.
     /// `tracing::warn!` has already fired; this surfaces the warning to the
-    /// progress callback (CLI/GUI) since the GUI does not subscribe to tracing.
+    /// event sink (CLI/GUI) since the GUI does not subscribe to tracing.
     Warning {
         message: String,
     },
@@ -229,11 +229,11 @@ impl From<CommitEvent> for BackupProgressEvent {
 }
 
 pub(crate) fn emit_progress(
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     event: BackupProgressEvent,
 ) {
-    if let Some(callback) = progress.as_deref_mut() {
-        callback(event);
+    if let Some(sink) = progress {
+        sink.emit(event);
     }
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn emit_progress(
 /// Up to two clauses are emitted. The directory clause is blunt on purpose:
 /// an unlistable directory omits an unbounded subtree, not one file.
 pub(crate) fn emit_dataless_summary(
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     files: u64,
     dirs: u64,
 ) {
@@ -274,18 +274,12 @@ pub(crate) fn emit_dataless_summary(
 /// always happen together. The tracing half reaches stderr (via the tracing
 /// subscriber in the CLI); the progress event half reaches the GUI log panel.
 /// Keeping both sides in one helper prevents drift.
-///
-/// Generic over `F: FnMut(..)` so callers that hold either a concrete closure
-/// (`&mut Option<impl FnMut(..)>`) or a type-erased one
-/// (`&mut Option<&mut dyn FnMut(..)>`) can use it.
-pub(crate) fn emit_post_commit_warning<F: FnMut(BackupProgressEvent)>(
-    progress: &mut Option<F>,
+pub(crate) fn emit_post_commit_warning(
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     msg: String,
 ) {
     warn!("{msg}");
-    if let Some(cb) = progress {
-        cb(BackupProgressEvent::Warning { message: msg });
-    }
+    emit_progress(progress, BackupProgressEvent::Warning { message: msg });
 }
 
 /// Render a soft per-file error for a `skipping file '<path>': <reason>`
@@ -322,7 +316,7 @@ pub(crate) fn stamp_item_metadata(item: &mut Item, meta: &fs::MetadataSummary) {
 }
 
 pub(crate) fn emit_stats_progress(
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     stats: &SnapshotStats,
     current_file: Option<String>,
 ) {
@@ -363,10 +357,10 @@ pub fn run(config: &VykarConfig, req: BackupRequest<'_>) -> Result<BackupOutcome
 pub fn run_with_progress(
     config: &VykarConfig,
     req: BackupRequest<'_>,
-    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    events: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
 ) -> Result<BackupOutcome> {
-    run_impl(config, req, progress, cancel, None, HostEnv::system())
+    run_impl(config, req, events, cancel, None, HostEnv::system())
 }
 
 /// Wraps the storage backend before the backup uses it (tests only).
@@ -389,39 +383,39 @@ pub(crate) enum FailureScope {
 pub(crate) fn run_impl(
     config: &VykarConfig,
     req: BackupRequest<'_>,
-    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    events: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> Result<BackupOutcome> {
-    run_scoped(config, req, progress, cancel, wrap_backend, host_env).map_err(|(_, e)| e)
+    run_scoped(config, req, events, cancel, wrap_backend, host_env).map_err(|(_, e)| e)
 }
 
 /// [`run_impl`] that also reports whether a failure was source-local.
 pub(crate) fn run_scoped(
     config: &VykarConfig,
     req: BackupRequest<'_>,
-    mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    events: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
-    let pending = upload(config, &req, &mut progress, cancel, wrap_backend, host_env)?;
+    let pending = upload(config, &req, events, cancel, wrap_backend, host_env)?;
 
     // ── Phase 2: Commit (no lock; the marker handshake, and the
     // single-writer check on a single-writer repository) ─────────────────
     let mut pending = pending;
-    if let Err(e) = pending.protect_commit(&mut progress, cancel) {
+    if let Err(e) = pending.protect_commit(events, cancel) {
         pending.abandon();
         return Err((FailureScope::Repository, e));
     }
     let mut commit = pending.begin_commit();
     let result = {
-        let events = FnMutSink::new(|e: CommitEvent| emit_progress(&mut progress, e.into()));
-        commit.drive(&events)
+        let commit_events = |e: CommitEvent| emit_progress(events, e.into());
+        commit.drive(&commit_events)
     };
     commit
-        .finish(result, &mut progress, cancel)
+        .finish(result, events, cancel)
         .map_err(|e| (FailureScope::Repository, e))
 }
 
@@ -432,7 +426,7 @@ pub(crate) fn run_scoped(
 pub(crate) fn upload(
     config: &VykarConfig,
     req: &BackupRequest<'_>,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    events: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
@@ -442,7 +436,7 @@ pub(crate) fn upload(
         config,
         req,
         &prepared,
-        progress,
+        events,
         cancel,
         wrap_backend,
         host_env,
@@ -513,7 +507,7 @@ fn upload_prepared(
     config: &VykarConfig,
     req: &BackupRequest<'_>,
     prepared: &Prepared<'_>,
-    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&dyn EventSink<BackupProgressEvent>>,
     cancel: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
     host_env: HostEnv,
@@ -741,13 +735,12 @@ mod tests {
     /// given `(files, dirs)` pair.
     fn dataless_warnings(files: u64, dirs: u64) -> Vec<String> {
         let mut msgs: Vec<String> = Vec::new();
-        let mut cb = |evt: BackupProgressEvent| {
+        let sink = crate::repo::control::FnMutSink::new(|evt: BackupProgressEvent| {
             if let BackupProgressEvent::Warning { message } = evt {
                 msgs.push(message);
             }
-        };
-        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
-        emit_dataless_summary(&mut progress, files, dirs);
+        });
+        emit_dataless_summary(Some(&sink), files, dirs);
         msgs
     }
 

@@ -37,10 +37,10 @@ fn tree(name: &str) -> SourceTree {
     SourceTree::seeded(name, 2, FILE_SIZE)
 }
 
-/// Invariants 1 to 4 and 12 (and 8): what a conditional store keeps while a
-/// violation of the lock's exclusion (invariant 7, gone with the lock) was
-/// expected; the name is historical.
-const NOT_LOCK: &[Invariant] = &[
+/// Invariants 1 to 4 and 12 (and 8): the data a conditional store keeps
+/// beside a late create (judged without invariant 7, the lock's exclusion,
+/// until it went with the lock).
+const DATA_INVARIANTS: &[Invariant] = &[
     Invariant::CommittedSnapshotsRestore,
     Invariant::AcknowledgedCommitsDurable,
     Invariant::NoSilentRemoval,
@@ -181,7 +181,7 @@ fn unknown_outcome_fails_and_a_late_create_is_harmless() {
             assert!(matches!(late.outcome, OpOutcome::Released(_)), "{late:?}");
             sim.backup(b, "b1", &tree("b1")).expect_ok();
             assert_eq!(latest_head(&sim).generation, 3);
-            sim.check_invariants(NOT_LOCK).assert_clean();
+            sim.check_invariants(DATA_INVARIANTS).assert_clean();
         }
     }
 }

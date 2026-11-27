@@ -405,7 +405,7 @@ fn requested_fold_writes_a_base_and_collects_garbage() {
     // fold-prefix step lists index.d/ for its age.
     sim.advance(T_PACK + Duration::from_secs(60));
     let r = sim.custom(c, "fold", |repo: &mut RepoWriter<'_>| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         repo.request_index_fold();
         repo.mark_index_dirty();
         repo.save_state()

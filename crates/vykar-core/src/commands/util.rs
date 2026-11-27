@@ -434,7 +434,7 @@ pub(crate) fn with_maintenance_session<T>(
 /// deleted snapshot is protected by its commit (the young-segment rule and
 /// compact's handling of committing sessions) or fails
 /// `StaleChunksDuringCommit`.
-pub(crate) fn with_snapshot_removal_exclusion<T>(
+pub(crate) fn with_snapshot_removal_session<T>(
     repo: &mut Repo,
     action: impl FnOnce(&mut RepoWriter<'_>) -> Result<T>,
 ) -> Result<T> {

@@ -30,7 +30,7 @@
 //! is the class of each run (`Ok`, its allowed error, or disallowed) the
 //! seed must end with. Step 10 re-recorded every seed: the labels
 //! "probe-locks" and "lock (locked)" became [`LABEL_LIST_EXCLUSIVE`] and
-//! [`LABEL_LOCKED`] ("wait (locked)"), the 3 h 1 min jump went from the
+//! [`LABEL_CONTENDED`] ("wait (locked)"), the 3 h 1 min jump went from the
 //! driver's advances (a seed's jump of 3 h 1 min became 46 min), the Lock
 //! faults that no client fired were dropped, and the choices were
 //! re-derived from their decisions ([`rederive`]); each note says so.
@@ -384,7 +384,7 @@ fn ends_intent(old: &str, new: &str) -> bool {
     if commit_started(old) && commit_started(new) {
         return true;
     }
-    if old == LABEL_LOCKED && new == LABEL_LOCKED {
+    if old == LABEL_CONTENDED && new == LABEL_CONTENDED {
         return true;
     }
     if old.ends_with("(gave up)") && new.ends_with("(gave up)") {

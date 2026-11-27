@@ -264,7 +264,7 @@ pub(crate) fn report_unreferenced_on_repo(
     };
     // Refuses `MultiWriterUnsupported` before anything.
     repo.commit_mode()?;
-    repo.load_chunk_index_under_lock()?;
+    repo.load_latest_chunk_index()?;
     let mut attempt = 1;
     loop {
         match report_marked(repo, cancel) {
@@ -272,7 +272,7 @@ pub(crate) fn report_unreferenced_on_repo(
             Err(e) if mark::passes_through(&e) => return Err(e),
             Err(e) if attempt < COMPACT_MARK_ATTEMPTS && head_moved(repo)? => {
                 debug!("the index head moved during the report's mark ({e}); marking again");
-                repo.load_chunk_index_under_lock()?;
+                repo.load_latest_chunk_index()?;
                 attempt += 1;
             }
             Err(e) => return Err(frame(e)),
@@ -446,7 +446,7 @@ fn run_on_repo_inner(
         }
         let listing = take_pack_listing(repo, dry_run, concurrency)?; // 1. packs
         list_live_sessions_registered(repo, own)?; // 2. sessions #1, "now"
-        repo.load_chunk_index_under_lock()?; // 3. head
+        repo.load_latest_chunk_index()?; // 3. head
         compact_repo_listed(repo, own.id(), listing, opts, cancel)
     })
 }
@@ -454,14 +454,14 @@ fn run_on_repo_inner(
 /// A single-writer compact (10-single-protocol step 7): registered with
 /// `writes_heads` (its flag is written before this listing), it refuses
 /// beside a live committing backup or another flagged compact, after
-/// three listings with jittered backoff (`retry_while_locked(3, 2000)`, as
+/// three listings with jittered backoff (`retry_while_contended(3, 2000)`, as
 /// registration retries). `Locked` names the other session; nothing was
 /// written but the registration (the stale temp sweep runs after this
 /// check, in the pack listing).
 fn single_writer_compact_check(repo: &Repo, own: &MaintenanceSession) -> Result<()> {
     let storage = repo.storage().as_ref();
     let env = repo.host_env();
-    sessions::retry_while_locked(3, 2000, env.clock.as_ref(), || {
+    sessions::retry_while_contended(3, 2000, env.clock.as_ref(), || {
         match sessions::single_writer_listing(storage, env, own.id())? {
             None => Ok(()),
             Some(writer) => Err(VykarError::Locked(writer.into_holder())),
@@ -861,7 +861,7 @@ struct MarkSoFar {
 /// mark that found the head moved).
 fn reload_index(repo: &mut Repo) -> Result<()> {
     repo.discard_index_edits();
-    repo.load_chunk_index_under_lock().map_err(mark_refused)
+    repo.load_latest_chunk_index().map_err(mark_refused)
 }
 
 /// Mark and sweep (04 step 9, 3.4 of the plan), after the pack listing,

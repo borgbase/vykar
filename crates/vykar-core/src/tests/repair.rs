@@ -740,7 +740,7 @@ fn index_sweep_excludes_doomed_snapshots() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn plan_only_does_not_take_maintenance_lock() {
+fn plan_only_registers_no_session() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, config) = setup_repo(tmp.path());
 

@@ -324,7 +324,7 @@ fn a_dangling_pointer_fails_before_the_destination_is_created() {
     let id = *meta.item_ptrs.last().unwrap();
     let mut repo = open_local_repo(&repo_dir);
     commands::util::with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         repo.chunk_index_mut().remove(&id).unwrap();
         repo.save_state()
     })

@@ -6,7 +6,7 @@ use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_exclusion};
+use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_session};
 use crate::repo::{OpenOptions, Repo};
 
 /// Aggregate result of a prune operation.
@@ -53,7 +53,7 @@ pub fn run(
 }
 
 /// [`run`] on an already opened repository, in a registered session
-/// (`with_snapshot_removal_exclusion`).
+/// (`with_snapshot_removal_session`).
 pub(crate) fn run_on_repo(
     repo: &mut Repo,
     config: &VykarConfig,
@@ -63,7 +63,7 @@ pub(crate) fn run_on_repo(
     source_filter: &[String],
     cancel: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
-    with_snapshot_removal_exclusion(repo, |repo| {
+    with_snapshot_removal_session(repo, |repo| {
         let now = repo.host_env().now_utc();
 
         // When --source is given, restrict to matching snapshots only

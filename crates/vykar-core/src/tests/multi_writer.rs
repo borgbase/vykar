@@ -96,7 +96,7 @@ fn exclusive_fold() -> Call {
     Call::ExclusiveCustom {
         label: "exclusive fold".into(),
         f: Box::new(|repo| {
-            repo.load_chunk_index_under_lock()?;
+            repo.load_latest_chunk_index()?;
             repo.request_index_fold();
             repo.mark_index_dirty();
             repo.save_state()
@@ -179,7 +179,7 @@ fn expect_locked(run: &crate::sim::RunRecord) {
 /// legacy lock key, the one whose generation was taken rebases and
 /// commits, and both snapshots restore.
 #[test]
-fn two_lock_free_backups_commit_without_a_lock() {
+fn two_multi_writer_backups_commit_side_by_side() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, b) = (sim.client("a"), sim.client("b"));
     let gate = sim.gate(GateRule::new(
@@ -595,7 +595,10 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
         .filter(|r| !r.key.starts_with("sessions/"))
         .collect();
     assert!(stray.is_empty(), "{}: {stray:?}", run.detail());
-    assert!(lock_writes(&recs).is_empty(), "no legacy lock key was written");
+    assert!(
+        lock_writes(&recs).is_empty(),
+        "no legacy lock key was written"
+    );
     assert!(
         sim.store()
             .keys("sessions/")
@@ -618,7 +621,7 @@ fn an_undecided_put_if_absent_check_fails_the_backup() {
 /// at deregistration, so other sessions no longer wait for it; no head or
 /// snapshot.
 #[test]
-fn a_cancel_during_the_lock_free_wait_returns_within_a_slice() {
+fn a_cancel_during_the_commit_wait_returns_within_a_slice() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
     let (f, l) = (sim.client("f"), sim.client("l"));
     sim.backup(l, "l0", &tree("l0")).expect_ok();
@@ -736,7 +739,7 @@ fn suspend_mid_upload(sim: &mut Sim, c: ClientId, name: &str) -> (GateId, Spawne
 /// heads, the snapshot committed and restorable. The next backup's record
 /// is continuous: no `config` GET in its commit.
 #[test]
-fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
+fn a_backup_with_a_gap_before_its_commit_still_commits() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
     let (gate, ra) = suspend_mid_upload(&mut sim, a, "a1");
@@ -745,7 +748,10 @@ fn a_backup_with_a_gap_before_its_commit_commits_lock_free() {
     ra.expect_ok();
     assert!(ra.shared, "a commits in a shared session");
     let recs = records(&sim, a, ra.index);
-    assert!(lock_writes(&recs).is_empty(), "a legacy lock key was written: {recs:?}");
+    assert!(
+        lock_writes(&recs).is_empty(),
+        "a legacy lock key was written: {recs:?}"
+    );
     let mark = recs
         .iter()
         .position(|r| r.op == OpKind::Put && r.key.ends_with(".1.json"))

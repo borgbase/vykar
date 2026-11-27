@@ -1322,7 +1322,7 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     assert!(repo.index_head().unwrap().segments.is_empty(), "folded");
 
     // A load at the head the fold wrote.
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     assert_eq!(repo.chunk_index().len(), 2);
 
     // A backup commit merges against the live table.

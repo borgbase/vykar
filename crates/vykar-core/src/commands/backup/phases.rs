@@ -564,7 +564,7 @@ impl PendingCommit {
             self.decide_mode()?;
         }
         let env = self.repo.host_env().clone();
-        sessions::wait_while_locked(
+        sessions::wait_while_contended(
             &env,
             sessions::COMMIT_MAX_WAIT,
             500,

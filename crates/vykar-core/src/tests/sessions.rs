@@ -2086,12 +2086,12 @@ fn heartbeat_retries_a_failed_put_at_the_next_poll() {
     assert_eq!(session_keys(storage.as_ref()), Vec::<String>::new());
 }
 
-// ── wait_while_locked ────────────────────────────────────────────────────
+// ── wait_while_contended ──────────────────────────────────────────────────
 
 mod deadline {
     use crate::repo::HostEnv;
     use crate::repo::control::CancelToken;
-    use crate::repo::sessions::{COMMIT_MAX_WAIT, wait_while_locked};
+    use crate::repo::sessions::{COMMIT_MAX_WAIT, wait_while_contended};
     use crate::sim::env::{SimTime, TimeMode};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2109,7 +2109,7 @@ mod deadline {
     /// An attempt that is `Locked` until another thread lets it pass (after
     /// 1 s real time) returns once it passes; `on_contended` is called once.
     #[test]
-    fn wait_while_locked_returns_once_the_holder_goes() {
+    fn wait_while_contended_returns_once_the_holder_goes() {
         let gone = Arc::new(AtomicBool::new(false));
         let releaser = {
             let gone = Arc::clone(&gone);
@@ -2119,7 +2119,7 @@ mod deadline {
             })
         };
         let mut contended = 0;
-        wait_while_locked(
+        wait_while_contended(
             &HostEnv::system(),
             Duration::from_secs(30),
             100,
@@ -2142,11 +2142,11 @@ mod deadline {
     /// that stays `Locked` ends `Locked` once 2 h have passed there, in
     /// under 5 s of real time.
     #[test]
-    fn wait_while_locked_times_out_after_budget() {
+    fn wait_while_contended_times_out_after_budget() {
         let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
         let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
         let start = Instant::now();
-        let err = wait_while_locked(
+        let err = wait_while_contended(
             &env,
             COMMIT_MAX_WAIT,
             500,
@@ -2164,18 +2164,18 @@ mod deadline {
         );
     }
 
-    /// `wait_while_locked`'s deadline (virtual time, `TimeMode::Auto`: each
+    /// `wait_while_contended`'s deadline (virtual time, `TimeMode::Auto`: each
     /// backoff sleep advances it at once): an attempt that stays `Locked`
     /// is retried until `max_wait` has passed, then one final attempt's
     /// `Locked(holder)` is returned; `on_contended` is called once.
     #[test]
-    fn wait_while_locked_gives_up_at_the_deadline() {
+    fn wait_while_contended_gives_up_at_the_deadline() {
         let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
         let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
         let max_wait = Duration::from_secs(10 * 60);
         let holder = rival();
         let (mut attempts, mut contended) = (0usize, 0usize);
-        let err = wait_while_locked(
+        let err = wait_while_contended(
             &env,
             max_wait,
             500,
@@ -2387,11 +2387,11 @@ mod deadline {
 
     /// A cancelled token ends the wait before the first attempt.
     #[test]
-    fn wait_while_locked_interrupted_before_first_attempt() {
+    fn wait_while_contended_interrupted_before_first_attempt() {
         let flag = CancelToken::new();
         flag.cancel();
         let mut attempts = 0;
-        let err = wait_while_locked(
+        let err = wait_while_contended(
             &HostEnv::system(),
             Duration::from_secs(30),
             500,
@@ -2409,7 +2409,7 @@ mod deadline {
 
     /// A cancel during the wait (after 200 ms) ends it within a sleep slice.
     #[test]
-    fn wait_while_locked_interrupted_during_contention() {
+    fn wait_while_contended_interrupted_during_contention() {
         let flag = CancelToken::new();
         let setter = {
             let flag = flag.clone();
@@ -2419,7 +2419,7 @@ mod deadline {
             })
         };
         let start = Instant::now();
-        let err = wait_while_locked(
+        let err = wait_while_contended(
             &HostEnv::system(),
             Duration::from_secs(600),
             500,

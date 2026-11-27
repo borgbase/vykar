@@ -68,7 +68,7 @@ impl Repo {
     /// session ends; in a maintenance session (04 step 9) other writers may
     /// move the head, and every write of the session checks for that (`RepoWriter::persist_maintenance`). Replaces any
     /// index loaded at open.
-    pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
+    pub(crate) fn load_latest_chunk_index(&mut self) -> Result<()> {
         debug_assert!(!self.index_dirty);
         let start = std::time::Instant::now();
         let synced = self.sync_index(None, true)?;

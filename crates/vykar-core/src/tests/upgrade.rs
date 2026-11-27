@@ -781,7 +781,7 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
 /// on a resumed one: `config` is not written, the legacy index stays, and a
 /// rerun resumes.
 #[test]
-fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
+fn a_lost_fence_before_the_version_switch_leaves_config_unchanged() {
     for resume in [false, true] {
         let fx = fixture(RepoFormat::V3);
         fx.write("a", "alpha");

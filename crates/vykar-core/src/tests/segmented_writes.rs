@@ -523,7 +523,7 @@ fn maintenance_writes_fold_at_the_hard_limit() {
     let mut last = None;
     let mut toggled = None;
     for _ in 0..5u32 {
-        repo.load_chunk_index_under_lock().unwrap();
+        repo.load_latest_chunk_index().unwrap();
         toggle_an_entry(&mut repo, &mut toggled);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
         repo.unchecked_writer().save_state().unwrap();
@@ -555,7 +555,7 @@ fn fence_failure_publishes_nothing() {
     let objects = fx.index_objects();
 
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     let before = sorted_entries(repo.chunk_index());
     toggle_an_entry(&mut repo, &mut None);
     let err = repo
@@ -1048,7 +1048,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
         .open_with(storage, &fx.cache(), OpenOptions::new())
         .unwrap();
     let stats = commands::util::with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         ops.lock().unwrap().clear();
         commands::compact::compact_in_session(
             repo,
@@ -1496,7 +1496,7 @@ fn a_partial_fold_failing_before_its_head_retries_on_the_same_handle() {
             .open_with(storage, &fx.cache(), OpenOptions::new())
             .unwrap();
         set_store_now(&mut repo);
-        repo.load_chunk_index_under_lock().unwrap();
+        repo.load_latest_chunk_index().unwrap();
         let mut toggled = None;
         toggle_an_entry(&mut repo, &mut toggled);
         repo.request_index_fold();
@@ -1579,7 +1579,7 @@ fn loaded_after_two_backups() -> (Fixture, PathBuf, Repo, IndexHead) {
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     let dir = crate::cache_paths::repo_cache_dir(&repo.config().id, Some(&fx.cache())).unwrap();
     (fx, dir, repo, first)
 }
@@ -2275,7 +2275,7 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
     let mut toggled = None;
     let mut repo = open(&fx);
     for _ in 0..2 {
-        repo.load_chunk_index_under_lock().unwrap();
+        repo.load_latest_chunk_index().unwrap();
         toggle_an_entry(&mut repo, &mut toggled);
         repo.unchecked_writer().save_state().unwrap();
     }
@@ -2287,7 +2287,7 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
 
     age_segment(&fx, &b1);
     let mut repo = open(&fx);
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
     repo.unchecked_writer().save_state().unwrap();
     let head = fx.head();
@@ -2306,11 +2306,11 @@ fn a_maintenance_fold_behind_a_young_segment_appends_its_edits() {
     let b1 = fx.head().segments[1].name;
     let mut toggled = None;
     let mut repo = open(&fx);
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
     repo.unchecked_writer().save_state().unwrap();
     let m1 = fx.head().segments[2].name;
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     toggle_an_entry(&mut repo, &mut toggled);
     repo.request_index_fold();
     repo.unchecked_writer().save_state().unwrap();
@@ -2346,7 +2346,7 @@ fn a_full_fold_folds_young_segments() {
     let before = fx.head();
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     commands::util::with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         repo.request_full_index_fold();
         repo.mark_index_dirty();
         repo.save_state()
@@ -2373,7 +2373,7 @@ fn a_partial_fold_fetches_what_the_cache_lacks() {
     age_segment(&fx, &before.segments[0].name);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     commands::util::with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         let dir = repo.cache_dir().unwrap();
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
@@ -2413,7 +2413,7 @@ fn a_partial_fold_refetches_a_damaged_cached_segment() {
     age_segment(&fx, &before.segments[0].name);
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     commands::util::with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         let dir = repo.cache_dir().unwrap();
         for r in &before.segments {
             let path = dir.join(format!("{}{}", table::SEGMENT_PREFIX, r.name.to_hex()));

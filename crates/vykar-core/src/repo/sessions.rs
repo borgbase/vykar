@@ -581,7 +581,7 @@ pub(crate) fn register_session_with(
 }
 
 /// [`register_session`] with its retry policy: PUT the marker (deleted again
-/// on a failed PUT), then [`exclusive_listing`] under [`retry_while_locked`]
+/// on a failed PUT), then [`exclusive_listing`] under [`retry_while_contended`]
 /// (`max_attempts`, `base_delay_ms`); the marker is deleted on the final
 /// error.
 pub(crate) fn register_session_inner(
@@ -609,7 +609,7 @@ pub(crate) fn register_session_inner(
     }
     let written = MarkerStamp::now(env.clock.as_ref());
 
-    match retry_while_locked(max_attempts, base_delay_ms, env.clock.as_ref(), || {
+    match retry_while_contended(max_attempts, base_delay_ms, env.clock.as_ref(), || {
         exclusive_listing(storage, env, &key).map(|_| ())
     }) {
         Ok(()) => {
@@ -2083,7 +2083,7 @@ fn describe_holder(holder: &LockHolder) -> String {
 /// Run `op` until it returns something other than `Locked`, with exponential
 /// backoff + jitter between attempts. Returns the last `Locked` when attempts
 /// run out. Blocks the calling thread on `clock`.
-pub(crate) fn retry_while_locked<T>(
+pub(crate) fn retry_while_contended<T>(
     max_attempts: usize,
     base_delay_ms: u64,
     clock: &dyn Clock,
@@ -2113,7 +2113,7 @@ pub(crate) fn retry_while_locked<T>(
     // Loop only falls through when `max_attempts == 0`; every other path
     // returns inside the match.
     Err(VykarError::Other(
-        "retry_while_locked called with max_attempts == 0".to_string(),
+        "retry_while_contended called with max_attempts == 0".to_string(),
     ))
 }
 
@@ -2142,7 +2142,7 @@ const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
 ///
 /// Blocks the calling thread on `env.clock`. Callers running inside an async
 /// runtime must invoke this via `tokio::task::spawn_blocking`.
-pub(crate) fn wait_while_locked<T>(
+pub(crate) fn wait_while_contended<T>(
     env: &HostEnv,
     max_wait: std::time::Duration,
     base_delay_ms: u64,

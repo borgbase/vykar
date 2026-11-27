@@ -2008,7 +2008,7 @@ fn a_head_that_drops_live_entries_makes_compact_refuse() {
     sim.backup(c, "c0", &tree("c0")).expect_ok();
     sim.backup(c, "t1", &tree("t1")).expect_ok();
     sim.custom(c, "drop t1's entries", |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         let items = crate::commands::list::load_snapshot_items(
             repo,
             "t1",
@@ -2285,7 +2285,7 @@ fn a_pack_the_sweep_empties_is_kept_while_young() {
         c,
         "compact without segment grace",
         |repo: &mut crate::repo::RepoWriter<'_>| {
-            repo.load_chunk_index_under_lock()?;
+            repo.load_latest_chunk_index()?;
             repo.set_segment_grace(Duration::ZERO);
             stats = Some(crate::commands::compact::compact_in_session(
                 repo,
@@ -2343,7 +2343,7 @@ fn compact_dry_run_counts_young_entries() {
         c,
         "compact --dry-run",
         |repo: &mut crate::repo::RepoWriter<'_>| {
-            repo.load_chunk_index_under_lock()?;
+            repo.load_latest_chunk_index()?;
             dry = Some(crate::commands::compact::compact_in_session(
                 repo,
                 crate::commands::compact::UNREGISTERED_TEST_SESSION,

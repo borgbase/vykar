@@ -19,36 +19,36 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
 #[derive(Clone)]
-struct AdvisoryLockBackend {
-    state: Arc<AdvisoryLockBackendState>,
+struct MarkerBackend {
+    state: Arc<MarkerBackendState>,
 }
 
-struct AdvisoryLockBackendState {
+struct MarkerBackendState {
     data: Mutex<HashMap<String, Vec<u8>>>,
-    release_calls: AtomicUsize,
-    fail_release: bool,
+    deregister_calls: AtomicUsize,
+    fail_deregister: bool,
     /// The next this many PUTs of a session journal fail.
     fail_journal_puts: AtomicUsize,
 }
 
-impl AdvisoryLockBackend {
-    fn new(fail_release: bool) -> Self {
+impl MarkerBackend {
+    fn new(fail_deregister: bool) -> Self {
         Self {
-            state: Arc::new(AdvisoryLockBackendState {
+            state: Arc::new(MarkerBackendState {
                 data: Mutex::new(HashMap::new()),
-                release_calls: AtomicUsize::new(0),
-                fail_release,
+                deregister_calls: AtomicUsize::new(0),
+                fail_deregister,
                 fail_journal_puts: AtomicUsize::new(0),
             }),
         }
     }
 
-    fn release_calls(&self) -> usize {
-        self.state.release_calls.load(Ordering::SeqCst)
+    fn deregister_calls(&self) -> usize {
+        self.state.deregister_calls.load(Ordering::SeqCst)
     }
 }
 
-impl StorageBackend for AdvisoryLockBackend {
+impl StorageBackend for MarkerBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let map = self.state.data.lock().unwrap();
         Ok(map.get(key).cloned())
@@ -72,8 +72,8 @@ impl StorageBackend for AdvisoryLockBackend {
     fn delete(&self, key: &str) -> Result<()> {
         // Track deregistration via deletes of exclusive session markers.
         if key.starts_with("sessions/x-") && key.ends_with(".json") {
-            self.state.release_calls.fetch_add(1, Ordering::SeqCst);
-            if self.state.fail_release {
+            self.state.deregister_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_deregister {
                 return Err(VykarError::Other("forced release failure".into()));
             }
         }
@@ -132,7 +132,7 @@ impl StorageBackend for AdvisoryLockBackend {
     vykar_storage::unsupported_server_ops!();
 }
 
-fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repo {
+fn init_repo_with_backend(backend: MarkerBackend) -> Repo {
     Repo::init(
         Box::new(backend),
         EncryptionMode::Aes256Gcm,
@@ -144,7 +144,7 @@ fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repo {
     .unwrap()
 }
 
-fn small_pack_repo(backend: &AdvisoryLockBackend) -> Repo {
+fn small_pack_repo(backend: &MarkerBackend) -> Repo {
     let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
@@ -172,14 +172,14 @@ fn exclusive_markers(storage: &dyn StorageBackend) -> Vec<String> {
 
 #[test]
 fn the_action_error_is_kept_when_deregistration_also_fails() {
-    let backend = AdvisoryLockBackend::new(true);
+    let backend = MarkerBackend::new(true);
     let mut repo = init_repo_with_backend(backend.clone());
 
     let result: Result<()> =
         with_exclusive_session(&mut repo, |_repo| Err(VykarError::Other("boom".into())));
     assert!(matches!(result, Err(VykarError::Other(msg)) if msg == "boom"));
     // Three attempts (`deregister_keys`).
-    assert_eq!(backend.release_calls(), 3);
+    assert_eq!(backend.deregister_calls(), 3);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn success_is_kept_when_deregistration_fails() {
     // non-fatal (`tracing::warn!` only): the work is committed. The marker
     // left behind stops blocking 45 minutes after its last refresh, or
     // `vykar break-lock --sessions` removes it.
-    let backend = AdvisoryLockBackend::new(true);
+    let backend = MarkerBackend::new(true);
     let mut repo = init_repo_with_backend(backend.clone());
 
     let result: Result<()> = with_exclusive_session(&mut repo, |_repo| Ok(()));
@@ -196,14 +196,14 @@ fn success_is_kept_when_deregistration_fails() {
         result.is_ok(),
         "a failed deregistration must not fail a successful action"
     );
-    assert_eq!(backend.release_calls(), 3);
+    assert_eq!(backend.deregister_calls(), 3);
 }
 
 #[test]
 fn the_action_flushes_its_session_before_deregistration() {
     crate::testutil::init_test_environment();
 
-    let backend = AdvisoryLockBackend::new(false);
+    let backend = MarkerBackend::new(false);
     let mut repo = small_pack_repo(&backend);
 
     let result: Result<()> = with_exclusive_session(&mut repo, |repo| {
@@ -221,7 +221,7 @@ fn the_action_flushes_its_session_before_deregistration() {
         repo.storage().exists("sessions/default.index").unwrap(),
         "sessions/default.index should exist after the error path"
     );
-    assert_eq!(backend.release_calls(), 1, "the session deregistered");
+    assert_eq!(backend.deregister_calls(), 1, "the session deregistered");
     assert!(exclusive_markers(repo.storage().as_ref()).is_empty());
 }
 
@@ -235,7 +235,7 @@ fn the_action_flushes_its_session_before_deregistration() {
 fn a_failed_save_session_writes_the_journal() {
     crate::testutil::init_test_environment();
 
-    let backend = AdvisoryLockBackend::new(false);
+    let backend = MarkerBackend::new(false);
     let mut repo = small_pack_repo(&backend);
     let id = format!("x-{:032x}", 7u128);
 
@@ -272,8 +272,8 @@ fn a_failed_save_session_writes_the_journal() {
 /// lock state is cleared, whatever the action returned; inside it the
 /// storage is the write-checked wrapper and the session is `x-` + 32 hex.
 #[test]
-fn the_storage_and_lock_state_are_restored() {
-    let backend = AdvisoryLockBackend::new(false);
+fn the_storage_and_session_state_are_restored() {
+    let backend = MarkerBackend::new(false);
     let mut repo = init_repo_with_backend(backend);
     let raw = Arc::clone(repo.storage());
     for fail in [false, true] {
@@ -305,7 +305,7 @@ fn the_storage_and_lock_state_are_restored() {
 /// `ActiveSessions`, deletes its own marker and runs no action.
 #[test]
 fn a_refused_registration_runs_nothing_and_leaves_no_marker() {
-    let backend = AdvisoryLockBackend::new(false);
+    let backend = MarkerBackend::new(false);
     let mut repo = init_repo_with_backend(backend);
     let env = repo.host_env().clone();
     let shared = sessions::register_session(repo.storage().as_ref(), "live-backup", &env).unwrap();
@@ -330,7 +330,7 @@ fn a_refused_registration_runs_nothing_and_leaves_no_marker() {
 /// `MarkerLostDuringCommit` and no head is written.
 #[test]
 fn a_removed_marker_blocks_the_index_write() {
-    let backend = AdvisoryLockBackend::new(false);
+    let backend = MarkerBackend::new(false);
     let mut repo = init_repo_with_backend(backend);
     repo.set_exclusive_check_reuse(std::time::Duration::ZERO);
     let raw = Arc::clone(repo.storage());

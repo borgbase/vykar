@@ -60,9 +60,9 @@ impl Gate {
 }
 
 /// Runs once, at the commit mark's PUT, before it is forwarded.
-type AtLock = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+type AtMark = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
-fn at_lock(f: impl FnOnce() + Send + 'static) -> Option<AtLock> {
+fn at_mark(f: impl FnOnce() + Send + 'static) -> Option<AtMark> {
     Some(Arc::new(Mutex::new(Some(Box::new(f)))))
 }
 
@@ -74,21 +74,21 @@ struct Shared {
     fail_packs: bool,
     /// Delete one stored pack just before the commit mark, as a concurrent
     /// compact would after reaping this session's marker.
-    delete_pack_at_lock: bool,
+    delete_pack_at_mark: bool,
     /// Answer `object_sizes` like a vykar-server with `?sizes` does, so the
     /// commit verifies its packs with one batch instead of per-pack requests.
     batch_sizes: bool,
     /// Number of `object_sizes` batches answered.
     batches: Arc<Mutex<usize>>,
     /// Fail the commit mark's PUT, so the commit is never protected.
-    fail_lock_put: bool,
+    fail_mark_put: bool,
     /// Set by the first successful pack PUT and passed to the backup as its
     /// cancel token, so the run is interrupted once packs are durable.
     interrupt_after_pack: Option<CancelToken>,
     /// Fail every `snapshots/` PUT, after the index write it follows.
     fail_snapshot_put: bool,
     /// Another client's work, run at the commit mark's PUT.
-    at_lock: Option<AtLock>,
+    at_mark: Option<AtMark>,
     /// Fail every `exists` of a session marker once the commit mark was
     /// seen, so the commit's marker probe is inconclusive.
     fail_marker_probe: bool,
@@ -135,18 +135,18 @@ impl ObservingBackend {
         }
         if mark {
             self.record(Event::MarkPut);
-            if self.shared.fail_lock_put {
+            if self.shared.fail_mark_put {
                 return Err(VykarError::Other("injected mark PUT failure".into()));
             }
             let hook = self
                 .shared
-                .at_lock
+                .at_mark
                 .as_ref()
                 .and_then(|h| h.lock().unwrap().take());
             if let Some(f) = hook {
                 f();
             }
-            if self.shared.delete_pack_at_lock {
+            if self.shared.delete_pack_at_mark {
                 let victim = self
                     .inner
                     .list("packs/")?
@@ -481,7 +481,7 @@ fn assert_missing_pack_fails_commit_with(
     let index_before = latest_head(&*storage);
     let objects_before = repo_keys(config, "index.d/");
     let shared = Shared {
-        delete_pack_at_lock: true,
+        delete_pack_at_mark: true,
         batch_sizes,
         ..Default::default()
     };
@@ -607,7 +607,7 @@ fn many_pack_backup_commits() {
 /// Nothing is left behind, and no lock was taken (10-single-protocol step
 /// 7; the commit lock was released last before).
 #[test]
-fn commit_cleans_up_session_before_releasing_lock() {
+fn commit_cleans_up_its_session_after_the_snapshot() {
     let (_dir, config, src) = setup();
     let shared = Shared::default();
     run_backup(&config, &src, &shared).unwrap();
@@ -677,10 +677,10 @@ fn session_keys(config: &crate::config::VykarConfig) -> (bool, bool) {
 /// the journal so the next run can recover the uploaded packs (it held the
 /// commit lock throughout until 10-single-protocol step 7).
 #[test]
-fn failed_commit_deregisters_before_releasing_lock() {
+fn a_failed_commit_deregisters_and_keeps_its_journal() {
     let (_dir, config, src) = setup();
     let shared = Shared {
-        delete_pack_at_lock: true,
+        delete_pack_at_mark: true,
         ..Default::default()
     };
     let err = run_backup(&config, &src, &shared).unwrap_err().to_string();
@@ -709,10 +709,10 @@ fn failed_commit_deregisters_before_releasing_lock() {
 /// 10-single-protocol step 7) deregisters its session and keeps the
 /// journal.
 #[test]
-fn lock_acquisition_failure_deregisters_and_keeps_journal() {
+fn a_failed_commit_mark_deregisters_and_keeps_journal() {
     let (_dir, config, src) = setup();
     let shared = Shared {
-        fail_lock_put: true,
+        fail_mark_put: true,
         ..Default::default()
     };
     let err = run_backup(&config, &src, &shared).unwrap_err().to_string();
@@ -1104,18 +1104,18 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
         }
     };
     let shared = Shared {
-        at_lock: at_lock(hook),
+        at_mark: at_mark(hook),
         ..Default::default()
     };
     run_backup(&config, &src, &shared).unwrap();
-    let head_at_lock = seen.lock().unwrap().take().expect("the hook ran");
-    assert_eq!(head_at_lock.segments.len(), 1, "{head_at_lock:?}");
+    let head_at_mark = seen.lock().unwrap().take().expect("the hook ran");
+    assert_eq!(head_at_mark.segments.len(), 1, "{head_at_mark:?}");
 
     let repo = cold_repo(&config, &dir.path().join("cold-after"));
     let after = repo.index_head().unwrap();
-    assert_eq!(after.generation, head_at_lock.generation + 1, "{after:?}");
-    assert_eq!(after.segments, head_at_lock.segments, "{after:?}");
-    assert_eq!(after.base, head_at_lock.base, "{after:?}");
+    assert_eq!(after.generation, head_at_mark.generation + 1, "{after:?}");
+    assert_eq!(after.segments, head_at_mark.segments, "{after:?}");
+    assert_eq!(after.base, head_at_mark.base, "{after:?}");
     drop(repo);
     let events = shared.events.lock().unwrap().clone();
     assert!(!events.contains(&Event::SegmentPut), "{events:?}");
@@ -1177,8 +1177,8 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
         }
         let other = other_client(dir.path(), &config);
 
-        type AtLockState = (Option<(String, Vec<u8>)>, Vec<String>);
-        let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+        type AtMarkState = (Option<(String, Vec<u8>)>, Vec<String>);
+        let seen: Arc<Mutex<Option<AtMarkState>>> = Arc::default();
         let repo_dir = dir.path().join("repo");
         let hook = {
             let (seen, config) = (Arc::clone(&seen), config.clone());
@@ -1245,7 +1245,7 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
             }
         };
         let shared = Shared {
-            at_lock: at_lock(hook),
+            at_mark: at_mark(hook),
             fail_marker_probe: true,
             ..Default::default()
         };
@@ -1258,12 +1258,12 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
             *shared.marker_probe_failures.lock().unwrap() > 0,
             "the marker probe never ran"
         );
-        let (head_at_lock, objects_at_lock) = seen.lock().unwrap().take().expect("the hook ran");
+        let (head_at_mark, objects_at_mark) = seen.lock().unwrap().take().expect("the hook ran");
 
         let storage =
             crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-        assert_eq!(latest_head(&*storage), head_at_lock, "the head moved");
-        assert_eq!(repo_keys(&config, "index.d/"), objects_at_lock);
+        assert_eq!(latest_head(&*storage), head_at_mark, "the head moved");
+        assert_eq!(repo_keys(&config, "index.d/"), objects_at_mark);
         let events = shared.events.lock().unwrap().clone();
         let lock = events.iter().position(|e| *e == Event::MarkPut).unwrap();
         assert!(

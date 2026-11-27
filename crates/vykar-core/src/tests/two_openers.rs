@@ -180,7 +180,7 @@ fn two_openers_share_one_cache_dir() {
         assert_eq!(b.read_chunk(id).unwrap(), payload(i as u8));
     }
 
-    b.load_chunk_index_under_lock().unwrap();
+    b.load_latest_chunk_index().unwrap();
     assert_eq!(b.index_head(), a.index_head());
     assert_eq!(
         b_gets.load(Ordering::SeqCst),

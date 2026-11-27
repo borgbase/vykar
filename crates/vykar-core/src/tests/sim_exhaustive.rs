@@ -12,7 +12,7 @@
 //! and `the_marker_handshake_keeps_heads_immutable` with its
 //! `handshake_search` (a lock-mode backup beside a lock-free one; the
 //! handshake itself still guards the exclusive commands, searched by
-//! `tests::lock_free` and `tests::sim_exclusion`).
+//! `tests::multi_writer` and `tests::sim_exclusion`).
 
 // The searches print their counts for the commit message and for anyone
 // re-measuring the bound; every other path asserts.
@@ -84,7 +84,7 @@ pub(super) fn conditional(c: Case) -> Case {
 }
 
 /// Two backups.
-pub(super) fn lock_pair(hosts: HostPlan) -> Case {
+pub(super) fn backup_pair(hosts: HostPlan) -> Case {
     base(hosts, vec![vec![backup()], vec![backup()]])
 }
 
@@ -175,8 +175,8 @@ pub(super) fn fault_plans() -> Vec<FaultSpec> {
 /// scenarios alone.
 pub(super) fn campaign_scenarios() -> Vec<(String, Case, u32)> {
     let bases = [
-        ("pair-distinct", lock_pair(HostPlan::Distinct)),
-        ("pair-hostname", lock_pair(HostPlan::SameHostname)),
+        ("pair-distinct", backup_pair(HostPlan::Distinct)),
+        ("pair-hostname", backup_pair(HostPlan::SameHostname)),
         ("compact-distinct", commit_vs_compact(HostPlan::Distinct)),
         (
             "compact-hostname",
@@ -383,20 +383,20 @@ fn assert_clean(name: &str, c: &Case) {
 }
 
 #[test]
-fn lock_pair_on_distinct_hosts_is_clean() {
-    assert_clean("pair-distinct", &lock_pair(HostPlan::Distinct));
+fn backup_pair_on_distinct_hosts_is_clean() {
+    assert_clean("pair-distinct", &backup_pair(HostPlan::Distinct));
 }
 
 /// [`assert_clean`], and some schedule has a run that committed in a
 /// shared session (`RunRecord::shared`: the case reaches the path it is
 /// about).
-fn assert_clean_lock_free(name: &str, c: &Case) {
-    assert_clean_lock_free_on(&Template::new(), name, c);
+fn assert_clean_shared(name: &str, c: &Case) {
+    assert_clean_shared_on(&Template::new(), name, c);
 }
 
-/// [`assert_clean_lock_free`] on template `t`.
-fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
-    let mut lock_free = 0usize;
+/// [`assert_clean_shared`] on template `t`.
+fn assert_clean_shared_on(t: &Template, name: &str, c: &Case) {
+    let mut shared = 0usize;
     let e = explore(
         t,
         c,
@@ -406,7 +406,7 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
         },
         |o| {
             if o.sim.history().runs.iter().any(|r| r.shared) {
-                lock_free += 1;
+                shared += 1;
             }
             if o.signatures.is_empty() {
                 Control::Continue
@@ -424,7 +424,7 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
     }
     assert!(e.search.complete, "{name}: the search did not complete");
     assert_eq!(e.clean, e.search.runs);
-    assert!(lock_free > 0, "{name}: no schedule committed in a session");
+    assert!(shared > 0, "{name}: no schedule committed in a session");
 }
 
 /// Two multi-writer backups (phase F part 10c: the encrypted template on
@@ -432,14 +432,14 @@ fn assert_clean_lock_free_on(t: &Template, name: &str, c: &Case) {
 /// schedule is clean (their head creates meet as part 9's do), and the search completes in the pre-commit bound although
 /// object names are random per run.
 #[test]
-fn lock_free_pair_is_clean() {
-    assert_clean_lock_free(
-        "lock-free-pair-distinct",
-        &conditional(lock_pair(HostPlan::Distinct)),
+fn multi_writer_pair_is_clean() {
+    assert_clean_shared(
+        "multi-pair-distinct",
+        &conditional(backup_pair(HostPlan::Distinct)),
     );
-    assert_clean_lock_free(
-        "lock-free-pair-hostname",
-        &conditional(lock_pair(HostPlan::SameHostname)),
+    assert_clean_shared(
+        "multi-pair-hostname",
+        &conditional(backup_pair(HostPlan::SameHostname)),
     );
 }
 
@@ -451,21 +451,21 @@ fn lock_free_pair_is_clean() {
 /// compact marks again or its sweep head's create is taken; the backup's
 /// reuse re-check fails it `StaleChunksDuringCommit` when it read the sweep.
 #[test]
-fn lock_free_backup_against_lock_free_compact_is_clean() {
+fn multi_writer_backup_against_compact_is_clean() {
     let cvc = || conditional(commit_vs_compact(HostPlan::Distinct));
-    assert_clean_lock_free("lock-free-compact-distinct", &cvc());
-    assert_clean_lock_free("lock-free-compact-distinct-stepped", &stepped(cvc()));
+    assert_clean_shared("multi-compact-distinct", &cvc());
+    assert_clean_shared("multi-compact-distinct-stepped", &stepped(cvc()));
 }
 
-/// [`lock_free_backup_against_lock_free_compact_is_clean`] on the young
+/// [`multi_writer_backup_against_compact_is_clean`] on the young
 /// template (c0's segment younger than T_pack: its chunks stay unswept).
 #[test]
-fn lock_free_backup_against_lock_free_compact_young_is_clean() {
+fn multi_writer_backup_against_compact_young_is_clean() {
     let cvc = || conditional(commit_vs_compact(HostPlan::Distinct));
-    assert_clean_lock_free_on(&Template::young(), "lock-free-compact-young", &cvc());
-    assert_clean_lock_free_on(
+    assert_clean_shared_on(&Template::young(), "multi-compact-young", &cvc());
+    assert_clean_shared_on(
         &Template::young(),
-        "lock-free-compact-young-stepped",
+        "multi-compact-young-stepped",
         &stepped(cvc()),
     );
 }
@@ -474,21 +474,21 @@ fn lock_free_backup_against_lock_free_compact_young_is_clean() {
 /// 10d), on the aged template: every schedule is clean (a jump past a marker's staleness
 /// inside the compact reaps nothing live: the driver's backups refresh).
 #[test]
-fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean() {
+fn multi_writer_backup_against_a_stepped_compact_with_jumps_is_clean() {
     let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.advances = true;
-    assert_clean_lock_free("lock-free-compact-stepped-advances", &c);
+    assert_clean_shared("multi-compact-stepped-advances", &c);
 }
 
-/// [`lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_is_clean`]
+/// [`multi_writer_backup_against_a_stepped_compact_with_jumps_is_clean`]
 /// on the young template.
 #[test]
-fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clean() {
+fn multi_writer_backup_against_a_stepped_compact_with_jumps_young_is_clean() {
     let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.advances = true;
-    assert_clean_lock_free_on(
+    assert_clean_shared_on(
         &Template::young(),
-        "lock-free-compact-young-stepped-advances",
+        "multi-compact-young-stepped-advances",
         &c,
     );
 }
@@ -496,15 +496,11 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_jumps_young_is_clea
 /// The stepped compact with one crash offered (either client, at
 /// any decision), aged and young templates: every schedule is clean.
 #[test]
-fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() {
+fn multi_writer_backup_against_a_stepped_compact_with_a_crash_is_clean() {
     let mut c = stepped(conditional(commit_vs_compact(HostPlan::Distinct)));
     c.crash = true;
-    assert_clean_lock_free("lock-free-compact-stepped-crash", &c);
-    assert_clean_lock_free_on(
-        &Template::young(),
-        "lock-free-compact-young-stepped-crash",
-        &c,
-    );
+    assert_clean_shared("multi-compact-stepped-crash", &c);
+    assert_clean_shared_on(&Template::young(), "multi-compact-young-stepped-crash", &c);
 }
 
 /// a: a backup, then a delete of c0; b: a stepped compact, on a
@@ -512,9 +508,9 @@ fn lock_free_backup_against_a_stepped_lock_free_compact_with_a_crash_is_clean() 
 /// its GET of c0 (the mark skips it once a second listing no longer shows
 /// it) or anywhere else: every schedule is clean.
 #[test]
-fn lock_free_delete_during_compact_is_clean() {
-    assert_clean_lock_free(
-        "lock-free-delete-during-compact",
+fn multi_writer_delete_during_compact_is_clean() {
+    assert_clean_shared(
+        "multi-delete-during-compact",
         &stepped(conditional(delete_during_compact())),
     );
 }
@@ -524,19 +520,16 @@ fn lock_free_delete_during_compact_is_clean() {
 /// again), their repacks rebase over each other's heads, and an orphan or
 /// source one deleted is gone for the other. Every schedule is clean.
 #[test]
-fn two_lock_free_compacts_are_clean() {
-    assert_clean_lock_free(
-        "two-lock-free-compacts",
-        &stepped(conditional(two_compacts())),
-    );
+fn two_multi_writer_compacts_are_clean() {
+    assert_clean_shared("two-multi-compacts", &stepped(conditional(two_compacts())));
 }
 
 /// On one hostname (cloned machines: one installation, other boot IDs) the
 /// second backup's registration no longer reaps the first one's live
 /// marker (H1 before 04 step 1): every schedule is clean.
 #[test]
-fn lock_pair_on_one_hostname_is_clean() {
-    assert_clean("pair-hostname", &lock_pair(HostPlan::SameHostname));
+fn backup_pair_on_one_hostname_is_clean() {
+    assert_clean("pair-hostname", &backup_pair(HostPlan::SameHostname));
 }
 
 /// A backup against delete + compact, compact one protocol-key operation at
@@ -584,7 +577,7 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
         // The same search as multi-compact-young-stepped, kept here for
         // the stale count this test asserts on a multi-writer repository too.
         (
-            "compact-young-distinct-stepped-lock-free",
+            "compact-young-distinct-stepped-multi",
             conditional(stepped(commit_vs_compact(HostPlan::Distinct))),
         ),
     ] {
@@ -622,13 +615,13 @@ fn backup_against_compact_over_a_young_control_never_goes_stale() {
 
 /// Most `sessions/` ops one client's main thread makes in one exclusive
 /// registration, deregistration included; one more is a harness bug.
-const MAX_LOCK_OPS: usize = 12;
+const MAX_SESSION_OPS: usize = 12;
 
 /// Real time to wait for a client's next gated op or its end.
 const GATE_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Default, Debug)]
-struct LockPairTally {
+struct ExclusivePairTally {
     schedules: usize,
     /// Both clients inside their sessions at once.
     double_holds: usize,
@@ -680,11 +673,11 @@ fn exclusive_registrations(
     template: &Template,
     hosts: HostPlan,
     bound: Bound,
-) -> (Search, LockPairTally) {
+) -> (Search, ExclusivePairTally) {
     let gated = || KeyMatch::Prefix("sessions/".into());
     let holds = |key: &str| key.starts_with("sessions/x-") && key.ends_with(".json");
     let refusal = AllowedError::ActiveSessions;
-    let mut tally = LockPairTally::default();
+    let mut tally = ExclusivePairTally::default();
     let search = dfs(bound, |prefix| {
         let mut sim = template.fork();
         let ids = ["a", "b"].map(|name| match hosts {
@@ -697,7 +690,7 @@ fn exclusive_registrations(
             .iter()
             .map(|&id| Contender {
                 id,
-                gates: (1..=MAX_LOCK_OPS as u32)
+                gates: (1..=MAX_SESSION_OPS as u32)
                     .map(|n| {
                         sim.gate(
                             GateRule::new(id, OpMatch::Any, gated())
@@ -708,7 +701,7 @@ fn exclusive_registrations(
                     .collect(),
                 next: 0,
                 held: false,
-                max: MAX_LOCK_OPS,
+                max: MAX_SESSION_OPS,
             })
             .collect();
         let mut spawned = Vec::new();
@@ -1655,8 +1648,8 @@ fn measure_bounds() {
     for k in [1, 2] {
         let mut total = Duration::ZERO;
         let bases = [
-            ("pair-distinct", lock_pair(HostPlan::Distinct)),
-            ("pair-hostname", lock_pair(HostPlan::SameHostname)),
+            ("pair-distinct", backup_pair(HostPlan::Distinct)),
+            ("pair-hostname", backup_pair(HostPlan::SameHostname)),
             ("compact-distinct", commit_vs_compact(HostPlan::Distinct)),
             (
                 "compact-distinct-stepped",
@@ -1738,68 +1731,68 @@ fn measure_part_10_searches() {
     let searches: Vec<(String, &Template, Case, u32)> = vec![
         // 10c.
         k1(
-            "lock_free_pair_is_clean: pair-distinct",
+            "multi_writer_pair_is_clean: pair-distinct",
             &enc,
-            conditional(lock_pair(HostPlan::Distinct)),
+            conditional(backup_pair(HostPlan::Distinct)),
         ),
         k1(
-            "lock_free_pair_is_clean: pair-hostname",
+            "multi_writer_pair_is_clean: pair-hostname",
             &enc,
-            conditional(lock_pair(HostPlan::SameHostname)),
+            conditional(backup_pair(HostPlan::SameHostname)),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: whole",
+            "multi_writer_backup_against_compact: whole",
             &enc,
             conditional(cvc()),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: stepped",
+            "multi_writer_backup_against_compact: stepped",
             &enc,
             conditional(stepped(cvc())),
         ),
         // 10d.
         k1(
-            "lock_free_backup_against_lock_free_compact: stepped advances",
+            "multi_writer_backup_against_compact: stepped advances",
             &enc,
             conditional(advances(stepped(cvc()))),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: stepped crash",
+            "multi_writer_backup_against_compact: stepped crash",
             &enc,
             conditional(crash(stepped(cvc()))),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: young whole",
+            "multi_writer_backup_against_compact: young whole",
             &young,
             conditional(cvc()),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: young stepped",
+            "multi_writer_backup_against_compact: young stepped",
             &young,
             conditional(stepped(cvc())),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: young stepped advances",
+            "multi_writer_backup_against_compact: young stepped advances",
             &young,
             conditional(advances(stepped(cvc()))),
         ),
         k1(
-            "lock_free_backup_against_lock_free_compact: young stepped crash",
+            "multi_writer_backup_against_compact: young stepped crash",
             &young,
             conditional(crash(stepped(cvc()))),
         ),
         k1(
-            "lock_free_delete_during_compact: stepped",
+            "multi_writer_delete_during_compact: stepped",
             &enc,
             conditional(stepped(delete_during_compact)),
         ),
         k1(
-            "two_lock_free_compacts: stepped",
+            "two_multi_writer_compacts: stepped",
             &enc,
             conditional(stepped(two_compacts)),
         ),
         (
-            "three-clients-lockfree (campaign) K = 2".to_string(),
+            "three-clients-multi (campaign) K = 2".to_string(),
             &enc,
             conditional(three_clients()),
             2,

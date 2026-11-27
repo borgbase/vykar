@@ -169,7 +169,7 @@ fn swept_and_aged(sim: &mut Sim, a: ClientId) {
 /// `writes_heads`, the others without), write no legacy lock key, and run
 /// as shared sessions.
 #[test]
-fn maintenance_runs_without_the_lock() {
+fn maintenance_runs_in_shared_sessions() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
     swept_and_aged(&mut sim, a);
@@ -182,7 +182,12 @@ fn maintenance_runs_without_the_lock() {
         .map(|run| {
             let recs = records(&sim, a, run.index);
             assert!(run.shared, "run {} is a shared session", run.index);
-            assert_eq!(lock_writes(&recs), 0, "run {} wrote a legacy lock key", run.index);
+            assert_eq!(
+                lock_writes(&recs),
+                0,
+                "run {} wrote a legacy lock key",
+                run.index
+            );
             let marker = sim
                 .store()
                 .log()
@@ -467,7 +472,7 @@ fn the_mark_still_fails_on_other_read_errors() {
 /// equal items, equal tree chunks) creates a head anyway, the
 /// predecessor's state at generation + 1, and still commits.
 #[test]
-fn a_reuse_only_lock_free_commit_creates_a_head() {
+fn a_reuse_only_multi_writer_commit_creates_a_head() {
     let mut sim = encrypted(StoreKind::Conditional);
     let a = sim.client("a");
     sim.backup(a, "a1", &tree("a1")).expect_ok();
@@ -598,7 +603,7 @@ fn a_reuse_only_commit_conflicts_with_a_concurrent_sweep() {
 /// before step 8); a compact whose registration listing meets repair's live
 /// exclusive session fails `Locked`. Each proceeds once the other is done.
 #[test]
-fn repair_and_a_lock_free_compact_exclude_each_other() {
+fn repair_and_a_compact_exclude_each_other() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, r) = (sim.client("a"), sim.client("r"));
     sim.backup(a, "a1", &tree("a1")).expect_ok();
@@ -658,7 +663,7 @@ fn repair_and_a_lock_free_compact_exclude_each_other() {
 /// while a compact is in flight (held after its pack
 /// listing); the compact then completes and every snapshot restores.
 #[test]
-fn a_backup_starts_and_commits_during_a_lock_free_compact() {
+fn a_backup_starts_and_commits_during_a_compact() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, b) = (sim.client("a"), sim.client("b"));
     swept_and_aged(&mut sim, a);
@@ -969,7 +974,7 @@ fn a_sweep_stalled_after_its_marker_check_is_aged_session_reaped() {
 /// client's lock-path backup before, whose reuse-only commit wrote no
 /// head; it writes one now).
 #[test]
-fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
+fn a_compact_stalled_before_its_sweep_stops_beside_a_single_writer_backup() {
     let mut sim = encrypted(StoreKind::Plain);
     let (a, c, l) = (sim.client("a"), sim.client("c"), sim.client("l"));
     swept_and_aged(&mut sim, a);
@@ -1019,7 +1024,7 @@ fn a_compact_stalled_before_its_sweep_stops_beside_a_lock_path_backup() {
 /// reuse of the swept chunks fails it typed (`StaleChunksDuringCommit`) or
 /// what it commits restores.
 #[test]
-fn a_lock_path_backup_waits_for_a_lock_free_compact() {
+fn a_single_writer_backup_waits_for_a_compact() {
     let mut sim = encrypted(StoreKind::Plain);
     let (a, c, l) = (sim.client("a"), sim.client("c"), sim.client("l"));
     swept_and_aged(&mut sim, a);
@@ -1083,7 +1088,7 @@ fn a_lock_path_backup_waits_for_a_lock_free_compact() {
 /// restores. Without the rule C repacked P', won the generation, deleted
 /// P', and B2's rebased head named X in it.
 #[test]
-fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
+fn a_young_pack_a_backup_adopts_is_not_a_repack_source() {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, b, c0, d, c) = (
@@ -1195,7 +1200,7 @@ fn a_young_pack_a_backup_adopts_is_not_a_lock_free_repack_source() {
 /// does not repack the shared pack (B's start, minus M, is older than it);
 /// once B has committed, the next compact repacks it.
 #[test]
-fn an_old_pack_inside_a_live_horizon_is_not_a_lock_free_repack_source() {
+fn an_old_pack_inside_a_live_horizon_is_not_a_repack_source() {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, b) = (sim.client("a"), sim.client("b"));
@@ -1257,7 +1262,7 @@ fn an_old_pack_inside_a_live_horizon_is_not_a_lock_free_repack_source() {
 /// A pack the latest head names, deleted: invariant 4 (the index names an
 /// absent pack) and invariant 1 (the snapshot no longer restores).
 #[test]
-fn a_lock_free_delete_of_a_named_pack_is_flagged() {
+fn a_shared_delete_of_a_named_pack_is_flagged() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, c) = (sim.client("a"), sim.client("c"));
     let ra = sim.backup(a, "a1", &tree("a1"));
@@ -1297,7 +1302,7 @@ fn a_lock_free_delete_of_a_named_pack_is_flagged() {
 /// An orphan pack younger than T_pack (a live backup's upload, not yet
 /// committed), deleted: invariant 10.
 #[test]
-fn a_lock_free_delete_of_a_young_orphan_is_flagged() {
+fn a_shared_delete_of_a_young_orphan_is_flagged() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (b, c) = (sim.client("b"), sim.client("c"));
     let b_snap = sim.gate(GateRule::new(
@@ -1333,7 +1338,7 @@ fn a_lock_free_delete_of_a_young_orphan_is_flagged() {
 /// A committed snapshot deleted by a run that does not report it removed:
 /// invariant 3.
 #[test]
-fn a_lock_free_silent_snapshot_delete_is_flagged() {
+fn a_shared_silent_snapshot_delete_is_flagged() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(a, "a1", &tree("a1")).expect_ok();
@@ -1354,7 +1359,7 @@ fn a_lock_free_silent_snapshot_delete_is_flagged() {
 
 /// An index object the latest head names, deleted: invariant 4.
 #[test]
-fn a_lock_free_delete_of_a_named_index_object_is_flagged() {
+fn a_shared_delete_of_a_named_index_object_is_flagged() {
     let mut sim = encrypted(StoreKind::Conditional);
     let (a, c) = (sim.client("a"), sim.client("c"));
     let ra = sim.backup(a, "a1", &tree("a1"));
@@ -1385,7 +1390,7 @@ fn a_lock_free_delete_of_a_named_index_object_is_flagged() {
 /// must only create):
 /// invariant 12.
 #[test]
-fn a_lock_free_head_overwrite_is_flagged() {
+fn a_shared_head_overwrite_is_flagged() {
     let mut sim = encrypted(StoreKind::ConditionalOverwrite);
     let (a, c) = (sim.client("a"), sim.client("c"));
     sim.backup(a, "a1", &tree("a1")).expect_ok();

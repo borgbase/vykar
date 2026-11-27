@@ -591,7 +591,7 @@ fn failed_index_write_in_compact_leaves_caches_untouched() {
 }
 
 #[test]
-fn lock_lost_before_save_leaves_caches_untouched() {
+fn marker_lost_before_save_leaves_caches_untouched() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11)]);
@@ -607,7 +607,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         // Every write checks the marker (no reuse of an earlier EXISTS).
         repo.set_exclusive_check_reuse(std::time::Duration::ZERO);
         let result = with_exclusive_session(&mut repo, |repo| {
-            repo.load_chunk_index_under_lock()?;
+            repo.load_latest_chunk_index()?;
             repo.mark_index_dirty();
             repo.request_full_index_fold();
             delete_markers(repo);
@@ -632,7 +632,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
 /// Persists the index as a full fold (a new base and head); call in an
 /// exclusive session.
 fn fold_and_save(repo: &mut RepoWriter<'_>) -> Result<()> {
-    repo.load_chunk_index_under_lock()?;
+    repo.load_latest_chunk_index()?;
     repo.mark_index_dirty();
     repo.request_full_index_fold();
     repo.save_state()
@@ -651,7 +651,7 @@ fn delete_markers(repo: &Repo) {
 /// Persists a fold in an exclusive session, then loses the session's
 /// marker before the action returns. Returns the generation before and
 /// after.
-fn save_then_lose_lock(env: &Env) -> (u64, u64) {
+fn save_then_lose_marker(env: &Env) -> (u64, u64) {
     let before = env.open_fresh().index_generation();
     let mut repo = env.open(env.local(), OpenOptions::new());
     with_exclusive_session(&mut repo, |repo| {
@@ -665,13 +665,13 @@ fn save_then_lose_lock(env: &Env) -> (u64, u64) {
 }
 
 #[test]
-fn lock_lost_after_save_still_installs_the_table_segmented() {
+fn marker_lost_after_save_still_installs_the_table_segmented() {
     let env = Env::new(RepoFormat::CURRENT);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     let id = env.open_fresh().config().id.clone();
 
-    let (before, after) = save_then_lose_lock(&env);
+    let (before, after) = save_then_lose_marker(&env);
     assert_ne!(before, after);
     let head = env.open_fresh().index_head().unwrap().clone();
     assert_eq!(head.generation, after);
@@ -745,7 +745,7 @@ fn assert_present(env: &Env, chunks: &HashMap<ChunkId, ChunkIndexEntry>) {
 }
 
 #[test]
-fn prune_uses_index_current_at_lock_time() {
+fn prune_uses_index_current_at_session_time() {
     for format in FORMATS {
         let env = Env::new(format);
         let src_a = env.source("a", &[("one.bin", 0x11)]);
@@ -787,7 +787,7 @@ fn prune_uses_index_current_at_lock_time() {
 }
 
 #[test]
-fn delete_uses_index_current_at_lock_time() {
+fn delete_uses_index_current_at_session_time() {
     for format in FORMATS {
         let env = Env::new(format);
         let src_a = env.source("a", &[("one.bin", 0x11)]);

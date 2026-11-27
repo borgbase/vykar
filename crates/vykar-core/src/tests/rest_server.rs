@@ -309,7 +309,7 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     let mut last = None;
     let mut toggled = None;
     for _ in 0..5u32 {
-        repo.load_chunk_index_under_lock().unwrap();
+        repo.load_latest_chunk_index().unwrap();
         crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
         repo.unchecked_writer().save_state().unwrap();
@@ -339,7 +339,7 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
         sorted_entries(repo.chunk_index())
     );
     // Put the removed entry back before the check.
-    repo.load_chunk_index_under_lock().unwrap();
+    repo.load_latest_chunk_index().unwrap();
     crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
     repo.unchecked_writer().save_state().unwrap();
     drop(repo);

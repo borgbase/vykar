@@ -221,7 +221,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         assert_eq!(entries(repo.chunk_index()), entries(&s4));
         let s5 = index_with(80..190);
         w.commit(&s5);
-        repo.load_chunk_index_under_lock().unwrap();
+        repo.load_latest_chunk_index().unwrap();
         assert_eq!(entries(repo.chunk_index()), entries(&s5));
         assert_eq!(repo.index_generation(), w.head.generation);
     }

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use vykar_types::error::Result;
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_exclusion};
+use super::util::{open_repo, refuse_on_append_only_server, with_snapshot_removal_session};
 use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repo, RepoWriter};
 
@@ -37,7 +37,7 @@ pub fn run(
 }
 
 /// [`run`] on an already opened repository, in a registered session in
-/// both modes (`with_snapshot_removal_exclusion`). A dry run only resolves
+/// both modes (`with_snapshot_removal_session`). A dry run only resolves
 /// the names.
 pub(crate) fn run_on_repo(
     repo: &mut Repo,
@@ -45,7 +45,7 @@ pub(crate) fn run_on_repo(
     dry_run: bool,
     cancel: &CancelToken,
 ) -> Result<DeleteResult> {
-    with_snapshot_removal_exclusion(repo, |repo| {
+    with_snapshot_removal_session(repo, |repo| {
         delete_on_writer(repo, snapshot_names, dry_run, cancel)
     })
 }

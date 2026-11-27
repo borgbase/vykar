@@ -22,7 +22,7 @@ pub fn run(
 ) -> Result<PackMapStats> {
     let mut repo = open_repo(config, passphrase, OpenOptions::new(), cancel)?;
     with_exclusive_session(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
+        repo.load_latest_chunk_index()?;
         repo.write_pack_maps(None, cancel)
     })
 }

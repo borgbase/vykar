@@ -319,7 +319,7 @@ pub enum Policy {
     First,
     /// The first action [`free_actions`] marks free: the client that stepped
     /// last continues; when it has no step, or its last step found
-    /// contention ([`LABEL_LOCKED`]) or ended its command, the lowest client
+    /// contention ([`LABEL_CONTENDED`]) or ended its command, the lowest client
     /// with a step; when no client has work, `Stop`. The bounded search
     /// (`sim::explore`) runs cases with it.
     Continue,
@@ -329,8 +329,8 @@ pub enum Policy {
 /// single-writer listing that found another head writer (the backup
 /// waits, unmarked), or a pre-head listing of `sessions/` that found a live
 /// exclusive session (10-single-protocol step 8). "lock (locked)" until
-/// step 10.
-pub const LABEL_LOCKED: &str = "wait (locked)";
+/// step 10; recorded seeds carry the value, so it stays.
+pub const LABEL_CONTENDED: &str = "wait (locked)";
 
 /// The label of a backup's commit mark (04 step 9; both modes since
 /// 10-single-protocol step 7).
@@ -338,11 +338,11 @@ pub const LABEL_MARK_COMMITTING: &str = "mark-committing";
 
 /// The label of a single-writer backup's listing of `sessions/` before or
 /// after its mark (10-single-protocol step 7) that found no other head
-/// writer (one that did is [`LABEL_LOCKED`]).
+/// writer (one that did is [`LABEL_CONTENDED`]).
 pub const LABEL_LIST_WRITERS: &str = "list-writers";
 
 /// The label of a backup's pre-head listing of `sessions/` that found no
-/// live exclusive session (one that did is [`LABEL_LOCKED`]); the suspend
+/// live exclusive session (one that did is [`LABEL_CONTENDED`]); the suspend
 /// rule runs in the same decision. "probe-locks" until 10-single-protocol
 /// step 10.
 pub const LABEL_LIST_EXCLUSIVE: &str = "list-exclusive";
@@ -350,7 +350,7 @@ pub const LABEL_LIST_EXCLUSIVE: &str = "list-exclusive";
 /// Which of `actions` are free under preemption bounding, given the
 /// decisions before it (`previous`): the pick-0 step of the client that
 /// stepped last, if it has one and its last step neither was labelled
-/// [`LABEL_LOCKED`] (it yields) nor ended its command (a switch at a
+/// [`LABEL_CONTENDED`] (it yields) nor ended its command (a switch at a
 /// command's end is no preemption); otherwise every client's pick-0 step;
 /// and `Stop`. Releases, time jumps, crashes, picks other than 0, and steps
 /// of another client while the last one can continue are not free.
@@ -360,7 +360,7 @@ pub fn free_actions(actions: &[Action], previous: &[TraceEntry]) -> Vec<bool> {
         _ => None,
     });
     let continuing = last.and_then(|(client, e)| {
-        let yielded = e.label == LABEL_LOCKED || e.ended;
+        let yielded = e.label == LABEL_CONTENDED || e.ended;
         let can_step = actions.contains(&Action::Step { client, pick: 0 });
         (!yielded && can_step).then_some(client)
     });
@@ -1556,7 +1556,7 @@ impl<'c> Driver<'c> {
                 w.listed_before = false;
                 w.listed_after = false;
                 self.actors[i].phase = Phase::Probe(w);
-                LABEL_LOCKED.into()
+                LABEL_CONTENDED.into()
             }
             e => {
                 let ProbeWait { run, pending, .. } = *w;

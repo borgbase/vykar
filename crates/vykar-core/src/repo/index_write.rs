@@ -401,7 +401,7 @@ impl Repo {
         }
         let trailers: std::collections::HashMap<_, _> = seg.pack_trailers.into_iter().collect();
         self.discard_index_edits();
-        self.load_chunk_index_under_lock()?;
+        self.load_latest_chunk_index()?;
         let mut dropped = 0;
         let mut kept_from = std::collections::HashSet::new();
         for (id, loc) in seg.relocations {

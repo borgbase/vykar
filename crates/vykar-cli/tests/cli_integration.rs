@@ -1097,7 +1097,8 @@ fn cli_clear_sessions_stale_removes_only_stale_markers_without_a_terminal() {
     );
     age(&stale_shared);
     age(&stale_exclusive);
-    let mut expected = 2;
+    // The Linux-only dead marker below adds one.
+    let expected = if cfg!(target_os = "linux") { 3 } else { 2 };
     #[cfg(target_os = "linux")]
     let dead = {
         // A fresh marker of this machine whose process is gone. The CLI's
@@ -1117,7 +1118,6 @@ fn cli_clear_sessions_stale_removes_only_stale_markers_without_a_terminal() {
             json(vykar_core::platform::boot_id()),
             vykar_core::platform::pid_namespace().map_or("null".to_string(), |n| n.to_string()),
         );
-        expected += 1;
         put("00000000000000000000000000000003", &body)
     };
     let removed = fx.run(&stale_args);

@@ -2,7 +2,40 @@
 title: "Testing"
 ---
 
-A single bug in serialization, encryption, or reference tracking can silently destroy data. vykar's testing strategy uses layered tiers so that each tier catches a different class of defect — from logic errors in individual functions through emergent failures in multi-step workflows across storage backends.
+A single bug in serialization, encryption, or reference tracking can silently destroy data. vykar's testing strategy uses layered tiers so that each tier catches a different class of defect — from logic errors in individual functions through multi-client protocol races and multi-backend stress workflows.
+
+```mermaid
+flowchart TB
+    subgraph PR["Every PR & make pre-commit"]
+        Unit["Unit Tests (isolated subsystems)"]
+        Prop["Property Tests (proptest invariants)"]
+        SimFast["Protocol Simulation (scripted, DFS K=1, 64 random, seeds)"]
+        Matrix["Corruption Matrix (detect & repair)"]
+        Int["Integration & Memory Regression"]
+    end
+
+    subgraph Weekly["Weekly Scheduled CI"]
+        Fuzz["Fuzz Campaign (20 libFuzzer targets, 300s each)"]
+        SimLong["Simulation Campaign (DFS K=2-4 + random, 1h)"]
+    end
+
+    subgraph Manual["On-Demand / Release"]
+        Bench["Testbench Scenarios & Stress (Local, REST, S3, SFTP)"]
+        Probe["Put-if-Absent Backend Probe"]
+    end
+
+    PR --> Weekly --> Manual
+```
+
+| Tier | Primary defect class | How to run | Cadence |
+|---|---|---|---|
+| [Unit Tests](#unit-tests) | Logic errors in isolated subsystems | `make pre-commit` / `cargo test` | Every PR |
+| [Property Tests](#property-tests) | Boundary, serde, crypto, and index edge cases | `make pre-commit` / `cargo test` | Every PR |
+| [Protocol Simulation](#protocol-simulation) | Multi-client concurrency, crash, and fault bugs | `make pre-commit` (fast), `make sim-campaign` (long) | Every PR & weekly CI |
+| [Corruption Matrix](#corruption-matrix-tests) | On-disk corruption detection and repair | `make pre-commit` / `cargo test` | Every PR |
+| [Fuzz Tests](#fuzz-tests) | Crashes, hangs, and OOM on untrusted bytes | `make fuzz-check` / `make fuzz` | Weekly CI (nightly) |
+| [Integration Tests](#integration-tests) | End-to-end command, CLI, and RSS regressions | `make pre-commit` / `cargo test` | Every PR |
+| [Scenario & Stress Tests](#scenario--stress-tests) | Multi-backend drift and long-cycle accumulation | `scripts/testbench` (`uv run ...`) | On-demand / release |
 
 ## Unit Tests
 
@@ -10,7 +43,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 
 | Category | Focus |
 |----------|-------|
-| Format & serialization | RepoObj envelope round-trips, pack header parsing, item serde |
+| Format & serialization | RepoObj envelope round-trips, pack header parsing, item serde, frozen format fixtures (`tests/fixtures/`) |
 | Chunk index | Add/remove, the mapped base table, applied segments and edits |
 | Sessions | Marker registration and refresh, stale reaping, exclusive sessions and their write check, the v2/v3 upgrade's legacy lock key |
 | Prune & retention | Policy evaluation (keep-last, keep-daily/weekly/monthly/yearly) |
@@ -20,30 +53,121 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 
 ## Property Tests
 
-7 `proptest` blocks. Most run 1,000 random cases; the IndexDelta state machine runs 500, and the backup-restore round-trip — which builds a real repository per case — runs 16. These catch edge cases that hand-written examples miss — off-by-one in chunk boundaries, subtle serde field-order regressions, or nonce/context-binding failures in AEAD. Regressions are reproducible via proptest's seed persistence.
+8 `proptest` blocks catch edge cases that hand-written examples miss — off-by-one chunk boundaries, serde field-order regressions, AEAD context-binding failures, and segmented index consistency across folds and sweeps. Regressions are reproducible via proptest's seed persistence.
 
-| Property | Invariant verified |
-|----------|--------------------|
-| Encryption round-trip | `decrypt(encrypt(P, ctx), ctx) == P` for both AES-256-GCM and ChaCha20-Poly1305; wrong-context decryption fails |
-| Item serde round-trip | Arbitrary files, directories, and symlinks survive msgpack positional encode/decode |
-| Legacy index blob round-trip | Legacy refcounts, pack offsets, and generation numbers survive encode/decode (the v2/v3 wire format) |
-| Chunker completeness & determinism | No gaps or overlaps; same input always produces same boundaries; size bounds respected; stream and slice APIs agree |
-| Backup-restore round-trip | Arbitrary nested file trees (empty, small, large files; nested directories) restore byte-identical |
-| Compression round-trip | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
-| IndexDelta state machine | Additions applied once; a file's reuse stage restores the reused set exactly |
+| Property | Cases | Invariant verified |
+|---|:-:|---|
+| Encryption round-trip | 1,000 | `decrypt(encrypt(P, ctx), ctx) == P` for both AES-256-GCM and ChaCha20-Poly1305; wrong-context decryption fails |
+| Item serde round-trip | 1,000 | Arbitrary files, directories, and symlinks survive msgpack positional encode/decode |
+| Legacy index blob round-trip | 1,000 | Legacy refcounts, pack offsets, and generation numbers survive encode/decode (the v2/v3 wire format) |
+| Chunker completeness & determinism | 1,000 | No gaps or overlaps; same input always produces same boundaries; size bounds respected; stream and slice APIs agree |
+| Compression round-trip | 1,000 | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
+| IndexDelta state machine | 500 | Additions applied once; a file's reuse stage restores the reused set exactly |
+| Backup-restore round-trip | 16 | Arbitrary nested file trees (empty, small, large files; nested directories) restore byte-identical |
+| Segmented index consistency | 16 | Random store/remove/relocate/sweep/fold/backup/age sequences match a cold reload from disk |
 
 ## Protocol Simulation
 
-The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `sim` feature) runs many logical clients over one in-memory store, `SimStore`, which logs every operation and injects faults (fail, fail after applying, delay until released, duplicate, crash). Clients run the real commands on virtual time with their own host identities. A checker judges the store and the history against the protocol's invariants: committed snapshots restore, acknowledged commits stay, nothing disappears silently, the index holds together, only allowed errors, exclusive sessions keep every other writer out (invariant 13, which replaced the repository lock's invariant 7 when the lock was removed: an exclusive run writes only while the one entered exclusive hold present is its own, a hold starting at its registration listing; no other run writes an index object, head or snapshot, or deletes a protected key, while an entered hold is present; a run without a session does neither), no pack is deleted younger than 12 h or while its writer's run is live with its marker, whether a head ever named it or not, repack sources (packs the deleting run read first) excepted (invariant 10), and no backup publishes a head after a marker reap or gap with packs past the commit rule's age limit (invariant 11). Each operation record carries the store's clock (`OpRecord.at`, not part of canonical traces) for the last two, and the clock when the request was issued (`OpRecord.issued`: earlier than `at` when a gate held the request), which invariant 11 measures the packs' age at. On a multi-writer repository (the store kinds init records multi-writer on) the checker also judges invariant 12 (no head replaced by other bytes, and each retained head names every live object of its predecessor; heads written by `check --repair`, the upgrade or init are exempt from the second part) and invariant 4 for every retained head (latest − 16 and newer), not only the latest.
+The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `sim` feature) runs multiple logical clients running real vykar commands over a shared, deterministic in-memory store (`SimStore`). Clients run on virtual time with independent host identities (`HostEnv`) and per-client cache directories, while `SimStore` logs every operation, maintains its own server clock for object `mtime`s, and injects faults. Every run uses an encrypted repository (AES-256-GCM with a fast KDF so object names stay fresh without slowing down searches).
 
-- **Scripted scenarios** hold one client at a pause point (a gate on its n-th matching operation) while another runs, and reproduce each known hazard (`sim::hazards`, `sim::interleavings`); once a hazard is fixed its scenario becomes a regression. `SimStore` keeps its own clock, which time advances move together with the clients' and which a scenario can also step alone (an NTP correction on the server); every protocol age is read on it, so client clock skew changes nothing, and H3-compact reaches its damage through a store clock step. Like vykar-server, it keeps the mtime and writer of an `index.d/` or `index.h/` object when the same bytes are PUT again (except on `ConditionalOverwrite`, below, which renews them as local, SFTP and S3 storage do). Its *kind* (`StoreKind`) says what it does with heads and put-if-absent: `Plain` offers no put-if-absent and lets a head PUT with other bytes replace the head (the single family's store); `Conditional` honours put-if-absent and refuses a head overwrite with 409, as vykar-server does; `ConditionalOverwrite` honours put-if-absent but lets a plain PUT replace any object, heads included, as local, OpenSSH SFTP and AWS S3 do (between them, the path most users are on); `Ignoring` overwrites on a create (Garage: the check fails, so init records a single-writer repository there and a client refuses on a multi-writer one); `RacyRelease` passes the check but lets a delayed create land over what is there (IDrive e2: the known hazard H-racy). The client runs vykar-storage's own check (`Verifier`) once per handle; a template forked onto another kind gets the `config` init would have recorded there. The re-read of `config` closes a stale mode at the commit mark and at a maintenance run's registration; it does not close a single-writer head PUT already past its EXISTS when the repository is switched to multi-writer (route B of the known hazard H-late-head-single, below). Every regression scenario states the kinds it holds on, and every known hazard what it does on the conditional kind (H3 and H3-compact are closed there: their conditional twins are the regressions H3-conditional and H3-compact-conditional; H1 and H1-late-clone hold exclusive sessions, `Call::ExclusiveDelete`; H1-late-clone reproduces there too; H2 was retired with the repository lock). Every scenario uses an encrypted repository (AES-256-GCM, passphrase `SIM_PASSPHRASE`, its key wrapped with a cheap Argon2id so a search stays fast), so an index object's or pack's name is fresh on every write; a backup's commit is a shared run (the run's `RunRecord::shared`, which the store records from the run's commit mark and which invariant 13 reads for a run without a session). `tests::multi_writer` scripts the multi-writer commit: two of them side by side, one waiting at its pre-head listing for a live exclusive session, an exclusive session refusing beside a committing backup, and a backup suspended mid-upload (a gap in its marker record) committing after the suspend rule. `tests::single_writer` scripts the single-writer protocol: the head write (EXISTS, PUT, read-back; a lost update and `ConcurrentHeadWrite` at the machine's level, the lost update of two full backups through an age reap, refused by compact and repaired), the single-writer check (a backup waits, a compact refuses), the suspend rule against mode switches, sweeps, old packs and a replaced `config`, maintenance's re-read of `config` after its registration, and a crashed committing marker blocking an exclusive session and a compact until it is stale. `tests::maintenance_sessions` scripts compact, prune and delete in sessions: a compact skipping its sweep beside a committing backup, marking again when a backup committed during its mark, giving the sweep up after three moved heads; a repack batch rebasing onto a backup's head and dropping a relocation another compact made; a snapshot deleted during the mark; a backup that adds no chunk (`Call::BackupSameSource`: the same untouched source again) creating a head, also after a taken generation, and that head conflicting with a concurrent sweep; repair (an exclusive session) kept apart from compacts, and on a single-writer repository two compacts refusing each other and a backup waiting for a compact. Its V3 tests make a shared run (`Sim::custom_shared`: a registered session) delete what it must not, and show the invariant that judges that delete flag it (4 and 1 for a named pack, 10 for a young orphan, 3 for a snapshot, 4 for a named index object, 12 for a replaced head; invariant 13 judges a shared run only under an exclusive hold). The known hazard H-committing-reaped is a backup whose committing marker is reaped by age after its marker probe, while a compact sweeps the chunks it reused. It runs on the single-writer store too (formerly a known hazard of its own, H-committing-reaped-single), the residual of a defeated single-writer check: a compact's single-writer listing reaps the committing marker, sweeps the reused chunks and deletes their packs, which repair cannot restore. The known hazard H-late-head-single is the same defeated check at the head write: a single-writer backup stalls 46 min between its head EXISTS and its plain PUT, a compact's single-writer listing reaps its marker, sweeps, deletes packs and writes that generation, and the late PUT replaces the compact's head, so the index names the deleted packs (invariant 4) until `check --repair`; the backup refuses its snapshot (`MarkerLostDuringCommit`). It reproduces on `Plain` and on `ConditionalOverwrite` switched to single-writer, and not on `Conditional`, whose 409 reads as `Taken`. Its route B (formerly the known hazard H-switch-late-head) is that stall across `vykar upgrade --commit-mode multi`: the switch reaps the marker, a multi-writer backup creates the generation put-if-absent, and on `ConditionalOverwrite` the late plain PUT replaces that head (invariant 12) and leaves its snapshot unindexed until `check --repair`; not on `Conditional`, and `Plain` cannot be switched. For both, `check --repair` leaves a clean repository and a later compact and restore are clean. H-late-head-single is the single-writer residual; its end state classifies as `SingleWriterHeadRace`, and every known hazard names the signature its end state must classify to. The mixed-mode hazards H-mixed-aged-lock and H-mixed-late-create went with lock mode (no binary commits in it any more).
-- **The driver** (`sim::driver`) runs a *case* on a fork of a template whose control snapshot `c0` was backed up more than 12 h before every case starts (so its segment is foldable and its entries sweepable, as a real repository's older snapshots are; `Template::young` leaves it young): hosts, a script of commands per client, a fault plan and a sequence of choices. The backup commit and the index write are steppable machines, so the driver interleaves the commits of several clients step by step with maintenance commands, releases of delayed writes, time jumps and crashes, one at a time, taking the next choice at every decision (0, the default, runs the first client's next step). Compact runs whole or gate-stepped (`Maintenance::Stepped`): on its own thread, held before each protocol-key operation (`sessions/`, `index.h/`, `index.d/`, `snapshots/`, `packmaps/`, pack deletes and the first pack-shard listing), one decision per operation; seeds that predate the stepped compact (no `maintenance` field) run it whole. Searches and random cases step it with time jumps and crashes too. A stepped compact runs in a session: jumps are offered inside it, and its heartbeat runs beside its gated main thread (the gates skip the heartbeat thread's operations). Delete is one decision. A case's `storage` picks the store kind (default `Plain`); on `Conditional` and `ConditionalOverwrite` the checker adds invariant 12. Every template is encrypted (`TemplateKind::Encrypted`, the only kind since the plaintext template went with plaintext repositories); object names differ between runs, so nothing the driver decides may depend on one, and the determinism tests run on the encrypted template. A backup whose head generation another writer created backs off (`backoff`, a step of its own) and repeats its commit from the snapshot refresh. A backup has its commit protection's decisions before its commit machine: on a multi-writer repository `mark-committing` and `list-exclusive` (the pre-head listing of `sessions/`), on a single-writer one also `list-writers` before and after the mark; a contended decision (another head writer listed, a live exclusive session listed) yields as `wait (locked)`, up to `PROTECTION_ATTEMPTS` of them, and the suspend rule runs in the pre-head listing's decision. Every case ends with the checker; what it found is classified by a damage signature (H3's late head, the single-writer residual, ...), and damage of no known shape fails the test.
-- **Exploration** (`tests::sim_explore`) generates random cases with proptest: a general family must show no damage of an unknown shape, a narrow family must find H3 and shrink it to a case with few non-default choices, and the one-hostname family (two backups on cloned machines) must stay clean; general cases are drawn on both store kinds, and H3's family on the conditional kind must show no late head's damage at all. A failing case is written as a trace (`$VYKAR_SIM_TRACE_DIR`, default `<temp>/vykar-sim`) whose first line is the case; `VYKAR_SIM_REPLAY=<trace>` with `tests::sim_driver::replay_from_env` runs it again. `VYKAR_SIM_SEED` sets the seed and `VYKAR_SIM_CASES` the number of general cases; `VYKAR_SIM_MEASURE=1` with `tests::sim_explore::measure` prints the cost per case.
-- **Bounded exhaustive search** (`sim::explore`, `tests::sim_exhaustive`) runs every schedule of a small scenario with at most K preemptions: a decision that switches away from a client that could continue, reorders a client's own reads, releases a delayed write, jumps time or crashes a client. A protection step that found contention, or a client that ends a command, yields for free. Pre-commit searches two backups on distinct hosts (clean), the same two on one hostname (clean since the installation ID), a backup against delete plus a gate-stepped compact (clean), and the same pair, whole and stepped, over the young template (clean, and no backup ends `StaleChunksDuringCommit`: the sweep keeps c0's young entries), at K = 1; and on a multi-writer repository two backups (distinct hosts and one hostname) and a backup against a delete plus compact, whole and stepped, on the aged and the young template, stepped with time jumps inside the compact and with a crash, a delete of c0 during a stepped compact, and two compacts, each clean with a multi-writer run reached; delete is one step. Gate-stepped searches cover two exclusive registrations (`exclusive_registrations_race`), and an exclusive session against a backup on both store kinds (`exclusive_against_backup_race`: every `sessions/` op of both but journals, and the backup's head and snapshot writes, held; the exclusive run refuses `ActiveSessions` or the backup `Locked`, and no backup write but its own marker keys lands under the exclusive hold), at K = 3; the single-writer check (`single_writer_checks_race`: two single-writer backups; `single_writer_compact_race`: a backup against a compact; every listing of `sessions/`, marker PUT and head EXISTS and PUT held at a gate; no damage, no generation written twice, no `ConcurrentHeadWrite`), at K = 2, which the campaign runs at K = 4; and the suspend rule (`gapped_backup_against_*`: a backup suspended 46 min after its uploads against a switch to multi-writer, a switch to single-writer, `check --repair` and a compact, every listing of `sessions/`, marker PUT, `config` op and head write held), at K = 2. The marker handshake's search (`the_marker_handshake_keeps_heads_immutable`) and the searches with a lock client went with lock mode.
-- **Regression seeds** (`crates/vykar-core/tests/sim-regressions/*.json`, `tests::sim_regressions`) are cases with the exact damage signatures they must show and the decisions their choices took when saved, so a seed whose schedule drifted fails as such. Every seed is also replayed with its clients' wall clocks skewed by hours (`tests::sim_regressions::regression_seeds_are_skew_invariant`) and must give the same decisions, signatures and run outcomes. `VYKAR_SIM_PROMOTE=<trace>` with `tests::sim_regressions::promote_from_env` prints a seed for a trace. Every seed runs on the encrypted template; the `<name>-conditional` seeds, the plaintext template's cases on the conditional store, were removed with it. A seed records how each run ended (`runs`), its case must name its template, and a seed or case with a field it does not know (an older `lock_clients`, a `Lock` fault, the `Plain` template) does not parse; every seed was re-recorded when the repository lock was removed (labels `list-exclusive` and `wait (locked)`, the 3 h 1 min jump gone), with the same signatures and run outcomes.
-- **Campaign**: `make sim-campaign` (`SIM_SECONDS`, default 3600; `SIM_TRACE_DIR`, default `target/sim-campaign`) runs wider searches (K = 2 and 3, time jumps, one fault on one operation, three clients; every scenario in the single family, on the `Plain` store (a single-writer repository), and in the multi family on the conditional store (`-multi`); in the multi family also a delete during a stepped compact and two compacts, with time jumps at K = 1 and at K = 2), the single-writer check's gate searches at K = 4 (in place of the marker handshake's), and then random cases (half of them on a multi-writer repository, on the conditional store or on `ConditionalOverwrite`) with seeds from the clock, on one worker per core. Workers take the searches from one shared queue until 60 % of the budget has passed, and run random cases from then until the deadline; a search still running then stops 2 % of the budget later, cut short. The queue's K = 1 searches take turns by family (single, multi), cheapest variants first within a family, and the K = 2 and 3 searches sit at a fixed stride through it, the first at its head, so a short budget still reaches every family and some wider searches. The report counts the searches completed, cut short and not started per family, and warns when some were not started. It fails if any case shows damage of an unknown shape, or, on a multi-writer repository, of a shape closed there (`CLOSED_ON_MULTI`: the late-head shapes that create-if-absent heads close and the single-writer residual, since every head is created put-if-absent), after writing its trace, and when it ran no random case; at a budget of 3600 s or more it also fails unless every family completed a search and a K = 2 or 3 search completed (below that it warns); each worker's case in progress is in `worker-<n>.current`, and the first trace of every signature seen is kept as `example-<signature>.trace`. CI runs it weekly (`.github/workflows/sim.yml`) and uploads the traces when it fails.
+```mermaid
+flowchart LR
+    subgraph Env["Simulated Environment"]
+        Store["SimStore (StoreKind, OpLog, Faults)"]
+        Clock["HostEnv (Virtual Clock, Host Identities)"]
+    end
 
-## Matrix Tests
+    subgraph Modes["Execution & Exploration"]
+        Runner["Scripted Runner (Gates & Hazards)"]
+        Driver["Deterministic Driver (Steppable Commit Machines)"]
+        Proptest["Random Exploration (proptest + shrinking)"]
+        DFS["Bounded DFS (at most K preemptions)"]
+        Seeds["Regression Seeds (sim-regressions)"]
+        Campaign["Weekly Campaign (make sim-campaign)"]
+    end
+
+    subgraph Verify["Verification"]
+        Checker["Invariant Checker (Invariants 1-4, 8-13)"]
+        Classifier["Signature Classifier (Known vs Unknown)"]
+    end
+
+    Env --> Runner
+    Env --> Driver
+    Proptest --> Driver
+    DFS --> Driver
+    Seeds --> Driver
+    Campaign --> DFS
+    Campaign --> Proptest
+    Runner --> Checker
+    Driver --> Checker
+    Checker --> Classifier
+```
+
+### Store Models & Faults
+
+`SimStore` models five backend behaviors (`StoreKind`) via vykar-storage's `Verifier` check and conditional-write semantics:
+
+| `StoreKind` | Put-if-absent | Plain head overwrite | Real-world equivalent |
+|---|---|---|---|
+| `Plain` | Unsupported | Allowed | S3 without conditional writes, SFTP without hardlink; single-writer mode |
+| `Conditional` | Honoured | Refused (409) | `vykar-server` (multi-writer mode) |
+| `ConditionalOverwrite` | Honoured | Allowed (renews `mtime`) | Local, OpenSSH SFTP, AWS S3 (multi-writer mode) |
+| `Ignoring` | Overwrites & returns yes | Allowed | Garage (init check detects & falls back to single-writer) |
+| `RacyRelease` | Passes sequential check, racy on late landing | Allowed | IDrive e2 (known hazard `H-racy`) |
+
+Injected fault actions (`FaultAction`):
+
+| Fault | Behavior |
+|---|---|
+| `Fail` | Operation is not applied and returns `Err` |
+| `FailApplied` | Write is applied to the store, then returns `Err` ("outcome unknown") |
+| `Delay` | Returns `Err` now; effect is parked and applied at a later scheduler step |
+| `Duplicate` | Applied now (`Ok`) and parked to land a second time later |
+| `Crash` | Client's future operations fail without effect and its PID becomes dead |
+
+### Checked Invariants
+
+After every run, the checker evaluates the store and operation log against the protocol invariants and classifies any violation into a known damage `Signature` (any `Signature::Unknown`, or a closed signature on a multi-writer store, fails the test):
+
+| # | Invariant | What it verifies | Scope |
+|---|---|---|---|
+| 1 | `CommittedSnapshotsRestore` | Every listed snapshot decodes and restores byte-for-byte against its recorded source tree | All stores |
+| 2 | `AcknowledgedCommitsDurable` | Every backup returning `Ok` remains present unless deleted or pruned | All stores |
+| 3 | `NoSilentRemoval` | Snapshots disappear only via a `delete` or `prune` that targeted them | All stores |
+| 4 | `IndexIntegrity` | Head decodes, all live `index.d/` objects exist with expected sizes, and no absent packs are named | Latest head (`Plain`); latest − 16 retained heads (multi-writer) |
+| 8 | `AllowedErrors` | Every failed run ends with an expected typed error (`Locked`, `ActiveSessions`, `StaleChunksDuringCommit`, injected storage error, etc.) | All stores |
+| 9 | `NoPermanentWedge` | After markers age out, a fresh `backup` and `compact` both succeed | Scripted checks |
+| 10 | `OrphanGrace` | No pack (except repack sources) is deleted younger than 12 h or while its writer's session marker is live | All stores |
+| 11 | `MarkerGapCommit` | No backup publishes a head after a marker reap or gap with packs past the commit age limit | All stores |
+| 12 | `HeadsImmutable` | No stored head is replaced by different bytes, and each retained head carries forward its predecessor's live objects (repair/upgrade/init exempt) | Multi-writer stores |
+| 13 | `ExclusiveSessions` | Exclusive runs write only while holding the sole entered exclusive session; no other writer mutates protected keys while an exclusive hold is active | All stores |
+
+### Test Modes & Schedule
+
+The first four modes run on every `make pre-commit` and PR CI; the long campaign runs weekly (`.github/workflows/sim.yml`) or on demand via `make sim-campaign`.
+
+| Mode | Module | What it explores |
+|---|---|---|
+| Scripted & gated scenarios | `sim::hazards`, `sim::interleavings`, `tests::single_writer`, `tests::multi_writer`, `tests::maintenance_sessions`, `tests::sim_exclusion` | Targeted pause points (`GateRule`) on protocol keys, clock steps, and known hazard reproductions |
+| Random exploration | `tests::sim_explore` | Proptest-generated cases (clients, commands, faults, crashes, time jumps, choice sequences) with automatic shrinking; fixed seed by default |
+| Bounded exhaustive DFS | `sim::explore`, `tests::sim_exhaustive` | Every schedule of small scenarios up to `K` preemptions (`K = 1` for driver scenarios; `K = 2–3` for gate-stepped exclusive, single-writer, and suspend-rule races) |
+| Regression seeds | `crates/vykar-core/tests/sim-regressions/*.json`, `tests::sim_regressions` | Committed cases asserting exact signatures, non-drifted decisions, run outcomes, and multi-hour client clock-skew invariance |
+| Long campaign | `tests::sim_campaign` | Wider DFS (`K = 2–4`, fault placements, 3 clients, stepped compacts) for 60% of the budget, then clock-seeded random proptest rounds for 40% across all cores |
+
+- **Driver cases** fork a template containing a control snapshot `c0` aged > 12 h (so its segment is foldable and sweepable; `Template::young` keeps it young). Backups step through commit protection (`list-writers`, `mark-committing`, `list-exclusive`, suspend rule) and the `BackupCommit` state machine; `compact` runs whole or gate-stepped per protocol-key operation (`sessions/`, `index.h/`, `index.d/`, `snapshots/`, `packmaps/`, pack deletes, and first pack-shard listing) while its heartbeat runs in the background.
+- **Known residual hazards** are explicitly tracked as expected signatures so protocol changes cannot silently regress them: `H3` / `H3-compact` (late head overwrite on `Plain`, closed on conditional stores), `H1-late-clone` (same-hostname late-booting clone reaping an exclusive session), `H-committing-reaped` (committing marker reaped by age during a compact sweep), `H-late-head-single` (single-writer head PUT stalled 46 min past `EXISTS` across a compact or mode switch; repairable via `check --repair`), and `H-racy` (racy conditional create on `RacyRelease`).
+
+### Running & Debugging
+
+| Command / Variable | Purpose |
+|---|---|
+| `make sim-campaign` | Run the long campaign (`SIM_SECONDS=3600`, `SIM_TRACE_DIR=target/sim-campaign`, `VYKAR_SIM_JOBS`) |
+| `VYKAR_SIM_REPLAY=<trace>` | Replay a failing trace via `tests::sim_driver::replay_from_env` |
+| `VYKAR_SIM_PROMOTE=<trace>` | Format a trace as a regression seed JSON via `tests::sim_regressions::promote_from_env` |
+| `VYKAR_SIM_SEED` / `VYKAR_SIM_CASES` | Override the default seed or case count in `tests::sim_explore` |
+| `VYKAR_SIM_MEASURE=1` | Print per-case latency and replay stats via `tests::sim_explore::measure` |
+
+## Corruption Matrix Tests
 
 9 corruption types tested against detection, repair, and resilience paths using `test-case` parametrization. Each corruption is applied to a known-good repository, then `check`, `repair`, and follow-up `backup` are run with assertions on the outcome.
 
@@ -59,49 +183,55 @@ The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `s
 | TruncateIndex | yes (Err) | not possible (Err) | — |
 | CorruptConfig | yes (Err) | not possible (Err) | — |
 
+*Legend: `yes (Ok + errors)` means the repository opens and `check` reports integrity errors; `yes (Err)` means opening or decoding fails outright; `—` means not applicable.*
+
 ## Fuzz Tests
 
 21 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
 
-| Target | Function under test | Risk surface |
-|--------|-------------------|--------------|
-| `fuzz_pack_scan` | `scan_pack_blobs_bytes` | Integer overflow in length fields, truncated frames |
-| `fuzz_pack_trailer` | `PackTrailer::decode_body`, `parse_footer`, `open_trailer_frame`, `read_trailer_from_pack_bytes` (under a deterministic AEAD engine) | Lying footer and frame lengths, entry counts, overlapping offsets; non-canonical bodies |
-| `fuzz_pack_map` | `PackMap::decode_body` | Lying pack and entry counts, unsorted or overlapping entries, oversized maps; non-canonical bodies |
-| `fuzz_decompress` | `decompress` + `decompress_metadata`, streaming zstd metadata reader | Decompression bombs, corrupt LZ4/Zstd frames, streaming vs buffered disagreement |
-| `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
-| `fuzz_listing_ext` | `decode_ext`, `check_ext`, the listing writer's index builder | Repository-controlled `ext`: lying counts and lengths, unknown versions and orders, invalid segment tables; `check` agreeing with decode; the writer's index always passing `check` |
-| `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
-| `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
-| `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext`, `FileCache::decode_from_plaintext_skipping` | Manual msgpack marker parsing, allocation cap, legacy fallback |
-| `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring for chunk, index, head, base and segment objects, tag authentication |
-| `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
-| `fuzz_index_base_v2` | `validate_base_body`, `BaseWriter` | Fixed-width base body: counts against the length, sort order, pack slots, unreferenced packs; re-encode identity |
-| `fuzz_index_segment_v2` | `SegmentBody::decode` | Keyed segment: header counts before allocation, sections, kinds, pack table; re-encode identity |
-| `fuzz_sweep_record` | `SweepRecord::decode`, `encode` | Lying lengths and counts in the sweep record; re-encode identity |
-| `fuzz_index_object` | Store-level segment and base decode (body version 2) of `index.d/` objects, the input sealed with a deterministic AEAD engine | Name check, zstd streaming, decode bounds, error classification as damage |
-| `fuzz_repo_config` | `RepoConfig::decode` (map and positional), `DecodedConfig::validate`, re-encode of a v6 map, pack-size targets, backup's chunker gate and both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, chunker parameters reaching FastCDC, resumable chunker disagreeing with fastcdc |
-| `fuzz_key_blob` | `inspect_key_blob` | Unauthenticated KDF parameters out of bounds (the KDF never runs) |
-| `fuzz_restore_paths` | `sanitize_item_into`, symlink target audit over an item stream | Path traversal on restore, raw (non-UTF-8) names, against an independent model |
-| `fuzz_pending_journal` | `decode_pending_journal`, recovery seeding | `sessions/<id>.index` from other clients, versioned and legacy shapes |
-| `fuzz_protocol_keys` | Storage-key validators, pack-key temp paths, `parse_byte_range`, `validate_pack_header` | Server keys resolving outside the repository root, `Range` header parsing |
-| `fuzz_metadata_msgpack` | `decode_metadata_msgpack::<IndexBlob>` | Streaming msgpack decode disagreeing with the buffered path |
+| Layer | Target | Function under test | Risk surface |
+|---|---|---|---|
+| Packs & compression | `fuzz_pack_scan` | `scan_pack_blobs_bytes` | Integer overflow in length fields, truncated frames |
+| Packs & compression | `fuzz_pack_trailer` | `PackTrailer::decode_body`, `parse_footer`, `open_trailer_frame`, `read_trailer_from_pack_bytes` (deterministic AEAD) | Lying footer/frame lengths, entry counts, overlapping offsets, non-canonical bodies |
+| Packs & compression | `fuzz_pack_map` | `PackMap::decode_body` | Lying pack/entry counts, unsorted or overlapping entries, oversized maps, non-canonical bodies |
+| Packs & compression | `fuzz_decompress` | `decompress`, `decompress_metadata`, streaming zstd metadata reader | Decompression bombs, corrupt LZ4/Zstd frames, streaming vs buffered disagreement |
+| Index & metadata | `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
+| Index & metadata | `fuzz_index_base_v2` | `validate_base_body`, `BaseWriter` | Fixed-width base body: counts vs length, sort order, pack slots, unreferenced packs, re-encode identity |
+| Index & metadata | `fuzz_index_segment_v2` | `SegmentBody::decode` | Keyed segment: header counts before allocation, sections, kinds, pack table, re-encode identity |
+| Index & metadata | `fuzz_sweep_record` | `SweepRecord::decode`, `encode` | Lying lengths and counts in sweep records, re-encode identity |
+| Index & metadata | `fuzz_index_object` | Store-level segment/base decode of `index.d/` objects (deterministic AEAD) | Name check, zstd streaming, decode bounds, damage classification |
+| Index & metadata | `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
+| Index & metadata | `fuzz_metadata_msgpack` | `decode_metadata_msgpack::<IndexBlob>` | Streaming msgpack decode disagreeing with buffered path |
+| Index & metadata | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` (+ skipping variant) | Manual msgpack marker parsing, allocation cap, legacy fallback |
+| Snapshots & restore | `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
+| Snapshots & restore | `fuzz_listing_ext` | `decode_ext`, `check_ext`, the listing writer's index builder | Repository-controlled `ext`: lying counts and lengths, unknown versions and orders, invalid segment tables; `check` agreeing with decode; the writer's index always passing `check` |
+| Snapshots & restore | `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
+| Snapshots & restore | `fuzz_restore_paths` | `sanitize_item_into`, symlink target audit over an item stream | Path traversal on restore, raw non-UTF-8 names, against an independent model |
+| Crypto, config & wire | `fuzz_unpack_object` | `unpack_object`, `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring, tag authentication |
+| Crypto, config & wire | `fuzz_repo_config` | `RepoConfig::decode` (map & positional), `DecodedConfig::validate`, chunker gate & both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, FastCDC params, resumable vs fastcdc disagreement |
+| Crypto, config & wire | `fuzz_key_blob` | `inspect_key_blob` | Unauthenticated KDF parameters out of bounds (KDF never runs) |
+| Crypto, config & wire | `fuzz_pending_journal` | `decode_pending_journal`, recovery seeding | `sessions/<id>.index` from other clients, versioned and legacy shapes |
+| Crypto, config & wire | `fuzz_protocol_keys` | Storage-key validators, pack-key temp paths, `parse_byte_range`, `validate_pack_header` | Server keys escaping repository root, `Range` header parsing |
 
-Corpus seeds are committed and deterministic. CI runs each target for 300 seconds weekly on nightly (`make fuzz-check` replays the corpus without new fuzzing for fast regression checks).
+Corpus seeds are committed and deterministic. Weekly CI (`.github/workflows/fuzz.yml`) runs every target for 300 seconds on nightly. Locally: `make fuzz` (60s per target), `make fuzz-check` (replay corpus without new fuzzing), and `make fuzz-list`.
 
 ## Integration Tests
 
-End-to-end tests at two levels:
-
-- **In-process** (`vykar-core/tests/`, ~2600 lines): init → backup → list → restore → delete → prune → compact → check cycles exercising the `commands` API directly. Covers encryption modes, multi-source configs, lifecycle transitions, concurrent session logic, and crash-recovery journal round-trips.
-- **CLI-level** (`vykar-cli/tests/`, ~1300 lines): spawn the `vykar` binary and assert on exit codes, stdout/stderr, and restored file content. Covers config parsing, multi-repo selection, and end-to-end command syntax.
-- **Memory regression**: backup and restore of a controlled corpus with RSS sampling; asserts peak RSS stays below fixed caps (512 MiB backup, 384 MiB restore) to catch memory regressions in the pipeline.
+| Level | Location | What it verifies |
+|---|---|---|
+| In-process | `vykar-core/tests/` | Full `init → backup → list → restore → delete → prune → compact → check` cycles via the `commands` API: encryption modes, multi-source configs, lifecycle transitions, concurrent sessions, and crash-recovery journals |
+| CLI-level | `vykar-cli/tests/` | Spawns the `vykar` binary and asserts exit codes, stdout/stderr, config parsing, multi-repo selection, and restored file contents |
+| Memory regression | `vykar-core/tests/` | Backup and restore of a controlled corpus with RSS sampling; asserts peak RSS stays below fixed caps (512 MiB backup, 384 MiB restore) |
 
 ## Scenario & Stress Tests
 
-YAML-driven scenario runner (`scripts/testbench`) executes multi-phase workflows against all four storage backends (local, REST, S3/MinIO, SFTP).
+The YAML-driven testbench (`scripts/testbench`) runs multi-phase workflows against all four real storage backends (**local**, **REST**, **S3/MinIO**, and **SFTP**) so storage-abstraction bugs cannot hide behind the local filesystem.
 
-- **Scenarios**: configurable corpus (mixed file types, sizes up to 2 GB), phases including `init → backup → verify (restore + diff) → check → churn → prune → compact → cleanup`. Churn simulation applies configurable adds, deletes, and modifications with growth caps to test incremental backup and dedup correctness over time.
-- **Stress mode**: up to 1000 iterations of `backup → list → restore → verify → delete → compact → prune` with periodic `check` and optional `check --verify-data`. Catches state-accumulation bugs (leaking index entries, index bloat, stale cache entries) that only manifest after many cycles.
-- **Multi-backend coverage**: ensures storage-abstraction bugs do not hide behind the local filesystem.
-- **Put-if-absent probe**: `uv run probe` builds the `put_if_absent_probe` example and runs it against loopback targets (local, `sftp-exec`, S3/MinIO, and SFTP with `--sftp-url`), keeping each JSON report and one Markdown table under `<runtime_root>/probe-runs`; a non-loopback S3 or SFTP host needs `--allow-remote`.
+| Mode | Workflow & coverage |
+|---|---|
+| Scenarios | Configurable corpus (mixed file types, up to 2 GB) through `init → backup → verify (restore + diff) → check → churn → prune → compact → cleanup`. Churn applies configurable adds, deletes, and edits with growth caps to verify incremental backup and deduplication |
+| Stress mode | Up to 1,000 iterations of `backup → list → restore → verify → delete → compact → prune` with periodic `check` (and optional `check --verify-data`). Catches state-accumulation bugs (leaking index entries, index bloat, stale caches) |
+
+### Put-if-Absent Probe
+
+`uv run probe` (in `scripts/testbench`) builds the `put_if_absent_probe` example and tests conditional-create semantics against loopback targets (local, `sftp-exec`, S3/MinIO, and SFTP with `--sftp-url`; non-loopback S3/SFTP requires `--allow-remote`), saving per-target JSON reports and a Markdown summary table under `<runtime_root>/probe-runs`.

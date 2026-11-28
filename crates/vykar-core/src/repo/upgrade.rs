@@ -514,10 +514,11 @@ const LEGACY_LOCK_STALE: chrono::Duration = chrono::Duration::hours(6);
 /// since its last rewrite, so at every write the key's `time` is at most
 /// this old (well under an hour), and a lapse counted from the last rewrite
 /// is counted from at most this long before the last check. Its cost: a
-/// write after a gap of this long or more costs an EXISTS and a PUT of the
-/// key before it (at most 12 rewrites an hour).
+/// write after a gap of this long or more costs an EXISTS, a PUT of the key
+/// and a LIST of `locks/` before it (at most 12 rewrites an hour).
 const LEGACY_LOCK_REWRITE_SECS: i64 = 5 * 60;
-/// A check fails once the last successful rewrite is older than this
+/// A check fails once the last confirmed rewrite (a PUT whose LIST of
+/// `locks/` found no other lock) is older than this
 /// (0.24's limit for an unrefreshed lock: 6 h − 30 min).
 const LEGACY_LOCK_MAX_UNREWRITTEN_SECS: i64 = 6 * 60 * 60 - 30 * 60;
 
@@ -560,7 +561,9 @@ impl LegacyLockEntry {
 /// runs before every write of the upgrade, after the exclusive session's
 /// check (the writer's fence and the session's [`WriteChecked`](super::write_check::WriteChecked) storage
 /// wrapper, `commands::util::with_exclusive_session_as`), rewrites the key every few minutes
-/// and fails once the key is gone or its last rewrite is 5.5 h old.
+/// and lists `locks/` after each rewrite. It fails once the key is gone, once
+/// that listing shows another lock (deleting the key first), or once its last
+/// confirmed rewrite is 5.5 h old.
 ///
 /// Self-contained, apart from the age and same-host judgements it shares
 /// with `sessions`: it outlived this binary's lock (10-single-protocol
@@ -577,12 +580,21 @@ struct LegacyKey {
     state: Mutex<LegacyKeyState>,
 }
 
+/// Why a check gave the key up; every later check fails with it.
+enum Lost {
+    /// A check's EXISTS found the key gone.
+    Removed,
+    /// The listing after a rewrite showed another lock (its key).
+    Foreign(String),
+}
+
 struct LegacyKeyState {
-    /// Unix seconds, on `env`'s clock, of the last successful write of the key.
+    /// Unix seconds, on `env`'s clock, of the last rewrite whose LIST found no
+    /// other lock (or of the acquisition).
     last_rewrite: i64,
-    /// A check found the key gone: every later check fails, release sends nothing.
-    lost: bool,
-    /// A rewrite has failed (warned once).
+    /// A check gave the key up: every later check fails, release sends nothing.
+    lost: Option<Lost>,
+    /// A rewrite (its PUT or its LIST) has failed (warned once).
     rewrite_failed: bool,
 }
 
@@ -672,7 +684,7 @@ impl LegacyUpgradeLock {
                 key,
                 state: Mutex::new(LegacyKeyState {
                     last_rewrite: now.timestamp(),
-                    lost: false,
+                    lost: None,
                     rewrite_failed: false,
                 }),
             }),
@@ -691,21 +703,24 @@ impl LegacyUpgradeLock {
 
     /// The check before every write, as a fence function: `LockExpired`
     /// once the key is gone (sticky, no further request), on a clock
-    /// anomaly, or once the last successful rewrite is more than 5.5 h old
+    /// anomaly, or once the last confirmed rewrite is more than 5.5 h old
     /// (wall clock, so a suspended machine fails its next check); otherwise
     /// it rewrites the key when [`LEGACY_LOCK_REWRITE_SECS`] have passed
-    /// since the last rewrite. A failed rewrite is warned once and retried
-    /// at the next check. Every function returned shares the state.
+    /// since the last confirmed rewrite, then lists `locks/`. When that
+    /// listing shows any other `locks/*.json` key the check deletes the key
+    /// (best effort) and fails with `LockExpired`, sticky like a removed
+    /// key. A failed rewrite (its PUT, or the LIST after it) is warned once
+    /// and retried at the next check. Every function returned shares the
+    /// state.
     pub(crate) fn check_fn(&self) -> FenceFn {
         let shared = Arc::clone(&self.shared);
         Arc::new(move || shared.check())
     }
 
-    /// Delete the key; sends nothing when a check found it gone. The error
+    /// Delete the key; sends nothing when a check gave the key up. The error
     /// is the DELETE's.
     pub(crate) fn release(self) -> Result<()> {
-        let lost = self.shared.lock_state().lost;
-        if lost {
+        if self.shared.lock_state().lost.is_some() {
             return Ok(());
         }
         self.shared.storage.delete(&self.shared.key)
@@ -719,24 +734,49 @@ impl LegacyKey {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lost_error(&self) -> VykarError {
-        VykarError::LockExpired(format!(
-            "the upgrade's lock key {} was removed (`vykar clear-sessions`, or a vykar 0.24 \
-             client on a machine with this hostname took it for stale); nothing more is \
-             written. Run `vykar upgrade` again",
-            self.key
-        ))
+    fn lost_error(&self, lost: &Lost) -> VykarError {
+        VykarError::LockExpired(match lost {
+            Lost::Removed => format!(
+                "the upgrade's lock key {} was removed (`vykar clear-sessions`, or a vykar 0.24 \
+                 client on a machine with this hostname took it for stale); nothing more is \
+                 written. Run `vykar upgrade` again",
+                self.key
+            ),
+            Lost::Foreign(other) => format!(
+                "another lock ({other}) appeared under locks/ beside the upgrade's lock key {} \
+                 (a vykar 0.24 client on a machine with this hostname that took the upgrade's \
+                 key for stale, or another `vykar upgrade` starting). The upgrade gave its key up \
+                 and nothing more is written. Stop vykar 0.24 on machines with this \
+                 hostname, then run `vykar upgrade` again",
+                self.key
+            ),
+        })
+    }
+
+    /// The first (sorted) `locks/*.json` key other than this lock's own.
+    fn foreign_lock(&self) -> Result<Option<String>> {
+        let mut others: Vec<String> = self
+            .storage
+            .list(LEGACY_LOCKS_PREFIX)?
+            .into_iter()
+            .filter(|k| {
+                *k != self.key && k.starts_with(LEGACY_LOCKS_PREFIX) && k.ends_with(".json")
+            })
+            .collect();
+        others.sort();
+        Ok(others.into_iter().next())
     }
 
     fn check(&self) -> Result<()> {
         // Held throughout: concurrent writes wait for one check.
         let mut state = self.lock_state();
-        if state.lost {
-            return Err(self.lost_error());
+        if let Some(lost) = &state.lost {
+            return Err(self.lost_error(lost));
         }
         if !self.storage.exists(&self.key)? {
-            state.lost = true;
-            return Err(self.lost_error());
+            let err = self.lost_error(&Lost::Removed);
+            state.lost = Some(Lost::Removed);
+            return Err(err);
         }
         let now_secs = self.env.now_utc().timestamp();
         let elapsed = now_secs - state.last_rewrite;
@@ -750,7 +790,7 @@ impl LegacyKey {
         if elapsed > LEGACY_LOCK_MAX_UNREWRITTEN_SECS {
             // The key is still ours: release deletes it.
             return Err(VykarError::LockExpired(format!(
-                "the upgrade's lock key was last rewritten {elapsed}s ago (limit \
+                "the upgrade's lock key's last confirmed rewrite was {elapsed}s ago (limit \
                  {LEGACY_LOCK_MAX_UNREWRITTEN_SECS}s); a vykar 0.24 client may take it for \
                  stale. Nothing more is written; run `vykar upgrade` again"
             )));
@@ -759,18 +799,45 @@ impl LegacyKey {
             let written = LegacyLockEntry::new(&self.env, self.env.now_utc())
                 .encode()
                 .and_then(|body| self.storage.put(&self.key, &body));
-            match written {
-                Ok(()) => {
+            if let Err(e) = written {
+                if !state.rewrite_failed {
+                    state.rewrite_failed = true;
+                    warn!(
+                        lock_key = %self.key,
+                        "could not rewrite the upgrade's lock key ({e}); retrying at the \
+                         next write"
+                    );
+                }
+                return Ok(());
+            }
+            // A 0.24 client that reaped the key between the EXISTS and the
+            // PUT and took its own lock is in this listing; the PUT brought
+            // the key back beside it, so it is deleted again.
+            match self.foreign_lock() {
+                Ok(None) => {
                     state.last_rewrite = now_secs;
                     debug!(lock_key = %self.key, "upgrade lock key rewritten");
+                }
+                Ok(Some(other)) => {
+                    if let Err(e) = self.storage.delete(&self.key) {
+                        warn!(
+                            lock_key = %self.key,
+                            "could not delete the upgrade's lock key ({e}); remove it with \
+                             `vykar clear-sessions`"
+                        );
+                    }
+                    let lost = Lost::Foreign(other);
+                    let err = self.lost_error(&lost);
+                    state.lost = Some(lost);
+                    return Err(err);
                 }
                 Err(e) => {
                     if !state.rewrite_failed {
                         state.rewrite_failed = true;
                         warn!(
                             lock_key = %self.key,
-                            "could not rewrite the upgrade's lock key ({e}); retrying at the \
-                             next write"
+                            "could not list locks/ after rewriting the upgrade's lock key \
+                             ({e}); retrying at the next write"
                         );
                     }
                 }

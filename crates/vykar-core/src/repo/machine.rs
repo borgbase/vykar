@@ -162,8 +162,9 @@ impl StepKind {
             // than a backup, the put-if-absent check (once per backend
             // instance), whose probe lives under `sessions/`. During a v2/v3
             // upgrade the fence also does EXISTS and PUT on the legacy key
-            // under `locks/` (`upgrade::LegacyUpgradeLock`); this table is
-            // checked only on v6 repositories.
+            // under `locks/`, a LIST of `locks/` after each PUT and possibly
+            // a DELETE of the key (`upgrade::LegacyUpgradeLock`); this table
+            // is checked only on v6 repositories.
             StepKind::Fence => &[
                 (Read, "sessions/"),
                 (Write, "sessions/"),

@@ -2405,6 +2405,115 @@ fn a_0_24_client_with_this_hostname_reaps_the_key() {
     assert!(fx.heads().is_empty());
 }
 
+/// The race the LIST after each rewrite closes: a 0.24 client on a machine
+/// with the upgrader's hostname reaps the key between a check's EXISTS and
+/// its rewrite PUT and takes its own lock. The rewrite brings the key back,
+/// the LIST after it sees the 0.24 lock, and the upgrade deletes its key and
+/// stops before the switch: nothing but the exclusion's own ops is sent
+/// after that rewrite, and a rerun completes once the 0.24 lock is gone.
+#[test]
+fn an_upgrade_stops_when_a_0_24_client_slips_past_its_rewrite() {
+    let fx = legacy_fixture();
+    let host = crate::repo::HostIdentity {
+        hostname: "upgrader-host".into(),
+        pid: 999_999,
+        boot_id: Some("boot-x".into()),
+        installation_id: None,
+        pid_ns: None,
+    };
+    let time = SimTime::new(chrono::Utc::now(), TimeMode::Manual);
+    let env = HostEnv::system()
+        .with_clock(Arc::new(time.clock(chrono::Duration::zero())))
+        .with_host(host);
+    let theirs: Arc<Mutex<Option<String>>> = Arc::default();
+    let hook: Hook = {
+        let time = Arc::clone(&time);
+        let theirs = Arc::clone(&theirs);
+        let own = Mutex::new(None::<String>);
+        Box::new(move |call, raw| {
+            let step = |minutes: u64| {
+                for _ in 0..minutes * 2 {
+                    time.advance(crate::repo::sessions::HEARTBEAT_POLL);
+                    time.wait_for_waiters(1, std::time::Duration::from_secs(5));
+                }
+            };
+            match call {
+                Call::Before(op) if op.starts_with("put locks/") && op.ends_with(".json") => {
+                    let mut own = own.lock().unwrap();
+                    match own.as_deref() {
+                        None => *own = Some(op.to_string()),
+                        Some(first) if first == op && theirs.lock().unwrap().is_none() => {
+                            // 0.24's reaper as it runs on a machine named
+                            // upgrader-host, where the upgrader's PID is not
+                            // alive; then its own lock.
+                            let surviving = v024::cleanup_stale_locks_inner(
+                                raw,
+                                chrono::Duration::hours(6),
+                                "upgrader-host",
+                                Some("boot-x"),
+                                |_| false,
+                            )
+                            .unwrap();
+                            assert!(surviving.is_empty(), "{surviving:?}");
+                            let guard = v024::acquire_lock(raw).unwrap();
+                            *theirs.lock().unwrap() = Some(guard.key().to_string());
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Call::Read(key)
+                    if !key.starts_with("locks/") && !key.starts_with("sessions/x-") =>
+                {
+                    step(10)
+                }
+                Call::After(op) if !is_lock_op(op) => step(50),
+                _ => {}
+            }
+            Ok(())
+        })
+    };
+    let (mut repo, hooked) = hooked_repo(&fx, Some(env), hook);
+    let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
+    drop(repo);
+    assert!(
+        matches!(&err, VykarError::LockExpired(m) if m.contains("another lock")),
+        "{err:?}"
+    );
+    let theirs = theirs
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the 0.24 client took its lock");
+    assert!(matches!(fx.decoded_config(), DecodedConfig::Positional(c) if c.version == 3));
+    assert_eq!(legacy_lock_keys(&*fx.storage()), vec![theirs.clone()]);
+    let ops = hooked.ops();
+    let own_put = ops[0].clone();
+    assert!(own_put.starts_with("put locks/"), "{ops:?}");
+    let own_key = own_put.strip_prefix("put ").unwrap();
+    let rewrite = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| **o == own_put)
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("the key was rewritten");
+    let after = &ops[rewrite + 1..];
+    assert!(after.iter().all(|o| is_lock_op(o)), "{ops:?}");
+    assert!(
+        after.contains(&format!("delete {own_key}")),
+        "the upgrade deleted its key: {ops:?}"
+    );
+    assert!(
+        exclusive_marker_keys(&*fx.storage()).is_empty(),
+        "the marker was deregistered"
+    );
+
+    fx.storage().delete(&theirs).unwrap();
+    commands::upgrade::run(&fx.config, pass(&fx.config)).unwrap();
+    assert_eq!(fx.version(), 6);
+    fx.check_clean();
+}
+
 /// The legacy key's own `LockExpired` through a whole v2/v3 upgrade (the
 /// legacy arm of the combined check): the exclusive session's heartbeat
 /// keeps its marker fresh (the clock stepped one heartbeat poll at a time,
@@ -2454,7 +2563,7 @@ fn a_legacy_key_that_cannot_be_rewritten_expires_beside_a_live_marker() {
     let err = commands::upgrade::upgrade_repo(&mut repo, None).unwrap_err();
     drop(repo);
     assert!(
-        matches!(&err, VykarError::LockExpired(m) if m.contains("last rewritten")),
+        matches!(&err, VykarError::LockExpired(m) if m.contains("last confirmed rewrite")),
         "{err:?}"
     );
     let ops = hooked.ops();

@@ -1,8 +1,9 @@
 //! The v2/v3 upgrade's legacy lock key (`repo::LegacyUpgradeLock`,
 //! 10-single-protocol step 6): a lock vykar 0.24 reads as its own,
-//! rewritten every few minutes, failing once gone or unrewritten for 5.5 h.
+//! rewritten every few minutes and listed after, failing once gone, beside
+//! another lock or unrewritten for 5.5 h.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
@@ -18,12 +19,15 @@ use crate::testutil::MemoryBackend;
 type BeforePut = Box<dyn FnOnce(&dyn StorageBackend) + Send>;
 
 /// A memory backend with mtimes that counts the requests reaching it, can
-/// fail PUTs to one key, and can run a hook before the next PUT to one key.
+/// fail PUTs to one key or every LIST, and can run a hook before the next
+/// PUT to one key.
 struct Counted {
     inner: MemoryBackend,
     requests: AtomicUsize,
     puts: Mutex<Vec<String>>,
     fail_puts_to: Mutex<Option<String>>,
+    /// Fail every `list` (the acquisition uses `list_meta`).
+    fail_lists: AtomicBool,
     before_put_to: Mutex<Option<(String, BeforePut)>>,
 }
 
@@ -34,6 +38,7 @@ impl Counted {
             requests: AtomicUsize::new(0),
             puts: Mutex::new(Vec::new()),
             fail_puts_to: Mutex::new(None),
+            fail_lists: AtomicBool::new(false),
             before_put_to: Mutex::new(None),
         })
     }
@@ -102,6 +107,9 @@ delegate_storage_backend! {
     }
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.note();
+        if self.fail_lists.load(Ordering::SeqCst) {
+            return Err(VykarError::Other(format!("injected failure: list {prefix}")));
+        }
         self.inner.list(prefix)
     }
     fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
@@ -313,12 +321,18 @@ fn check_rewrites_every_five_minutes() {
     let key = lock.key().to_string();
     assert_eq!(storage.puts_to(&key), 1);
 
+    // A check with no rewrite due costs one EXISTS.
     advance(&time, Duration::minutes(4));
+    let before = storage.requests();
     lock.check().unwrap();
+    assert_eq!(storage.requests() - before, 1);
     assert_eq!(storage.puts_to(&key), 1);
 
+    // One with a rewrite: EXISTS, PUT and the LIST of locks/.
     advance(&time, Duration::minutes(2));
+    let before = storage.requests();
     lock.check().unwrap();
+    assert_eq!(storage.requests() - before, 3);
     assert_eq!(storage.puts_to(&key), 2);
     assert_eq!(time_of(&entry_of(&*storage, &key)), time.now_utc());
     assert_eq!(lock_keys(&*storage), vec![key.clone()]);
@@ -341,8 +355,8 @@ fn check_fails_after_5_5h_without_a_rewrite() {
     advance(&time, Duration::minutes(5 * 60 + 29));
     lock.check().unwrap();
     advance(&time, Duration::minutes(2));
-    expired_containing(lock.check(), "last rewritten");
-    expired_containing(lock.check(), "last rewritten");
+    expired_containing(lock.check(), "last confirmed rewrite");
+    expired_containing(lock.check(), "last confirmed rewrite");
     // Still ours: release deletes it.
     assert!(storage.exists(&key).unwrap());
     lock.release().unwrap();
@@ -374,21 +388,16 @@ fn check_refuses_on_a_clock_anomaly() {
     lock.release().unwrap();
 }
 
-/// H2's successor (10-single-protocol step 9 retired H2, the lock refresh
-/// recreating a reaped key, with this binary's lock): the legacy key's
-/// rewrite recreates a key a vykar 0.24 client reaped. A 0.24 client on the
-/// upgrader's hostname that takes the key for stale (it sees the PID dead
-/// there: the documented same-hostname residual of step 6) reaps it between
-/// the check's EXISTS and its rewrite PUT and takes its own lock; the PUT
-/// then recreates the upgrade's key: two holders, and the upgrade's next
-/// check passes. This asserts the residual reproduces; it is not fixed in
-/// this step. An EXISTS after the rewrite would not see it (it follows our
-/// own PUT), and put-if-absent cannot rewrite an existing key. The fix that
-/// works: after the rewrite PUT, LIST `locks/`; if any other `*.json` key is
-/// there, delete our own key, set `lost` and return `LockExpired` (one LIST
-/// per rewrite).
+/// A vykar 0.24 client on the upgrader's hostname that takes the key for
+/// stale (it sees the PID dead there: the documented same-hostname residual
+/// of step 6) reaps it between the check's EXISTS and its rewrite PUT and
+/// takes its own lock; the PUT then recreates the upgrade's key beside it
+/// (H2's shape on the legacy key; 10-single-protocol step 9 retired H2 with
+/// this binary's lock). The LIST of `locks/` after the rewrite sees the
+/// other lock: the check deletes the upgrade's key and fails, and every
+/// later check fails without a request.
 #[test]
-fn h2_legacy_a_rewrite_after_a_0_24_reap_resurrects_the_key() {
+fn a_rewrite_after_a_0_24_reap_stops_the_upgrade() {
     let storage = Counted::new();
     let (time, env) = env();
     let lock = acquire(&storage, &env).unwrap();
@@ -416,19 +425,66 @@ fn h2_legacy_a_rewrite_after_a_0_24_reap_resurrects_the_key() {
         *storage.before_put_to.lock().unwrap() = Some((key.clone(), reap_and_take));
     }
     // The rewrite is due: EXISTS finds the key, 0.24 reaps it and takes
-    // its own lock, then the rewrite PUT lands.
+    // its own lock, the rewrite PUT lands and the LIST after it sees theirs.
     advance(&time, Duration::minutes(6));
-    lock.check().unwrap();
+    expired_containing(lock.check(), "another lock");
     let theirs = theirs
         .lock()
         .unwrap()
         .clone()
         .expect("the 0.24 client took its lock");
-    let mut both = vec![key.clone(), theirs.clone()];
-    both.sort();
-    assert_eq!(lock_keys(&*storage), both, "two holders");
+    expired_containing(lock.check(), &theirs);
+    assert_eq!(lock_keys(&*storage), vec![theirs.clone()], "ours deleted");
+    let before = storage.requests();
+    advance(&time, Duration::minutes(6));
+    expired_containing(lock.check(), "another lock");
+    assert_eq!(storage.requests(), before);
+    lock.release().unwrap();
+    assert_eq!(storage.requests(), before);
+    assert_eq!(lock_keys(&*storage), vec![theirs]);
+}
+
+/// Keys under `locks/` that are not `*.json` (probe debris) are no lock:
+/// the listing after a rewrite ignores them, as the acquisition does.
+#[test]
+fn check_ignores_non_lock_keys_under_locks() {
+    let storage = Counted::new();
+    let (time, env) = env();
+    let lock = acquire(&storage, &env).unwrap();
+    let key = lock.key().to_string();
+    storage.put("locks/probe-x", b"x").unwrap();
+    advance(&time, Duration::minutes(6));
+    lock.check().unwrap();
+    assert_eq!(storage.puts_to(&key), 2);
+    lock.release().unwrap();
+    assert!(!storage.exists(&key).unwrap());
+    assert!(storage.exists("locks/probe-x").unwrap());
+}
+
+/// A failed LIST after a rewrite counts as a failed rewrite: the check
+/// passes and the next check rewrites and lists again, until one LIST
+/// succeeds.
+#[test]
+fn a_failed_list_after_a_rewrite_is_retried() {
+    let storage = Counted::new();
+    let (time, env) = env();
+    let lock = acquire(&storage, &env).unwrap();
+    let key = lock.key().to_string();
+    storage.fail_lists.store(true, Ordering::SeqCst);
+
+    advance(&time, Duration::minutes(6));
+    lock.check().unwrap();
+    assert_eq!(storage.puts_to(&key), 2);
     advance(&time, Duration::minutes(1));
     lock.check().unwrap();
+    assert_eq!(storage.puts_to(&key), 3, "still due");
+
+    storage.fail_lists.store(false, Ordering::SeqCst);
+    advance(&time, Duration::minutes(1));
+    lock.check().unwrap();
+    assert_eq!(storage.puts_to(&key), 4);
+    advance(&time, Duration::minutes(1));
+    lock.check().unwrap();
+    assert_eq!(storage.puts_to(&key), 4, "confirmed");
     lock.release().unwrap();
-    assert_eq!(lock_keys(&*storage), vec![theirs]);
 }

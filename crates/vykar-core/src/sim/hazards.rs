@@ -29,8 +29,9 @@
 //!
 //! Retired by 10-single-protocol step 9: H2 (the lock refresh recreating a
 //! reaped key; no binary that opens a v6 repository takes the lock). Its
-//! shape on the v2/v3 upgrade's legacy key is the residual
-//! `tests::legacy_lock::h2_legacy_a_rewrite_after_a_0_24_reap_resurrects_the_key`.
+//! shape on the v2/v3 upgrade's legacy key (a rewrite recreating a key a
+//! 0.24 client reaped) is caught by the LIST after each rewrite:
+//! `tests::legacy_lock::a_rewrite_after_a_0_24_reap_stops_the_upgrade`.
 //!
 //! Retired by 10-single-protocol step 7: H4 and H4-skew (compact's own lock
 //! route after a lost lock, which no command reaches since compact runs in a

@@ -136,7 +136,9 @@ pub(super) async fn batch_delete(
 }
 
 /// Remove the files in `data_dir` named in `LEGACY_ROOT_FILES` and return
-/// the bytes they held. A file that cannot be removed is logged and kept.
+/// the bytes they held. A symlink of such a name is removed too (the link,
+/// not its target) and counts no bytes. A file that cannot be removed is
+/// logged and kept.
 fn remove_legacy_root_files(data_dir: &std::path::Path) -> u64 {
     let mut bytes = 0;
     for name in vykar_protocol::LEGACY_ROOT_FILES {
@@ -144,10 +146,12 @@ fn remove_legacy_root_files(data_dir: &std::path::Path) -> u64 {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_file() {
+        let link = meta.file_type().is_symlink();
+        if !meta.is_file() && !link {
             continue;
         }
         match std::fs::remove_file(&path) {
+            Ok(()) if link => {}
             Ok(()) => bytes += meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -387,6 +391,29 @@ mod tests {
         let resp = authed_post(router, "/?batch-delete&cleanup-dirs", keys).await;
         assert_status(&resp, StatusCode::NO_CONTENT);
         assert!(!tmp.path().join("manifest").exists());
+        assert_eq!(state.quota_used(), 0);
+        assert!(!tmp.path().exists(), "data dir should be removed");
+    }
+
+    /// A symlink named `manifest` goes too: the link, not what it names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn batch_delete_cleanup_dirs_removes_a_legacy_root_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"kept").unwrap();
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("manifest")).unwrap();
+        let (router, state, tmp) = setup_app_in(tmp, 0, false);
+        assert_eq!(state.quota_used(), 3);
+        for d in ["keys", "snapshots", "locks", "packs"] {
+            std::fs::remove_dir_all(tmp.path().join(d)).unwrap();
+        }
+        let keys = serde_json::to_vec(&serde_json::json!(["config"])).unwrap();
+        let resp = authed_post(router, "/?batch-delete&cleanup-dirs", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
         assert_eq!(state.quota_used(), 0);
         assert!(!tmp.path().exists(), "data dir should be removed");
     }

@@ -68,7 +68,7 @@ When `append_only = true`, `PUT` of an existing key, `DELETE` and `/?batch-delet
 
 Keys are classified after trimming leading and trailing slashes, as path resolution does. Directories and keys outside the schema have no class and are refused.
 
-`manifest`, which vykar 0.11 and earlier wrote at the repository root, is outside the schema: requests for it are refused like any unknown key in every mode, and no listing names it. A data directory that still holds one is accepted at startup. Because the client cannot name it, `/?batch-delete&cleanup-dirs` on a server without append-only removes it along with the temp files.
+`manifest`, which vykar 0.11 and earlier wrote at the repository root, is outside the schema: requests for it are refused like any unknown key in every mode, and no listing names it. A data directory that still holds one is accepted at startup. Because the client cannot name it, `/?batch-delete&cleanup-dirs` on a server without append-only removes it along with the temp files (a symlink of that name is removed as a link; its target is left alone).
 
 Independently of append-only, `index.h/<gen>` is write-once and `index.d/<id>` is checked against its BLAKE3 name in every mode (see the `PUT` row above). A PUT onto an existing head with other bytes is therefore a `409`, not a `403`, in append-only mode too.
 

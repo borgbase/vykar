@@ -168,7 +168,8 @@ pub(super) struct ConfigDocument {
     /// Override hostname recorded in snapshot metadata.
     #[serde(default)]
     pub(super) hostname: Option<String>,
-    /// Paths to .env files loaded before environment variable expansion.
+    /// Paths to .env files, read in a pre-parse of the raw text; placeholders
+    /// are expanded later, per value, during the main parse.
     /// Accepts a single path or a list of paths. Consumed during pre-parse in
     /// `load_and_resolve`; present here so `deny_unknown_fields` accepts it.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -180,7 +181,8 @@ pub(super) struct ConfigDocument {
 #[cfg(test)]
 pub(super) type RawConfig = ConfigDocument;
 
-/// Pre-parse struct to extract `env_file` before environment variable expansion.
+/// Pre-parse struct to extract `env_file`, read in a pre-parse of the raw text;
+/// placeholders are expanded later, per value, during the main parse.
 /// The flattened catch-all swallows every other field. It is deliberately not
 /// the YAML crate's own `Value` type: the field is never read, so `IgnoredAny`
 /// keeps this struct independent of whichever parser is in use.

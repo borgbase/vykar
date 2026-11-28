@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::super::hooks::HooksConfig;
@@ -5,7 +6,8 @@ use super::super::sources::{SourceEntry, normalize_sources};
 use super::super::types::*;
 use super::super::util::expand_tilde;
 use super::document::{ConfigDocument, EnvFilePre};
-use super::env::{expand_env_placeholders, parse_env_files};
+use super::env::parse_env_files;
+use super::env_de::from_str_expanding;
 
 /// A fully resolved repository with its merged config.
 #[derive(Debug, Clone)]
@@ -33,7 +35,8 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
         vykar_types::error::VykarError::Config(format!("cannot read '{}': {e}", path.display()))
     })?;
 
-    // Pre-parse to extract env_file paths before environment variable expansion.
+    // Pre-parse the raw text for env_file paths; placeholders are expanded
+    // later, per value, while the document is deserialized.
     let pre: EnvFilePre = crate::config::yaml::from_str(&contents).map_err(|e| {
         vykar_types::error::VykarError::Config(format!("invalid config '{}': {e}", path.display()))
     })?;
@@ -47,11 +50,12 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
         .collect();
     let env_overlay = parse_env_files(path, &env_paths)?;
 
-    let expanded = expand_env_placeholders(&contents, path, &env_overlay)?;
-    let raw: ConfigDocument = crate::config::yaml::from_str(&expanded).map_err(|e| {
+    // Placeholders are expanded per value while the document is
+    // deserialized; the text itself is never rewritten.
+    let raw: ConfigDocument = from_str_expanding(&contents, &env_overlay).map_err(|e| {
         let text = e.to_string();
         let named = if text.contains(PLAINTEXT_MODE_REFUSAL) {
-            unencrypted_repositories(&expanded)
+            unencrypted_repositories(&contents, &env_overlay)
         } else {
             String::new()
         };
@@ -65,11 +69,12 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
 }
 
 /// `"repository 'x': "` for the repositories whose own `encryption.mode`
-/// is `none`, by label or url, read leniently from `yaml`, naming the
+/// is `none`, by label or url, read leniently from `yaml`, with placeholders
+/// expanded, naming the
 /// top-level section too when it says `none` as well; empty when no
 /// repository entry does (only the top-level mode says it) or the file
 /// cannot be read that way.
-fn unencrypted_repositories(yaml: &str) -> String {
+fn unencrypted_repositories(yaml: &str, overlay: &HashMap<String, String>) -> String {
     #[derive(serde::Deserialize)]
     struct Probe {
         #[serde(default)]
@@ -92,7 +97,7 @@ fn unencrypted_repositories(yaml: &str) -> String {
         mode: Option<String>,
     }
 
-    let Ok(probe) = crate::config::yaml::from_str::<Probe>(yaml) else {
+    let Ok(probe) = from_str_expanding::<Probe>(yaml, overlay) else {
         return String::new();
     };
     let says_none = |e: &Option<ProbeEncryption>| {
@@ -131,6 +136,20 @@ pub(super) fn resolve_document(
         if !seen.insert(label) {
             return Err(vykar_types::error::VykarError::Config(format!(
                 "duplicate repository label: '{label}'"
+            )));
+        }
+    }
+
+    // A url that is empty after expansion (an empty variable, or an empty
+    // default) is refused here, by repository, instead of at the first open.
+    for (i, entry) in raw.repositories.iter().enumerate() {
+        if entry.url.trim().is_empty() {
+            let which = entry
+                .label
+                .as_deref()
+                .map_or_else(|| format!("#{}", i + 1), |l| format!("'{l}'"));
+            return Err(vykar_types::error::VykarError::Config(format!(
+                "repository {which}: url is empty"
             )));
         }
     }
@@ -1655,13 +1674,66 @@ sources:
 
         let err = load_and_resolve(&path).unwrap_err();
         let msg = err.to_string();
-        // deny_unknown_fields on SourceHooksConfig triggers a deser error;
-        // serde wraps it in the untagged-enum "did not match" message.
+        // deny_unknown_fields on SourceHooksConfig names the key.
         assert!(
-            msg.contains("before_backup")
-                || msg.contains("unknown field")
-                || msg.contains("did not match"),
+            msg.contains("unknown field `before_backup`"),
             "expected deserialization error for unknown hook key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_source_entry_scalar_must_be_a_string() {
+        let yaml = "repositories:\n  - url: /tmp/repo\nsources:\n  - 7\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let msg = load_and_resolve(&path).unwrap_err().to_string();
+        assert!(
+            msg.contains("string value must be quoted"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_empty_url_is_refused() {
+        let yaml = "repositories:\n  - url: \"\"\nsources:\n  - /data\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let msg = load_and_resolve(&path).unwrap_err().to_string();
+        assert!(
+            msg.contains("repository #1: url is empty"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_empty_source_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        fs::write(
+            &path,
+            "repositories:\n  - url: /tmp/repo\nsources:\n  - \"\"\n",
+        )
+        .unwrap();
+        let msg = load_and_resolve(&path).unwrap_err().to_string();
+        assert!(
+            msg.contains("source #1: path is empty"),
+            "unexpected: {msg}"
+        );
+
+        fs::write(
+            &path,
+            "repositories:\n  - url: /tmp/repo\nsources:\n  - /data\n  - path: \"\"\n",
+        )
+        .unwrap();
+        let msg = load_and_resolve(&path).unwrap_err().to_string();
+        assert!(
+            msg.contains("source #2: path is empty"),
+            "unexpected: {msg}"
         );
     }
 

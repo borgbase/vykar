@@ -845,11 +845,13 @@ Supported syntax:
 
 Notes:
 
-- Expansion runs on raw config text before YAML parsing.
-- Variable names must match `[A-Za-z_][A-Za-z0-9_]*`.
-- Malformed placeholders fail config loading.
-- No escape syntax is supported for literal `${...}`.
-- `${VAR}` in YAML comments is also expanded (since expansion runs before YAML parsing).
+- Placeholders are expanded after the file is parsed, inside values only. An expanded value is never read as YAML: it may contain `#`, `: `, quotes or line breaks, and it cannot add a list, a mapping or another setting.
+- Placeholders in comments are ignored. Placeholders in mapping keys are not expanded.
+- In a text setting the result is the text. In a number or boolean setting (`sftp_timeout`, `min_pack_size`, `allow_insecure_http`, `one_file_system`, `keep_daily`, `zstd_level`, `limits.threads`, ...) the result is read as that type, quoted or not: a decimal number with an optional sign (no `0x`, `0o`, `0b` or `_`), or `true`/`false`.
+- The variable's text is used exactly as it is: surrounding spaces and quote characters are kept, where an unquoted placeholder used to drop them. A passphrase variable that carries quotes (some `--env-file` formats keep them) or a trailing space now includes them.
+- A variable cannot supply a list or a mapping. `exclude_patterns: ${PATTERNS}` fails to load. Write the list in the file and use one placeholder per item, as in `exclude_patterns: ["${PATTERN_A}", "${PATTERN_B}"]`. Inside `[...]` or `{...}` a placeholder must be quoted.
+- A variable that is set but empty gives an empty text. A number or boolean setting refuses it, and so do a repository `url` and a source path. To keep a setting's default, leave the setting out; `${VAR:-}` does not unset it.
+- Variable names must match `[A-Za-z_][A-Za-z0-9_]*`. A malformed or unset placeholder in a value fails config loading. The error names the setting (for example `repositories[0].url`) and the variable, not the value. No escape syntax is supported for a literal `${...}` in a value.
 
 ### Loading `.env` files
 

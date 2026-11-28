@@ -8,10 +8,8 @@
 # Top-level options (encryption/compression/retention/etc.) are defaults.
 # Rich source/repository entries can override parts of those defaults.
 #
-# Environment variable expansion (before YAML parsing):
-#   Use env placeholders in values (see docs for exact syntax).
-#   Avoid writing placeholder syntax in comments, because expansion runs
-#   before YAML parsing.
+# Environment variable expansion: use env placeholders in values (see docs for
+#   exact syntax). Placeholders in comments are ignored.
 #
 # Load variables from .env files (Docker-style KEY=VALUE):
 # env_file: .db.env
@@ -121,13 +119,7 @@ compression:
 #   - label: databases
 #     command_dumps:
 #       - name: myapp.sql
-#         command: "mysqldump -u '<DB_USER>' -p'<DB_PASSWORD>' '<DB_DATABASE>'"
-#
-# Replace each <NAME> above with an environment placeholder — see "Environment
-# variable expansion" in the configuration docs for the exact spelling. It is
-# not written out literally here because expansion rewrites comments too, so a
-# real placeholder in this file would stop it loading whenever the variable is
-# unset.
+#         command: "mysqldump -u '${DB_USER}' -p'${DB_PASSWORD}' '${DB_DATABASE}'"
 
 # --- Repositories (where backups go) ----------------------------------------
 

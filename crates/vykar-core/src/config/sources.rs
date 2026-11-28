@@ -1,3 +1,6 @@
+use std::fmt;
+
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use super::deserialize::*;
@@ -17,33 +20,114 @@ pub struct CommandDump {
 }
 
 /// YAML input for a source entry — either a plain path or a rich object.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SourceInput {
-    Simple(#[serde(deserialize_with = "deserialize_strict_string")] String),
+    Simple(String),
     Rich {
-        #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
         path: Option<String>,
-        #[serde(default, deserialize_with = "deserialize_optional_vec_strict_string")]
         paths: Option<Vec<String>>,
-        #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
         label: Option<String>,
-        #[serde(default, deserialize_with = "deserialize_vec_strict_string")]
         exclude: Vec<String>,
-        #[serde(default, deserialize_with = "deserialize_optional_vec_strict_string")]
         exclude_if_present: Option<Vec<String>>,
         one_file_system: Option<bool>,
         git_ignore: Option<bool>,
         xattrs: Option<XattrsConfig>,
-        #[serde(default)]
         hooks: SourceHooksConfig,
         retention: Option<RetentionConfig>,
-        #[serde(default, deserialize_with = "deserialize_vec_strict_string")]
         repos: Vec<String>,
-        #[serde(default)]
         command_dumps: Vec<CommandDump>,
     },
+}
+
+/// The mapping form of a source entry. Deserialized directly from the YAML
+/// mapping, not through serde's untagged buffering, so every setting inside
+/// it reaches the config deserializer with its own type (environment
+/// placeholders in number and boolean settings depend on that).
+#[derive(Deserialize)]
+struct RichSourceInput {
+    #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
+    path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_vec_strict_string")]
+    paths: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
+    label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_strict_string")]
+    exclude: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_vec_strict_string")]
+    exclude_if_present: Option<Vec<String>>,
+    one_file_system: Option<bool>,
+    git_ignore: Option<bool>,
+    xattrs: Option<XattrsConfig>,
+    #[serde(default)]
+    hooks: SourceHooksConfig,
+    retention: Option<RetentionConfig>,
+    #[serde(default, deserialize_with = "deserialize_vec_strict_string")]
+    repos: Vec<String>,
+    #[serde(default)]
+    command_dumps: Vec<CommandDump>,
+}
+
+impl From<RichSourceInput> for SourceInput {
+    fn from(r: RichSourceInput) -> Self {
+        Self::Rich {
+            path: r.path,
+            paths: r.paths,
+            label: r.label,
+            exclude: r.exclude,
+            exclude_if_present: r.exclude_if_present,
+            one_file_system: r.one_file_system,
+            git_ignore: r.git_ignore,
+            xattrs: r.xattrs,
+            hooks: r.hooks,
+            retention: r.retention,
+            repos: r.repos,
+            command_dumps: r.command_dumps,
+        }
+    }
+}
+
+/// A string is a plain source path; a mapping is a rich entry. Any other
+/// scalar is refused as the strict-string fields refuse it.
+impl<'de> Deserialize<'de> for SourceInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SourceVisitor;
+
+        impl<'de> Visitor<'de> for SourceVisitor {
+            type Value = SourceInput;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a source path or a mapping of source settings")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<SourceInput, E> {
+                Ok(SourceInput::Simple(v.to_owned()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<SourceInput, E> {
+                Ok(SourceInput::Simple(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<SourceInput, A::Error> {
+                RichSourceInput::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(SourceInput::from)
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<SourceInput, E> {
+                Err(E::custom(STRICT_STRING_ERROR))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<SourceInput, E> {
+                Err(E::custom(STRICT_STRING_ERROR))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<SourceInput, E> {
+                Err(E::custom(STRICT_STRING_ERROR))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<SourceInput, E> {
+                Err(E::custom(STRICT_STRING_ERROR))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<SourceInput, E> {
+                Err(E::custom(STRICT_STRING_ERROR))
+            }
+        }
+
+        deserializer.deserialize_any(SourceVisitor)
+    }
 }
 
 /// Canonical resolved source entry.
@@ -60,6 +144,13 @@ pub struct SourceEntry {
     pub retention: Option<RetentionConfig>,
     pub repos: Vec<String>,
     pub command_dumps: Vec<CommandDump>,
+}
+
+/// The error for a source path that is empty, written literally as `""` or
+/// set from an empty variable. `index` is the entry's position in `sources`.
+fn empty_source_path(index: usize, label: Option<&str>) -> vykar_types::error::VykarError {
+    let which = label.map_or_else(|| format!("#{}", index + 1), |l| format!("'{l}'"));
+    vykar_types::error::VykarError::Config(format!("source {which}: path is empty"))
 }
 
 /// Normalize a list of `SourceInput` into resolved `SourceEntry` values.
@@ -80,9 +171,12 @@ pub(super) fn normalize_sources(
     let mut simple_paths: Vec<String> = Vec::new();
     let mut rich_entries: Vec<SourceEntry> = Vec::new();
 
-    for input in inputs {
+    for (i, input) in inputs.into_iter().enumerate() {
         match input {
             SourceInput::Simple(path) => {
+                if path.trim().is_empty() {
+                    return Err(empty_source_path(i, None));
+                }
                 simple_paths.push(expand_tilde(&path));
             }
             SourceInput::Rich {
@@ -133,7 +227,12 @@ pub(super) fn normalize_sources(
                 }
 
                 let resolved_paths = match (path, paths) {
-                    (Some(p), None) => vec![expand_tilde(&p)],
+                    (Some(p), None) => {
+                        if p.trim().is_empty() {
+                            return Err(empty_source_path(i, label.as_deref()));
+                        }
+                        vec![expand_tilde(&p)]
+                    }
                     (None, Some(ps)) => {
                         if ps.is_empty() {
                             return Err(vykar_types::error::VykarError::Config(

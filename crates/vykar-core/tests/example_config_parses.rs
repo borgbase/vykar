@@ -18,10 +18,8 @@ fn repo_root() -> PathBuf {
 /// Loads the file exactly as shipped, with no environment prepared. Users copy
 /// it verbatim, so that is the property worth testing.
 ///
-/// This also guards a trap the file documents but once fell into itself: env
-/// expansion rewrites the whole file, comments included, and there is no escape
-/// syntax, so a literal `${VAR}` in a commented-out example makes the config
-/// fail to load whenever that variable is unset.
+/// Env placeholders in comments are ignored; the example's commented
+/// command_dumps uses real placeholders, so this also guards that rule.
 #[test]
 fn shipped_example_config_parses() {
     let path = repo_root().join("vykar.example.yaml");
@@ -85,9 +83,17 @@ fn yaml_errors_do_not_print_neighboring_secrets() {
     for (secret_value, invalid_setting) in [
         // Syntax error in the first pass, next to a literal secret.
         (secret, "s3_soft_delete: ["),
-        // Type and unknown-field errors after environment expansion.
+        // Type and unknown-field errors in a document that uses a placeholder.
         ("${VYKAR_YAML_REVIEW_SECRET}", "s3_soft_delete: typo"),
         ("${VYKAR_YAML_REVIEW_SECRET}", "unknown_setting: true"),
+        (
+            "${VYKAR_YAML_REVIEW_SECRET}",
+            "s3_conditional_writes: ${VYKAR_YAML_REVIEW_SECRET}",
+        ),
+        (
+            "${VYKAR_YAML_REVIEW_SECRET}",
+            "sftp_timeout: ${VYKAR_YAML_REVIEW_SECRET}",
+        ),
     ] {
         std::fs::write(&config, format!(
             "env_file: .env\nsources: [/tmp/source]\nrepositories:\n  - url: /tmp/repo\n    secret_access_key: {secret_value}\n    {invalid_setting}\n"

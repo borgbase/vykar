@@ -82,6 +82,89 @@ pub fn peek_layout(bytes: &[u8]) -> Option<u32> {
     }
 }
 
+/// The `features` of an encoded map head without decoding the rest: read
+/// through a struct with the single field `features`, ignoring every other
+/// key, so a head whose other fields this binary cannot decode (a newer
+/// writer's, behind a feature name) still shows its features. None for a
+/// non-map body or when `features` is missing or not an array of strings.
+pub fn peek_features(bytes: &[u8]) -> Option<Vec<String>> {
+    #[derive(Deserialize)]
+    struct FeaturesOnly {
+        features: Vec<String>,
+    }
+    let mut rd = bytes;
+    match rmp::decode::read_marker(&mut rd).ok()? {
+        rmp::Marker::FixMap(_) | rmp::Marker::Map16 | rmp::Marker::Map32 => {
+            rmp_serde::from_slice::<FeaturesOnly>(bytes)
+                .ok()
+                .map(|f| f.features)
+        }
+        _ => None,
+    }
+}
+
+/// Of `features`, the names this binary does not know
+/// ([`KNOWN_HEAD_FEATURES`]), in their order.
+pub fn unknown_head_features(features: &[String]) -> Vec<String> {
+    features
+        .iter()
+        .filter(|f| !KNOWN_HEAD_FEATURES.contains(&f.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Test only: the map body of `head` as a newer writer might write it,
+/// with `features` replaced and one extra segment of kind 2 appended (a
+/// value this binary's `SegmentKind` refuses), so the typed decode fails
+/// while `layout` and `features` stay readable.
+#[cfg(test)]
+pub(crate) fn retyped_head_body(head: &IndexHead, features: &[&str]) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Segment {
+        name: ObjectName,
+        size: u64,
+        kind: u8,
+        entries: u64,
+    }
+    #[derive(Serialize)]
+    struct Head<'a> {
+        layout: u32,
+        #[serde(rename = "gen")]
+        generation: u64,
+        features: Vec<String>,
+        base: &'a Option<BaseRef>,
+        segments: Vec<Segment>,
+        retired: &'a [ObjectName],
+        sweep: SweepState,
+    }
+    let mut segments: Vec<Segment> = head
+        .segments
+        .iter()
+        .map(|s| Segment {
+            name: s.name,
+            size: s.size,
+            kind: u8::from(s.kind),
+            entries: s.entries,
+        })
+        .collect();
+    segments.push(Segment {
+        name: ObjectName([0xee; 32]),
+        size: 1,
+        kind: 2,
+        entries: 0,
+    });
+    rmp_serde::to_vec_named(&Head {
+        layout: head.layout,
+        generation: head.generation,
+        features: features.iter().map(|f| f.to_string()).collect(),
+        base: &head.base,
+        segments,
+        retired: &head.retired,
+        sweep: head.sweep,
+    })
+    .unwrap()
+}
+
 /// Name of a write-once object under `index.d/`: BLAKE3 of its stored bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectName(#[serde(with = "serde_bytes")] pub [u8; 32]);
@@ -232,11 +315,7 @@ impl IndexHead {
 
     /// The features this head names that this binary does not know.
     pub fn unknown_features(&self) -> Vec<String> {
-        self.features
-            .iter()
-            .filter(|f| !KNOWN_HEAD_FEATURES.contains(&f.as_str()))
-            .cloned()
-            .collect()
+        unknown_head_features(&self.features)
     }
 
     /// Check the head's internal consistency: known layout and features, a
@@ -435,6 +514,31 @@ mod tests {
         assert_eq!(peek_layout(&[]), None);
         assert_eq!(peek_layout(&[0x90]), None);
         assert_eq!(peek_layout(&[0x80]), None);
+    }
+
+    /// peek_features reads a map head's features, also when the rest does
+    /// not decode.
+    #[test]
+    fn peek_features_reads_map_heads() {
+        assert_eq!(peek_features(&sample().encode().unwrap()), Some(vec![]));
+        let mut h = sample();
+        h.features = vec!["x".into()];
+        assert_eq!(
+            peek_features(&h.encode().unwrap()),
+            Some(vec!["x".to_string()])
+        );
+        let retyped = retyped_head_body(&sample(), &["later"]);
+        assert!(IndexHead::decode(&retyped).is_err());
+        assert_eq!(peek_layout(&retyped), Some(3));
+        assert_eq!(peek_features(&retyped), Some(vec!["later".to_string()]));
+        let positional =
+            rmp_serde::to_vec(&(1u32, serde_bytes::Bytes::new(&[0; 32]), 0u64)).unwrap();
+        assert_eq!(peek_features(&positional), None);
+        assert_eq!(peek_features(&[0xc0]), None);
+        assert_eq!(peek_features(&[]), None);
+        assert_eq!(peek_features(&[0x80]), None);
+        assert_eq!(peek_features(&[0x90]), None);
+        assert_eq!(unknown_head_features(&["a".into()]), vec!["a".to_string()]);
     }
 
     /// HEAD-6.

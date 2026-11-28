@@ -350,7 +350,9 @@ pub(crate) enum StoredHead {
     Head(IndexHead),
     /// Decrypts, and names a head layout this binary does not read.
     UnknownLayout(u32),
-    /// Layout 3, but names features this binary does not know.
+    /// Layout 3 (or a layout that cannot be read on its own), and names
+    /// features this binary does not know; the rest of the head need not
+    /// decode.
     UnknownFeatures(Vec<String>),
     /// An object type tag this binary does not know (a newer writer).
     UnknownType(u8),
@@ -359,7 +361,10 @@ pub(crate) enum StoredHead {
 }
 
 /// Classify the bytes stored at `head_key(generation)`. A head whose `generation` field
-/// differs from `generation` is unreadable. No storage access.
+/// differs from `generation` is unreadable. No storage access. A body that fails to
+/// decode is classed by its `layout` and then its `features`, each read on its own
+/// (`head::peek_layout`, `head::peek_features`); only when neither names something
+/// newer is it `Unreadable`.
 pub(crate) fn classify_head(generation: u64, data: &[u8], crypto: &dyn CryptoEngine) -> StoredHead {
     let plain = match unpack_object_expect_with_context(
         data,
@@ -374,12 +379,22 @@ pub(crate) fn classify_head(generation: u64, data: &[u8], crypto: &dyn CryptoEng
     let decoded = match IndexHead::decode_unchecked(&plain) {
         Ok(h) => h,
         Err(e) => {
-            return match head::peek_layout(&plain) {
-                Some(layout) if layout != head::HEAD_LAYOUT_VERSION => {
-                    StoredHead::UnknownLayout(layout)
-                }
-                _ => StoredHead::Unreadable(e),
-            };
+            // A newer writer may change a field behind a feature name while
+            // keeping layout 3, so the typed decode fails: read the layout and
+            // then the features on their own before calling the head damaged
+            // (same precedence as for a head that decodes).
+            if let Some(layout) = head::peek_layout(&plain)
+                && layout != head::HEAD_LAYOUT_VERSION
+            {
+                return StoredHead::UnknownLayout(layout);
+            }
+            let unknown = head::peek_features(&plain)
+                .map(|f| head::unknown_head_features(&f))
+                .unwrap_or_default();
+            if !unknown.is_empty() {
+                return StoredHead::UnknownFeatures(unknown);
+            }
+            return StoredHead::Unreadable(e);
         }
     };
     if decoded.layout != head::HEAD_LAYOUT_VERSION {

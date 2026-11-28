@@ -13,12 +13,15 @@ use crate::commands;
 use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
 use crate::commands::restore::{RestoreOptions, RestoreRequest, RestoreSelection};
 use crate::config::VykarConfig;
-use crate::index::head::{IndexHead, ObjectName, SegmentKind};
+use crate::index::head::{IndexHead, ObjectName, SegmentKind, retyped_head_body};
 use crate::index::table;
 use crate::repo::control::CancelToken;
-use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
+use crate::repo::format::{
+    ObjectType, pack_object_streaming_with_context, pack_object_with_context,
+};
 use crate::repo::index_store::{
-    HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment_v2, object_key, pack_head,
+    HEAD_CONTEXT, HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment_v2, object_key,
+    pack_head,
 };
 use crate::repo::{EncryptionMode, Fence, OpenOptions, Repo, RepoFormat, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
@@ -1982,9 +1985,10 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
     assert_eq!(read_restored(&fx.restore(&cold, "s3"), "c"), "charlie");
 }
 
-/// A latest head of a newer layout, with unknown features, or of an unknown
-/// type is refused, not rebuilt over; so is a head of an older development
-/// layout, with its own advice.
+/// A latest head of a newer layout, with unknown features (also when the
+/// rest of the head does not decode), or of an unknown type is refused, not
+/// rebuilt over; so is a head of an older development layout, with its own
+/// advice.
 #[test]
 fn repair_refuses_a_newer_index() {
     let fx = fixture(RepoFormat::CURRENT);
@@ -2005,6 +2009,13 @@ fn repair_refuses_a_newer_index() {
             features: vec!["later".into()],
             ..fx.head()
         },
+        crypto,
+    )
+    .unwrap();
+    let retyped = pack_object_with_context(
+        ObjectType::IndexHead,
+        HEAD_CONTEXT,
+        &retyped_head_body(&fx.head(), &["later"]),
         crypto,
     )
     .unwrap();
@@ -2029,6 +2040,10 @@ fn repair_refuses_a_newer_index() {
         ),
         (
             featured,
+            ["feature(s) later", newer_vykar[0], newer_vykar[1]],
+        ),
+        (
+            retyped,
             ["feature(s) later", newer_vykar[0], newer_vykar[1]],
         ),
         (

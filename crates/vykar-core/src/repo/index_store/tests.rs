@@ -2016,6 +2016,70 @@ fn classify_head_tells_damage_from_newer_heads() {
     }
 }
 
+/// A head body that does not decode is classed by its layout and then its
+/// features, each read on its own; without either it is damage.
+#[test]
+fn classify_head_reads_features_of_a_head_that_does_not_decode() {
+    use crate::index::head::retyped_head_body;
+    for crypto in [deterministic(), encrypted()] {
+        let c = crypto.as_ref();
+        let seal = |body: &[u8]| {
+            pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, body, c).unwrap()
+        };
+
+        let featured = seal(&retyped_head_body(&IndexHead::initial(), &["later"]));
+        match classify_head(1, &featured, c) {
+            StoredHead::UnknownFeatures(names) => assert_eq!(names, vec!["later".to_string()]),
+            other => panic!("expected UnknownFeatures, got {other:?}"),
+        }
+        let err = classify_head(1, &featured, c)
+            .into_head()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("feature(s) later"), "{err}");
+        assert!(err.contains("newer vykar"), "{err}");
+
+        let plain = seal(&retyped_head_body(&IndexHead::initial(), &[]));
+        assert!(
+            matches!(
+                classify_head(1, &plain, c),
+                StoredHead::Unreadable(VykarError::Deserialization(_))
+            ),
+            "{:?}",
+            classify_head(1, &plain, c)
+        );
+
+        // The layout comes first.
+        let layout4 = seal(&retyped_head_body(
+            &IndexHead {
+                layout: 4,
+                ..IndexHead::initial()
+            },
+            &["later"],
+        ));
+        assert!(matches!(
+            classify_head(1, &layout4, c),
+            StoredHead::UnknownLayout(4)
+        ));
+
+        // No readable layout, but an unknown feature: refused, not damage.
+        #[derive(serde::Serialize)]
+        struct FeaturesOnly {
+            features: Vec<String>,
+        }
+        let no_layout = seal(
+            &rmp_serde::to_vec_named(&FeaturesOnly {
+                features: vec!["later".into()],
+            })
+            .unwrap(),
+        );
+        match classify_head(1, &no_layout, c) {
+            StoredHead::UnknownFeatures(names) => assert_eq!(names, vec!["later".to_string()]),
+            other => panic!("expected UnknownFeatures, got {other:?}"),
+        }
+    }
+}
+
 /// The base body of `index_with(0..40)`.
 fn base_body() -> Vec<u8> {
     crate::testutil::base_table_of(&index_with(0..40))

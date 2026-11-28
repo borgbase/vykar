@@ -905,6 +905,52 @@ fn open_rejects_an_unknown_repository_version() {
     }
 }
 
+/// A future config whose fields this binary cannot decode is still refused
+/// by its version, not with a parse error.
+#[test]
+fn open_rejects_a_newer_config_that_does_not_decode() {
+    crate::testutil::init_test_environment();
+
+    let repo = Repo::init(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::Aes256Gcm,
+        ChunkerParams::default(),
+        Some(crate::testing::TEST_PASSPHRASE),
+        None,
+        None,
+    )
+    .unwrap();
+
+    #[derive(serde::Serialize)]
+    struct Newer {
+        version: u32,
+        id: Vec<u8>,
+        created: chrono::DateTime<chrono::Utc>,
+    }
+    let config = repo.config();
+    let newer = rmp_serde::to_vec_named(&Newer {
+        version: 7,
+        id: config.id.clone(),
+        created: config.created,
+    })
+    .unwrap();
+    repo.storage().put("config", &newer).unwrap();
+
+    let result = Repo::open(
+        Box::new(repo.storage().clone()),
+        Some(crate::testing::TEST_PASSPHRASE),
+        None,
+        crate::repo::OpenOptions::new(),
+    );
+    match result {
+        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 7),
+        other => panic!(
+            "expected UnsupportedVersion(7), got {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
 #[test]
 fn open_rejects_oversized_max_pack_size() {
     crate::testutil::init_test_environment();

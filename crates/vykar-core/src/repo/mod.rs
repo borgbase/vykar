@@ -319,13 +319,22 @@ impl RepoConfig {
 
     /// Decode `config` bytes. A msgpack map decodes as [`RepoConfig`], an
     /// array as [`LegacyRepoConfig`]; anything else is the error of decoding
-    /// it as a map. Nothing is validated: see [`DecodedConfig::validate`].
+    /// it as a map. Nothing is validated (see [`DecodedConfig::validate`]),
+    /// except that a map that does not decode is first read for its
+    /// `version` and `features` alone: a version above 6 is
+    /// `UnsupportedVersion`, an unknown feature the "written by a newer vykar"
+    /// refusal, so a newer config that changes a field other than the seven
+    /// original ones (see architecture.md) is refused by
+    /// version or feature rather than with a parse error.
     pub fn decode(bytes: &[u8]) -> Result<DecodedConfig> {
         match bytes.first() {
             Some(0x90..=0x9f | 0xdc | 0xdd) => {
                 Ok(DecodedConfig::Positional(rmp_serde::from_slice(bytes)?))
             }
-            _ => Ok(DecodedConfig::Map(rmp_serde::from_slice(bytes)?)),
+            _ => match rmp_serde::from_slice::<RepoConfig>(bytes) {
+                Ok(config) => Ok(DecodedConfig::Map(config)),
+                Err(e) => Err(newer_map_config_refusal(bytes).unwrap_or_else(|| e.into())),
+            },
         }
     }
 }
@@ -347,6 +356,30 @@ fn refuse_unknown_features(features: &[String], known: &[&str]) -> Result<()> {
          written by a newer vykar. Upgrade vykar",
         unknown.join(", ")
     )))
+}
+
+/// For a map `config` that does not decode as [`RepoConfig`]: the refusal by
+/// version or feature, each read on its own, a version above 6 first, then
+/// unknown features. Unlike [`DecodedConfig::validate`] it does not refuse a
+/// version below 6 first: such a map with an unknown feature gets the feature
+/// refusal. None when neither can be read or neither is newer; the caller then
+/// returns the decode error.
+fn newer_map_config_refusal(bytes: &[u8]) -> Option<vykar_types::error::VykarError> {
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    #[derive(Deserialize)]
+    struct FeaturesOnly {
+        features: Vec<String>,
+    }
+    if let Ok(VersionOnly { version }) = rmp_serde::from_slice(bytes)
+        && version > MAP_CONFIG_VERSION
+    {
+        return Some(vykar_types::error::VykarError::UnsupportedVersion(version));
+    }
+    let FeaturesOnly { features } = rmp_serde::from_slice(bytes).ok()?;
+    refuse_unknown_features(&features, KNOWN_CONFIG_FEATURES).err()
 }
 
 /// What `config` held.
@@ -1453,6 +1486,91 @@ mod format_tests {
         let mut c = v6(HashAlgorithm::Blake3);
         c.version = 3;
         assert!(matches!(c.encode(), Err(VykarError::InvalidFormat(_))));
+    }
+
+    /// A map config that does not decode is refused by its version or its
+    /// features, each read on its own; otherwise the decode error stays.
+    #[test]
+    fn map_configs_that_do_not_decode_are_refused_by_version_or_feature() {
+        /// `RepoConfig` with `chunk_hash` retyped, so the typed decode fails.
+        #[derive(Serialize)]
+        struct Retyped {
+            version: u32,
+            id: Vec<u8>,
+            chunker_params: ChunkerParams,
+            encryption: EncryptionMode,
+            created: DateTime<Utc>,
+            min_pack_size: u32,
+            max_pack_size: u32,
+            chunk_hash: u32,
+            features: Vec<String>,
+        }
+        let base = v6(HashAlgorithm::Blake3);
+        let retyped = |version: u32, features: &[&str]| {
+            rmp_serde::to_vec_named(&Retyped {
+                version,
+                id: base.id.clone(),
+                chunker_params: base.chunker_params.clone(),
+                encryption: base.encryption.clone(),
+                created: base.created,
+                min_pack_size: base.min_pack_size,
+                max_pack_size: base.max_pack_size,
+                chunk_hash: 3,
+                features: features.iter().map(|f| f.to_string()).collect(),
+            })
+            .unwrap()
+        };
+        let decode = |version, features: &[&str]| RepoConfig::decode(&retyped(version, features));
+
+        assert!(matches!(
+            decode(7, &[]),
+            Err(VykarError::UnsupportedVersion(7))
+        ));
+        // The version comes first.
+        assert!(matches!(
+            decode(7, &["later"]),
+            Err(VykarError::UnsupportedVersion(7))
+        ));
+        match decode(6, &["later"]) {
+            Err(VykarError::Other(m)) => {
+                assert!(m.contains("later") && m.contains("newer vykar"), "{m}")
+            }
+            other => panic!("expected the feature refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            decode(6, &[]),
+            Err(VykarError::Deserialization(_))
+        ));
+        assert!(matches!(
+            decode(6, &[MULTI_WRITER_FEATURE]),
+            Err(VykarError::Deserialization(_))
+        ));
+        assert!(matches!(
+            decode(5, &[]),
+            Err(VykarError::Deserialization(_))
+        ));
+        // Unlike `validate`, a version below 6 is not refused first: the
+        // unknown feature is.
+        match decode(5, &["later"]) {
+            Err(VykarError::Other(m)) => {
+                assert!(m.contains("later") && m.contains("newer vykar"), "{m}")
+            }
+            other => panic!("expected the feature refusal, got {other:?}"),
+        }
+
+        #[derive(Serialize)]
+        struct VersionOnly {
+            version: u32,
+        }
+        let bytes = rmp_serde::to_vec_named(&VersionOnly { version: 7 }).unwrap();
+        assert!(matches!(
+            RepoConfig::decode(&bytes),
+            Err(VykarError::UnsupportedVersion(7))
+        ));
+        assert!(matches!(
+            RepoConfig::decode(&[0xc1]),
+            Err(VykarError::Deserialization(_))
+        ));
     }
 
     /// CFG-6: an unknown key in the map is ignored.

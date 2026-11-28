@@ -32,7 +32,7 @@ pub(crate) fn default_max_size() -> u32 {
 /// `SnapshotMeta` and in the positional config of formats v2 and v3
 /// (`LegacyRepoConfig`), and as a map with named keys inside the v6
 /// `config` map. Field order, names, types and the serde attributes are
-/// frozen (`legacy_repo_config_golden_bytes`,
+/// frozen (`legacy_repo_config_golden_bytes`, `v6_config_golden_bytes`,
 /// `chunker_params_names_and_serde_defaults_are_pinned`). The YAML
 /// `chunker:` section is a separate type, `ChunkerConfig`, that converts
 /// into this one.

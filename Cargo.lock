@@ -7649,6 +7649,7 @@ dependencies = [
 name = "vykar-cli"
 version = "0.24.0"
 dependencies = [
+ "axum",
  "base64 0.23.1",
  "chrono",
  "clap",
@@ -7665,11 +7666,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tiny_http",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "ureq",
  "vykar-common",
  "vykar-core",
+ "vykar-server",
  "vykar-storage",
  "vykar-types",
  "windows-sys 0.61.2",

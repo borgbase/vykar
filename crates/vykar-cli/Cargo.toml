@@ -46,6 +46,11 @@ rmp-serde.workspace = true
 # `cli_integration` extracts a frozen v3 fixture (vykar-core/tests/fixtures).
 tar = "0.4"
 flate2 = "1"
+# `cli_integration` serves a frozen fixture through an in-process vykar-server
+# that does not advertise put-if-absent (a store without it).
+vykar-server = { path = "../vykar-server" }
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

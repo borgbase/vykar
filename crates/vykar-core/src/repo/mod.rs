@@ -1317,7 +1317,8 @@ mod format_tests {
         assert_eq!(short.max_size, 8 * 1024 * 1024);
     }
 
-    /// CFG-1: the v6 config is a nine-entry map and round-trips.
+    /// CFG-1: the v6 config is a nine-entry map and round-trips; the full
+    /// bytes are pinned by `v6_config_golden_bytes`.
     #[test]
     fn v6_config_is_a_map_and_round_trips() {
         for hash in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
@@ -1328,6 +1329,98 @@ mod format_tests {
             assert!(matches!(decoded, DecodedConfig::Map(_)));
             assert_eq!(decoded.validate().unwrap(), RepoFormat::V6(hash));
             assert_eq!(decoded.into_repo_config(), config);
+        }
+    }
+
+    /// Pins the exact bytes of two fixed v6 configs, the nested chunker map
+    /// included: one without features, one with `multi_writer`. Every v6
+    /// repository's `config` is `RepoConfig::encode` of such a value, so a
+    /// difference means repositories written before and after disagree, and
+    /// older binaries may no longer reach their version or feature refusal.
+    /// Never update a constant to make it pass.
+    #[test]
+    fn v6_config_golden_bytes() {
+        use chrono::TimeZone;
+        // Common to both: version 6; id 0, 8, .., 248 (an array of 32 integers,
+        // those from 0x80 on as uint8); the chunker map (512 KiB / 2 MiB /
+        // 8 MiB).
+        const HEAD: &str = "89\
+            a776657273696f6e06\
+            a26964dc0020\
+            00081018202830384048505860687078\
+            cc80cc88cc90cc98cca0cca8ccb0ccb8\
+            ccc0ccc8ccd0ccd8cce0cce8ccf0ccf8\
+            ae6368756e6b65725f706172616d7383\
+            a86d696e5f73697a65ce00080000\
+            a86176675f73697a65ce00200000\
+            a86d61785f73697a65ce00800000";
+        // "created", then the pack sizes (32 MiB / 192 MiB).
+        const CREATED_AND_PACK_SIZES: &str = "a763726561746564bb323032332d31312d31345432323a31333a32302e3132333435365a\
+            ad6d696e5f7061636b5f73697a65ce02000000\
+            ad6d61785f7061636b5f73697a65ce0c000000";
+        // "encryption": "Aes256Gcm" .. "chunk_hash": "blake3", "features": [].
+        let single = format!(
+            "{HEAD}aa656e6372797074696f6ea941657332353647636d{CREATED_AND_PACK_SIZES}\
+             aa6368756e6b5f68617368a6626c616b6533a8666561747572657390"
+        );
+        // "encryption": "Chacha20Poly1305" .. "chunk_hash": "blake2b",
+        // "features": ["multi_writer"].
+        let multi = format!(
+            "{HEAD}aa656e6372797074696f6eb04368616368613230506f6c7931333035\
+             {CREATED_AND_PACK_SIZES}\
+             aa6368756e6b5f68617368a7626c616b653262\
+             a8666561747572657391ac6d756c74695f777269746572"
+        );
+        let config = |encryption, hash| {
+            RepoConfig::new_v6(
+                (0u8..32).map(|i| i * 8).collect(),
+                ChunkerParams {
+                    min_size: 512 * 1024,
+                    avg_size: 2 * 1024 * 1024,
+                    max_size: 8 * 1024 * 1024,
+                },
+                encryption,
+                chrono::Utc
+                    .timestamp_opt(1_700_000_000, 123_456_000)
+                    .unwrap(),
+                32 * 1024 * 1024,
+                192 * 1024 * 1024,
+                hash,
+            )
+        };
+        let without = config(EncryptionMode::Aes256Gcm, HashAlgorithm::Blake3);
+        let mut with = config(EncryptionMode::Chacha20Poly1305, HashAlgorithm::Blake2b);
+        with.set_writer_mode(WriterMode::Multi);
+
+        for (name, value, golden, hash, mode) in [
+            (
+                "no features",
+                &without,
+                &single,
+                HashAlgorithm::Blake3,
+                WriterMode::Single,
+            ),
+            (
+                "multi_writer",
+                &with,
+                &multi,
+                HashAlgorithm::Blake2b,
+                WriterMode::Multi,
+            ),
+        ] {
+            let bytes = value.encode().unwrap();
+            assert_eq!(
+                hex::encode(&bytes),
+                golden.as_str(),
+                "{name}: encode changed"
+            );
+            let decoded = RepoConfig::decode(&hex::decode(golden).unwrap()).unwrap();
+            assert!(matches!(decoded, DecodedConfig::Map(_)), "{name}");
+            assert_eq!(decoded.validate().unwrap(), RepoFormat::V6(hash), "{name}");
+            let back = decoded.into_repo_config();
+            assert_eq!(&back, value, "{name}: decode changed");
+            assert_eq!(back.writer_mode(), mode, "{name}");
+            assert_eq!(back.encode().unwrap(), bytes, "{name}: not a fixed point");
         }
     }
 

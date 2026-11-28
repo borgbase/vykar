@@ -618,6 +618,212 @@ fn cli_upgrade_switches_the_commit_mode() {
     assert!(!out.contains("--commit-mode multi"), "{out}");
 }
 
+/// A copy of the frozen v2 fixture `vykar-core/tests/fixtures/<name>.tar.gz`,
+/// extracted under the fixture's temp dir: the extraction root (with
+/// `repo/`, `source/`, `cache/` and `meta.json`) and the parsed `meta.json`.
+fn extract_v2_fixture(fx: &CliFixture, name: &str) -> (PathBuf, serde_json::Value) {
+    let archive = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../vykar-core/tests/fixtures/{name}.tar.gz"));
+    let root = fx._tmp.path().join(name);
+    tar::Archive::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(&archive).unwrap(),
+    ))
+    .unpack(&root)
+    .unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["format_version"].as_u64(), Some(2), "{name}");
+    (root, meta)
+}
+
+/// A config for one repository at `url` (already YAML-quoted), with `extra`
+/// lines of the repository entry, and the fixture's encryption mode and
+/// passphrase.
+fn write_fixture_config(config_path: &Path, url: &str, extra: &str, meta: &serde_json::Value) {
+    let config = format!(
+        "repositories:\n  - url: {url}\n{extra}encryption:\n  mode: {}\n  passphrase: \"{}\"\nsources: []\n",
+        meta["encryption"].as_str().unwrap(),
+        meta["passphrase"].as_str().unwrap(),
+    );
+    std::fs::write(config_path, config).unwrap();
+}
+
+/// The v6 `config` at `repo_dir`; panics on a positional one.
+fn recorded_v6_config(repo_dir: &Path) -> vykar_core::repo::RepoConfig {
+    match vykar_core::repo::RepoConfig::decode(&std::fs::read(repo_dir.join("config")).unwrap())
+        .unwrap()
+    {
+        vykar_core::repo::DecodedConfig::Map(c) => c,
+        vykar_core::repo::DecodedConfig::Positional(c) => {
+            panic!("still positional (version {})", c.version)
+        }
+    }
+}
+
+/// `vykar upgrade` takes a frozen v2 repository (BLAKE2b, written by a
+/// pre-BLAKE3 binary) to v6 on storage that offers put-if-absent (the local
+/// filesystem): the config records multi-writer, and the hash stays blake2b.
+#[test]
+fn cli_upgrade_moves_a_v2_fixture_to_v6_as_multi_writer_with_put_if_absent() {
+    let fx = CliFixture::new();
+    let (root, meta) = extract_v2_fixture(&fx, "v2-chacha20poly1305");
+    let repo = root.join("repo");
+    write_fixture_config(&fx.config_path, &yaml_quote_path(&repo), "", &meta);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let (_, stderr) = fx.run_err(&["--config", &cfg, "list"]);
+    assert!(stderr.contains("vykar upgrade"), "{stderr}");
+
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("from format v2 to v6 (blake2b)"), "{out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "Commit mode: multi-writer"),
+        "{out}"
+    );
+    let config = recorded_v6_config(&repo);
+    assert_eq!((config.version, config.chunk_hash.as_str()), (6, "blake2b"));
+    assert_eq!(config.features, [vykar_core::repo::MULTI_WRITER_FEATURE]);
+    assert_eq!(config.writer_mode(), vykar_core::repo::WriterMode::Multi);
+    assert!(!repo.join("index").exists() && !repo.join("index.gen").exists());
+
+    let info = fx.run_ok(&["--config", &cfg, "info"]);
+    assert!(
+        info.lines()
+            .any(|l| l.contains("Commit mode") && l.contains("multi-writer")),
+        "{info}"
+    );
+    let list = fx.run_ok(&["--config", &cfg, "list"]);
+    for snapshot in meta["snapshots"].as_array().unwrap() {
+        let id = snapshot.as_str().unwrap();
+        assert!(list.contains(id), "snapshot {id} missing from:\n{list}");
+    }
+}
+
+/// vykar-server serving `data_dir` (one repository) on 127.0.0.1 with
+/// `conditional_put` set to false in its `/health` answer: to a client, a
+/// store without put-if-absent. Dropping it stops the server.
+struct NoPutIfAbsentServer {
+    _rt: tokio::runtime::Runtime,
+    url: String,
+}
+
+const SERVER_TOKEN: &str = "cli-test-token";
+
+impl NoPutIfAbsentServer {
+    fn start(data_dir: &Path) -> Self {
+        let state = vykar_server::state::AppState::new(
+            vykar_server::config::ServerSection {
+                data_dir: data_dir.to_string_lossy().into_owned(),
+                token: SERVER_TOKEN.into(),
+                ..Default::default()
+            },
+            Some(1 << 40),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let app = vykar_server::handlers::router(state).layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                use axum::response::IntoResponse;
+                let health = req.uri().path() == "/health";
+                let resp = next.run(req).await;
+                if !health {
+                    return resp;
+                }
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let mut caps: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                caps["conditional_put"] = serde_json::Value::Bool(false);
+                (status, axum::Json(caps)).into_response()
+            },
+        ));
+        rt.spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { _rt: rt, url }
+    }
+}
+
+/// `vykar upgrade` of a frozen v2 repository on storage without put-if-absent
+/// (a vykar-server that does not advertise it): `--commit-mode multi` is
+/// refused with nothing changed; a plain upgrade records single-writer and
+/// says why, and neither it nor `info` offers `--commit-mode multi`.
+#[test]
+fn cli_upgrade_moves_a_v2_fixture_to_v6_as_single_writer_without_put_if_absent() {
+    let fx = CliFixture::new();
+    let (root, meta) = extract_v2_fixture(&fx, "v2-aes256gcm");
+    let repo = root.join("repo");
+    let server = NoPutIfAbsentServer::start(&repo);
+    let health: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/health", server.url))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(health["conditional_put"], serde_json::Value::Bool(false));
+    assert_eq!(health["segmented_index"], serde_json::Value::Bool(true));
+    write_fixture_config(
+        &fx.config_path,
+        &format!("\"{}\"", server.url),
+        &format!("    access_token: \"{SERVER_TOKEN}\"\n    allow_insecure_http: true\n"),
+        &meta,
+    );
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let positional = std::fs::read(repo.join("config")).unwrap();
+
+    let (_, stderr) = fx.run_err(&[
+        "--config",
+        &cfg,
+        "upgrade",
+        "--yes",
+        "--commit-mode",
+        "multi",
+    ]);
+    assert!(
+        stderr.contains("does not pass the put-if-absent check")
+            && stderr.contains("nothing was changed"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(repo.join("config")).unwrap(), positional);
+    assert!(repo.join("index").exists() && repo.join("index.gen").exists());
+
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("from format v2 to v6 (blake2b)"), "{out}");
+    assert!(
+        out.contains("Commit mode: single-writer (") && out.contains("offers no put-if-absent"),
+        "{out}"
+    );
+    let config = recorded_v6_config(&repo);
+    assert_eq!((config.version, config.chunk_hash.as_str()), (6, "blake2b"));
+    assert!(config.features.is_empty(), "{:?}", config.features);
+    assert_eq!(config.writer_mode(), vykar_core::repo::WriterMode::Single);
+
+    let info = fx.run_ok(&["--config", &cfg, "info"]);
+    assert!(
+        info.lines()
+            .any(|l| l.contains("Commit mode") && l.contains("single-writer")),
+        "{info}"
+    );
+    assert!(!info.contains("--commit-mode multi"), "{info}");
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(
+        out.contains("already at format v6 (single-writer)"),
+        "{out}"
+    );
+    assert!(!out.contains("--commit-mode multi"), "{out}");
+}
+
 #[test]
 fn cli_delete_dry_run_then_real_delete() {
     let fx = CliFixture::new();

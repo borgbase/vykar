@@ -32,6 +32,8 @@ pub struct CheckResult {
     #[serde(skip)]
     pub item_impacts: Vec<ItemImpact>,
     /// True when the check was skipped entirely (e.g. max_percent=0 and full_every not due).
+    /// Not in the JSON: the entry's `outcome.status` says it.
+    #[serde(skip)]
     pub skipped: bool,
 }
 

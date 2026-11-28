@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 const FILE: &str = "compact_refused.json";
 
 /// A compact on this machine refused its mark, and none has marked since.
+///
+/// This serde impl is the on-disk record (`compact_refused.json`); `vykar info
+/// --json` serializes it through `serialize_json`, with other names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactRefusal {
     /// The first refusal since the record was last cleared.
@@ -23,6 +26,31 @@ pub struct CompactRefusal {
     pub last: DateTime<Utc>,
     /// The latest refusal's error text (it carries the advice).
     pub detail: String,
+}
+
+#[derive(Serialize)]
+struct RefusalJson<'a> {
+    first_at: DateTime<Utc>,
+    last_at: DateTime<Utc>,
+    message: &'a str,
+}
+
+/// The JSON form of an optional record in `vykar info --json` (schema 1), for
+/// `#[serde(serialize_with)]`.
+// `serialize_with` passes a reference.
+#[allow(clippy::ref_option)]
+pub(crate) fn serialize_json<S: serde::Serializer>(
+    refusal: &Option<CompactRefusal>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    refusal
+        .as_ref()
+        .map(|r| RefusalJson {
+            first_at: r.first,
+            last_at: r.last,
+            message: &r.detail,
+        })
+        .serialize(s)
 }
 
 /// Record a refusal now: `first` is kept from an existing record.
@@ -122,6 +150,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(FILE), b"{not json").unwrap();
         assert_eq!(read(Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn the_file_keeps_its_names_and_the_json_has_its_own() {
+        let t = DateTime::parse_from_rfc3339("2026-11-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let r = CompactRefusal {
+            first: t,
+            last: t,
+            detail: "d".into(),
+        };
+        // The record file (read by other versions): unchanged names.
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"first":"2026-11-27T10:00:00Z","last":"2026-11-27T10:00:00Z","detail":"d"}"#
+        );
+        // `vykar info --json`.
+        let mut json = Vec::new();
+        serialize_json(&Some(r), &mut serde_json::Serializer::new(&mut json)).unwrap();
+        assert_eq!(
+            String::from_utf8(json).unwrap(),
+            r#"{"first_at":"2026-11-27T10:00:00Z","last_at":"2026-11-27T10:00:00Z","message":"d"}"#
+        );
     }
 
     #[test]

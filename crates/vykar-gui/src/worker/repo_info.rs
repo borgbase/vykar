@@ -26,7 +26,7 @@ fn ok_repo_info(repo_name: &str, url: &str, stats: &InfoStats) -> RepoInfoData {
         name: repo_name.into(),
         url: url.into(),
         snapshots: stats.snapshot_count.to_string().into(),
-        last_snapshot: format_last_snapshot(stats.last_snapshot_time).into(),
+        last_snapshot: format_last_snapshot(stats.last_snapshot_at).into(),
         size: format_bytes(stats.unique_stored_size).into(),
         has_error: false,
         error: SharedString::default(),

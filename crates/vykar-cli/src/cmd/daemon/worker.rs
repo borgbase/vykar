@@ -161,7 +161,7 @@ impl<I: StatusIo> Worker<I> {
             .iter()
             .map(|e| {
                 let mut row = e.info.clone();
-                row.state = e.state;
+                row.status = e.state;
                 row
             })
             .collect();
@@ -484,7 +484,7 @@ mod tests {
 
         let s = w.status.read().unwrap();
         assert_eq!(s.repos.len(), 2);
-        assert!(s.repos.iter().all(|r| r.state == RepoState::Pending));
+        assert!(s.repos.iter().all(|r| r.status == RepoState::Pending));
         assert_eq!(io.lists("/a") + io.fetches("/a"), 0);
     }
 
@@ -502,8 +502,8 @@ mod tests {
         w.work(t);
 
         assert_eq!(io.lists("/dead") + io.fetches("/dead"), 0);
-        assert_eq!(row(&w, "dead").state, RepoState::Skipped);
-        assert_eq!(row(&w, "ok").state, RepoState::Ok);
+        assert_eq!(row(&w, "dead").status, RepoState::Skipped);
+        assert_eq!(row(&w, "ok").status, RepoState::Ok);
         assert_eq!(io.fetches("/ok"), 1);
     }
 
@@ -519,7 +519,7 @@ mod tests {
         cycle_done(&mut w, &["r"], &[]);
         w.work(Instant::now());
         let r = row(&w, "r");
-        assert_eq!(r.state, RepoState::Error);
+        assert_eq!(r.status, RepoState::Error);
         assert_eq!(r.snapshot_count, Some(1));
         assert!(r.refreshed_at.is_some());
         assert_eq!(w.status.read().unwrap().recent_snapshots.len(), 1);
@@ -533,7 +533,7 @@ mod tests {
         io.fail("/r", false);
         cycle_done(&mut w, &["r"], &[]);
         w.work(Instant::now());
-        assert_eq!(row(&w, "r").state, RepoState::Ok);
+        assert_eq!(row(&w, "r").status, RepoState::Ok);
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
         io.fail("/r", true);
         let t = later(&w);
         w.work(t);
-        assert_eq!(row(&w, "r").state, RepoState::Error);
+        assert_eq!(row(&w, "r").status, RepoState::Error);
 
         let lists = io.lists("/r");
         let t = later(&w);
@@ -606,7 +606,7 @@ mod tests {
         running.store(false, Ordering::SeqCst);
         io.fail("/err", true);
         w.work(Instant::now());
-        assert_eq!(row(&w, "err").state, RepoState::Error);
+        assert_eq!(row(&w, "err").status, RepoState::Error);
 
         io.fail("/err", false);
         configure(
@@ -617,15 +617,15 @@ mod tests {
                 repo("moved", "/moved-new"),
             ],
         );
-        assert_eq!(row(&w, "skip").state, RepoState::Skipped);
-        assert_eq!(row(&w, "err").state, RepoState::Pending);
-        assert_eq!(row(&w, "moved").state, RepoState::Pending);
+        assert_eq!(row(&w, "skip").status, RepoState::Skipped);
+        assert_eq!(row(&w, "err").status, RepoState::Pending);
+        assert_eq!(row(&w, "moved").status, RepoState::Pending);
         assert_eq!(row(&w, "moved").url, "/moved-new");
         assert_eq!(w.status.read().unwrap().repos.len(), 3);
 
         w.work(Instant::now());
         assert_eq!(io.lists("/skip"), 0);
-        assert_eq!(row(&w, "err").state, RepoState::Ok);
+        assert_eq!(row(&w, "err").status, RepoState::Ok);
         assert_eq!(io.fetches("/moved-new"), 1);
     }
 

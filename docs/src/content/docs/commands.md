@@ -91,11 +91,11 @@ The document:
         "snapshots": [
           {
             "name": "a1b2c3d4",
-            "time": "2026-11-27T10:00:00Z",
+            "created_at": "2026-11-27T10:00:00Z",
             "hostname": "laptop",
             "source_label": "docs",
             "source_paths": ["/home/user/docs"],
-            "stats": { "nfiles": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }
+            "stats": { "file_count": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }
           }
         ],
         "hidden": []
@@ -128,7 +128,7 @@ A backup, as an example of a failed outcome with a result:
       "repository": { "name": "/backups/repo", "label": null, "url": "/backups/repo" },
       "outcome": { "status": "failed", "kind": "other", "message": "1 of 2 source(s) failed" },
       "result": {
-        "created": [ { "source_label": "docs", "snapshot_name": "a1b2c3d4", "source_paths": ["/home/user/docs"], "stats": { "nfiles": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }, "dataless_files_skipped": 0, "dataless_dirs_skipped": 0 } ],
+        "created": [ { "source_label": "docs", "snapshot_name": "a1b2c3d4", "source_paths": ["/home/user/docs"], "stats": { "file_count": 120, "original_size": 52428800, "compressed_size": 31457280, "deduplicated_size": 1048576, "errors": 0 }, "dataless_files_skipped": 0, "dataless_dirs_skipped": 0 } ],
         "skipped": [],
         "failed": [ { "source_label": "photos", "error": { "kind": "config", "message": "…" } } ],
         "aborted": null

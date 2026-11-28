@@ -161,8 +161,8 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         .map(|r| r.snapshot_count.unwrap_or(0))
         .sum();
 
-    let last_outcome = status.last_cycle.state.map_or("n/a", CycleOutcome::as_str);
-    let outcome_class = match status.last_cycle.state {
+    let last_outcome = status.last_cycle.status.map_or("n/a", CycleOutcome::as_str);
+    let outcome_class = match status.last_cycle.status {
         Some(CycleOutcome::Ok) => "outcome-ok",
         Some(CycleOutcome::Partial) => "outcome-partial",
         Some(CycleOutcome::Errors) => "outcome-errors",
@@ -194,7 +194,7 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
     // Metric cards
     let next_run = status
         .process
-        .next_run
+        .next_run_at
         .map_or_else(|| "—".to_string(), local_time);
     let last_started = status
         .last_cycle
@@ -244,7 +244,7 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
              </tr></thead><tbody>",
         );
         for r in &status.repos {
-            let state_class = match r.state {
+            let state_class = match r.status {
                 RepoState::Ok => "state-ok",
                 RepoState::Error => "state-error",
                 RepoState::Skipped => "state-skipped",
@@ -257,12 +257,12 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
                 None => ("—".to_string(), "—".to_string(), "—".to_string()),
                 Some(n) => (
                     n.to_string(),
-                    format_last_snapshot(r.last_snapshot_time),
+                    format_last_snapshot(r.last_snapshot_at),
                     r.unique_stored_size
                         .map_or_else(|| "—".to_string(), format_bytes),
                 ),
             };
-            let next_run = r.next_run.map_or_else(|| "Off".to_string(), local_time);
+            let next_run = r.next_run_at.map_or_else(|| "Off".to_string(), local_time);
             let _ = write!(
                 out,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
@@ -274,7 +274,7 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
                 esc(&size),
                 esc(&next_run),
                 state_class,
-                esc(r.state.as_str()),
+                esc(r.status.as_str()),
                 asof,
             );
         }
@@ -334,12 +334,12 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
                     <span class=\"target\">→ {target}</span>\
                   </summary>\
                   <dl class=\"detail\">",
-                label = esc(&s.label),
-                paths = esc(&s.paths.join(", ")),
+                label = esc(&s.source_label),
+                paths = esc(&s.source_paths.join(", ")),
                 target = esc(&target_repos),
             );
 
-            render_detail_list(&mut out, "Folders", &s.paths);
+            render_detail_list(&mut out, "Folders", &s.source_paths);
             render_detail_list(&mut out, "Exclusions", &s.exclude);
             render_detail_list(&mut out, "Exclude if present", &s.exclude_if_present);
             if !options.is_empty() {
@@ -411,17 +411,17 @@ mod tests {
                 version: "0.14.0".into(),
                 started_at: Some(at(8, 0, 0)),
                 uptime_seconds: 3900,
-                next_run: Some(at(12, 0, 0)),
+                next_run_at: Some(at(12, 0, 0)),
             },
             schedule_brief: "0 * * * *".into(),
             repos: vec![RepoInfo {
                 name: "repo-a".into(),
                 url: "rest:https://example.com/repo".into(),
                 snapshot_count: Some(3),
-                last_snapshot_time: Some(at(9, 55, 0)),
+                last_snapshot_at: Some(at(9, 55, 0)),
                 unique_stored_size: Some(1_200_000_000),
-                next_run: Some(at(12, 0, 0)),
-                state: RepoState::Error,
+                next_run_at: Some(at(12, 0, 0)),
+                status: RepoState::Error,
                 refreshed_at: Some(at(9, 58, 31)),
             }],
             recent_snapshots: vec![SnapshotRow {
@@ -429,8 +429,8 @@ mod tests {
                 snapshot: SnapshotRecord::new(&entry, Some(&stats)),
             }],
             sources: vec![SourceInfo {
-                label: "home".into(),
-                paths: vec!["/home/user".into()],
+                source_label: "home".into(),
+                source_paths: vec!["/home/user".into()],
                 exclude: vec![".cache".into(), "*.tmp".into()],
                 exclude_if_present: vec![".nobackup".into()],
                 target_repos: vec![],
@@ -442,7 +442,7 @@ mod tests {
             last_cycle: CycleSummary {
                 started_at: Some(at(9, 55, 0)),
                 finished_at: Some(at(9, 58, 30)),
-                state: Some(CycleOutcome::Ok),
+                status: Some(CycleOutcome::Ok),
                 duration_seconds: Some(210),
                 had_error: false,
                 had_partial: false,
@@ -484,8 +484,8 @@ mod tests {
         let mut s = fixture();
         s.repos[0].snapshot_count = None;
         s.repos[0].unique_stored_size = None;
-        s.repos[0].next_run = None;
-        s.process.next_run = None;
+        s.repos[0].next_run_at = None;
+        s.process.next_run_at = None;
         s.last_cycle = CycleSummary::default();
         let html = render_html(&s);
         assert!(
@@ -504,7 +504,7 @@ mod tests {
         assert!(html.contains(&format!("as of {}", local_time(at(9, 58, 31)))));
 
         let mut s = fixture();
-        s.repos[0].state = RepoState::Pending;
+        s.repos[0].status = RepoState::Pending;
         s.repos[0].refreshed_at = None;
         let html = render_html(&s);
         assert!(html.contains("<span class=\"state-pending\">pending</span>"));

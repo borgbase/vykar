@@ -95,7 +95,7 @@ fn backup_run_report_json() {
         "/home/u/docs"
       ],
       "stats": {
-        "nfiles": 3,
+        "file_count": 3,
         "original_size": 4096,
         "compressed_size": 2048,
         "deduplicated_size": 1024,
@@ -210,7 +210,7 @@ fn compact_stats_json() {
 }
 
 #[test]
-fn check_result_json_leaves_out_item_impacts() {
+fn check_result_json_leaves_out_item_impacts_and_skipped() {
     let result = CheckResult {
         snapshots_checked: 2,
         key_files_checked: 1,
@@ -245,10 +245,19 @@ fn check_result_json_leaves_out_item_impacts() {
       "context": "snapshot aaaa0001",
       "message": "references missing pack"
     }
-  ],
-  "skipped": false
+  ]
 }"#
     );
+    // `skipped` is not in the JSON either way: the entry's `outcome.status`
+    // says it.
+    let skipped = CheckResult {
+        skipped: true,
+        errors: vec![],
+        item_impacts: vec![],
+        ..result
+    };
+    let v = serde_json::to_value(&skipped).unwrap();
+    assert!(v.get("skipped").is_none(), "{v}");
 }
 
 #[test]
@@ -256,15 +265,15 @@ fn info_stats_json() {
     let t = Utc.with_ymd_and_hms(2026, 11, 27, 10, 0, 0).unwrap();
     let info = InfoStats {
         snapshot_count: 1,
-        last_snapshot_time: Some(t),
+        last_snapshot_at: Some(t),
         original_size: 100,
         compressed_size: 50,
         deduplicated_size: 40,
         unique_stored_size: 45,
         referenced_stored_size: None,
-        last_sweep_time: None,
-        unique_chunks: 7,
-        repo_created: t,
+        last_sweep_at: None,
+        unique_chunk_count: 7,
+        repo_created_at: t,
         encryption: EncryptionMode::Aes256Gcm,
         format: RepoFormat::V6(HashAlgorithm::Blake3),
         index: Some(IndexLayoutStats {
@@ -284,15 +293,15 @@ fn info_stats_json() {
         pretty(&info),
         r#"{
   "snapshot_count": 1,
-  "last_snapshot_time": "2026-11-27T10:00:00Z",
+  "last_snapshot_at": "2026-11-27T10:00:00Z",
   "original_size": 100,
   "compressed_size": 50,
   "deduplicated_size": 40,
   "unique_stored_size": 45,
   "referenced_stored_size": null,
-  "last_sweep_time": null,
-  "unique_chunks": 7,
-  "repo_created": "2026-11-27T10:00:00Z",
+  "last_sweep_at": null,
+  "unique_chunk_count": 7,
+  "repo_created_at": "2026-11-27T10:00:00Z",
   "encryption": "aes256gcm",
   "format": {
     "version": 6,
@@ -304,9 +313,9 @@ fn info_stats_json() {
     "segment_bytes": 2
   },
   "compact_refused": {
-    "first": "2026-11-27T10:00:00Z",
-    "last": "2026-11-27T10:00:00Z",
-    "detail": "d"
+    "first_at": "2026-11-27T10:00:00Z",
+    "last_at": "2026-11-27T10:00:00Z",
+    "message": "d"
   },
   "writer_mode": "multi",
   "put_if_absent_offered": false
@@ -339,7 +348,7 @@ fn snapshot_record_json() {
         pretty(&SnapshotRecord::new(&entry, None)),
         r#"{
   "name": "a1b2c3d4",
-  "time": "2026-11-27T10:00:00Z",
+  "created_at": "2026-11-27T10:00:00Z",
   "hostname": "",
   "source_label": "legacy",
   "source_paths": [],
@@ -354,6 +363,6 @@ fn snapshot_record_json() {
     };
     assert_eq!(
         serde_json::to_string(&SnapshotRecord::new(&entry, Some(&stats()))).unwrap(),
-        r#"{"name":"a1b2c3d4","time":"2026-11-27T10:00:00Z","hostname":"h","source_label":"docs","source_paths":["/home/u/docs"],"stats":{"nfiles":3,"original_size":4096,"compressed_size":2048,"deduplicated_size":1024,"errors":0}}"#
+        r#"{"name":"a1b2c3d4","created_at":"2026-11-27T10:00:00Z","hostname":"h","source_label":"docs","source_paths":["/home/u/docs"],"stats":{"file_count":3,"original_size":4096,"compressed_size":2048,"deduplicated_size":1024,"errors":0}}"#
     );
 }

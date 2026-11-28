@@ -4288,7 +4288,7 @@ fn cli_json_documents() {
         .map(|c| c["snapshot_name"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(created.len(), 2, "{backup}");
-    assert_eq!(backup["created"][0]["stats"]["nfiles"], 1, "{backup}");
+    assert_eq!(backup["created"][0]["stats"]["file_count"], 1, "{backup}");
 
     // `--json` is global: before the subcommand works too.
     let list = json_ok(&fx, &["--config", &cfg, "--json", "list"], "list");
@@ -4302,11 +4302,17 @@ fn cli_json_documents() {
     listed.sort();
     assert_eq!(listed, created, "{list}");
     assert_eq!(list["hidden"], serde_json::json!([]));
+    let snap = &list["snapshots"][0];
+    assert!(snap["created_at"].is_string(), "{list}");
+    assert_eq!(snap["stats"]["file_count"], 1, "{list}");
 
     let info = json_ok(&fx, &["--config", &cfg, "info", "--json"], "info");
     assert_eq!(info["snapshot_count"], 2, "{info}");
     assert_eq!(info["encryption"], "aes256gcm", "{info}");
     assert_eq!(info["format"]["version"], 6, "{info}");
+    assert!(info["last_snapshot_at"].is_string(), "{info}");
+    assert!(info["repo_created_at"].is_string(), "{info}");
+    assert!(info["unique_chunk_count"].as_u64().unwrap() > 0, "{info}");
 
     let prune = json_ok(
         &fx,
@@ -4331,6 +4337,7 @@ fn cli_json_documents() {
     let check = json_ok(&fx, &["--config", &cfg, "check", "--json"], "check");
     assert_eq!(check["errors"], serde_json::json!([]), "{check}");
     assert!(check.get("item_impacts").is_none(), "{check}");
+    assert!(check.get("skipped").is_none(), "{check}");
 }
 
 #[test]

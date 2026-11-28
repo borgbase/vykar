@@ -95,8 +95,9 @@ impl SnapshotMeta {
 /// `BackupOutcome`, not here. Anything that genuinely must be persisted goes in
 /// `SnapshotMeta::ext`.
 ///
-/// The field names are also the JSON names of `--json` and the daemon's
-/// status.json (schema 1): do not rename them.
+/// This serde impl is the snapshot encoding only. `--json` and the daemon's
+/// status.json (schema 1) serialize it through `stats_json`, whose names
+/// differ (`file_count`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotStats {
     pub nfiles: u64,
@@ -119,6 +120,57 @@ pub struct ByteCounterSnapshot {
     original_size: u64,
     compressed_size: u64,
     deduplicated_size: u64,
+}
+
+/// The JSON form of [`SnapshotStats`] in `--json` and the daemon's
+/// status.json (schema 1), for `#[serde(serialize_with)]`. Kept apart from the
+/// type's own serde impl, which is the snapshot encoding.
+pub(crate) mod stats_json {
+    use serde::{Serialize, Serializer};
+
+    use super::SnapshotStats;
+
+    #[derive(Serialize)]
+    struct StatsJson {
+        file_count: u64,
+        original_size: u64,
+        compressed_size: u64,
+        deduplicated_size: u64,
+        errors: u64,
+    }
+
+    impl From<&SnapshotStats> for StatsJson {
+        fn from(stats: &SnapshotStats) -> Self {
+            // Exhaustive: a new counter fails to compile until it has a JSON name.
+            let &SnapshotStats {
+                nfiles,
+                original_size,
+                compressed_size,
+                deduplicated_size,
+                errors,
+            } = stats;
+            Self {
+                file_count: nfiles,
+                original_size,
+                compressed_size,
+                deduplicated_size,
+                errors,
+            }
+        }
+    }
+
+    pub(crate) fn serialize<S: Serializer>(stats: &SnapshotStats, s: S) -> Result<S::Ok, S::Error> {
+        StatsJson::from(stats).serialize(s)
+    }
+
+    // `serialize_with` passes a reference.
+    #[allow(clippy::ref_option)]
+    pub(crate) fn serialize_option<S: Serializer>(
+        stats: &Option<SnapshotStats>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        stats.as_ref().map(StatsJson::from).serialize(s)
+    }
 }
 
 impl SnapshotStats {

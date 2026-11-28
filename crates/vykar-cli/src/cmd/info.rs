@@ -57,7 +57,7 @@ pub(crate) fn run_info(
         theme,
         "Created",
         stats
-            .repo_created
+            .repo_created_at
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M:%S"),
     );
@@ -71,7 +71,7 @@ pub(crate) fn run_info(
     let mut t2 = theme.new_kv_table();
     add_kv_row(&mut t2, theme, "Snapshots", stats.snapshot_count);
     let last_snapshot = stats
-        .last_snapshot_time
+        .last_snapshot_at
         .map(|t| {
             t.with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S")
@@ -112,7 +112,7 @@ pub(crate) fn run_info(
             .map_or_else(|| "-".to_string(), format_bytes),
     );
     let last_sweep = stats
-        .last_sweep_time
+        .last_sweep_at
         .map(|t| {
             t.with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S")
@@ -138,7 +138,7 @@ pub(crate) fn run_info(
             ),
         );
     }
-    add_kv_row(&mut t2, theme, "Unique chunks", stats.unique_chunks);
+    add_kv_row(&mut t2, theme, "Unique chunks", stats.unique_chunk_count);
     println!("{t2}");
     Ok(())
 }

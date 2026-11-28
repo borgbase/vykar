@@ -13,14 +13,14 @@ fn info_empty_repo_reports_zero_sizes_and_no_last_snapshot() {
 
     let stats = commands::info::run(&config, pass(&config)).unwrap();
     assert_eq!(stats.snapshot_count, 0);
-    assert!(stats.last_snapshot_time.is_none());
+    assert!(stats.last_snapshot_at.is_none());
     assert_eq!(stats.original_size, 0);
     assert_eq!(stats.compressed_size, 0);
     assert_eq!(stats.deduplicated_size, 0);
     assert_eq!(stats.unique_stored_size, 0);
     assert_eq!(stats.referenced_stored_size, None);
-    assert!(stats.last_sweep_time.is_none());
-    assert_eq!(stats.unique_chunks, 0);
+    assert!(stats.last_sweep_at.is_none());
+    assert_eq!(stats.unique_chunk_count, 0);
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn info_reports_referenced_size_larger_than_unique_when_chunks_are_reused() {
     // "Referenced" is the last sweep's figure: none before a compact.
     let stats = commands::info::run(&config, pass(&config)).unwrap();
     assert_eq!(stats.referenced_stored_size, None);
-    assert!(stats.last_sweep_time.is_none());
+    assert!(stats.last_sweep_at.is_none());
 
     commands::compact::run(
         &config,
@@ -56,9 +56,9 @@ fn info_reports_referenced_size_larger_than_unique_when_chunks_are_reused() {
     .unwrap();
     let stats = commands::info::run(&config, pass(&config)).unwrap();
     assert_eq!(stats.snapshot_count, 2);
-    assert!(stats.last_snapshot_time.is_some());
-    assert!(stats.last_sweep_time.is_some());
-    assert!(stats.unique_chunks > 0);
+    assert!(stats.last_snapshot_at.is_some());
+    assert!(stats.last_sweep_at.is_some());
+    assert!(stats.unique_chunk_count > 0);
     assert!(stats.unique_stored_size > 0);
     let referenced = stats.referenced_stored_size.expect("a sweep ran");
     assert!(referenced > stats.unique_stored_size);

@@ -135,15 +135,17 @@ pub fn collect_source_summaries(repos: &[ResolvedRepo]) -> Vec<SourceSummary> {
 pub struct SnapshotRecord {
     /// The snapshot name (the "ID" column).
     pub name: String,
-    /// UTC, RFC 3339.
-    pub time: DateTime<Utc>,
+    /// When the snapshot was taken (`SnapshotEntry::time`); UTC, RFC 3339.
+    pub created_at: DateTime<Utc>,
     /// Empty when the snapshot did not record one.
     pub hostname: String,
     /// [`SnapshotRowView::effective_label`]; empty when there is none.
     pub source_label: String,
     /// As recorded (no fallback to the label).
     pub source_paths: Vec<String>,
-    /// `None` when the snapshot's metadata could not be read.
+    /// `None` when the snapshot's metadata could not be read. JSON:
+    /// `crate::snapshot::stats_json`, not the snapshot encoding's names.
+    #[serde(serialize_with = "crate::snapshot::stats_json::serialize_option")]
     pub stats: Option<SnapshotStats>,
 }
 
@@ -152,7 +154,7 @@ impl SnapshotRecord {
     pub fn new(entry: &SnapshotEntry, stats: Option<&SnapshotStats>) -> Self {
         Self {
             name: entry.name.clone(),
-            time: entry.time,
+            created_at: entry.time,
             hostname: entry.hostname.clone(),
             source_label: SnapshotRowView::effective_label(entry).to_string(),
             source_paths: entry.source_paths.clone(),
@@ -241,11 +243,11 @@ impl SnapshotRowView {
         Self {
             id: record.name.clone(),
             time: record
-                .time
+                .created_at
                 .with_timezone(&Local)
                 .format(SNAPSHOT_TIME_FORMAT)
                 .to_string(),
-            time_epoch: record.time.timestamp(),
+            time_epoch: record.created_at.timestamp(),
             hostname: dash_if_empty(&record.hostname),
             label: dash_if_empty(&record.source_label),
             source_paths,

@@ -30,6 +30,8 @@ pub struct BackupSourceResult {
     pub source_label: String,
     pub snapshot_name: String,
     pub source_paths: Vec<String>,
+    /// JSON: `crate::snapshot::stats_json`.
+    #[serde(serialize_with = "crate::snapshot::stats_json::serialize")]
     pub stats: crate::snapshot::SnapshotStats,
     /// Cloud-only (macOS `FileProvider`) files omitted from the snapshot. Run-
     /// local — not part of `stats`, and never counted as an error. See

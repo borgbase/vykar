@@ -55,15 +55,15 @@ pub(crate) struct RepoInfo {
     pub url: String,
     /// `None` until the row is fetched.
     pub snapshot_count: Option<usize>,
-    pub last_snapshot_time: Option<DateTime<Utc>>,
+    pub last_snapshot_at: Option<DateTime<Utc>>,
     /// `None` until the row is fetched.
     pub unique_stored_size: Option<u64>,
     /// This repo's own next scheduled run (repos can have different
     /// cadences); `None` when it is not scheduled. Stamped by
     /// `set_repo_next_runs` and carried across row rebuilds by
     /// `carry_over_next_runs` (the status worker does not know the schedule).
-    pub next_run: Option<DateTime<Utc>>,
-    pub state: RepoState,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub status: RepoState,
     /// When the row was last fetched successfully; `None` until then.
     pub refreshed_at: Option<DateTime<Utc>>,
 }
@@ -75,10 +75,10 @@ impl RepoInfo {
             name: repo.label_or_url().to_string(),
             url: repo.config.repository.url.clone(),
             snapshot_count: None,
-            last_snapshot_time: None,
+            last_snapshot_at: None,
             unique_stored_size: None,
-            next_run: None,
-            state: RepoState::Pending,
+            next_run_at: None,
+            status: RepoState::Pending,
             refreshed_at: None,
         }
     }
@@ -93,8 +93,8 @@ pub(crate) struct SnapshotRow {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SourceInfo {
-    pub label: String,
-    pub paths: Vec<String>,
+    pub source_label: String,
+    pub source_paths: Vec<String>,
     pub exclude: Vec<String>,
     pub exclude_if_present: Vec<String>,
     /// Empty: all repositories.
@@ -171,7 +171,7 @@ pub(crate) struct CycleSummary {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     /// `None` before the first cycle.
-    pub state: Option<CycleOutcome>,
+    pub status: Option<CycleOutcome>,
     pub duration_seconds: Option<u64>,
     pub had_error: bool,
     /// Only repositories without failures count.
@@ -190,7 +190,7 @@ pub(crate) struct ProcessInfo {
     pub started_at: Option<DateTime<Utc>>,
     pub uptime_seconds: u64,
     /// The earliest next run; `None` when nothing is scheduled.
-    pub next_run: Option<DateTime<Utc>>,
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,7 +263,7 @@ pub(crate) fn init(status: &SharedStatus, repos: &[ResolvedRepo], started_at: In
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: Some(started),
         uptime_seconds: elapsed.as_secs(),
-        next_run: None,
+        next_run_at: None,
     };
     let schedules: Vec<&_> = repos.iter().map(|r| &r.config.schedule).collect();
     s.schedule_brief = repos_schedule_brief(&schedules, false);
@@ -292,7 +292,7 @@ pub(crate) fn touch_process(
 ) {
     let mut s = status.write().expect("status lock poisoned");
     s.process.uptime_seconds = started_at.elapsed().as_secs();
-    s.process.next_run = next_run.map(utc);
+    s.process.next_run_at = next_run.map(utc);
 }
 
 /// Stamp each repo row with its own next scheduled run, matched by name.
@@ -304,7 +304,7 @@ pub(crate) fn set_repo_next_runs(
     let mut s = status.write().expect("status lock poisoned");
     for row in &mut s.repos {
         if let Some((_, next)) = next_runs.iter().find(|(name, _)| *name == row.name) {
-            row.next_run = next.map(utc);
+            row.next_run_at = next.map(utc);
         }
     }
 }
@@ -313,8 +313,8 @@ fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
     views::collect_source_summaries(repos)
         .into_iter()
         .map(|s| SourceInfo {
-            label: s.label,
-            paths: s.paths,
+            source_label: s.label,
+            source_paths: s.paths,
             exclude: s.excludes,
             exclude_if_present: s.exclude_if_present,
             target_repos: s.target_repo_names,
@@ -334,13 +334,13 @@ fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
 fn carry_over_next_runs(new_rows: &mut [RepoInfo], previous: &[RepoInfo]) {
     for row in new_rows {
         if let Some(prev) = previous.iter().find(|p| p.name == row.name) {
-            row.next_run = prev.next_run;
+            row.next_run_at = prev.next_run_at;
         }
     }
 }
 
 /// Read one repo's summary row and its newest `RECENT_SNAPSHOTS_LIMIT`
-/// snapshots. The returned row has `state`/`refreshed_at` unset; the caller
+/// snapshots. The returned row has `status`/`refreshed_at` unset; the caller
 /// stamps them.
 pub(crate) fn fetch_repo(repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
     let name = repo.label_or_url().to_string();
@@ -350,7 +350,7 @@ pub(crate) fn fetch_repo(repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotR
     let stats = vykar_core::commands::info::run(&repo.config, pass_ref)?;
     let info = RepoInfo {
         snapshot_count: Some(stats.snapshot_count),
-        last_snapshot_time: stats.last_snapshot_time,
+        last_snapshot_at: stats.last_snapshot_at,
         unique_stored_size: Some(stats.unique_stored_size),
         ..RepoInfo::placeholder(repo)
     };
@@ -376,7 +376,7 @@ pub(crate) fn fetch_repo(repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotR
 /// each repo's own list; they are merged newest first and truncated.
 pub(crate) fn publish(status: &SharedStatus, mut rows: Vec<RepoInfo>, snapshots: Vec<SnapshotRow>) {
     let mut recent = snapshots;
-    recent.sort_by_key(|r| std::cmp::Reverse(r.snapshot.time));
+    recent.sort_by_key(|r| std::cmp::Reverse(r.snapshot.created_at));
     recent.truncate(RECENT_SNAPSHOTS_LIMIT);
 
     let mut s = status.write().expect("status lock poisoned");
@@ -393,7 +393,7 @@ pub(crate) fn record_cycle_start(status: &SharedStatus) {
     s.last_cycle = CycleSummary {
         started_at: Some(now()),
         finished_at: None,
-        state: Some(CycleOutcome::Running),
+        status: Some(CycleOutcome::Running),
         duration_seconds: None,
         had_error: false,
         had_partial: false,
@@ -470,7 +470,7 @@ pub(crate) fn record_cycle_end(
         .collect();
     let mut s = status.write().expect("status lock poisoned");
     s.last_cycle.finished_at = Some(now());
-    s.last_cycle.state = Some(cycle_outcome(flags));
+    s.last_cycle.status = Some(cycle_outcome(flags));
     s.last_cycle.duration_seconds = Some(elapsed.as_secs());
     s.last_cycle.had_error = flags.had_error;
     s.last_cycle.had_partial = flags.had_partial;
@@ -497,10 +497,10 @@ mod tests {
             name: name.to_string(),
             url: format!("/backups/{name}"),
             snapshot_count: Some(0),
-            last_snapshot_time: None,
+            last_snapshot_at: None,
             unique_stored_size: Some(0),
-            next_run,
-            state: RepoState::Ok,
+            next_run_at: next_run,
+            status: RepoState::Ok,
             refreshed_at: None,
         }
     }
@@ -574,8 +574,8 @@ mod tests {
         let s = status.read().unwrap();
         assert_eq!(s.schema, 1);
         assert_eq!(s.repos.len(), 1);
-        assert_eq!(s.repos[0].state, RepoState::Pending);
-        assert_eq!(s.repos[0].next_run, None);
+        assert_eq!(s.repos[0].status, RepoState::Pending);
+        assert_eq!(s.repos[0].next_run_at, None);
         assert!(s.process.started_at.is_some());
     }
 
@@ -589,8 +589,8 @@ mod tests {
 
         let s = status.read().unwrap();
         let want = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        assert_eq!(s.repos[0].next_run, Some(want));
-        assert_eq!(s.process.next_run, Some(want));
+        assert_eq!(s.repos[0].next_run_at, Some(want));
+        assert_eq!(s.process.next_run_at, Some(want));
     }
 
     #[test]
@@ -604,9 +604,9 @@ mod tests {
         let rows = seed_rows(&[resolved("a", "/a"), resolved("b", "/b-new")], &previous);
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].state, RepoState::Ok);
+        assert_eq!(rows[0].status, RepoState::Ok);
         assert_eq!(
-            (rows[1].state, rows[1].url.as_str()),
+            (rows[1].status, rows[1].url.as_str()),
             (RepoState::Pending, "/b-new")
         );
     }
@@ -623,12 +623,12 @@ mod tests {
         publish(&status, vec![row("a", None), row("b", None)], snaps);
 
         let s = status.read().unwrap();
-        assert_eq!(s.repos[0].next_run, Some(at(13, 0)));
-        assert_eq!(s.repos[1].next_run, None);
+        assert_eq!(s.repos[0].next_run_at, Some(at(13, 0)));
+        assert_eq!(s.repos[1].next_run_at, None);
         assert_eq!(s.recent_snapshots.len(), RECENT_SNAPSHOTS_LIMIT);
-        assert_eq!(s.recent_snapshots[0].snapshot.time, day(2, 8));
+        assert_eq!(s.recent_snapshots[0].snapshot.created_at, day(2, 8));
         assert!(s.recent_snapshots[..8].iter().all(|r| r.repo_name == "b"));
-        assert_eq!(s.recent_snapshots[8].snapshot.time, day(1, 8));
+        assert_eq!(s.recent_snapshots[8].snapshot.created_at, day(1, 8));
     }
 
     #[test]
@@ -703,8 +703,8 @@ mod tests {
 
         carry_over_next_runs(&mut rebuilt, &previous);
 
-        assert_eq!(rebuilt[0].next_run, None);
-        assert_eq!(rebuilt[1].next_run, Some(at(13, 0)));
+        assert_eq!(rebuilt[0].next_run_at, None);
+        assert_eq!(rebuilt[1].next_run_at, Some(at(13, 0)));
     }
 
     #[test]
@@ -716,7 +716,7 @@ mod tests {
 
         carry_over_next_runs(&mut rebuilt, &previous);
 
-        assert_eq!(rebuilt[0].next_run, None);
+        assert_eq!(rebuilt[0].next_run_at, None);
     }
 
     #[test]
@@ -736,7 +736,7 @@ mod tests {
             let s = status.read().unwrap();
             assert!(s.last_cycle.had_error);
             assert!(!s.last_cycle.had_partial);
-            assert_eq!(s.last_cycle.state, Some(CycleOutcome::Errors));
+            assert_eq!(s.last_cycle.status, Some(CycleOutcome::Errors));
             assert_eq!(s.last_cycle.duration_seconds, Some(5));
             assert_eq!(s.last_cycle.repos.len(), 2);
             assert_eq!(s.last_cycle.repos[1].name, "b");
@@ -747,7 +747,7 @@ mod tests {
         let s = status.read().unwrap();
         assert!(!s.last_cycle.had_error);
         assert!(s.last_cycle.had_partial);
-        assert_eq!(s.last_cycle.state, Some(CycleOutcome::Partial));
+        assert_eq!(s.last_cycle.status, Some(CycleOutcome::Partial));
     }
 
     #[test]
@@ -760,7 +760,7 @@ mod tests {
         record_cycle_start(&status);
 
         let s = status.read().unwrap();
-        assert_eq!(s.last_cycle.state, Some(CycleOutcome::Running));
+        assert_eq!(s.last_cycle.status, Some(CycleOutcome::Running));
         assert_eq!(s.last_cycle.finished_at, None);
         assert_eq!(s.last_cycle.duration_seconds, None);
         assert_eq!(s.last_cycle.repos.len(), 1);
@@ -834,7 +834,7 @@ mod tests {
                 version: "1.2.3".into(),
                 started_at: Some(at(9, 0)),
                 uptime_seconds: 3900,
-                next_run: Some(at(12, 0)),
+                next_run_at: Some(at(12, 0)),
             },
             schedule_brief: "1h".into(),
             repos: vec![
@@ -842,20 +842,20 @@ mod tests {
                     name: "fresh".into(),
                     url: "/fresh".into(),
                     snapshot_count: None,
-                    last_snapshot_time: None,
+                    last_snapshot_at: None,
                     unique_stored_size: None,
-                    next_run: None,
-                    state: RepoState::Pending,
+                    next_run_at: None,
+                    status: RepoState::Pending,
                     refreshed_at: None,
                 },
                 RepoInfo {
                     name: "nas".into(),
                     url: "/nas".into(),
                     snapshot_count: Some(3),
-                    last_snapshot_time: Some(at(10, 0)),
+                    last_snapshot_at: Some(at(10, 0)),
                     unique_stored_size: Some(1024),
-                    next_run: Some(at(12, 0)),
-                    state: RepoState::Ok,
+                    next_run_at: Some(at(12, 0)),
+                    status: RepoState::Ok,
                     refreshed_at: Some(at(10, 5)),
                 },
             ],
@@ -864,8 +864,8 @@ mod tests {
                 snapshot: record("a1b2c3d4", at(10, 0)),
             }],
             sources: vec![SourceInfo {
-                label: "home".into(),
-                paths: vec!["/home/u".into()],
+                source_label: "home".into(),
+                source_paths: vec!["/home/u".into()],
                 exclude: vec![".cache".into()],
                 exclude_if_present: vec![],
                 target_repos: vec![],
@@ -877,7 +877,7 @@ mod tests {
             last_cycle: CycleSummary {
                 started_at: Some(at(10, 0)),
                 finished_at: Some(at(10, 3)),
-                state: Some(CycleOutcome::Ok),
+                status: Some(CycleOutcome::Ok),
                 duration_seconds: Some(180),
                 had_error: false,
                 had_partial: false,
@@ -901,13 +901,13 @@ mod tests {
             serde_json::to_string(&s).unwrap(),
             concat!(
                 r#"{"schema":1,"#,
-                r#""process":{"hostname":"host1","pid":7,"version":"1.2.3","started_at":"2026-07-25T09:00:00Z","uptime_seconds":3900,"next_run":"2026-07-25T12:00:00Z"},"#,
+                r#""process":{"hostname":"host1","pid":7,"version":"1.2.3","started_at":"2026-07-25T09:00:00Z","uptime_seconds":3900,"next_run_at":"2026-07-25T12:00:00Z"},"#,
                 r#""schedule_brief":"1h","#,
-                r#""repos":[{"name":"fresh","url":"/fresh","snapshot_count":null,"last_snapshot_time":null,"unique_stored_size":null,"next_run":null,"state":"pending","refreshed_at":null},"#,
-                r#"{"name":"nas","url":"/nas","snapshot_count":3,"last_snapshot_time":"2026-07-25T10:00:00Z","unique_stored_size":1024,"next_run":"2026-07-25T12:00:00Z","state":"ok","refreshed_at":"2026-07-25T10:05:00Z"}],"#,
-                r#""recent_snapshots":[{"repo_name":"nas","name":"a1b2c3d4","time":"2026-07-25T10:00:00Z","hostname":"h","source_label":"l","source_paths":["/p"],"stats":null}],"#,
-                r#""sources":[{"label":"home","paths":["/home/u"],"exclude":[".cache"],"exclude_if_present":[],"target_repos":[],"options":["git_ignore"],"hooks":[],"retention":["keep_last: 7"],"command_dumps":[]}],"#,
-                r#""last_cycle":{"started_at":"2026-07-25T10:00:00Z","finished_at":"2026-07-25T10:03:00Z","state":"ok","duration_seconds":180,"had_error":false,"had_partial":false,"#,
+                r#""repos":[{"name":"fresh","url":"/fresh","snapshot_count":null,"last_snapshot_at":null,"unique_stored_size":null,"next_run_at":null,"status":"pending","refreshed_at":null},"#,
+                r#"{"name":"nas","url":"/nas","snapshot_count":3,"last_snapshot_at":"2026-07-25T10:00:00Z","unique_stored_size":1024,"next_run_at":"2026-07-25T12:00:00Z","status":"ok","refreshed_at":"2026-07-25T10:05:00Z"}],"#,
+                r#""recent_snapshots":[{"repo_name":"nas","name":"a1b2c3d4","created_at":"2026-07-25T10:00:00Z","hostname":"h","source_label":"l","source_paths":["/p"],"stats":null}],"#,
+                r#""sources":[{"source_label":"home","source_paths":["/home/u"],"exclude":[".cache"],"exclude_if_present":[],"target_repos":[],"options":["git_ignore"],"hooks":[],"retention":["keep_last: 7"],"command_dumps":[]}],"#,
+                r#""last_cycle":{"started_at":"2026-07-25T10:00:00Z","finished_at":"2026-07-25T10:03:00Z","status":"ok","duration_seconds":180,"had_error":false,"had_partial":false,"#,
                 r#""repos":[{"name":"nas","url":"/nas","steps":[{"step":"backup","status":"ok","kind":null},{"step":"check","status":"skipped","kind":"check_not_due"}]}]}}"#,
             )
         );

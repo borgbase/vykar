@@ -13,7 +13,7 @@ use crate::repo::OpenOptions;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InfoStats {
     pub snapshot_count: usize,
-    pub last_snapshot_time: Option<DateTime<Utc>>,
+    pub last_snapshot_at: Option<DateTime<Utc>>,
     pub original_size: u64,
     pub compressed_size: u64,
     pub deduplicated_size: u64,
@@ -24,9 +24,9 @@ pub struct InfoStats {
     /// as the last sweep found them. `None` before the first compact.
     pub referenced_stored_size: Option<u64>,
     /// When the last sweep ran (the client clock of that compact).
-    pub last_sweep_time: Option<DateTime<Utc>>,
-    pub unique_chunks: usize,
-    pub repo_created: DateTime<Utc>,
+    pub last_sweep_at: Option<DateTime<Utc>>,
+    pub unique_chunk_count: usize,
+    pub repo_created_at: DateTime<Utc>,
     /// JSON: `EncryptionMode::as_str`, not the repository config's encoding.
     #[serde(serialize_with = "ser_encryption")]
     pub encryption: EncryptionMode,
@@ -39,7 +39,9 @@ pub struct InfoStats {
     pub index: Option<IndexLayoutStats>,
     /// The last compact on this machine refused its mark because the index
     /// lacks a chunk a live snapshot needs, and no compact has marked since
-    /// (nor a repair applied): [`crate::commands::compact_refusal`].
+    /// (nor a repair applied): [`crate::commands::compact_refusal`]. JSON:
+    /// `first_at`, `last_at`, `message`, not the record file's names.
+    #[serde(serialize_with = "crate::commands::compact_refusal::serialize_json")]
     pub compact_refused: Option<crate::commands::compact_refusal::CompactRefusal>,
     /// As `config` records it. JSON: "single" or "multi" (the
     /// `--commit-mode` values).
@@ -102,11 +104,11 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
     let mut original_size = 0u64;
     let mut compressed_size = 0u64;
     let mut deduplicated_size = 0u64;
-    let mut last_snapshot_time = None;
+    let mut last_snapshot_at = None;
 
     for entry in &repo.manifest().snapshots {
-        if last_snapshot_time.is_none_or(|current| entry.time > current) {
-            last_snapshot_time = Some(entry.time);
+        if last_snapshot_at.is_none_or(|current| entry.time > current) {
+            last_snapshot_at = Some(entry.time);
         }
 
         let meta = load_snapshot_meta(&repo, &entry.name)?;
@@ -134,15 +136,15 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
 
     Ok(InfoStats {
         snapshot_count: repo.manifest().snapshots.len(),
-        last_snapshot_time,
+        last_snapshot_at,
         original_size,
         compressed_size,
         deduplicated_size,
         unique_stored_size,
         referenced_stored_size: record.as_ref().map(|r| r.referenced_bytes),
-        last_sweep_time: record.as_ref().map(|r| r.time),
-        unique_chunks: repo.chunk_index().len(),
-        repo_created: repo.config().created,
+        last_sweep_at: record.as_ref().map(|r| r.time),
+        unique_chunk_count: repo.chunk_index().len(),
+        repo_created_at: repo.config().created,
         encryption: repo.config().encryption.clone(),
         format: repo.format(),
         index: repo.index_head().map(|head| IndexLayoutStats {

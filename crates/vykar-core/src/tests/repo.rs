@@ -1401,10 +1401,12 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     );
 }
 
-/// Answers the capability probe with a server that serves the segmented
-/// index but not the v6 key directories.
+/// Answers the capability probe with a server that does not serve the v6
+/// key directories, and serves the segmented index only if told to.
 struct ServerWithoutV6Dirs {
     inner: MemoryBackend,
+    /// What `/health` reports as `segmented_index`.
+    segmented_index: bool,
 }
 
 impl vykar_storage::InnerBackend for ServerWithoutV6Dirs {
@@ -1433,7 +1435,7 @@ impl vykar_storage::ServerOps for ServerWithoutV6Dirs {
             version: "0.24.0".into(),
             protocol_version: vykar_protocol::PROTOCOL_VERSION,
             hashes: vec!["blake3".into()],
-            segmented_index: true,
+            segmented_index: self.segmented_index,
             key_dirs: vec!["index.d".into()],
             ..Default::default()
         })
@@ -1446,14 +1448,19 @@ impl vykar_storage::ServerOps for ServerWithoutV6Dirs {
     }
 }
 
-/// FMT-3: init refuses a vykar-server that does not accept the `index.h/`
-/// and `packmaps/` keys, before writing anything.
-#[test]
-fn init_refuses_a_server_without_the_v6_key_dirs() {
+/// Run `Repo::init` against `ServerWithoutV6Dirs` and return its refusal
+/// together with the storage, to check that nothing was written.
+fn init_against_old_server(
+    segmented_index: bool,
+) -> (
+    vykar_types::error::VykarError,
+    std::sync::Arc<dyn vykar_storage::StorageBackend>,
+) {
     crate::testutil::init_test_environment();
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
         std::sync::Arc::new(ServerWithoutV6Dirs {
             inner: MemoryBackend::new(),
+            segmented_index,
         });
     let err = Repo::init(
         Box::new(std::sync::Arc::clone(&storage)),
@@ -1465,13 +1472,39 @@ fn init_refuses_a_server_without_the_v6_key_dirs() {
     )
     .err()
     .expect("init must refuse");
+    (err, storage)
+}
+
+/// FMT-3: init refuses a vykar-server that does not accept the `index.h/`
+/// and `packmaps/` keys, before writing anything.
+#[test]
+fn init_refuses_a_server_without_the_v6_key_dirs() {
+    let (err, storage) = init_against_old_server(true);
     let msg = err.to_string();
     assert!(
         matches!(err, vykar_types::error::VykarError::Config(_)),
         "{err:?}"
     );
     assert!(
-        msg.contains("index.h/") && msg.contains("Upgrade the server first"),
+        msg.contains("index.h/") && msg.contains("Upgrade the server to 0.30 or later first"),
+        "{msg}"
+    );
+    assert!(storage.list("").unwrap().is_empty(), "nothing written");
+}
+
+/// Init refuses a vykar-server without the segmented index, before writing
+/// anything.
+#[test]
+fn init_refuses_a_server_without_the_segmented_index() {
+    let (err, storage) = init_against_old_server(false);
+    let msg = err.to_string();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::Config(_)),
+        "{err:?}"
+    );
+    assert!(
+        msg.contains("does not support the segmented index")
+            && msg.contains("Upgrade the server to 0.30 or later first"),
         "{msg}"
     );
     assert!(storage.list("").unwrap().is_empty(), "nothing written");

@@ -501,6 +501,11 @@ impl DecodedConfig {
 
 const INDEX_OBJECT_CONTEXT: &[u8] = b"index";
 
+/// The first vykar-server release that serves format v6 (the segmented
+/// index and the `index.h/` and `packmaps/` keys), named in the refusals
+/// of `init` and `vykar upgrade` for an older server.
+pub(crate) const MIN_V6_SERVER_RELEASE: &str = "0.30";
+
 /// The repository key, stored twice.
 ///
 /// Both objects hold the **same serialized bytes**, not two independent wraps:

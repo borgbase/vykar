@@ -13,8 +13,8 @@ use super::tree_cache::TreeChunkCache;
 use super::writer_mode::{ModeCheck, init_time_check};
 use super::{
     ChunkerParams, EncryptionMode, HostEnv, InitOptions, KEY_PRIMARY, KEY_SECONDARY,
-    MAX_PACK_SIZE_LIMIT, OpenOptions, Repo, RepoConfig, RepoFormat, WriterMode,
-    default_max_pack_size, default_min_pack_size,
+    MAX_PACK_SIZE_LIMIT, MIN_V6_SERVER_RELEASE, OpenOptions, Repo, RepoConfig, RepoFormat,
+    WriterMode, default_max_pack_size, default_min_pack_size,
 };
 use crate::index::LiveIndex;
 use crate::index::head::IndexHead;
@@ -211,19 +211,22 @@ impl Repo {
             if !caps.segmented_index {
                 return Err(VykarError::Config(format!(
                     "vykar-server at {} (version {}) does not support the segmented \
-                     index of format v{}. Upgrade the server first.",
+                     index of format v{}. Upgrade the server to {} or later first.",
                     storage_label(init_opts),
                     caps.version,
                     format.version(),
+                    MIN_V6_SERVER_RELEASE,
                 )));
             }
             if !caps.serves_v6_key_dirs() {
                 return Err(VykarError::Config(format!(
                     "vykar-server at {} (version {}) does not accept the index.h/ and \
-                     packmaps/ keys of format v{}. Upgrade the server first.",
+                     packmaps/ keys of format v{}. Upgrade the server to {} or later \
+                     first.",
                     storage_label(init_opts),
                     caps.version,
                     format.version(),
+                    MIN_V6_SERVER_RELEASE,
                 )));
             }
         }

@@ -34,7 +34,7 @@ pub(crate) fn run_upgrade(
             ),
             None => eprintln!(
                 "This upgrades the repository to the v6 repository format. It is one-way:\n\
-                 vykar releases before 0.25 can no longer read or write it. Stop every other\n\
+                 vykar releases before 0.30 can no longer read or write it. Stop every other\n\
                  client of this repository first, and upgrade vykar on all of them."
             ),
         }

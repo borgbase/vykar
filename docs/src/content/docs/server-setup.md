@@ -184,6 +184,10 @@ Between windows, old index heads and index objects accumulate on the server: bac
 
 A damaged index, or one a compromised client wrote to hide data, is fixed from the trusted machine during a maintenance window. `vykar check --repair` rebuilds the index from the packs, which describe their own contents (pack trailers and pack maps; see [Repair](/maintenance#repair)). An index head crafted to drop entries is also caught by `compact` itself: it marks every live snapshot before deleting anything, and refuses, changing nothing, when a chunk a snapshot needs is missing from the index.
 
+## Upgrading
+
+Upgrade `vykar-server` before the clients. vykar 0.30 clients need vykar-server 0.30 or later for repositories of format v6: `vykar init` and `vykar upgrade` check the server's `/health` first and refuse an older one ("Upgrade the server to 0.30 or later first"), changing nothing. vykar-server 0.30 keeps serving vykar 0.24 clients on repositories of format v2 and v3, so the server can go first while the clients follow. Do not roll the server back once a repository on it is of format v6, or once an upgrade has started: an older server refuses to start on a data directory that contains `index.d/`, `index.h/` or `packmaps/` ("contains unexpected entries"). See [Upgrade the repository format](/maintenance#upgrade-the-repository-format).
+
 ## Health check
 
 ```bash
@@ -194,5 +198,5 @@ curl http://localhost:8585/health
 Returns JSON like:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}
+{"append_only":false,"conditional_put":true,"hashes":["blake2b","blake3"],"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"list_tree":true,"object_sizes":true,"pack_parts":true,"protocol_version":3,"repack":true,"repack_trailer":true,"segmented_index":true,"status":"ok","verify_packs":true,"version":"0.30.0"}
 ```

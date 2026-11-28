@@ -70,7 +70,7 @@ use crate::sim::driver::*;
 struct Seed {
     /// The file stem.
     name: String,
-    /// Where it came from, and which plan fixes the hazard it shows.
+    /// Where it came from, and what removes the hazard it shows or why it stays.
     note: String,
     /// The exact signature set the case must give. Never contains Unknown.
     expect: BTreeSet<Signature>,
@@ -99,17 +99,17 @@ fn taken(o: &Outcome, choices: usize) -> Vec<(Action, String)> {
         .collect()
 }
 
-/// The plan that removes a signature's hazard, as its doc comment names it.
+/// What removes a signature's hazard, or why it stays.
 fn fixed_by(s: Signature) -> &'static str {
     match s {
         Signature::SessionReaped => "04 step 1",
         Signature::AgedSessionReaped => {
-            "part 10 (04 step 9 and the reused section; narrowed by step 7: horizon, I8, \
-             young segments)"
+            "not planned: a reap by age of a stalled run's marker is the marker's documented \
+             limit (H-committing-reaped); the session horizon, I8 and young segments narrow it"
         }
         Signature::LateSnapshotWrite => {
-            "part 10 (04 step 9 and the reused section; narrowed by step 7: needs a segment \
-             older than T_pack)"
+            "not planned: a snapshot PUT released after its writer ended (R3); young segments \
+             narrow it to a segment older than T_pack"
         }
         Signature::LateHeadWrite
         | Signature::LateHeadThenCompact

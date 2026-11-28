@@ -965,7 +965,7 @@ fn upgrade_probes_the_server_before_writing() {
         let msg = err.to_string();
         assert!(
             msg.contains("does not support the index of format v6")
-                && msg.contains("Upgrade the server first"),
+                && msg.contains("Upgrade the server to 0.30 or later first"),
             "{msg}"
         );
         only_lock_ops(&ops);

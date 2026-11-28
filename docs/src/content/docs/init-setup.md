@@ -122,6 +122,6 @@ Repositories created by vykar 0.24 and earlier (**format v2**, BLAKE2b, from 0.1
 This matters in two situations:
 
 - **Older vykar binaries cannot open a v6 repository** (`unsupported repository version: 6`). If several machines share one repository, upgrade vykar on all of them together.
-- **A self-hosted `vykar-server` must be upgraded first** (0.25 or later, which supports the segmented index). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail.
+- **A self-hosted `vykar-server` must be upgraded first** (0.30 or later, which supports the segmented index). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail. See [Server Setup](/server-setup#upgrading).
 
 Next: [Back Up](/backup)

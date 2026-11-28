@@ -41,7 +41,6 @@ zstd = "0.14"
 fastcdc = "5.0.0"
 
 # Filesystem
-dunce = { workspace = true }
 tempfile.workspace = true
 globset = "0.4"
 ignore = "0.4"
@@ -133,3 +132,5 @@ xattr = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+# Strips the verbatim \\?\ prefix in platform::fs::rootless_slash_path.
+dunce = { workspace = true }

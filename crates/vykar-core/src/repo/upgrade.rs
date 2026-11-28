@@ -57,7 +57,10 @@ use super::sessions::{
 };
 use super::writer::FenceFn;
 use super::writer_mode::{ModeCheck, init_time_check};
-use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, Repo, RepoConfig, RepoFormat, WriterMode};
+use super::{
+    DecodedConfig, INDEX_OBJECT_CONTEXT, MIN_V6_SERVER_RELEASE, Repo, RepoConfig, RepoFormat,
+    WriterMode,
+};
 use crate::compress;
 use std::sync::Arc;
 
@@ -195,9 +198,10 @@ impl Repo {
                 return Err(VykarError::Config(format!(
                     "vykar-server (version {}) does not support the index of format v{} \
                      (the segmented index and the index.h/ and packmaps/ keys). Upgrade \
-                     the server first.",
+                     the server to {} or later first.",
                     caps.version,
                     target.version(),
+                    MIN_V6_SERVER_RELEASE,
                 )));
             }
         }

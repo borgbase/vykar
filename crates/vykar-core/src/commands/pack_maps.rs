@@ -14,7 +14,9 @@ pub use crate::repo::pack_map::PackMapStats;
 /// step 8), so it refuses beside any live session (a backup included) and
 /// every other writer refuses beside it: a compact deletes maps none of
 /// whose packs it saw alive, so maps are written only where no compact
-/// runs. No CLI command runs it yet; `vykar upgrade` will.
+/// runs. No CLI command calls this entry point (tests and fixtures do):
+/// `vykar upgrade` and `check --repair` write maps through
+/// `Repo::write_pack_maps` inside their own exclusive sessions.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,

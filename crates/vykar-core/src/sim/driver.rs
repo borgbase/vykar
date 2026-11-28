@@ -589,8 +589,9 @@ pub enum Signature {
     /// young: the swept-packs route needs a stall of T_pack in all between
     /// the victim's head PUT and the compact (seed
     /// `aged-session-reaped-swept-packs-old-segment`). Left by part 9 (04
-    /// step 8): the sweep cannot mark a snapshot not yet written; part 10
-    /// (04 step 9 and 05's `reused` section). Since phase F part 10d's fix
+    /// step 8): the sweep cannot mark a snapshot not yet written; no fix is
+    /// planned (a reap by age of a stalled run's marker is the marker's
+    /// documented limit, H-committing-reaped). Since phase F part 10d's fix
     /// round also a compact's residual: it checks its marker
     /// before every head create and batch of deletes, so what remains is a
     /// reap by age while a head create is in flight after that check. The
@@ -673,8 +674,8 @@ pub enum Signature {
     /// compact (seed `late-snapshot-write-old-segment`), or a chunk it
     /// reused from a snapshot whose segment is old and that nothing else
     /// visible references. Left by part 9: a head visible before its
-    /// snapshot needs 05's `reused` section or snapshot-before-head (part 10,
-    /// 04 step 9).
+    /// snapshot; no fix is planned (R3: a snapshot PUT released after its
+    /// writer ended).
     LateSnapshotWrite,
     /// The single-writer residual (10-single-protocol step 7's defeated
     /// check, named by step 10): a run's plain PUT of `index.h/<g>`, issued

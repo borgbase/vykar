@@ -24,8 +24,11 @@
 //! writes an empty segment). A backup segment only adds. Violations are
 //! `InvalidFormat`; a version other than 2 is `UnsupportedVersion`.
 //!
-//! No section is reserved for later use: a new section is a new body
-//! version, which this binary refuses by version.
+//! No section is reserved for later use: a new section (a two-phase
+//! sweep's condemned entries, a list of reused chunks) is a new body
+//! version, which this binary refuses by version, and is named by a head
+//! feature so that older binaries refuse the index before they read or
+//! write it (architecture.md, Segmented Index: the sweep is single-phase).
 
 // Every slice is taken at an offset computed from counts checked against the
 // body's length first.

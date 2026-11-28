@@ -273,6 +273,52 @@ fn a_noop_switch_writes_nothing() {
     assert!(stray.is_empty(), "{stray:?}");
 }
 
+/// An unknown key in `config` is tolerated by open and gone after a
+/// commit-mode switch (`set_writer_mode_under` encodes the handle's decoded
+/// config). Pins the rule that a config field without a feature name is
+/// advisory (architecture.md, Repository Versions); a failure here is a
+/// format decision, not a test to update.
+#[test]
+fn a_mode_switch_drops_unknown_config_keys() {
+    #[derive(serde::Serialize)]
+    struct Newer<'a> {
+        #[serde(flatten)]
+        config: &'a crate::repo::RepoConfig,
+        later_field: u32,
+    }
+    let has_key = |b: &[u8]| b.windows(11).any(|w| w == b"later_field");
+    let (mut sim, ctl, _) = multi_writer_sim();
+    let stored = sim.store().object("config").unwrap().data;
+    let crate::repo::DecodedConfig::Map(config) = crate::repo::RepoConfig::decode(&stored).unwrap()
+    else {
+        panic!("a v6 config");
+    };
+    let with_extra_key = rmp_serde::to_vec_named(&Newer {
+        config: &config,
+        later_field: 1,
+    })
+    .unwrap();
+    assert!(has_key(&with_extra_key));
+    sim.tamper_put("config", &with_extra_key);
+    let (run, report) = switch(&mut sim, ctl, WriterMode::Single);
+    run.expect_ok();
+    assert!(report.unwrap().changed);
+    let after = sim.store().object("config").unwrap().data;
+    assert!(
+        !has_key(&after),
+        "an advisory config key survived the mode switch: the rule in architecture.md changed"
+    );
+    let mut expected = config.clone();
+    expected.set_writer_mode(WriterMode::Single);
+    let crate::repo::DecodedConfig::Map(written) = crate::repo::RepoConfig::decode(&after).unwrap()
+    else {
+        panic!("a v6 config");
+    };
+    assert_eq!(written, expected);
+    assert_eq!(sim.store().writer_mode(), Some(WriterMode::Single));
+    sim.check_invariants(STEP8_WITH_REFUSALS).assert_clean();
+}
+
 // ── Init's check ────────────────────────────────────────────────────────
 
 /// A memory backend whose put-if-absent answers as `raw` scripts it,

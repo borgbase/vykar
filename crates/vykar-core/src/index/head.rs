@@ -4,10 +4,21 @@
 //!
 //! Serialized as a msgpack **map** (layout 3) with the field names as keys.
 //! Readers ignore unknown keys, so a field can be added later without a new
-//! layout: such a field must carry `#[serde(default)]`, and one whose
-//! meaning a reader must understand must also add a name to `features`,
-//! which this binary refuses when it does not know the name. Every field
-//! below is required on decode; a missing key is damage.
+//! layout; such a field must carry `#[serde(default)]`. A field without a
+//! feature name is advisory: a binary decodes the head into its own
+//! struct, so an older one drops every key it does not know when it writes
+//! the next head ([`IndexHead::successor`] copies the decoded struct). A
+//! field that must survive that, or whose meaning a reader must
+//! understand, must also add a name to `features`, which this binary
+//! refuses when it does not know the name. Every field below is required
+//! on decode; a missing key is damage.
+//!
+//! A head that fails its typed decode is still read for its `layout` and
+//! its `features` on their own ([`peek_layout`], [`peek_features`]), so a
+//! newer head that keeps layout 3 and changes a field behind a feature
+//! name is refused by that feature, not taken for damage. That peek
+//! freezes the head as a msgpack map with `layout` an unsigned integer and
+//! `features` an array of strings.
 //!
 //! The head names objects only, no state hash: the index state is the base
 //! plus the segments applied in the head's order, and local files are
@@ -284,7 +295,8 @@ impl IndexHead {
     }
 
     /// A copy with the next generation; the caller then edits the objects
-    /// and the sweep.
+    /// and the sweep. Keys of the stored head that this binary does not know
+    /// were dropped at decode and are not carried over (module comment).
     pub fn successor(&self) -> Self {
         Self {
             generation: self.generation + 1,
@@ -483,6 +495,38 @@ mod tests {
         })
         .unwrap();
         assert_eq!(IndexHead::decode(&bytes).unwrap(), head);
+    }
+
+    /// HEAD-3b: an unknown key is not carried to the successor. Pins the rule
+    /// that a head field without a feature name is advisory (architecture.md,
+    /// Repository Versions); a failure here is a format decision, not a test
+    /// to update.
+    #[test]
+    fn unknown_keys_are_dropped_by_successor() {
+        #[derive(Serialize)]
+        struct Newer<'a> {
+            #[serde(flatten)]
+            head: &'a IndexHead,
+            later_field: u32,
+        }
+        let head = sample();
+        let bytes = rmp_serde::to_vec_named(&Newer {
+            head: &head,
+            later_field: 42,
+        })
+        .unwrap();
+        let has_key = |b: &[u8]| b.windows(11).any(|w| w == b"later_field");
+        assert!(has_key(&bytes));
+        let decoded = IndexHead::decode(&bytes).unwrap();
+        assert_eq!(decoded, head, "tolerated on read");
+        let next = decoded.successor();
+        let out = next.encode().unwrap();
+        assert!(
+            !has_key(&out),
+            "an advisory head key survived successor(): the rule in architecture.md changed"
+        );
+        assert_eq!(IndexHead::decode(&out).unwrap(), next);
+        assert_eq!(next.generation, head.generation + 1);
     }
 
     /// HEAD-4 (the classification half is in repo::index_store's tests).

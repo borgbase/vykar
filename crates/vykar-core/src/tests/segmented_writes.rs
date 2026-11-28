@@ -20,8 +20,8 @@ use crate::repo::format::{
     ObjectType, pack_object_streaming_with_context, pack_object_with_context,
 };
 use crate::repo::index_store::{
-    HEAD_CONTEXT, HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment_v2, object_key,
-    pack_head,
+    HEAD_CONTEXT, HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment_v2, head_key,
+    object_key, pack_head,
 };
 use crate::repo::{EncryptionMode, Fence, OpenOptions, Repo, RepoFormat, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
@@ -1983,6 +1983,67 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
     assert!(fx.named_objects_exist(&fx.head()));
     fx.check_clean(&cold);
     assert_eq!(read_restored(&fx.restore(&cold, "s3"), "c"), "charlie");
+}
+
+/// An unknown key in the latest head is tolerated by open and gone from the
+/// head the next backup writes (`publish_machine` builds it with
+/// `IndexHead::successor`). Pins the rule that a head field without a
+/// feature name is advisory (architecture.md, Repository Versions); a
+/// failure here is a format decision, not a test to update.
+#[test]
+fn a_backup_drops_unknown_head_keys() {
+    #[derive(serde::Serialize)]
+    struct Newer<'a> {
+        #[serde(flatten)]
+        head: &'a IndexHead,
+        later_field: u32,
+    }
+    let has_key = |b: &[u8]| b.windows(11).any(|w| w == b"later_field");
+    let fx = fixture(RepoFormat::CURRENT);
+    fx.write("a", "alpha");
+    fx.backup(&fx.config, "s1");
+    let crypto = Arc::clone(fx.open(&fx.cache(), false).unwrap().crypto());
+    let head = fx.head();
+    let next = IndexHead {
+        generation: head.generation + 1,
+        ..head
+    };
+    let body = rmp_serde::to_vec_named(&Newer {
+        head: &next,
+        later_field: 7,
+    })
+    .unwrap();
+    assert!(has_key(&body));
+    let sealed =
+        pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, &body, crypto.as_ref())
+            .unwrap();
+    fx.storage()
+        .put(&head_key(next.generation), &sealed)
+        .unwrap();
+    assert_eq!(fx.head(), next, "tolerated on read");
+    fx.write("b", "beta");
+    fx.backup(&fx.config, "s2");
+    let key = latest_head_key(&*fx.storage());
+    let bytes = fx.storage().get(&key).unwrap().unwrap();
+    let plain = crate::repo::format::unpack_object_expect_with_context(
+        &bytes,
+        ObjectType::IndexHead,
+        HEAD_CONTEXT,
+        crypto.as_ref(),
+    )
+    .unwrap();
+    assert!(
+        !has_key(&plain),
+        "an advisory head key survived the next backup's head: the rule in architecture.md changed"
+    );
+    let written = IndexHead::decode(&plain).unwrap();
+    assert_eq!(
+        written.generation,
+        next.generation + 1,
+        "built on the tampered head"
+    );
+    assert!(written.segments.starts_with(&next.segments));
+    fx.check_clean(&fx.config);
 }
 
 /// A latest head of a newer layout, with unknown features (also when the

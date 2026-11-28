@@ -173,6 +173,10 @@ pub struct LegacyRepoConfig {
 /// map. Carries the seven old fields under their old names and types for
 /// good, so old releases reach their version gate
 /// (`tests/legacy_config_refusal.rs`).
+/// Unknown keys are dropped at decode, so an older binary that rewrites
+/// `config` (`vykar upgrade --commit-mode`) loses fields it does not know:
+/// a field that must survive, or that readers must understand, needs a
+/// name in `features` (architecture.md, Repository Versions).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub version: u32,
@@ -1594,6 +1598,43 @@ mod format_tests {
             RepoFormat::V6(HashAlgorithm::Blake3)
         );
         assert_eq!(decoded.into_repo_config(), config);
+    }
+
+    /// CFG-6b: an unknown key does not survive the commit-mode rewrite's path
+    /// (decode, `into_repo_config`, `set_writer_mode`, `encode`). Pins the
+    /// rule that a config field without a feature name is advisory
+    /// (architecture.md, Repository Versions); a failure here is a format
+    /// decision, not a test to update.
+    #[test]
+    fn unknown_map_keys_are_dropped_on_rewrite() {
+        #[derive(Serialize)]
+        struct Newer<'a> {
+            #[serde(flatten)]
+            config: &'a RepoConfig,
+            later_field: u32,
+        }
+        let config = v6(HashAlgorithm::Blake3);
+        let bytes = rmp_serde::to_vec_named(&Newer {
+            config: &config,
+            later_field: 1,
+        })
+        .unwrap();
+        let has_key = |b: &[u8]| b.windows(11).any(|w| w == b"later_field");
+        assert!(has_key(&bytes));
+        let mut c = RepoConfig::decode(&bytes).unwrap().into_repo_config();
+        assert_eq!(c, config, "tolerated on read");
+        c.set_writer_mode(WriterMode::Multi);
+        let out = c.encode().unwrap();
+        assert!(
+            !has_key(&out),
+            "an advisory config key survived the rewrite: the rule in architecture.md changed"
+        );
+        let decoded = RepoConfig::decode(&out).unwrap();
+        assert_eq!(
+            decoded.validate().unwrap(),
+            RepoFormat::V6(HashAlgorithm::Blake3)
+        );
+        assert_eq!(decoded.into_repo_config().writer_mode(), WriterMode::Multi);
     }
 
     #[test]

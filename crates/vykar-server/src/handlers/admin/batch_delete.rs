@@ -76,13 +76,22 @@ pub(super) async fn batch_delete(
         // PUT (`persist` hits NotFound, the client retries), the same outcome
         // as the 24 h sweep catching a stalled upload; and the repository it
         // targets is being deleted anyway.
+        //
+        // Root files older versions left behind (`LEGACY_ROOT_FILES`) are
+        // hidden from listings for the same reason and go with them. Unlike
+        // temp files their bytes are in `quota_usage`.
         let purged = if state_clone.inner.config.append_only {
             Vec::new()
         } else {
             let purge_dir = data_dir.clone();
-            tokio::task::spawn_blocking(move || crate::cleanup::purge_temp_files(&purge_dir))
-                .await
-                .map_err(|e| ServerError::Internal(format!("temp purge task failed: {e}")))?
+            let (purged, legacy_bytes) = tokio::task::spawn_blocking(move || {
+                let purged = crate::cleanup::purge_temp_files(&purge_dir);
+                (purged, remove_legacy_root_files(&purge_dir))
+            })
+            .await
+            .map_err(|e| ServerError::Internal(format!("temp purge task failed: {e}")))?;
+            state_clone.sub_quota_usage(legacy_bytes);
+            purged
         };
         let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
@@ -124,6 +133,29 @@ pub(super) async fn batch_delete(
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Remove the files in `data_dir` named in `LEGACY_ROOT_FILES` and return
+/// the bytes they held. A file that cannot be removed is logged and kept.
+fn remove_legacy_root_files(data_dir: &std::path::Path) -> u64 {
+    let mut bytes = 0;
+    for name in vykar_protocol::LEGACY_ROOT_FILES {
+        let path = data_dir.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => bytes += meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cleanup-dirs: cannot remove legacy root file");
+            }
+        }
+    }
+    bytes
 }
 
 fn dir_not_empty(e: &std::io::Error) -> bool {
@@ -334,6 +366,40 @@ mod tests {
         assert!(!data_dir.join(".tmp.config.0").exists());
         assert!(!data_dir.join("packs/ab").exists());
         assert!(!data_dir.join("packs").exists());
+    }
+
+    /// Listings hide a `manifest` left by vykar 0.11 and earlier, so the
+    /// client cannot name it; delete-repo's cleanup removes it, with its
+    /// bytes, so the data directory can go.
+    #[tokio::test]
+    async fn batch_delete_cleanup_dirs_removes_legacy_root_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        std::fs::write(tmp.path().join("manifest"), vec![0u8; 1000]).unwrap();
+        let (router, state, tmp) = setup_app_in(tmp, 0, false);
+        // The startup scan counts the file's bytes.
+        assert_eq!(state.quota_used(), 1003);
+        // Drop the helper's skeleton so only the two files are left.
+        for d in ["keys", "snapshots", "locks", "packs"] {
+            std::fs::remove_dir_all(tmp.path().join(d)).unwrap();
+        }
+        let keys = serde_json::to_vec(&serde_json::json!(["config"])).unwrap();
+        let resp = authed_post(router, "/?batch-delete&cleanup-dirs", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("manifest").exists());
+        assert_eq!(state.quota_used(), 0);
+        assert!(!tmp.path().exists(), "data dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn append_only_cleanup_dirs_keeps_legacy_root_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("manifest"), b"old").unwrap();
+        let (router, _state, tmp) = setup_app_in(tmp, 0, true);
+        let keys = serde_json::to_vec(&serde_json::json!([])).unwrap();
+        let resp = authed_post(router, "/?batch-delete&cleanup-dirs", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read(tmp.path().join("manifest")).unwrap(), b"old");
     }
 
     #[tokio::test]

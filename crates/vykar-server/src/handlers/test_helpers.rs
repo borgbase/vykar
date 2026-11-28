@@ -23,7 +23,21 @@ pub fn setup_app_append_only(quota: u64) -> (Router, AppState, tempfile::TempDir
 }
 
 pub fn setup_app_with(quota: u64, append_only: bool) -> (Router, AppState, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().expect("create tempdir");
+    setup_app_in(
+        tempfile::tempdir().expect("create tempdir"),
+        quota,
+        append_only,
+    )
+}
+
+/// Like [`setup_app_with`] on a caller-prepared directory: files placed in
+/// `tmp` before the call are present when the server state is built
+/// (which runs the startup data-directory check).
+pub fn setup_app_in(
+    tmp: tempfile::TempDir,
+    quota: u64,
+    append_only: bool,
+) -> (Router, AppState, tempfile::TempDir) {
     let data_dir = tmp.path().to_path_buf();
 
     // Create repo structure directly in data_dir (single-repo mode)

@@ -432,9 +432,8 @@ pub async fn put_object(
         .await
         .map_err(ServerError::from)?;
 
-    // Detect backup completion: v2 writes snapshots/<id>, v1 writes manifest.
-    // Remove the manifest branch once v1 clients are retired.
-    if (key.starts_with("snapshots/") && old_size == 0) || key == "manifest" {
+    // Detect backup completion: a new `snapshots/<id>`.
+    if key.starts_with("snapshots/") && old_size == 0 {
         state.record_backup();
     }
 
@@ -942,7 +941,11 @@ fn list_files_recursive(dir: &std::path::Path, prefix: &str, mtime: bool) -> Vec
             };
             if meta.is_dir() {
                 keys.extend(list_files_recursive(&path, &full_key, mtime));
-            } else if !vykar_protocol::is_temp_file(&full_key) {
+            } else if !vykar_protocol::is_temp_file(&full_key)
+                // `GET //?list` reaches here with prefix "/" and would name
+                // root files left by older versions (see `repo_list_all`).
+                && !vykar_protocol::LEGACY_ROOT_FILES.contains(&full_key.trim_start_matches('/'))
+            {
                 keys.push(SizedKey {
                     key: full_key,
                     size: meta.len(),
@@ -1560,7 +1563,6 @@ mod tests {
             ("config".into(), WriteOnce),
             ("keys/k".into(), WriteOnce),
             ("pending_index/p".into(), WriteOnce),
-            ("manifest".into(), LegacyMutable),
             (pack_key(0x7e), WriteOnce),
             ("index.h/7".into(), WriteOnce),
             (format!("packmaps/{hex}"), WriteOnce),
@@ -1675,6 +1677,104 @@ mod tests {
     #[tokio::test]
     async fn without_append_only_every_class_is_mutable() {
         run_class_matrix(false).await;
+    }
+
+    async fn authed_head(router: axum::Router, path: &str) -> axum::response::Response {
+        let req = axum::http::Request::builder()
+            .method("HEAD")
+            .uri(path)
+            .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        tower::ServiceExt::oneshot(router, req).await.unwrap()
+    }
+
+    /// A `manifest` left by vykar 0.11 and earlier does not stop the server
+    /// from starting, is answered like a key that was never valid, and is
+    /// left out of the root listing.
+    async fn run_legacy_manifest(append_only: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("manifest");
+        std::fs::write(&manifest, b"old").unwrap();
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        // Building the state runs the startup check, which exits on failure.
+        let (router, _state, tmp) = setup_app_in(tmp, 0, append_only);
+        let ctx = format!("append_only={append_only}");
+
+        for key in ["manifest", "unknown"] {
+            let ctx = format!("{key} {ctx}");
+            let resp = authed_get(router.clone(), &format!("/{key}")).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "GET {ctx}");
+            let resp = authed_head(router.clone(), &format!("/{key}")).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "HEAD {ctx}");
+            let resp = authed_get(router.clone(), &format!("/{key}?list")).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "list {ctx}");
+            let resp = put_with_blake3(router.clone(), key, b"new").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "PUT {ctx}");
+            let resp = authed_post(router.clone(), &format!("/{key}?mkdir"), Vec::new()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "mkdir {ctx}");
+            let resp = authed_delete(router.clone(), &format!("/{key}")).await;
+            let want = if append_only {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            assert_eq!(resp.status(), want, "DELETE {ctx}");
+        }
+        assert!(!tmp.path().join("unknown").exists());
+
+        for uri in ["/?list", "/?list&sized"] {
+            let resp = authed_get(router.clone(), uri).await;
+            assert_status(&resp, StatusCode::OK);
+            let body = body_bytes(resp).await;
+            let keys: Vec<String> = if uri.ends_with("sized") {
+                serde_json::from_slice::<Vec<vykar_protocol::SizedKey>>(&body)
+                    .unwrap()
+                    .into_iter()
+                    .map(|k| k.key)
+                    .collect()
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+            assert!(keys.iter().any(|k| k == "config"), "{uri}: {keys:?}");
+            assert!(
+                !keys.iter().any(|k| k.contains("manifest")),
+                "{uri}: {keys:?}"
+            );
+        }
+        // The wildcard route takes `//?list` as a listing of prefix "/".
+        let resp = authed_get(router.clone(), "//?list").await;
+        assert_status(&resp, StatusCode::OK);
+        let keys: Vec<String> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(keys.iter().any(|k| k == "/config"), "//?list: {keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.contains("manifest")),
+            "//?list: {keys:?}"
+        );
+
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"old", "{ctx}");
+
+        // Batch delete resolves keys leniently: outside append-only it
+        // removes any safe path, `manifest` included.
+        let body = serde_json::to_vec(&["manifest"]).unwrap();
+        let resp = authed_post(router, "/?batch-delete", body).await;
+        if append_only {
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "batch {ctx}");
+            assert!(manifest.exists(), "batch {ctx}");
+        } else {
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "batch {ctx}");
+            assert!(!manifest.exists(), "batch {ctx}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_is_not_served_append_only() {
+        run_legacy_manifest(true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_manifest_is_not_served() {
+        run_legacy_manifest(false).await;
     }
 
     /// Slashes around a key resolve to the same file, so they must not change

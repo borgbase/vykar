@@ -51,7 +51,12 @@ fn list_all_recursive(
                 .map(|c| c.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            if !vykar_protocol::is_temp_file(&key) {
+            // Hide temp files, and root files older versions left behind
+            // (`LEGACY_ROOT_FILES`): they are not keys, so a client could
+            // neither read nor delete one it was shown.
+            if !vykar_protocol::is_temp_file(&key)
+                && !vykar_protocol::LEGACY_ROOT_FILES.contains(&key.as_str())
+            {
                 out.push(SizedKey {
                     key,
                     size: meta.len(),

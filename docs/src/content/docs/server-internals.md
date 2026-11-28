@@ -62,11 +62,13 @@ When `append_only = true`, `PUT` of an existing key, `DELETE` and `/?batch-delet
 |-------|------|-----------|--------|
 | Write-once | `config`, `keys/*`, `snapshots/*`, `packs/<xx>/<id>`, `index.h/<gen>`, `packmaps/<id>`, legacy `pending_index/*` | no | no |
 | Content-addressed | `index.d/<id>` | same bytes only (no write) | no |
-| Legacy mutable | `index`, `index.gen`, `manifest` | yes | no |
+| Legacy mutable | `index`, `index.gen` | yes | no |
 | Ephemeral | `locks/*`, `sessions/*` | yes | yes |
 | Temp | leftover temporary upload files (`.tmp.*`, `.repack_tmp.*`) | — | yes |
 
 Keys are classified after trimming leading and trailing slashes, as path resolution does. Directories and keys outside the schema have no class and are refused.
+
+`manifest`, which vykar 0.11 and earlier wrote at the repository root, is outside the schema: requests for it are refused like any unknown key in every mode, and no listing names it. A data directory that still holds one is accepted at startup. Because the client cannot name it, `/?batch-delete&cleanup-dirs` on a server without append-only removes it along with the temp files.
 
 Independently of append-only, `index.h/<gen>` is write-once and `index.d/<id>` is checked against its BLAKE3 name in every mode (see the `PUT` row above). A PUT onto an existing head with other bytes is therefore a `409`, not a `403`, in append-only mode too.
 

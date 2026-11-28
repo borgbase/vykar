@@ -74,6 +74,8 @@ pub(crate) fn write_unpoisoned<'a, T>(
 /// Return the names of any top-level entries in `data_dir` that are not part
 /// of a valid vykar repository layout. An empty or non-existent directory is fine.
 /// Server-created temp files (`.tmp.*`) are tolerated — they come from interrupted PUTs.
+/// Files older versions left at the root ([`vykar_protocol::LEGACY_ROOT_FILES`]) are
+/// tolerated too; the server neither serves nor lists them.
 pub(crate) fn unexpected_entries(data_dir: &Path) -> Vec<String> {
     let mut bad = Vec::new();
     if let Ok(entries) = std::fs::read_dir(data_dir) {
@@ -81,6 +83,7 @@ pub(crate) fn unexpected_entries(data_dir: &Path) -> Vec<String> {
             if let Some(name) = entry.file_name().to_str() {
                 let known = vykar_protocol::KNOWN_ROOT_FILES.contains(&name)
                     || vykar_protocol::KNOWN_ROOT_DIRS.contains(&name)
+                    || vykar_protocol::LEGACY_ROOT_FILES.contains(&name)
                     || vykar_protocol::is_temp_file(name);
                 if !known {
                     bad.push(name.to_string());
@@ -308,7 +311,7 @@ impl AppState {
                 });
     }
 
-    /// Record that a manifest was written (backup completed).
+    /// Record that a new snapshot was written (backup completed).
     pub fn record_backup(&self) {
         let mut ts = write_unpoisoned(&self.inner.last_backup_at, "last_backup_at");
         *ts = Some(Utc::now());
@@ -465,7 +468,7 @@ mod tests {
             "index.d/{}/x",
             "0f".repeat(32)
         )));
-        assert!(is_valid_storage_key("manifest"));
+        assert!(!is_valid_storage_key("manifest"));
         assert!(is_valid_storage_key("index.h/12"));
         assert!(!is_valid_storage_key("index.h/012"));
         assert!(is_valid_storage_key(&format!(
@@ -547,6 +550,18 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("index.h")).unwrap();
         std::fs::create_dir_all(tmp.path().join("packmaps")).unwrap();
         assert!(unexpected_entries(tmp.path()).is_empty());
+    }
+
+    /// Nor does a `manifest` left by vykar 0.11 and earlier; an unknown
+    /// name next to it is still flagged.
+    #[test]
+    fn legacy_manifest_is_an_expected_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("manifest"), b"m").unwrap();
+        std::fs::write(tmp.path().join("config"), b"c").unwrap();
+        assert!(unexpected_entries(tmp.path()).is_empty());
+        std::fs::write(tmp.path().join("unknown"), b"u").unwrap();
+        assert_eq!(unexpected_entries(tmp.path()), vec!["unknown"]);
     }
 
     #[test]

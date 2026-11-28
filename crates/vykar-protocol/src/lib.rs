@@ -623,9 +623,17 @@ pub struct VerifyPacksResponse {
 
 // ── Repository layout ─────────────────────────────────────────────────────
 
-/// Top-level file entries that can appear in a vykar repository root.
-/// "manifest" is a v1 legacy artifact — remove once v1 clients are retired.
-pub const KNOWN_ROOT_FILES: &[&str] = &["config", "index", "index.gen", "manifest"];
+/// Top-level files that are keys of a vykar repository: the server serves
+/// them and [`is_valid_storage_key`] accepts them.
+pub const KNOWN_ROOT_FILES: &[&str] = &["config", "index", "index.gen"];
+
+/// Top-level files that older vykar versions left in a repository root
+/// and no supported version reads or writes: `manifest` (vykar 0.11 and
+/// earlier). They are not keys: [`is_valid_storage_key`] refuses them and a
+/// server does not serve or list them. A server still starts on a data
+/// directory that holds one, and [`is_known_repo_key`] counts them as part
+/// of the repository, so deleting a repository removes them.
+pub const LEGACY_ROOT_FILES: &[&str] = &["manifest"];
 
 /// Top-level directory entries that can appear in a vykar repository root.
 pub const KNOWN_ROOT_DIRS: &[&str] = &[
@@ -723,9 +731,11 @@ pub fn is_repo_temp_file(key: &str) -> bool {
 
 /// Returns true if `key` is a known vykar repository storage key.
 ///
-/// Matches root files, directory-prefixed paths, and `.tmp.*` temp files.
+/// Matches root files (including [`LEGACY_ROOT_FILES`]), directory-prefixed
+/// paths, and `.tmp.*` temp files.
 pub fn is_known_repo_key(key: &str) -> bool {
     KNOWN_ROOT_FILES.contains(&key)
+        || LEGACY_ROOT_FILES.contains(&key)
         || KNOWN_ROOT_DIRS
             .iter()
             .any(|d| key.starts_with(d) && key.as_bytes().get(d.len()) == Some(&b'/'))
@@ -791,7 +801,7 @@ pub enum KeyClass {
     /// checks on every PUT. A PUT onto an existing object stores nothing. Not
     /// deletable in append-only mode.
     ContentAddressed,
-    /// `index`, `index.gen`, `manifest`: overwritten in place by v2/v3 clients.
+    /// `index`, `index.gen`: overwritten in place by v2/v3 clients.
     LegacyMutable,
     /// `locks/*`, `sessions/*`: coordination state.
     Ephemeral,
@@ -940,7 +950,7 @@ fn classify_committed(key: &str) -> Option<Entry> {
         (HEAD_DIR, [_]) if head_generation(trimmed).is_some() => Entry::Object(KeyClass::WriteOnce),
         (PACK_MAP_DIR, [_]) if is_pack_map_key(trimmed) => Entry::Object(KeyClass::WriteOnce),
         ("config", []) => Entry::Object(KeyClass::WriteOnce),
-        ("index" | "index.gen" | "manifest", []) => Entry::Object(KeyClass::LegacyMutable),
+        ("index" | "index.gen", []) => Entry::Object(KeyClass::LegacyMutable),
         _ => return None,
     };
     Some(entry)
@@ -1351,8 +1361,27 @@ mod tests {
 
     #[test]
     fn known_root_files_accepted() {
-        for f in KNOWN_ROOT_FILES {
+        for f in KNOWN_ROOT_FILES.iter().chain(LEGACY_ROOT_FILES) {
             assert!(is_known_repo_key(f), "{f} should be known");
+        }
+    }
+
+    /// Files older versions left at the root are part of a repository but
+    /// not keys: no class, refused for every verb.
+    #[test]
+    fn legacy_root_files_are_not_keys() {
+        assert_eq!(key_class("manifest"), None);
+        for f in LEGACY_ROOT_FILES {
+            assert!(!KNOWN_ROOT_FILES.contains(f), "{f}");
+            assert!(is_known_repo_key(f), "{f}");
+            for k in [f.to_string(), format!("/{f}"), format!("{f}/")] {
+                assert!(!is_valid_storage_key(&k), "{k:?}");
+                assert_eq!(key_class(&k), None, "{k:?}");
+                assert_eq!(put_rule(&k), PutRule::Plain, "{k:?}");
+                for verb in [Verb::Create, Verb::Overwrite, Verb::Delete] {
+                    assert!(!append_only_allows(&k, verb), "{k:?} {verb:?}");
+                }
+            }
         }
     }
 
@@ -1477,7 +1506,7 @@ mod tests {
             }
             _ => {}
         }
-        if KNOWN_ROOT_FILES.contains(first) {
+        if ["config", "index", "index.gen", "manifest"].contains(first) {
             return parts.len() == 1;
         }
         false
@@ -1601,11 +1630,18 @@ mod tests {
         key.split('/').find(|s| !s.is_empty()).unwrap_or("")
     }
 
+    /// Outside the v6 directories, the schema is the pre-table one, except
+    /// for `LEGACY_ROOT_FILES`, which left it on purpose.
     #[test]
     fn is_valid_storage_key_is_unchanged_outside_v6_dirs() {
         for (key, variants) in key_corpus() {
             for k in std::iter::once(key).chain(variants) {
                 if V6_KEY_DIRS.contains(&first_segment(k)) {
+                    continue;
+                }
+                // `manifest` left the schema on purpose (0.30).
+                if LEGACY_ROOT_FILES.contains(&k.trim_matches('/')) {
+                    assert!(!is_valid_storage_key(k), "{k:?}");
                     continue;
                 }
                 assert_eq!(

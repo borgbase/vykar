@@ -27,6 +27,10 @@
 //! object the listing lacks, one listed without an mtime, or no "now".
 //! Every segment gets a fresh nonce, so a new segment always has a new name
 //! and a new mtime.
+//!
+//! These values are protocol between v6 clients (pinned in
+//! `tests::protocol_v6`): changing one is a format change and needs a new
+//! `config` feature name, so older clients refuse the repository.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

@@ -470,6 +470,10 @@ fn group_session_markers(keys: &[String]) -> std::collections::BTreeMap<&str, Ve
 }
 
 /// A session marker stored at `sessions/<session_id>[.<n>].json`.
+///
+/// Its JSON, the marker key shapes and the timing constants (here and in
+/// `ages`) are protocol between v6 clients, pinned in `tests::protocol_v6`:
+/// changing them needs a new `config` feature name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub hostname: String,

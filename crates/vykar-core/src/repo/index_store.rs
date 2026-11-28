@@ -104,6 +104,7 @@ impl IndexGcGrace {
 }
 
 /// Heads kept below the latest regardless of age (04: latest − 16).
+/// Protocol between v6 clients (pinned in `tests::protocol_v6`).
 pub(crate) const HEADS_KEPT: u64 = 16;
 
 /// How often a reader retries on a re-read head after a named object

@@ -40,6 +40,7 @@ mod measure;
 mod multi_writer;
 mod passphrase;
 mod proptest;
+mod protocol_v6;
 mod prune;
 mod prune_command;
 mod readers_read_only;

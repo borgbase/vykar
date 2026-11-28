@@ -15,6 +15,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_pack_map` | Pack map body decoder (`PackMap::decode_body`, which must re-encode identically) |
 | `fuzz_decompress` | LZ4/Zstd decompression (`decompress`, `decompress_metadata`, and the streaming zstd metadata reader against it); chunk decoding with and without a size hint must agree |
 | `fuzz_msgpack_snapshot_meta` | `SnapshotMeta` deserialization |
+| `fuzz_listing_ext` | Snapshot key index (`SnapshotMeta.ext`): `decode_ext`, `check_ext` against a listing built from the input, re-encode, and the writer's own index decoding and checking clean |
 | `fuzz_msgpack_index_blob` | `IndexBlob` deserialization (the v2/v3 index, read only by the upgrade) |
 | `fuzz_item_stream` | Streaming item decode (`for_each_decoded_item`) |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` (custom msgpack parser) |

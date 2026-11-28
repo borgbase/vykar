@@ -14,6 +14,7 @@ use std::path::Path;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use vykar_core::compress::{Compression, compress};
+use vykar_core::fuzzing::{self, ExtVerdict, ListingOp};
 use vykar_core::index::base_v2::BaseWriter;
 use vykar_core::index::head::{
     BaseRef, IndexHead, ObjectName, ObjectRef, SegmentKind, SegmentRef, SweepState,
@@ -31,6 +32,7 @@ use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
 use vykar_core::repo::{ChunkerParams, EncryptionMode, LegacyRepoConfig, RepoConfig};
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
+use vykar_core::snapshot::listing::{NoIndex, ORDER_DFS_NAME, ORDER_UNKNOWN, encode_ext};
 use vykar_core::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
 use vykar_crypto::testing::DeterministicEngine;
@@ -711,6 +713,192 @@ fn seed_sweep_record() {
     write_seed("fuzz_sweep_record", "empty", &empty.encode().unwrap());
 }
 
+/// A fuzz_listing_ext input (layout: fuzz_targets/fuzz_listing_ext.rs).
+fn listing_ext_input(ext: Option<&[u8]>, stride: u32, ops: &[ListingOp<'_>]) -> Vec<u8> {
+    assert!((1..=32).contains(&stride));
+    let ext_bytes = ext.unwrap_or_default();
+    let mut out = vec![u8::from(ext.is_none()), u8::try_from(stride - 1).unwrap()];
+    out.extend_from_slice(&u16::try_from(ext_bytes.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(ext_bytes);
+    for (i, op) in ops.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        match *op {
+            ListingOp::Cut => {}
+            ListingOp::BeginSegment(root) => {
+                assert!(!root.contains(&b'\n'));
+                out.push(0x01);
+                out.extend_from_slice(root);
+            }
+            ListingOp::Push(path) => {
+                assert!(!path.contains(&b'\n'));
+                out.push(0x02);
+                out.extend_from_slice(path);
+            }
+        }
+    }
+    out
+}
+
+fn from_hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Write a fuzz_listing_ext seed whose ext `check` accepts.
+fn write_listing_seed(name: &str, ext: &[u8], stride: u32, ops: &[ListingOp<'_>]) {
+    let listing = fuzzing::write_listing(ops, stride);
+    assert_eq!(
+        fuzzing::check_ext(Some(ext), &listing.chunks),
+        ExtVerdict::Ok,
+        "{name}"
+    );
+    write_seed(
+        "fuzz_listing_ext",
+        name,
+        &listing_ext_input(Some(ext), stride, ops),
+    );
+}
+
+fn seed_listing_ext() {
+    // The TREE of listing.rs's builder tests, two entries per tree chunk.
+    let tree: &[&[u8]] = &[
+        b"a", b"a.b", b"b", b"a/x", b"a/y", b"a/y/1", b"a/y/2", b"b/c", b"b/d",
+    ];
+    let mut tree_ops = Vec::new();
+    for (i, p) in tree.iter().enumerate() {
+        tree_ops.push(ListingOp::Push(p));
+        if i % 2 == 1 {
+            tree_ops.push(ListingOp::Cut);
+        }
+    }
+    let tree_listing = fuzzing::write_listing(&tree_ops, 2);
+    assert_eq!(tree_listing.index.order, ORDER_DFS_NAME);
+    assert_eq!(tree_listing.chunks.len(), 5);
+    let keys: Vec<&[u8]> = tree_listing
+        .index
+        .keys
+        .iter()
+        .map(|k| k.as_slice())
+        .collect();
+    assert_eq!(keys, [&b""[..], b"a/y", b"b/d"]);
+    let tree_ext = encode_ext(&tree_listing.index).unwrap();
+    write_listing_seed("tree_stride_2", &tree_ext, 2, &tree_ops);
+
+    // Explicit segments, one of them empty, two entries per tree chunk.
+    let segments: &[(&[u8], &[&[u8]])] = &[
+        (
+            b"vykar-dumps",
+            &[b"vykar-dumps", b"vykar-dumps/a", b"vykar-dumps/b"],
+        ),
+        (b"none", &[]),
+        (b"home/u/b", &[b"home/u/b", b"home/u/b/x", b"home/u/b/y/z"]),
+        (b"home/u/a", &[b"home/u/a", b"home/u/a/k"]),
+    ];
+    let mut seg_ops = Vec::new();
+    for (root, paths) in segments {
+        seg_ops.push(ListingOp::BeginSegment(root));
+        for (i, p) in paths.iter().enumerate() {
+            seg_ops.push(ListingOp::Push(p));
+            if i % 2 == 1 {
+                seg_ops.push(ListingOp::Cut);
+            }
+        }
+    }
+    let seg_index = fuzzing::write_listing(&seg_ops, 1).index;
+    assert_eq!(seg_index.order, ORDER_DFS_NAME);
+    let first_ptrs: Vec<u32> = seg_index.segments.iter().map(|s| s.first_ptr).collect();
+    assert_eq!(first_ptrs, [0, 2, 4]);
+    write_listing_seed(
+        "segments_stride_1",
+        &encode_ext(&seg_index).unwrap(),
+        1,
+        &seg_ops,
+    );
+
+    // The frozen bytes of listing.rs's ext_golden_bytes, derived by the
+    // writer's builder from a 33-chunk listing.
+    let golden_paths: Vec<Vec<u8>> = (0..31)
+        .map(|i| format!("r/a/a{i:02}").into_bytes())
+        .collect();
+    let mut golden_ops = vec![
+        ListingOp::BeginSegment(b"vykar-dumps"),
+        ListingOp::Push(b"vykar-dumps"),
+        ListingOp::BeginSegment(b"r"),
+    ];
+    for p in &golden_paths {
+        golden_ops.push(ListingOp::Push(p));
+        golden_ops.push(ListingOp::Cut);
+    }
+    golden_ops.push(ListingOp::Push(b"r/a/b"));
+    let golden_listing = fuzzing::write_listing(&golden_ops, 32);
+    assert_eq!(golden_listing.chunks.len(), 33);
+    let golden = golden_listing.index;
+    let golden_ext = encode_ext(&golden).unwrap();
+    assert_eq!(
+        golden_ext,
+        from_hex(concat!(
+            "92019401",
+            "92",
+            "92c40b76796b61722d64756d707300",
+            "92c4017201",
+            "20",
+            "92c400c403612f62"
+        ))
+    );
+    write_listing_seed("golden", &golden_ext, 32, &golden_ops);
+
+    // A trailing element after the index is ignored.
+    let trailing = rmp_serde::to_vec(&(1u32, &golden, "extra")).unwrap();
+    write_listing_seed("golden_trailing", &trailing, 32, &golden_ops);
+
+    // An unknown ext version: no index, not a mismatch.
+    let unknown = rmp_serde::to_vec(&(2u32, &golden)).unwrap();
+    assert_eq!(
+        fuzzing::check_ext(Some(&unknown), &golden_listing.chunks),
+        ExtVerdict::NoIndex(NoIndex::UnknownVersion(2))
+    );
+    write_seed(
+        "fuzz_listing_ext",
+        "unknown_version",
+        &listing_ext_input(Some(&unknown), 32, &golden_ops),
+    );
+
+    // A listing out of name order: the writer's order-0 index.
+    let order0_ops = [ListingOp::Push(b"b"), ListingOp::Push(b"a")];
+    let order0 = fuzzing::write_listing(&order0_ops, 2);
+    assert_eq!(order0.index.order, ORDER_UNKNOWN);
+    let order0_ext = encode_ext(&order0.index).unwrap();
+    assert_eq!(
+        fuzzing::check_ext(Some(&order0_ext), &order0.chunks),
+        ExtVerdict::NoIndex(NoIndex::Unordered)
+    );
+    write_seed(
+        "fuzz_listing_ext",
+        "order_0",
+        &listing_ext_input(Some(&order0_ext), 2, &order0_ops),
+    );
+
+    // No tree chunks at all.
+    let empty = fuzzing::write_listing(&[], 32).index;
+    assert_eq!(empty.order, ORDER_DFS_NAME);
+    write_listing_seed("empty_listing", &encode_ext(&empty).unwrap(), 32, &[]);
+
+    // An absent ext.
+    assert_eq!(
+        fuzzing::check_ext(None, &tree_listing.chunks),
+        ExtVerdict::NoIndex(NoIndex::Absent)
+    );
+    write_seed(
+        "fuzz_listing_ext",
+        "absent",
+        &listing_ext_input(None, 2, &tree_ops),
+    );
+}
+
 /// A positional (v2/v3, or a refused development version) config.
 fn repo_config(
     version: u32,
@@ -1023,6 +1211,9 @@ fn main() {
 
     seed_sweep_record();
     println!("  fuzz_sweep_record: done");
+
+    seed_listing_ext();
+    println!("  fuzz_listing_ext: done");
 
     seed_index_object();
     println!("  fuzz_index_object: done");

@@ -12,6 +12,9 @@ use crate::index::segment_v2::SegmentBody;
 use crate::repo::ChunkerParams;
 use crate::repo::index_store;
 use crate::snapshot::item::Item;
+use crate::snapshot::listing::{
+    self, ChunkPaths, ExtCheck, ListingIndex, ListingIndexBuilder, NoIndex,
+};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
@@ -128,4 +131,84 @@ pub fn symlink_target(item: &Item) -> (PathBuf, bool) {
     let target = crate::commands::restore::symlink_target_path(item);
     let flagged = classify_symlink_target_path(&target) != SymlinkSafety::Safe;
     (target, flagged)
+}
+
+/// One step of `ListingWriter` as the listing's key index sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListingOp<'a> {
+    /// `ListingWriter::begin_segment(root)`: closes the open tree chunk,
+    /// then announces the segment.
+    BeginSegment(&'a [u8]),
+    /// `ListingWriter::push` of an entry whose `Item::path_bytes()` is this.
+    Push(&'a [u8]),
+    /// The cut rule closes the open tree chunk (a no-op when it is empty).
+    Cut,
+}
+
+/// What a listing written by [`write_listing`] holds: the entry paths of
+/// each tree chunk, in `item_ptrs` order, and the key index the writer
+/// derived (`FinishedListing::ext` before encoding).
+#[derive(Debug, Clone)]
+pub struct WrittenListing {
+    pub chunks: Vec<Vec<Vec<u8>>>,
+    pub index: ListingIndex,
+}
+
+/// `ListingIndexBuilder` driven exactly as `ListingWriter` drives it
+/// (commands/backup/listing.rs: begin_segment, push, close_chunk, finish),
+/// with `stride` in place of `STRIDE`.
+pub fn write_listing(ops: &[ListingOp<'_>], stride: u32) -> WrittenListing {
+    fn close(chunks: &mut Vec<Vec<Vec<u8>>>, open: &mut Vec<Vec<u8>>) {
+        if !open.is_empty() {
+            chunks.push(std::mem::take(open));
+        }
+    }
+    let mut builder = ListingIndexBuilder::with_stride(stride);
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut open: Vec<Vec<u8>> = Vec::new();
+    for op in ops {
+        match *op {
+            ListingOp::BeginSegment(root) => {
+                close(&mut chunks, &mut open);
+                builder.begin_segment(root.to_vec());
+            }
+            ListingOp::Push(path) => {
+                builder.observe(path, chunks.len(), open.is_empty());
+                open.push(path.to_vec());
+            }
+            ListingOp::Cut => close(&mut chunks, &mut open),
+        }
+    }
+    close(&mut chunks, &mut open);
+    let index = builder.finish(chunks.len());
+    WrittenListing { chunks, index }
+}
+
+/// `snapshot::listing::ExtCheck`, public for the fuzz crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtVerdict {
+    Ok,
+    NoIndex(NoIndex),
+    Mismatch(String),
+}
+
+/// `snapshot::listing::check_ext` over tree chunks given as their entry
+/// paths, summarised as `check` summarises them (commands/check/scan.rs).
+pub fn check_ext(ext: Option<&[u8]>, chunks: &[Vec<Vec<u8>>]) -> ExtVerdict {
+    let sums: Vec<ChunkPaths> = chunks
+        .iter()
+        .map(|paths| {
+            let mut s = ChunkPaths::default();
+            for p in paths {
+                s.observe(p);
+            }
+            s
+        })
+        .collect();
+    let refs: Vec<&ChunkPaths> = sums.iter().collect();
+    match listing::check_ext(ext, &refs) {
+        ExtCheck::Ok => ExtVerdict::Ok,
+        ExtCheck::NoIndex(no) => ExtVerdict::NoIndex(no),
+        ExtCheck::Mismatch(reason) => ExtVerdict::Mismatch(reason),
+    }
 }

@@ -61,7 +61,7 @@ The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `s
 
 ## Fuzz Tests
 
-20 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
+21 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
 
 | Target | Function under test | Risk surface |
 |--------|-------------------|--------------|
@@ -70,6 +70,7 @@ The protocol simulator (`vykar-core/src/sim`, compiled for tests and with the `s
 | `fuzz_pack_map` | `PackMap::decode_body` | Lying pack and entry counts, unsorted or overlapping entries, oversized maps; non-canonical bodies |
 | `fuzz_decompress` | `decompress` + `decompress_metadata`, streaming zstd metadata reader | Decompression bombs, corrupt LZ4/Zstd frames, streaming vs buffered disagreement |
 | `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
+| `fuzz_listing_ext` | `decode_ext`, `check_ext`, the listing writer's index builder | Repository-controlled `ext`: lying counts and lengths, unknown versions and orders, invalid segment tables; `check` agreeing with decode; the writer's index always passing `check` |
 | `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
 | `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext`, `FileCache::decode_from_plaintext_skipping` | Manual msgpack marker parsing, allocation cap, legacy fallback |

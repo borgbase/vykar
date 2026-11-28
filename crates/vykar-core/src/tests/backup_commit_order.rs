@@ -316,7 +316,11 @@ fn setup() -> (
     fs::create_dir_all(&src_dir).unwrap();
     fs::write(src_dir.join("a.bin"), vec![0x5au8; 64 * 1024]).unwrap();
     fs::write(src_dir.join("b.txt"), b"hello").unwrap();
-    let config = crate::tests::helpers::init_repo(&repo_dir);
+    let mut config = crate::tests::helpers::init_repo(&repo_dir);
+    // `run_backup` reads no xattrs; other clients of `config` must match,
+    // or an xattr the OS adds (macOS `com.apple.provenance`) changes the
+    // item stream.
+    config.xattrs.enabled = false;
     // The recording wrapper offers no put-if-absent: single-writer.
     crate::tests::helpers::make_single_writer(&repo_dir);
     (dir, config, src_dir)

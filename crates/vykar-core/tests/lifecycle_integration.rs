@@ -990,10 +990,8 @@ fn item_stream_reader_propagates_interrupt_without_fallback() {
 
 /// Compute the local file cache path for a given repo ID.
 fn filecache_path(repo_id: &[u8]) -> std::path::PathBuf {
-    let cache_base = std::env::var("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap();
-    cache_base
+    vykar_common::paths::cache_dir()
+        .expect("platform cache dir")
         .join("vykar")
         .join(hex::encode(repo_id))
         .join("filecache")

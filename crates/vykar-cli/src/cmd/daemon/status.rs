@@ -15,13 +15,14 @@ use chrono::{DateTime, SubsecRound, Utc};
 use serde::Serialize;
 
 use vykar_core::app::operations::{CycleStep, StepOutcome};
-use vykar_core::app::passphrase::configured_passphrase;
+use vykar_core::app::passphrase::{configured_passphrase, resolving_runs_command};
 use vykar_core::app::scheduler::repos_schedule_brief;
 use vykar_core::app::service::CycleReport;
 use vykar_core::app::views::{self, SnapshotRecord};
 use vykar_core::commands::list;
 use vykar_core::config::ResolvedRepo;
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
+use zeroize::Zeroizing;
 
 use crate::json::SCHEMA;
 
@@ -342,9 +343,24 @@ fn carry_over_next_runs(new_rows: &mut [RepoInfo], previous: &[RepoInfo]) {
 /// Read one repo's summary row and its newest `RECENT_SNAPSHOTS_LIMIT`
 /// snapshots. The returned row has `status`/`refreshed_at` unset; the caller
 /// stamps them.
-pub(crate) fn fetch_repo(repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
+/// `accepted` is the passphrase a cycle accepted; without one, a repo whose
+/// passphrase comes from a passcommand is refused instead of running it.
+pub(crate) fn fetch_repo(
+    repo: &ResolvedRepo,
+    accepted: Option<&str>,
+) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
     let name = repo.label_or_url().to_string();
-    let pass = configured_passphrase(&repo.config)?;
+    let pass = match accepted {
+        Some(p) => Some(Zeroizing::new(p.to_string())),
+        // The worker never gets here for a passcommand repo; refuse rather
+        // than run a passcommand before the repo's hooks.
+        None if resolving_runs_command(&repo.config) => {
+            return Err(VykarError::Other(
+                "no passphrase accepted by a cycle yet".into(),
+            ));
+        }
+        None => configured_passphrase(&repo.config)?,
+    };
     let pass_ref = pass.as_deref().map(|s| s.as_str());
 
     let stats = vykar_core::commands::info::run(&repo.config, pass_ref)?;

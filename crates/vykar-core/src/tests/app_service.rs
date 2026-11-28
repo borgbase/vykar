@@ -350,6 +350,49 @@ fn run_cycle_reuses_an_accepted_value() {
 }
 
 #[test]
+fn accepted_passphrase_follows_the_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, "r");
+    let _env = prompt_only(&mut repo.config);
+    repo.config.encryption.passcommand = Some(format!("echo {TEST_PASSPHRASE}"));
+    let repos = vec![repo];
+    let mut service = AppService::new();
+    assert!(
+        service.accepted_passphrase(&repos[0].config).is_none(),
+        "nothing accepted yet"
+    );
+
+    let mut prompt = ScriptedPrompt::new(&[]);
+    let report = service.run_cycle(
+        &repos,
+        &CycleRequest::default(),
+        &mut prompt,
+        &CancelToken::new(),
+        &|_: AppEvent<'_>| {},
+    );
+    assert!(
+        !report.has_failures(),
+        "{:?}",
+        conformance::summary(&report, &repos)
+    );
+    assert_eq!(prompt.asks(), 0);
+    assert_eq!(
+        service
+            .accepted_passphrase(&repos[0].config)
+            .as_deref()
+            .map(String::as_str),
+        Some(TEST_PASSPHRASE)
+    );
+
+    let mut changed = repos[0].config.clone();
+    changed.encryption.passcommand = Some("echo other".into());
+    assert!(
+        service.accepted_passphrase(&changed).is_none(),
+        "not handed over under another source"
+    );
+}
+
+#[test]
 fn conformance_core_cycle() {
     let tmp = tempfile::tempdir().unwrap();
     super::helpers::init_test_environment();

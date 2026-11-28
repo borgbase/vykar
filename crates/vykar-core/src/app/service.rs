@@ -172,6 +172,12 @@ impl AppService {
         self.cache.contains(config)
     }
 
+    /// The value a repository accepted, cached under its current passphrase
+    /// source (the daemon hands it to its status worker).
+    pub fn accepted_passphrase(&self, config: &VykarConfig) -> Option<Zeroizing<String>> {
+        self.cache.peek(config)
+    }
+
     /// Run `action` inside `command`'s repo-level hooks, or without hooks when
     /// `dry_run`. The passphrase scope is lazy, so a prompt comes after the
     /// `before` hooks and a re-prompt does not re-run them. Non-fatal hook

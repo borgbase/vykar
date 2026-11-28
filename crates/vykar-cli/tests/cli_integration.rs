@@ -2465,6 +2465,141 @@ fn cli_daemon_sighup_picks_up_changed_passphrase() {
     );
 }
 
+/// A config with one repository whose passphrase comes from `passcommand`,
+/// backing up `source_a` every hour; `extra` is appended verbatim.
+#[cfg(unix)]
+fn passcommand_daemon_config(fx: &CliFixture, passcommand: &str, extra: &str) -> String {
+    format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passcommand: {}\nsources:\n  - {}\n{extra}",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_single(passcommand),
+        yaml_quote_path(&fx.source_a),
+    )
+}
+
+/// [`passcommand_daemon_config`] with an inline passphrase, to create the repo.
+#[cfg(unix)]
+fn init_for_passcommand(fx: &CliFixture, cfg: &str) {
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: 'secret'\nsources:\n  - {}\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&fx.source_a),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    fx.init_repos(cfg);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_daemon_passcommand_may_depend_on_a_before_hook() {
+    let fx = CliFixture::new();
+    std::fs::write(fx.source_a.join("a.txt"), b"hook-gated passphrase\n").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    init_for_passcommand(&fx, &cfg);
+
+    let marker = fx.config_home.join("unlocked");
+    let config = passcommand_daemon_config(
+        &fx,
+        &format!("test -f '{}' && echo secret", marker.display()),
+        &format!(
+            "hooks:\n  before_backup: {}\nschedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+            yaml_single(&format!("touch '{}'", marker.display()))
+        ),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+    let ok = logs.wait_for(
+        "backup cycle finished successfully",
+        Duration::from_secs(30),
+    );
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+    let stderr = logs.snapshot();
+    assert!(ok, "the cycle should succeed, got stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("failed to validate passphrase"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("finished with errors"), "{stderr}");
+}
+
+/// Lines in the count file a counting passcommand appends to.
+#[cfg(unix)]
+fn passcommand_runs(count: &Path) -> usize {
+    std::fs::read_to_string(count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_daemon_runs_the_passcommand_once_across_startup_and_cycle() {
+    let fx = CliFixture::new();
+    std::fs::write(fx.source_a.join("a.txt"), b"counted passphrase\n").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    init_for_passcommand(&fx, &cfg);
+
+    let count = fx.config_home.join("passcommand-runs");
+    let config = passcommand_daemon_config(
+        &fx,
+        &format!("echo run >> '{}' && echo secret", count.display()),
+        "schedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let _ = std::fs::remove_file(&count);
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+    let ok = logs.wait_for(
+        "backup cycle finished successfully",
+        Duration::from_secs(30),
+    );
+    // Let the status worker (1 s tick) do its post-cycle fetch.
+    std::thread::sleep(Duration::from_secs(3));
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+    assert!(
+        ok,
+        "the cycle should succeed, got stderr:\n{}",
+        logs.snapshot()
+    );
+    assert_eq!(passcommand_runs(&count), 1, "stderr:\n{}", logs.snapshot());
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_daemon_without_on_startup_runs_no_passcommand() {
+    let fx = CliFixture::new();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    init_for_passcommand(&fx, &cfg);
+
+    let count = fx.config_home.join("passcommand-runs");
+    let config = passcommand_daemon_config(
+        &fx,
+        &format!("echo run >> '{}' && echo secret", count.display()),
+        "schedule:\n  enabled: true\n  every: \"1h\"\n",
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let _ = std::fs::remove_file(&count);
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+    let started = logs.wait_for("daemon starting", Duration::from_secs(15));
+    // Give the status worker (1 s tick) time to do its startup fetches.
+    std::thread::sleep(Duration::from_secs(3));
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+    assert!(
+        started,
+        "daemon should start, got stderr:\n{}",
+        logs.snapshot()
+    );
+    assert!(
+        !count.exists(),
+        "passcommand ran; stderr:\n{}",
+        logs.snapshot()
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn cli_daemon_sighup_invalid_config_keeps_old() {

@@ -4,8 +4,9 @@
 use zeroize::Zeroizing;
 
 use crate::app::passphrase::{
-    InitPassphrase, InitPromptStage, PromptContext, reset_env_passphrase_cache,
-    resolve_init_passphrase, resolve_passphrase,
+    InitPassphrase, InitPromptStage, PromptContext, configured_passphrase, has_configured_source,
+    reset_env_passphrase_cache, resolve_init_passphrase, resolve_passphrase,
+    resolving_runs_command,
 };
 use crate::config::EncryptionModeConfig;
 use vykar_types::error::VykarError;
@@ -357,4 +358,56 @@ fn init_cancellation_of_either_prompt_is_not_an_error() {
     })
     .unwrap();
     assert!(matches!(second, InitPassphrase::Cancelled));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn has_configured_source_does_not_run_the_passcommand() {
+    let _lock = CWD_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("runs");
+    let mut config = config_without_passphrase(tmp.path());
+    config.encryption.passcommand = Some(counting_passcommand(&marker, "x"));
+    set_vykar_passphrase(None);
+
+    assert!(has_configured_source(&config));
+    assert!(!marker.exists(), "the passcommand must not run");
+}
+
+#[test]
+fn has_configured_source_reads_env_into_the_memo() {
+    let _lock = CWD_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_without_passphrase(tmp.path());
+    assert!(config.encryption.passcommand.is_none());
+
+    set_vykar_passphrase(Some("env-pass"));
+    assert!(has_configured_source(&config));
+    assert!(std::env::var_os("VYKAR_PASSPHRASE").is_none());
+    let pass = configured_passphrase(&config).unwrap().unwrap();
+    assert_eq!(pass.as_str(), "env-pass");
+
+    set_vykar_passphrase(None);
+    assert!(!has_configured_source(&config));
+}
+
+#[test]
+fn has_configured_source_accepts_inline_passphrase() {
+    let _lock = CWD_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config_without_passphrase(tmp.path());
+    config.encryption.passphrase = Some("inline".into());
+    set_vykar_passphrase(None);
+    assert!(has_configured_source(&config));
+}
+
+#[test]
+fn resolving_runs_command_follows_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config_without_passphrase(tmp.path());
+    assert!(!resolving_runs_command(&config));
+    config.encryption.passcommand = Some("false".into());
+    assert!(resolving_runs_command(&config));
+    config.encryption.passphrase = Some("inline".into());
+    assert!(!resolving_runs_command(&config));
 }

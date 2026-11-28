@@ -14,12 +14,13 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::AppService;
-use vykar_core::app::passphrase::{NoPrompt, configured_passphrase};
+use vykar_core::app::passphrase::{NoPrompt, has_configured_source};
 use vykar_core::app::scheduler::{Scheduler, SchedulerLock};
 use vykar_core::app::service::{AppEvent, CycleReport, CycleRequest, RepoSelection};
 use vykar_core::config::{self, ConfigSource, ResolvedRepo, ScheduleConfig};
 use vykar_core::repo::control::FnMutSink;
 use vykar_types::error::VykarError;
+use zeroize::Zeroizing;
 
 use crate::cycle::CycleRenderer;
 use crate::dispatch::warn_if_untrusted_rest;
@@ -129,23 +130,17 @@ fn load_daemon_config(source: &ConfigSource) -> CliResult<Vec<ResolvedRepo>> {
         ));
     }
 
-    // Pre-validate passphrases for every repo, including those whose schedule is
-    // disabled — they still take part in SIGUSR1 cycles and the status page.
+    // Every repository, including those whose schedule is disabled (they still
+    // take part in SIGUSR1 cycles and the status page), must name a source the
+    // daemon can use without prompting. Nothing runs here: a passcommand runs
+    // in the cycle, after the before hooks, and a failure is a failed step.
     for repo in &repos {
-        let label = repo.label_or_url();
-        match configured_passphrase(&repo.config) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(CliError::from(format!(
-                    "encrypted repository '{label}' has no non-interactive passphrase source; \
-                     configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
-                )));
-            }
-            Err(e) => {
-                return Err(CliError::from(format!(
-                    "failed to validate passphrase for '{label}': {e}"
-                )));
-            }
+        if !has_configured_source(&repo.config) {
+            let label = repo.label_or_url();
+            return Err(CliError::from(format!(
+                "repository '{label}' has no non-interactive passphrase source; \
+                 configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
+            )));
         }
     }
 
@@ -191,7 +186,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
     ));
     let status_tx = worker::spawn(status.clone(), cycle_running.clone(), &SHUTDOWN)
         .map_err(|e| CliError::from(format!("failed to spawn status worker: {e}")))?;
-    send_configure(&status_tx, &repos);
+    send_configure(&status_tx, &repos, &service);
 
     status::touch_process(&status, started_at, scheduler.next_wake());
     status::set_repo_next_runs(&status, &repo_next_runs(&repos, &scheduler));
@@ -216,7 +211,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                     repos = new_repos;
                     service.reload(&repos);
                     status::init(&status, &repos, started_at);
-                    send_configure(&status_tx, &repos);
+                    send_configure(&status_tx, &repos, &service);
 
                     log_registered_repos(&repos);
 
@@ -298,9 +293,19 @@ fn log_registered_repos(repos: &[ResolvedRepo]) {
     }
 }
 
-fn send_configure(tx: &Sender<worker::Msg>, repos: &[ResolvedRepo]) {
+/// Hand the worker the repositories and, index-aligned, the passphrase each
+/// one accepted under its current source (none at startup; on reload, those
+/// `AppService::reload` kept).
+fn send_configure(tx: &Sender<worker::Msg>, repos: &[ResolvedRepo], service: &AppService) {
+    let passphrases = repos
+        .iter()
+        .map(|r| service.accepted_passphrase(&r.config))
+        .collect();
     if tx
-        .send(worker::Msg::Configure(Arc::new(repos.to_vec())))
+        .send(worker::Msg::Configure {
+            repos: Arc::new(repos.to_vec()),
+            passphrases,
+        })
         .is_err()
     {
         tracing::warn!("status worker is gone; status page will not update");
@@ -323,6 +328,7 @@ fn run_cycle(
     let _ = status_tx.send(worker::Msg::CycleDone {
         ran: names.ran,
         skipped: names.skipped,
+        passphrases: names.passphrases,
     });
     cycle_running.store(false, Ordering::SeqCst);
 }
@@ -332,6 +338,8 @@ fn run_cycle(
 struct CycleNames {
     ran: Vec<String>,
     skipped: Vec<String>,
+    /// For each repo in `ran`, the passphrase it accepted, if any.
+    passphrases: Vec<(String, Option<Zeroizing<String>>)>,
 }
 
 /// Run a backup cycle for the `selection` of `all`, the full configured set:
@@ -413,6 +421,7 @@ fn run_backup_cycle_report(
     let mut names = CycleNames {
         ran: Vec::new(),
         skipped: Vec::new(),
+        passphrases: Vec::new(),
     };
     for r in &report.repos {
         let name = all
@@ -422,6 +431,10 @@ fn run_backup_cycle_report(
         if r.skipped().is_some() {
             names.skipped.push(name);
         } else {
+            let accepted = all
+                .get(r.index)
+                .and_then(|repo| service.accepted_passphrase(&repo.config));
+            names.passphrases.push((name.clone(), accepted));
             names.ran.push(name);
         }
     }

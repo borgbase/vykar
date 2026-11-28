@@ -5,7 +5,7 @@ title: "Schedule Backups"
 `vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for the repositories that are due, sequentially. The shutdown flag is checked between steps.
 
 - **Scheduling**: a fixed interval (`schedule.every`) or a cron expression (`schedule.cron`), with optional random jitter. See [Configuration → Schedule](/configuration#schedule) for all fields.
-- **Passphrase**: the daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env). It cannot prompt interactively.
+- **Passphrase**: every repository needs a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env); the daemon cannot prompt. At startup and on reload it only checks that a source is configured. A `passcommand` first runs in the repository's cycle, after its `before` hooks; a failure there is a failed step (`failed` and `finally` hooks run).
 - **Scheduler lock**: the daemon and GUI share a process-wide scheduler lock under the local config directory so only one scheduler is active at a time. On Unix this uses `flock(2)`, on Windows `LockFileEx`; the OS releases it when the process exits.
 
 A minimal schedule:
@@ -51,8 +51,8 @@ How the daemon runs this:
   schedule; otherwise it exits with `schedule.enabled is false for all
   repositories`.
 - Repositories with a disabled schedule stay loaded: skipped by the timer, but
-  still covered by `SIGUSR1` cycles, the status page, and startup passphrase
-  validation.
+  still covered by `SIGUSR1` cycles, the status page, and the startup check
+  for a passphrase source.
 - `on_startup` is per repository — only the repos that set it back up at start.
 - A repository whose cadence cannot be computed is logged as a warning and
   dropped from the timer; the others keep running.
@@ -86,7 +86,7 @@ What the page shows:
 - Configured sources and their target repositories
 - Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors` / `skipped`). `skipped` means every attempted repository was [skipped by a hook](/configuration#skipping-a-run) or [unavailable](/configuration#unavailable-local-repositories)
 
-The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Repository data is refreshed in the background, so a slow or unreachable repository never delays the page or a backup cycle: after each cycle for the repositories that ran, on a SIGHUP reload for new or failed repositories, and when a 60-second check finds the set of snapshots changed (for example after a `delete` or `prune` from the CLI). At startup each repository is fetched once, after the first cycle when `on_startup` is set. Repositories in `skipped` or `error` are not contacted again until their next cycle. See [Daemon status refresh](/configuration#skipping-a-run).
+The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Repository data is refreshed in the background, so a slow or unreachable repository never delays the page or a backup cycle: after each cycle for the repositories that ran, on a SIGHUP reload for new or failed repositories, and when a 60-second check finds the set of snapshots changed (for example after a `delete` or `prune` from the CLI). At startup each repository is fetched once, after the first cycle when `on_startup` is set. A repository with a `passcommand` is fetched only after a cycle has run it, with the passphrase that cycle accepted; the status page never runs a `passcommand`, so the row shows `pending` until the repository's first cycle (for a repository with a disabled schedule, its first `SIGUSR1` cycle), and stays `pending` if that cycle could not resolve the passphrase. When a reload changes a repository's passphrase source, or a cycle could not resolve it, the row keeps its last status and numbers and is not refreshed until a later cycle accepts a passphrase. Repositories in `skipped` or `error` are not contacted again until their next cycle. See [Daemon status refresh](/configuration#skipping-a-run).
 
 Endpoints:
 - `GET /` — HTML overview
@@ -132,7 +132,7 @@ kill -HUP $(pidof vykar)
 Reload behavior:
 - The reload takes effect **between backup cycles** — a cycle in progress runs to completion first
 - `on_startup` is ignored on reload; every repository's next run is recalculated from its schedule relative to now
-- If the new config is **invalid** (parse error, empty repositories, no repository with `schedule.enabled: true`, passphrase validation failure), the daemon logs a warning and continues with the previous config
+- If the new config is **invalid** (parse error, empty repositories, no repository with `schedule.enabled: true`, a repository without a passphrase source), the daemon logs a warning and continues with the previous config
 - If the new config is **valid**, repos and schedules are replaced and the next run times are recalculated
 - The daemon keeps a passphrase only after a repository accepted it, and drops it when that repository's `encryption` passphrase settings change on reload. If the repository refuses a kept passphrase, the daemon resolves it again from the configuration, so a passphrase changed together with its `passcommand` secret is picked up on the next cycle without `SIGHUP`
 

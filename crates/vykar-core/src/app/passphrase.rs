@@ -77,6 +77,23 @@ pub fn configured_passphrase(config: &VykarConfig) -> Result<Option<Zeroizing<St
     Ok(None)
 }
 
+/// Whether `config` names a non-interactive passphrase source, without
+/// running `encryption.passcommand`. Only when neither `encryption.passphrase`
+/// nor `encryption.passcommand` is set does it read `VYKAR_PASSPHRASE`, as
+/// [`configured_passphrase`] does: into the process memo, removing it from
+/// the environment, so the value stays available to later lookups.
+pub fn has_configured_source(config: &VykarConfig) -> bool {
+    config.encryption.passphrase.is_some()
+        || config.encryption.passcommand.is_some()
+        || take_env_passphrase().is_some()
+}
+
+/// Whether [`configured_passphrase`] would run `encryption.passcommand` for
+/// `config` (an inline passphrase takes precedence over it).
+pub fn resolving_runs_command(config: &VykarConfig) -> bool {
+    config.encryption.passphrase.is_none() && config.encryption.passcommand.is_some()
+}
+
 /// Cache for `VYKAR_PASSPHRASE`: `None` = not yet read, `Some(v)` = already consumed.
 static ENV_PASSPHRASE: Mutex<Option<Option<Zeroizing<String>>>> = Mutex::new(None);
 
@@ -95,12 +112,12 @@ fn take_env_passphrase() -> Option<Zeroizing<String>> {
     if val.is_some() {
         // SAFETY: `remove_var` is unsound while another thread reads or
         // writes the environment. Single-repo CLI commands and daemon startup
-        // (`load_daemon_config`) get here before spawning threads, and the
-        // cache above makes every later call return early. Not guaranteed in
-        // the GUI (passphrases resolve on its worker thread while the UI
-        // thread runs), in multi-repo CLI runs (an earlier repo may already
-        // have started the storage runtime), or for a daemon whose first env
-        // lookup comes after a SIGHUP reload.
+        // (`load_daemon_config`, through `has_configured_source`) get here
+        // before spawning threads, and the cache above makes every later call
+        // return early. Not guaranteed in the GUI (passphrases resolve on its
+        // worker thread while the UI thread runs), in multi-repo CLI runs (an
+        // earlier repo may already have started the storage runtime), or for a
+        // daemon whose first env lookup comes after a SIGHUP reload.
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("VYKAR_PASSPHRASE");
@@ -330,6 +347,14 @@ impl PassphraseCache {
         self.entries
             .get(&config.repository.url)
             .is_some_and(|e| e.source == SourceKey::of(config))
+    }
+
+    /// The cached value under the current source, without removing a stale entry.
+    pub fn peek(&self, config: &VykarConfig) -> Option<Zeroizing<String>> {
+        self.entries
+            .get(&config.repository.url)
+            .filter(|e| e.source == SourceKey::of(config))
+            .map(|e| e.value.clone())
     }
 
     /// Keep only entries of a repository in `repos` whose source is unchanged.
@@ -679,6 +704,18 @@ mod scope_tests {
         assert!(!cache.contains(&b));
         assert!(cache.get(&b).is_none());
         assert!(!cache.contains(&a), "the stale entry is dropped");
+    }
+
+    #[test]
+    fn peek_follows_the_source_without_evicting() {
+        let a = config();
+        let mut b = a.clone();
+        b.encryption.passphrase = Some("b".into());
+        let mut cache = PassphraseCache::default();
+        cache.insert(&a, Zeroizing::new("a".into()));
+        assert_eq!(cache.peek(&a).as_deref().map(String::as_str), Some("a"));
+        assert!(cache.peek(&b).is_none());
+        assert!(cache.contains(&a), "a stale peek does not evict");
     }
 
     #[test]

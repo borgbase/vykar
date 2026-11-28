@@ -8,6 +8,16 @@
 //! - `CycleDone` after each backup cycle, naming the repos that ran and the
 //!   repos skipped by a hook or because they were unavailable.
 //!
+//! Both carry the passphrases the daemon's cycles accepted. The worker never
+//! runs a passcommand: a repo whose passphrase comes from one is not contacted
+//! until a cycle accepted its passphrase, and stays `pending` until then.
+//! Status I/O reuses that value; if the secret behind the passcommand changes,
+//! a refresh before the next cycle fails and marks the row `error`, and the
+//! next cycle hands over the new value. A repo whose passphrase was withdrawn
+//! (a reload changed its source, or a cycle handed over none) keeps its last
+//! state and numbers and is not refreshed until a later cycle hands over a
+//! value.
+//!
 //! A skipped repo is not contacted until its next cycle runs. A repo whose
 //! status fetch or poll fails is marked `error` and is likewise left alone
 //! until its next cycle or a reload. Status I/O does not retry.
@@ -18,8 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use vykar_core::app::passphrase::resolving_runs_command;
 use vykar_core::config::ResolvedRepo;
 use vykar_types::error::Result;
+use zeroize::Zeroizing;
 
 use super::poll;
 use super::release_malloc_arenas;
@@ -33,10 +45,17 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const TICK: Duration = Duration::from_secs(1);
 
 pub(super) enum Msg {
-    Configure(Arc<Vec<ResolvedRepo>>),
+    Configure {
+        repos: Arc<Vec<ResolvedRepo>>,
+        /// Index-aligned with `repos`: the value each accepted under its
+        /// current passphrase source, if any.
+        passphrases: Vec<Option<Zeroizing<String>>>,
+    },
     CycleDone {
         ran: Vec<String>,
         skipped: Vec<String>,
+        /// For repos in `ran`: the passphrase each accepted, if any.
+        passphrases: Vec<(String, Option<Zeroizing<String>>)>,
     },
 }
 
@@ -44,7 +63,13 @@ pub(super) enum Msg {
 /// testable without a repository.
 pub(super) trait StatusIo: Sync {
     fn list_ids(&self, repo: &ResolvedRepo) -> Result<HashSet<String>>;
-    fn fetch(&self, repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)>;
+    /// `pass` is a value a cycle accepted, else `None`: resolve from an
+    /// inline passphrase or VYKAR_PASSPHRASE only, never a passcommand.
+    fn fetch(
+        &self,
+        repo: &ResolvedRepo,
+        pass: Option<&str>,
+    ) -> Result<(RepoInfo, Vec<SnapshotRow>)>;
 }
 
 struct RepoStatusIo;
@@ -54,8 +79,12 @@ impl StatusIo for RepoStatusIo {
         poll::list_snapshot_ids(repo)
     }
 
-    fn fetch(&self, repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
-        status::fetch_repo(repo)
+    fn fetch(
+        &self,
+        repo: &ResolvedRepo,
+        pass: Option<&str>,
+    ) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
+        status::fetch_repo(repo, pass)
     }
 }
 
@@ -68,6 +97,16 @@ struct Entry {
     snapshots: Vec<SnapshotRow>,
     baseline: Option<HashSet<String>>,
     dirty: bool,
+    /// Accepted by the daemon's cycles under the current source; never printed.
+    passphrase: Option<Zeroizing<String>>,
+}
+
+impl Entry {
+    /// Status I/O would not run a passcommand: a cycle handed a value, or
+    /// resolution uses an inline passphrase or VYKAR_PASSPHRASE.
+    fn can_resolve(&self) -> bool {
+        self.passphrase.is_some() || !resolving_runs_command(&self.repo.config)
+    }
 }
 
 /// Status I/O must not sit through the backend retry schedule: a dead repo
@@ -106,11 +145,19 @@ impl<I: StatusIo> Worker<I> {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Configure(repos) => self.configure(&repos),
-            Msg::CycleDone { ran, skipped } => {
+            Msg::Configure { repos, passphrases } => self.configure(&repos, passphrases),
+            Msg::CycleDone {
+                ran,
+                skipped,
+                mut passphrases,
+            } => {
                 for e in &mut self.entries {
                     if ran.contains(&e.name) {
                         e.dirty = true;
+                        e.passphrase = passphrases
+                            .iter_mut()
+                            .find(|(name, _)| *name == e.name)
+                            .and_then(|(_, p)| p.take());
                     } else if skipped.contains(&e.name) {
                         e.state = RepoState::Skipped;
                         e.dirty = false;
@@ -121,9 +168,11 @@ impl<I: StatusIo> Worker<I> {
         }
     }
 
-    fn configure(&mut self, repos: &[ResolvedRepo]) {
+    fn configure(&mut self, repos: &[ResolvedRepo], passphrases: Vec<Option<Zeroizing<String>>>) {
         let mut old = std::mem::take(&mut self.entries);
+        let mut passphrases = passphrases.into_iter();
         for repo in repos {
+            let passphrase = passphrases.next().flatten();
             let name = repo.label_or_url().to_string();
             let url = &repo.config.repository.url;
             let kept = old
@@ -133,6 +182,7 @@ impl<I: StatusIo> Worker<I> {
             let entry = match kept {
                 Some(mut e) => {
                     e.repo = without_retries(repo);
+                    e.passphrase = passphrase;
                     if e.state == RepoState::Error {
                         // The reload may have fixed it.
                         e.state = RepoState::Pending;
@@ -148,6 +198,7 @@ impl<I: StatusIo> Worker<I> {
                     snapshots: Vec::new(),
                     baseline: None,
                     dirty: true,
+                    passphrase,
                 },
             };
             self.entries.push(entry);
@@ -188,14 +239,16 @@ impl<I: StatusIo> Worker<I> {
         if !self.may_do_io() {
             return false;
         }
-        let dirty: Vec<(usize, ResolvedRepo)> = self
+        // A dirty entry that cannot resolve without a passcommand stays dirty
+        // and keeps its state until a cycle hands it a passphrase.
+        let dirty: Vec<(usize, ResolvedRepo, Option<Zeroizing<String>>)> = self
             .entries
             .iter_mut()
             .enumerate()
-            .filter(|(_, e)| e.dirty)
+            .filter(|(_, e)| e.dirty && e.can_resolve())
             .map(|(i, e)| {
                 e.dirty = false;
-                (i, e.repo.clone())
+                (i, e.repo.clone(), e.passphrase.clone())
             })
             .collect();
         if dirty.is_empty() {
@@ -204,7 +257,7 @@ impl<I: StatusIo> Worker<I> {
 
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
-            for (idx, repo) in &dirty {
+            for (idx, repo, _) in &dirty {
                 let tx = tx.clone();
                 let io = &self.io;
                 scope.spawn(move || {
@@ -214,7 +267,7 @@ impl<I: StatusIo> Worker<I> {
             drop(tx);
 
             for (idx, listed) in rx {
-                let (_, repo) = dirty.iter().find(|(i, _)| *i == idx).expect("sent idx");
+                let (_, repo, pass) = dirty.iter().find(|(i, ..)| *i == idx).expect("sent idx");
                 let result = match listed {
                     // A cycle started meanwhile: leave the fetch for later.
                     Ok(_) if !self.may_do_io() => {
@@ -223,7 +276,10 @@ impl<I: StatusIo> Worker<I> {
                         }
                         continue;
                     }
-                    Ok(ids) => self.io.fetch(repo).map(|fetched| (ids, fetched)),
+                    Ok(ids) => self
+                        .io
+                        .fetch(repo, pass.as_deref().map(String::as_str))
+                        .map(|fetched| (ids, fetched)),
                     Err(e) => Err(e),
                 };
                 let Some(entry) = self.entries.get_mut(idx) else {
@@ -351,6 +407,7 @@ mod tests {
         failing: Mutex<HashSet<String>>,
         lists: Mutex<HashMap<String, usize>>,
         fetches: Mutex<HashMap<String, usize>>,
+        passes: Mutex<HashMap<String, Option<String>>>,
     }
 
     impl FakeIo {
@@ -373,6 +430,10 @@ mod tests {
         }
         fn fetches(&self, url: &str) -> usize {
             self.fetches.lock().unwrap().get(url).copied().unwrap_or(0)
+        }
+        /// The `pass` of the last fetch of `url` (also `None` if never fetched).
+        fn last_pass(&self, url: &str) -> Option<String> {
+            self.passes.lock().unwrap().get(url).cloned().flatten()
         }
         fn assert_no_retries(repo: &ResolvedRepo) {
             assert_eq!(repo.config.repository.retry.max_retries, 0);
@@ -405,8 +466,16 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        fn fetch(&self, repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
+        fn fetch(
+            &self,
+            repo: &ResolvedRepo,
+            pass: Option<&str>,
+        ) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
             let url = &repo.config.repository.url;
+            self.passes
+                .lock()
+                .unwrap()
+                .insert(url.clone(), pass.map(str::to_string));
             let n = {
                 let mut f = self.fetches.lock().unwrap();
                 let n = f.entry(url.clone()).or_default();
@@ -450,6 +519,13 @@ mod tests {
         }
     }
 
+    /// [`repo`] whose passphrase comes from a passcommand.
+    fn repo_with_passcommand(label: &str, url: &str, cmd: &str) -> ResolvedRepo {
+        let mut r = repo(label, url);
+        r.config.encryption.passcommand = Some(cmd.to_string());
+        r
+    }
+
     fn worker(io: &FakeIo) -> (Worker<&FakeIo>, Arc<AtomicBool>) {
         let running = Arc::new(AtomicBool::new(false));
         let w = Worker::new(io, status::new_shared(), running.clone(), &NO_SHUTDOWN);
@@ -457,13 +533,40 @@ mod tests {
     }
 
     fn configure(w: &mut Worker<&FakeIo>, repos: Vec<ResolvedRepo>) {
-        w.handle(Msg::Configure(Arc::new(repos)));
+        let passes = vec![None; repos.len()];
+        configure_with(w, repos, &passes);
+    }
+
+    /// `passes` is index-aligned with `repos`.
+    fn configure_with(w: &mut Worker<&FakeIo>, repos: Vec<ResolvedRepo>, passes: &[Option<&str>]) {
+        w.handle(Msg::Configure {
+            repos: Arc::new(repos),
+            passphrases: passes
+                .iter()
+                .map(|p| p.map(|s| Zeroizing::new(s.to_string())))
+                .collect(),
+        });
     }
 
     fn cycle_done(w: &mut Worker<&FakeIo>, ran: &[&str], skipped: &[&str]) {
+        cycle_done_with(w, &[], ran, skipped);
+    }
+
+    /// `passes` names the passphrase each repo in `ran` accepted; a repo in
+    /// `ran` it does not name accepted none.
+    fn cycle_done_with(
+        w: &mut Worker<&FakeIo>,
+        passes: &[(&str, Option<&str>)],
+        ran: &[&str],
+        skipped: &[&str],
+    ) {
         w.handle(Msg::CycleDone {
             ran: ran.iter().map(|s| (*s).to_string()).collect(),
             skipped: skipped.iter().map(|s| (*s).to_string()).collect(),
+            passphrases: passes
+                .iter()
+                .map(|(n, p)| ((*n).to_string(), p.map(|s| Zeroizing::new(s.to_string()))))
+                .collect(),
         });
     }
 
@@ -640,5 +743,88 @@ mod tests {
         cycle_done(&mut w, &["a"], &[]);
         w.work(Instant::now());
         assert_eq!(io.fetches("/a"), 1);
+    }
+
+    #[test]
+    fn passcommand_repo_waits_for_a_cycle() {
+        let io = FakeIo::default();
+        let (mut w, _) = worker(&io);
+        configure(
+            &mut w,
+            vec![
+                repo_with_passcommand("pc", "/pc", "false"),
+                repo("plain", "/plain"),
+            ],
+        );
+        w.work(Instant::now());
+        let t = later(&w);
+        w.work(t);
+        assert_eq!(io.lists("/pc") + io.fetches("/pc"), 0);
+        assert_eq!(row(&w, "pc").status, RepoState::Pending);
+        assert_eq!((io.fetches("/plain"), io.last_pass("/plain")), (1, None));
+        assert_eq!(row(&w, "plain").status, RepoState::Ok);
+
+        cycle_done_with(&mut w, &[("pc", Some("s"))], &["pc"], &[]);
+        w.work(Instant::now());
+        assert_eq!(io.fetches("/pc"), 1);
+        assert_eq!(io.last_pass("/pc"), Some("s".into()));
+        assert_eq!(row(&w, "pc").status, RepoState::Ok);
+    }
+
+    #[test]
+    fn cycle_without_accepted_value_leaves_passcommand_repo_alone() {
+        let io = FakeIo::default();
+        let (mut w, _) = worker(&io);
+        configure(&mut w, vec![repo_with_passcommand("pc", "/pc", "false")]);
+        cycle_done(&mut w, &["pc"], &[]);
+        w.work(Instant::now());
+        let t = later(&w);
+        w.work(t);
+        assert_eq!(io.lists("/pc") + io.fetches("/pc"), 0);
+        assert_eq!(row(&w, "pc").status, RepoState::Pending);
+    }
+
+    #[test]
+    fn reload_takes_the_passphrase_the_service_kept() {
+        let io = FakeIo::default();
+        let (mut w, _) = worker(&io);
+        configure(&mut w, vec![repo_with_passcommand("pc", "/pc", "old")]);
+        cycle_done_with(&mut w, &[("pc", Some("s"))], &["pc"], &[]);
+        w.work(Instant::now());
+        assert_eq!(io.fetches("/pc"), 1);
+
+        // The source changed, so the service dropped the value: no contact.
+        io.set_ids("/pc", &["new"]);
+        configure(&mut w, vec![repo_with_passcommand("pc", "/pc", "new")]);
+        let t = later(&w);
+        w.work(t);
+        assert_eq!(io.fetches("/pc"), 1);
+
+        // The service kept a value: it is used, also under a new label.
+        configure_with(
+            &mut w,
+            vec![repo_with_passcommand("renamed", "/pc", "new")],
+            &[Some("t")],
+        );
+        w.work(Instant::now());
+        assert_eq!(io.fetches("/pc"), 2);
+        assert_eq!(io.last_pass("/pc"), Some("t".into()));
+        assert_eq!(row(&w, "renamed").status, RepoState::Ok);
+    }
+
+    #[test]
+    fn skipped_cycle_keeps_handed_value() {
+        let io = FakeIo::default();
+        let (mut w, _) = worker(&io);
+        configure(&mut w, vec![repo_with_passcommand("pc", "/pc", "false")]);
+        cycle_done_with(&mut w, &[("pc", Some("s"))], &["pc"], &[]);
+        cycle_done(&mut w, &[], &["pc"]);
+        assert_eq!(row(&w, "pc").status, RepoState::Skipped);
+
+        // The skip kept the value: once dirty again, the repo is fetched with it.
+        w.entries[0].dirty = true;
+        w.work(Instant::now());
+        assert_eq!(io.fetches("/pc"), 1);
+        assert_eq!(io.last_pass("/pc"), Some("s".into()));
     }
 }
